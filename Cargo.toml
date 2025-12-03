@@ -1,6 +1,6 @@
 [package]
 name = "exfilguard"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Rust egress proxy that enforces outbound network policies with TLS interception support."
 license = "Apache-2.0"

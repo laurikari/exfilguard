@@ -3,6 +3,9 @@
 # Policies define what traffic is allowed or denied. Each policy contains
 # one or more rules that are evaluated in order.
 #
+# Recommended: Add your policies in /etc/exfilguard/policies.d/*.toml
+# rather than editing this file, so package upgrades don't conflict.
+#
 # See https://laurikari.github.io/exfilguard/policies/ for full documentation.
 
 # Default deny-all policy - blocks all traffic not explicitly allowed.
@@ -10,7 +13,8 @@
 name = "deny-all"
   [[policy.rule]]
   action = "DENY"
-  reason = "No matching allow rule"
+  status = 470
+  reason = "Blocked by ExfilGuard"
 
 # Example: Allow HTTPS to specific domains (uncomment to enable)
 # [[policy]]

@@ -1,7 +1,10 @@
 # ExfilGuard clients configuration
 #
 # Clients map source IP ranges to policies. When a connection arrives,
-# the first matching client (by CIDR) determines which policies apply.
+# the most specific matching client (by CIDR) determines which policies apply.
+#
+# Recommended: Add your clients in /etc/exfilguard/clients.d/*.toml
+# rather than editing this file, so package upgrades don't conflict.
 #
 # See https://laurikari.github.io/exfilguard/configuration/ for full documentation.
 
