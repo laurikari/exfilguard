@@ -1,0 +1,19 @@
+# ExfilGuard clients configuration
+#
+# Clients map source IP ranges to policies. When a connection arrives,
+# the first matching client (by CIDR) determines which policies apply.
+#
+# See https://laurikari.github.io/exfilguard/configuration/ for full documentation.
+
+# Default catch-all denies all traffic. Add specific client rules above this.
+[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["deny-all"]
+catch_all = true
+
+# Example: Allow specific subnet with custom policies (uncomment to enable)
+# [[client]]
+# name = "app-servers"
+# cidr = "10.0.1.0/24"
+# policies = ["allow-example", "deny-all"]

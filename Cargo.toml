@@ -1,6 +1,6 @@
 [package]
 name = "exfilguard"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Rust egress proxy that enforces outbound network policies with TLS interception support."
 license = "Apache-2.0"
@@ -77,11 +77,11 @@ dest = "etc/exfilguard/exfilguard.toml"
 mode = "0640"
 
 [[package.metadata.deb.assets]]
-source = "examples/full/clients.toml"
+source = "packaging/deb/config/clients.toml"
 dest = "etc/exfilguard/clients.toml"
 mode = "0640"
 
 [[package.metadata.deb.assets]]
-source = "examples/full/policies.toml"
+source = "packaging/deb/config/policies.toml"
 dest = "etc/exfilguard/policies.toml"
 mode = "0640"

@@ -1,0 +1,27 @@
+# ExfilGuard policies configuration
+#
+# Policies define what traffic is allowed or denied. Each policy contains
+# one or more rules that are evaluated in order.
+#
+# See https://laurikari.github.io/exfilguard/policies/ for full documentation.
+
+# Default deny-all policy - blocks all traffic not explicitly allowed.
+[[policy]]
+name = "deny-all"
+  [[policy.rule]]
+  action = "DENY"
+  reason = "No matching allow rule"
+
+# Example: Allow HTTPS to specific domains (uncomment to enable)
+# [[policy]]
+# name = "allow-example"
+#   [[policy.rule]]
+#   action = "ALLOW"
+#   methods = ["GET", "POST"]
+#   url_pattern = "https://api.example.com/**"
+#
+#   [[policy.rule]]
+#   action = "ALLOW"
+#   methods = ["CONNECT"]
+#   url_pattern = "https://cdn.example.com/**"
+#   inspect_payload = false  # Pass-through without TLS interception
