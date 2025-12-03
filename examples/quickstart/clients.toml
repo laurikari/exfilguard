@@ -1,0 +1,10 @@
+[[client]]
+name = "loopback"
+ip = "127.0.0.1"
+policies = ["allow-searchkit", "default-deny"]
+
+[[client]]
+name = "catch-all"
+cidr = "0.0.0.0/0"
+policies = ["default-deny"]
+catch_all = true

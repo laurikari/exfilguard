@@ -1,0 +1,20 @@
+[[policy]]
+name = "allow-searchkit"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT"]
+  url_pattern = "https://www.searchkit.com/**"
+  inspect_payload = true
+
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET", "HEAD"]
+  url_pattern = "https://www.searchkit.com/faq/**"
+
+[[policy]]
+name = "default-deny"
+  [[policy.rule]]
+  action = "DENY"
+  status = 470
+  reason = "Policy Blocked"
+  body = "Blocked by ExfilGuard\n"

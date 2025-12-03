@@ -1,0 +1,34 @@
+# SaaS worker tiers mapped by CIDR to enforce different egress needs.
+[[client]]
+name = "analytics-batch-workers"
+cidr = "10.42.16.0/27"
+policies = [
+  "trusted-analytics-egress",
+  "fallback-egress-deny",
+]
+
+[[client]]
+name = "payments-forwarders"
+cidr = "10.42.48.0/28"
+policies = [
+  "pinned-payments-egress",
+  "fallback-egress-deny",
+]
+
+[[client]]
+name = "integration-webhooks"
+cidr = "10.42.96.0/28"
+policies = [
+  "trusted-analytics-egress",
+  "pinned-payments-egress",
+  "fallback-egress-deny",
+]
+
+# Fallback catch-all for anything not mapped above.
+[[client]]
+name = "catch-all"
+cidr = "0.0.0.0/0"
+policies = [
+  "fallback-egress-deny",
+]
+catch_all = true

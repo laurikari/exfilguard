@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+if ! id -u exfilguard >/dev/null 2>&1; then
+    adduser --system --group --home /var/lib/exfilguard --no-create-home --shell /usr/sbin/nologin exfilguard >/dev/null 2>&1 || true
+fi
+
+install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard
+install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/ca
+install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/cache
+install -d -o root -g exfilguard -m 0750 /etc/exfilguard
+install -d -o root -g exfilguard -m 0750 /etc/exfilguard/clients.d
+install -d -o root -g exfilguard -m 0750 /etc/exfilguard/policies.d
+
+for file in /etc/exfilguard/*.toml; do
+    [ -f "$file" ] || continue
+    chown root:exfilguard "$file"
+    chmod 0640 "$file"
+done
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

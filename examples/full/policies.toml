@@ -1,0 +1,31 @@
+# Baseline deny rule keeps behavior explicit when a SaaS service does not match an allow policy.
+[[policy]]
+name = "fallback-egress-deny"
+  [[policy.rule]]
+  action = "DENY"
+  status = 470
+  reason = "Policy Blocked"
+  body = "Blocked by ExfilGuard\n"
+
+# Inspect a trusted analytics provider while enforcing HTTP verbs and paths.
+[[policy]]
+name = "trusted-analytics-egress"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET", "POST"]
+  url_pattern = "https://api.trusted-analytics.com/v1/exports/**"
+
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["ANY"]
+  url_pattern = "https://reports.trusted-analytics.com/dashboards/**"
+
+# Pass-through a payments gateway that refuses TLS interception. Validation enforces CONNECT-only and host-wide patterns.
+[[policy]]
+name = "pinned-payments-egress"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT"]
+  url_pattern = "https://secure.partner.com/payments/**"
+  inspect_payload = false
+  allow_private_connect = true

@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed exfilguard.service >/dev/null 2>&1 || true
+fi
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/exfilguard
+    if command -v deluser >/dev/null 2>&1; then
+        deluser --system --quiet exfilguard >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

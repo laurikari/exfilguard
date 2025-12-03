@@ -1,0 +1,24 @@
+[[policy]]
+name = "allow-ipv6-specific"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["ANY"]
+  url_pattern = "https://[2001:db8::10]/allowed"
+  allow_private_connect = false
+
+[[policy]]
+name = "deny-loopback"
+  [[policy.rule]]
+  action = "DENY"
+  methods = ["ANY"]
+  url_pattern = "http://[::1]/**"
+  status = 451
+  reason = "Unavailable For Legal Reasons"
+  body = "loopback denied"
+
+[[policy]]
+name = "allow-rfc4193"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["ANY"]
+  url_pattern = "http://[fd00:1234::]/**"

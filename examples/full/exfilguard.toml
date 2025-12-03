@@ -1,0 +1,9 @@
+listen = "127.0.0.1:3128"
+
+ca_dir = "/tmp/exfilguard/full-example/ca"
+cert_cache_dir = "/tmp/exfilguard/full-example/cache"
+
+clients = "clients.toml"
+policies = "policies.toml"
+
+log = "text"

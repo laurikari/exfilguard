@@ -1,0 +1,18 @@
+# Default ExfilGuard configuration installed by the Debian package.
+# Tweak listen address and file paths to match your deployment.
+
+listen = "0.0.0.0:3128"
+
+ca_dir = "/var/lib/exfilguard/ca"
+cert_cache_dir = "/var/lib/exfilguard/cache"
+
+clients = "clients.toml"
+clients_dir = "clients.d"
+policies = "policies.toml"
+policies_dir = "policies.d"
+
+# Available values: "json" or "text"
+log = "json"
+
+# Uncomment to enable verbose request logging
+# log_queries = true

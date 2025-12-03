@@ -1,0 +1,20 @@
+[[client]]
+name = "dualstack"
+cidr = "2001:db8::/48"
+policies = ["allow-ipv6-specific", "deny-loopback"]
+
+[[client]]
+name = "loopback"
+cidr = "::1/128"
+policies = ["deny-loopback"]
+
+[[client]]
+name = "unique-local"
+cidr = "fd00:1234::/48"
+policies = ["allow-rfc4193"]
+
+[[client]]
+name = "catch-all"
+cidr = "::/0"
+policies = ["deny-loopback"]
+catch_all = true

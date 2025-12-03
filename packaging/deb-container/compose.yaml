@@ -1,0 +1,33 @@
+x-builder-build: &builder-build
+  context: ../..
+  dockerfile: packaging/deb-container/Dockerfile
+  args:
+    UID: ${HOST_UID:-1000}
+    GID: ${HOST_GID:-1000}
+
+x-builder-base: &builder-base
+  build: *builder-build
+  working_dir: /workspace
+  command: ["cargo", "deb"]
+  environment:
+    CARGO_TARGET_DIR: /workspace/target
+    CARGO_HOME: /home/builder/.cargo
+    RUSTUP_HOME: /home/builder/.rustup
+  volumes:
+    - ../..:/workspace
+    - cargo-registry:/home/builder/.cargo/registry
+    - cargo-git:/home/builder/.cargo/git
+  init: true
+  tty: true
+
+services:
+  deb-builder:
+    <<: *builder-base
+
+  deb-builder-amd64:
+    <<: *builder-base
+    platform: linux/amd64
+
+volumes:
+  cargo-registry:
+  cargo-git:
