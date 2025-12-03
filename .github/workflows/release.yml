@@ -95,7 +95,8 @@ jobs:
           dpkg-scanpackages --multiversion . /dev/null > Packages
           gzip -k -f Packages
 
-          cat > Release << EOF
+          # Generate Release file with proper Date and Hash entries
+          cat > Release <<EOF
           Origin: ExfilGuard
           Label: ExfilGuard
           Suite: stable
@@ -103,7 +104,26 @@ jobs:
           Architectures: amd64
           Components: main
           Description: ExfilGuard APT repository
+          Date: $(date -Ru)
           EOF
+          # Remove leading whitespace from Release file
+          sed -i 's/^[[:space:]]*//' Release
+
+          # Add hash entries for Packages files
+          {
+            echo "MD5Sum:"
+            for f in Packages Packages.gz; do
+              hash=$(md5sum "$f" | cut -d' ' -f1)
+              size=$(wc -c < "$f" | tr -d ' ')
+              echo " $hash $size $f"
+            done
+            echo "SHA256:"
+            for f in Packages Packages.gz; do
+              hash=$(sha256sum "$f" | cut -d' ' -f1)
+              size=$(wc -c < "$f" | tr -d ' ')
+              echo " $hash $size $f"
+            done
+          } >> Release
 
       - name: Deploy to GitHub Pages
         if: env.PUBLISH_PAGES == 'true'
