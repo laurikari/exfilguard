@@ -76,6 +76,13 @@ jobs:
         if: env.PUBLISH_PAGES == 'true'
         run: sudo apt-get update && sudo apt-get install -y dpkg-dev
 
+      - name: Import GPG key
+        if: env.PUBLISH_PAGES == 'true'
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
       - name: Download .deb artifact
         uses: actions/download-artifact@v4
         with:
@@ -124,6 +131,13 @@ jobs:
               echo " $hash $size $f"
             done
           } >> Release
+
+          # Sign the Release file
+          gpg --armor --detach-sign -o Release.gpg Release
+          gpg --armor --clearsign -o InRelease Release
+
+          # Export public key for users to download
+          gpg --armor --export > exfilguard.gpg
 
       - name: Deploy to GitHub Pages
         if: env.PUBLISH_PAGES == 'true'

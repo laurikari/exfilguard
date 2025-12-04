@@ -64,8 +64,12 @@ Control integrations with external partners. Enforce OAuth/API credentials usage
 ### 1. Add the APT repository
 
 ```bash
+# Download and install the signing key
+curl -fsSL https://laurikari.github.io/exfilguard/apt/exfilguard.gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/exfilguard.gpg
+
 # Add ExfilGuard repository
-echo "deb [trusted=yes] https://laurikari.github.io/exfilguard/apt ./" | \
+echo "deb [signed-by=/etc/apt/keyrings/exfilguard.gpg] https://laurikari.github.io/exfilguard/apt ./" | \
   sudo tee /etc/apt/sources.list.d/exfilguard.list
 sudo apt update
 ```
