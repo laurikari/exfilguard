@@ -30,6 +30,37 @@ reloaded without restarting the process.
 
    The response should be `200 OK`. Any other host, path, or client IP is denied.
 
+## Architecture Overview
+
+ExfilGuard is designed as a modular pipeline to ensure security policies are
+enforced consistently across different protocols.
+
+### 1. The Listener Layer (`src/proxy/listener.rs`)
+The entry point that accepts raw TCP connections. It hands off the stream to
+the **Dispatcher**.
+
+### 2. The Dispatcher Layer (`src/proxy/http/dispatch.rs`)
+Determines the protocol (HTTP/1.1, HTTP/2, or CONNECT). If a `CONNECT`
+request is received and the policy requires `inspect_payload = true`, it
+triggers the **TLS Bumping** flow.
+
+### 3. The Policy Engine (`src/policy/`)
+A decoupled module that takes a "Request" (Scheme, Host, Port, Path, Method)
+and returns a **Decision** (Allow/Deny).
+- **Compilation**: TOML is compiled into a CIDR Trie and Regex-based Matchers.
+- **Evaluation**: Client resolution happens via Source IP before policy iteration.
+
+### 4. The Request Pipeline (`src/proxy/request_pipeline.rs`)
+An abstraction layer using the `RequestHandler` trait. This allows the same
+policy evaluation logic to be shared by:
+- Plain HTTP requests.
+- CONNECT tunnels (Splicing).
+- "Unwrapped" HTTPS requests inside a bumped tunnel.
+
+### 5. Upstream Handling (`src/proxy/http/forward.rs`)
+Manages a connection pool (`UpstreamPool`) to reduce latency for outbound
+requests, supporting both HTTP/1.1 and H2 multiplexing.
+
 ### Full example lab
 
 Use the richer sample layout when you need multiple clients, a mix of inspection

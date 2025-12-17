@@ -31,6 +31,12 @@ impl PolicyMatcher {
     }
 }
 
+/// PolicySnapshot provides a thread-safe, point-in-time view of the security configuration.
+///
+/// The evaluation follows a two-stage hierarchy:
+/// 1. Client Resolution: Maps the source IP to a `ClientEntry` using a CIDR trie.
+/// 2. Rule Matching: Iterates through the client's assigned policies. The first
+///    `Rule` that matches the request's method and URL pattern determines the outcome.
 #[derive(Clone)]
 pub struct PolicySnapshot {
     pub compiled: Arc<CompiledConfig>,

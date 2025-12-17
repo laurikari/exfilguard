@@ -101,6 +101,12 @@ fn build_server_config(app: &AppContext, host: &str, prefer_h2: bool) -> Result<
     Ok(Arc::new(config))
 }
 
+/// Attempts to determine if the upstream server supports HTTP/2.
+///
+/// This is critical because if the proxy negotiates H2 with the client but the
+/// upstream only supports H1.1, the proxy would have to perform expensive
+/// protocol translation. By probing first, we can align the ALPN offer
+/// sent to the client with the upstream's capabilities.
 async fn probe_upstream_http2(
     resolved: &ResolvedTarget,
     app: &AppContext,

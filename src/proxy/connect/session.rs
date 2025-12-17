@@ -26,6 +26,13 @@ use super::{
     target::ConnectTarget,
 };
 
+/// Manages the state and lifecycle of a CONNECT tunnel.
+///
+/// A session is responsible for:
+/// 1. Resolving the upstream target (with DNS and private-IP checks).
+/// 2. Executing the "Decision Path":
+///    - Splicing: Raw byte streaming for pass-through (inspect_payload=false).
+///    - Bumping: Handing off to the TLS interceptor for inspection (inspect_payload=true).
 pub struct ConnectSession {
     peer: SocketAddr,
     parsed: ConnectTarget,

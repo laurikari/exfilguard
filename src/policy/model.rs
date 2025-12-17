@@ -215,6 +215,12 @@ pub struct UrlMatcher {
 }
 
 impl UrlMatcher {
+    /// Matches a request against the pattern.
+    ///
+    /// NOTE: For `CONNECT` requests, `ignore_path` should be true. In a CONNECT
+    /// tunnel, the proxy only knows the host/port; the path is hidden inside
+    /// the encrypted payload. The path is only validated after TLS bumping
+    /// occurs and the tunnel is "unwrapped."
     pub fn matches(
         &self,
         scheme: Scheme,

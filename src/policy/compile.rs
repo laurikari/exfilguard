@@ -16,6 +16,13 @@ use super::model::{
     HostMatcher, MethodMask, PathMatcher, UrlMatcher,
 };
 
+/// Transforms a validated configuration into a performance-optimized memory model.
+///
+/// Compilation involves:
+/// 1. Building a `CidrTrie` for O(log N) client lookups by source IP.
+/// 2. Converting URL patterns into specialized `HostMatcher` (Glob/Exact)
+///    and `PathMatcher` (Regex) structures for fast evaluation.
+/// 3. Resolving policy name references into direct indices to avoid string lookups at runtime.
 pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
     let config = config.as_ref();
 
