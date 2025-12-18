@@ -6,16 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use http::StatusCode;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder,
-    HistogramOpts,
-    HistogramVec,
-    IntCounter,
-    IntCounterVec,
-    IntGauge,
-    IntGaugeVec,
-    Opts,
-    Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use rustls::{ServerConfig, pki_types::PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
@@ -149,11 +141,11 @@ static INFLIGHT_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
 });
 
 static INFLIGHT_REQUESTS_BY_CLIENT: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let vec =
-        IntGaugeVec::new(Opts::new("inflight_requests_by_client", "Inflight per client"), &[
-            "client",
-        ])
-        .expect("create gauge vec");
+    let vec = IntGaugeVec::new(
+        Opts::new("inflight_requests_by_client", "Inflight per client"),
+        &["client"],
+    )
+    .expect("create gauge vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register inflight_requests_by_client");
@@ -170,8 +162,11 @@ static UPSTREAM_POOL_IN_USE: Lazy<IntGauge> = Lazy::new(|| {
 });
 
 static UPSTREAM_POOL_CAPACITY: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::new("upstream_pool_capacity", "Configured upstream pool capacity")
-        .expect("create upstream_pool_capacity");
+    let gauge = IntGauge::new(
+        "upstream_pool_capacity",
+        "Configured upstream pool capacity",
+    )
+    .expect("create upstream_pool_capacity");
     REGISTRY
         .register(Box::new(gauge.clone()))
         .expect("register upstream_pool_capacity");
@@ -180,7 +175,10 @@ static UPSTREAM_POOL_CAPACITY: Lazy<IntGauge> = Lazy::new(|| {
 
 static UPSTREAM_POOL_REUSE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let vec = IntCounterVec::new(
-        Opts::new("upstream_pool_reuse_total", "Upstream connection reuse counts"),
+        Opts::new(
+            "upstream_pool_reuse_total",
+            "Upstream connection reuse counts",
+        ),
         &["reused"],
     )
     .expect("create upstream_pool_reuse_total");
@@ -269,15 +267,11 @@ pub fn record_request(
     let decision = normalize_label(decision, "unknown");
     let status_class = status_class(status.as_u16());
 
-    REQUESTS_TOTAL
-        .with_label_values(&[decision.as_str()])
-        .inc();
+    REQUESTS_TOTAL.with_label_values(&[decision.as_str()]).inc();
     REQUEST_STATUS_TOTAL
         .with_label_values(&[status_class])
         .inc();
-    REQUEST_METHOD_TOTAL
-        .with_label_values(&[method])
-        .inc();
+    REQUEST_METHOD_TOTAL.with_label_values(&[method]).inc();
 
     if let Some(client) = client {
         CLIENT_REQUESTS_TOTAL
@@ -329,9 +323,7 @@ pub fn record_pool_miss() {
 }
 
 pub fn record_upstream_error(kind: &str) {
-    UPSTREAM_ERRORS_TOTAL
-        .with_label_values(&[kind])
-        .inc();
+    UPSTREAM_ERRORS_TOTAL.with_label_values(&[kind]).inc();
 }
 
 pub fn gather() -> Vec<u8> {
@@ -360,7 +352,11 @@ pub async fn serve(addr: SocketAddr, path: String, tls: Option<MetricsTlsConfig>
         None
     };
     let listener = TcpListener::bind(addr).await?;
-    let path = if path.is_empty() { "/metrics".to_string() } else { path };
+    let path = if path.is_empty() {
+        "/metrics".to_string()
+    } else {
+        path
+    };
     loop {
         let (stream, _) = listener.accept().await?;
         let path = path.clone();
@@ -433,7 +429,8 @@ fn build_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
 }
 
 fn load_certs(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let data = std::fs::read(path).with_context(|| format!("failed to read certs from {}", path.display()))?;
+    let data = std::fs::read(path)
+        .with_context(|| format!("failed to read certs from {}", path.display()))?;
     let mut reader = std::io::BufReader::new(&data[..]);
     let certs = certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -442,7 +439,8 @@ fn load_certs(path: &std::path::Path) -> Result<Vec<rustls::pki_types::Certifica
 }
 
 fn load_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
-    let data = std::fs::read(path).with_context(|| format!("failed to read key from {}", path.display()))?;
+    let data = std::fs::read(path)
+        .with_context(|| format!("failed to read key from {}", path.display()))?;
     let mut reader = std::io::BufReader::new(&data[..]);
     if let Some(key) = pkcs8_private_keys(&mut reader).next() {
         let key = key.map_err(|e| anyhow!("failed to parse pkcs8 key: {e}"))?;
@@ -458,7 +456,10 @@ fn load_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
     Err(anyhow!("no valid private key found in {}", path.display()))
 }
 
-fn build_tls_acceptor(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<tokio_rustls::TlsAcceptor> {
+fn build_tls_acceptor(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<tokio_rustls::TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let mut config = ServerConfig::builder()

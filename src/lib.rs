@@ -1,11 +1,11 @@
 pub mod cli;
 pub mod config;
 pub mod logging;
+pub mod metrics;
 pub mod policy;
 pub mod proxy;
 pub mod settings;
 pub mod tls;
-pub mod metrics;
 pub mod util;
 
 use std::sync::Arc;
