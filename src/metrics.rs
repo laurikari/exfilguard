@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use http::StatusCode;
 use once_cell::sync::Lazy;
 use prometheus::{
@@ -14,6 +14,7 @@ use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
+    time::timeout,
 };
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -216,6 +217,9 @@ fn latency_buckets() -> Vec<f64> {
     ]
 }
 
+const METRICS_MAX_REQUEST_BYTES: usize = 8192;
+const METRICS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn status_class(status: u16) -> &'static str {
     match status {
         200..=299 => "2xx",
@@ -386,9 +390,36 @@ async fn handle_stream<S>(stream: S, path: &str) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    handle_stream_with_limits(
+        stream,
+        path,
+        METRICS_READ_TIMEOUT,
+        METRICS_MAX_REQUEST_BYTES,
+    )
+    .await
+}
+
+async fn handle_stream_with_limits<S>(
+    stream: S,
+    path: &str,
+    read_timeout: Duration,
+    max_bytes: usize,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    let bytes = reader.read_line(&mut request_line).await?;
+    let mut total_bytes = 0usize;
+    let bytes = read_line_with_limits(
+        &mut reader,
+        &mut request_line,
+        read_timeout,
+        max_bytes,
+        &mut total_bytes,
+        "reading metrics request line",
+    )
+    .await?;
     if bytes == 0 {
         return Ok(());
     }
@@ -400,7 +431,15 @@ where
     // Consume and ignore headers until empty line.
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = read_line_with_limits(
+            &mut reader,
+            &mut line,
+            read_timeout,
+            max_bytes,
+            &mut total_bytes,
+            "reading metrics request headers",
+        )
+        .await?;
         if n == 0 || line == "\r\n" {
             break;
         }
@@ -470,6 +509,31 @@ fn build_tls_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+async fn read_line_with_limits<R>(
+    reader: &mut BufReader<R>,
+    buf: &mut String,
+    timeout_dur: Duration,
+    max_bytes: usize,
+    total: &mut usize,
+    context: &str,
+) -> Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if max_bytes == 0 {
+        anyhow::bail!("max_bytes must be greater than zero");
+    }
+    buf.clear();
+    let bytes = timeout(timeout_dur, reader.read_line(buf))
+        .await
+        .map_err(|_| anyhow!("timed out {context}"))??;
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| anyhow!("metrics request length overflow"))?;
+    ensure!(*total <= max_bytes, "metrics request exceeded allowed size");
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +558,41 @@ mod tests {
         assert!(
             text.contains("rule_hits_total"),
             "expected rule_hits_total in metrics output"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_request_line() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        // Build a request line that exceeds a tiny limit.
+        let oversized = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(64));
+        client.write_all(oversized.as_bytes()).await.unwrap();
+        drop(client);
+
+        let err = super::handle_stream_with_limits(
+            server,
+            "/metrics",
+            Duration::from_secs(1),
+            32, // very small limit to trigger rejection
+        )
+        .await
+        .expect_err("oversized request should be rejected");
+        assert!(
+            err.to_string().contains("exceeded allowed size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn times_out_on_slow_request() {
+        let (_client, server) = tokio::io::duplex(1024);
+        let err =
+            super::handle_stream_with_limits(server, "/metrics", Duration::from_millis(50), 1024)
+                .await
+                .expect_err("slow request should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
         );
     }
 }
