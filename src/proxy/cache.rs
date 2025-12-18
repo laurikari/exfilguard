@@ -428,6 +428,15 @@ impl CacheState {
             return Ok(None);
         }
 
+        if !self.body_hash_matches(&body_path, &persisted.body_hash) {
+            warn!(
+                "cache body hash mismatch for {}; removing entry",
+                body_path.display()
+            );
+            self.remove_entry_files_from_meta(meta_path);
+            return Ok(None);
+        }
+
         if persisted.content_length > self.max_entry_size {
             self.remove_entry_files_from_meta(meta_path);
             return Ok(None);
@@ -452,6 +461,25 @@ impl CacheState {
         let evicted = self.insert_entry(persisted.key_base.clone(), entry);
         self.remove_evicted_files(evicted);
         Ok(Some(persisted.body_hash))
+    }
+
+    fn body_hash_matches(&self, path: &Path, expected_hex: &str) -> bool {
+        let mut file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut hasher = Hasher::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut file, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                }
+                Err(_) => return false,
+            }
+        }
+        hasher.finalize().to_hex().to_string() == expected_hex
     }
 
     fn remove_entry_files_from_meta(&self, meta_path: &Path) {
@@ -816,6 +844,44 @@ mod tests {
             .expect("entry should be restored from disk");
         let body = fs::read(hit.body_path)?;
         assert_eq!(body, b"persisted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_drops_entries_with_corrupted_body() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/corrupt");
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"body",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        // Corrupt the body on disk
+        if let Some(hit) = cache.lookup(&method, &uri, &req_headers) {
+            fs::write(hit.body_path, b"tampered")?;
+        }
+
+        drop(cache);
+
+        let rebuilt = HttpCache::new(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10)?;
+        assert!(
+            rebuilt.lookup(&method, &uri, &req_headers).is_none(),
+            "corrupted body should cause entry to be dropped"
+        );
         Ok(())
     }
 
