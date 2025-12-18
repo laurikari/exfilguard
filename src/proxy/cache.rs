@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -10,6 +11,7 @@ use blake3::Hasher;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use lru::LruCache;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{trace, warn};
@@ -52,6 +54,40 @@ struct CacheEntry {
     pub expires_at: SystemTime,
     pub body_hash: String,
     pub content_length: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedEntry {
+    key_base: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    vary_headers: Vec<(String, String)>,
+    expires_at: u64,
+    body_hash: String,
+    content_length: u64,
+}
+
+fn to_headermap(items: &[(String, String)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in items {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::try_from(name.as_str()),
+            http::HeaderValue::from_str(value),
+        ) {
+            map.append(name, value);
+        }
+    }
+    map
+}
+
+fn headermap_to_vec(map: &HeaderMap) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    for (name, value) in map.iter() {
+        if let Ok(value_str) = value.to_str() {
+            items.push((name.as_str().to_string(), value_str.to_string()));
+        }
+    }
+    items
 }
 
 pub struct CacheStream {
@@ -260,27 +296,194 @@ impl CacheState {
         self.disk_dir.join(first).join(second).join(hash)
     }
 
+    fn meta_path(&self, hash: &str) -> PathBuf {
+        let mut path = self.body_path(hash);
+        path.set_extension("meta");
+        path
+    }
+
     fn rebuild_from_disk(&self) -> Result<()> {
-        self.clean_dir(&self.disk_dir)?;
+        self.remove_temp_files()?;
         let mut guard = self.inner.lock();
         guard.bytes_in_use = 0;
         guard.lru.clear();
+        drop(guard);
+
+        if !self.disk_dir.exists() {
+            return Ok(());
+        }
+
+        for shard1 in fs::read_dir(&self.disk_dir)? {
+            let shard1 = shard1?;
+            if !shard1.file_type()?.is_dir() {
+                continue;
+            }
+            for shard2 in fs::read_dir(shard1.path())? {
+                let shard2 = shard2?;
+                if !shard2.file_type()?.is_dir() {
+                    continue;
+                }
+                let mut meta_files = Vec::new();
+                let mut other_files = Vec::new();
+                for entry in fs::read_dir(shard2.path())? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if entry.file_type()?.is_file() {
+                        if path.extension().and_then(|ext| ext.to_str()) == Some("meta") {
+                            meta_files.push(path);
+                        } else {
+                            other_files.push(path);
+                        }
+                    }
+                }
+
+                let mut live_hashes = HashSet::new();
+                for meta in meta_files {
+                    if let Some(hash) = self.restore_entry_from_meta(&meta)? {
+                        live_hashes.insert(hash);
+                    }
+                }
+
+                for path in other_files {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
+                    let keep = name
+                        .as_ref()
+                        .map(|n| live_hashes.contains(n))
+                        .unwrap_or(false);
+                    if !keep {
+                        fs::remove_file(&path).ok();
+                    }
+                }
+
+                if fs::read_dir(shard2.path())?.next().is_none() {
+                    fs::remove_dir_all(shard2.path()).ok();
+                }
+            }
+            if fs::read_dir(shard1.path())?.next().is_none() {
+                fs::remove_dir_all(shard1.path()).ok();
+            }
+        }
         Ok(())
     }
 
-    fn clean_dir(&self, dir: &Path) -> Result<()> {
-        if !dir.exists() {
+    fn remove_temp_files(&self) -> Result<()> {
+        if !self.disk_dir.exists() {
             return Ok(());
         }
-        for entry in fs::read_dir(dir)? {
+        for entry in fs::read_dir(&self.disk_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                fs::remove_dir_all(&path).ok();
-            } else {
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|name| name.starts_with("tmp_"))
+                    .unwrap_or(false)
+            {
                 fs::remove_file(&path).ok();
             }
         }
+        Ok(())
+    }
+
+    fn restore_entry_from_meta(&self, meta_path: &Path) -> Result<Option<String>> {
+        let data = match fs::read(meta_path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    "failed to read cache metadata {}: {}",
+                    meta_path.display(),
+                    err
+                );
+                return Ok(None);
+            }
+        };
+
+        let persisted: PersistedEntry = match serde_json::from_slice(&data) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "failed to parse cache metadata {}: {}",
+                    meta_path.display(),
+                    err
+                );
+                self.remove_entry_files_from_meta(meta_path);
+                return Ok(None);
+            }
+        };
+
+        // Basic validation
+        let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.expires_at);
+        if SystemTime::now() > expires_at {
+            self.remove_entry_files_from_meta(meta_path);
+            return Ok(None);
+        }
+
+        let body_path = self.body_path(&persisted.body_hash);
+        if !body_path.exists() {
+            self.remove_entry_files_from_meta(meta_path);
+            return Ok(None);
+        }
+
+        if persisted.content_length > self.max_entry_size {
+            self.remove_entry_files_from_meta(meta_path);
+            return Ok(None);
+        }
+        if persisted.content_length > self.max_bytes {
+            self.remove_entry_files_from_meta(meta_path);
+            return Ok(None);
+        }
+
+        let headers = to_headermap(&persisted.headers);
+        let vary_headers = to_headermap(&persisted.vary_headers);
+
+        let entry = CacheEntry {
+            status: StatusCode::from_u16(persisted.status).unwrap_or(StatusCode::OK),
+            headers,
+            vary_headers,
+            expires_at,
+            body_hash: persisted.body_hash.clone(),
+            content_length: persisted.content_length,
+        };
+
+        let evicted = self.insert_entry(persisted.key_base.clone(), entry);
+        self.remove_evicted_files(evicted);
+        Ok(Some(persisted.body_hash))
+    }
+
+    fn remove_entry_files_from_meta(&self, meta_path: &Path) {
+        if let Some(stem) = meta_path.file_stem().and_then(|s| s.to_str()) {
+            let body_path = self.body_path(stem);
+            fs::remove_file(body_path).ok();
+        }
+        fs::remove_file(meta_path).ok();
+    }
+
+    fn remove_evicted_files(&self, evicted: Vec<CacheEntry>) {
+        for evicted_entry in evicted {
+            crate::metrics::record_cache_eviction();
+            let path = self.body_path(&evicted_entry.body_hash);
+            let meta = self.meta_path(&evicted_entry.body_hash);
+            trace!("removing evicted cache file: {}", path.display());
+            if let Err(e) = fs::remove_file(path) {
+                warn!("failed to remove evicted cache file: {}", e);
+            }
+            fs::remove_file(meta).ok();
+        }
+    }
+
+    fn write_metadata(&self, entry: &PersistedEntry) -> Result<()> {
+        let meta_path = self.meta_path(&entry.body_hash);
+        if let Some(parent) = meta_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create cache shard {}", parent.display()))?;
+        }
+        let data = serde_json::to_vec(entry)?;
+        fs::write(&meta_path, data)
+            .with_context(|| format!("failed to write cache metadata {}", meta_path.display()))?;
         Ok(())
     }
 
@@ -356,18 +559,35 @@ impl CacheStream {
             content_length: self.current_size,
         };
 
+        let persisted = PersistedEntry {
+            key_base: self.key_base.clone(),
+            status: status.as_u16(),
+            headers: headermap_to_vec(&entry.headers),
+            vary_headers: headermap_to_vec(&entry.vary_headers),
+            expires_at: entry
+                .expires_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            body_hash: entry.body_hash.clone(),
+            content_length: entry.content_length,
+        };
+
+        if let Err(err) = self.state.write_metadata(&persisted) {
+            warn!("failed to write cache metadata: {}", err);
+            tokio::fs::remove_file(&self.state.meta_path(&entry.body_hash))
+                .await
+                .ok();
+            tokio::fs::remove_file(self.state.body_path(&entry.body_hash))
+                .await
+                .ok();
+            return Ok(());
+        }
+
         let evicted = self.state.insert_entry(self.key_base.clone(), entry);
         trace!("stored cache entry for {}", self.key_base);
 
-        for evicted_entry in evicted {
-            crate::metrics::record_cache_eviction();
-            let path = self.state.body_path(&evicted_entry.body_hash);
-
-            trace!("removing evicted cache file: {}", path.display());
-            if let Err(e) = tokio::fs::remove_file(path).await {
-                warn!("failed to remove evicted cache file: {}", e);
-            }
-        }
+        self.state.remove_evicted_files(evicted);
 
         Ok(())
     }
@@ -562,6 +782,88 @@ mod tests {
 
         assert!(hit_c.body_path.exists());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_persisted_entries() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/persist");
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"persisted",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        drop(cache);
+
+        let rebuilt = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let hit = rebuilt
+            .lookup(&method, &uri, &req_headers)
+            .expect("entry should be restored from disk");
+        let body = fs::read(hit.body_path)?;
+        assert_eq!(body, b"persisted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_prunes_expired_entries() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/expired-persisted");
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"expired",
+                Duration::from_secs(0),
+            )
+            .await?;
+
+        std::thread::sleep(Duration::from_millis(10));
+        drop(cache);
+
+        let rebuilt = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        assert!(
+            rebuilt.lookup(&method, &uri, &req_headers).is_none(),
+            "expired entry should be pruned during rebuild"
+        );
+        let file_count = fs::read_dir(&disk_dir)?
+            .filter_map(|entry| entry.ok())
+            .flat_map(|entry| {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    fs::read_dir(entry.path())
+                        .map(|iter| iter.filter_map(|e| e.ok()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                } else {
+                    vec![entry]
+                }
+            })
+            .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .count();
+        assert_eq!(file_count, 0, "disk cache should be empty of files");
         Ok(())
     }
 
