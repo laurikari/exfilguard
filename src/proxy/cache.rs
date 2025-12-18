@@ -304,13 +304,22 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn build_uri(host: &str, port: u16, path: &str) -> Uri {
+        http::Uri::builder()
+            .scheme("http")
+            .authority(format!("{host}:{port}").as_str())
+            .path_and_query(path)
+            .build()
+            .expect("build test uri")
+    }
+
     #[tokio::test]
     async fn test_cache_lifecycle() -> Result<()> {
         let dir = TempDir::new()?;
         let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024)?;
 
         let method = Method::GET;
-        let uri = "/test".parse::<Uri>()?;
+        let uri = build_uri("example.com", 80, "/test");
         let req_headers = HeaderMap::new();
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert("content-type", "text/plain".parse()?);
@@ -349,7 +358,7 @@ mod tests {
         let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024)?;
 
         let method = Method::GET;
-        let uri = "/expired".parse::<Uri>()?;
+        let uri = build_uri("example.com", 80, "/expired");
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
 
@@ -392,7 +401,7 @@ mod tests {
         let method = Method::GET;
 
         // 1. Store Item A
-        let uri_a = "/item-a".parse::<Uri>()?;
+        let uri_a = build_uri("example.com", 80, "/item-a");
         cache
             .store(
                 &method,
@@ -408,7 +417,7 @@ mod tests {
         assert!(hit_a.body_path.exists());
 
         // 2. Store Item B
-        let uri_b = "/item-b".parse::<Uri>()?;
+        let uri_b = build_uri("example.com", 80, "/item-b");
         cache
             .store(
                 &method,
@@ -424,7 +433,7 @@ mod tests {
         assert!(hit_b.body_path.exists());
 
         // 3. Store Item C -> Should evict A (LRU)
-        let uri_c = "/item-c".parse::<Uri>()?;
+        let uri_c = build_uri("example.com", 80, "/item-c");
         cache
             .store(
                 &method,
@@ -463,7 +472,7 @@ mod tests {
 
         let method = Method::GET;
 
-        let uri = "/vary".parse::<Uri>()?;
+        let uri = build_uri("example.com", 80, "/vary");
 
         let mut req_headers_1 = HeaderMap::new();
 
@@ -498,6 +507,40 @@ mod tests {
         req_headers_2.insert("user-agent", "desktop".parse()?);
 
         assert!(cache.lookup(&method, &uri, &req_headers_2).is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_keys_include_scheme_and_authority() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024)?;
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+        let method = Method::GET;
+
+        let uri_a = build_uri("alpha.example.com", 80, "/shared");
+        cache
+            .store(
+                &method,
+                &uri_a,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"alpha",
+                Duration::from_secs(30),
+            )
+            .await?;
+
+        // Different host with same path must not hit cache
+        let uri_b = build_uri("beta.example.com", 80, "/shared");
+        assert!(
+            cache.lookup(&method, &uri_b, &req_headers).is_none(),
+            "cache should not mix hosts for identical paths"
+        );
+
+        // Original host still hits
+        assert!(cache.lookup(&method, &uri_a, &req_headers).is_some());
 
         Ok(())
     }

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use async_trait::async_trait;
 
@@ -215,7 +215,13 @@ where
             && let Some(cache) = &self.app.cache
         {
             let method_obj = &self.parsed.method;
-            let uri_obj = self.parsed.path.parse::<http::Uri>().unwrap_or_default();
+            let uri_obj = match self.parsed.cache_uri() {
+                Ok(uri) => Some(uri),
+                Err(err) => {
+                    debug!(peer = %self.peer, error = %err, "skipping cache lookup due to URI build failure");
+                    None
+                }
+            };
 
             let mut req_headers_map = http::HeaderMap::new();
             for h in self.headers.forward_headers() {
@@ -226,7 +232,9 @@ where
                 }
             }
 
-            if let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map) {
+            if let Some(uri_obj) = uri_obj
+                && let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map)
+            {
                 // Serve from cache
                 let client_stream = self.reader.get_mut();
 

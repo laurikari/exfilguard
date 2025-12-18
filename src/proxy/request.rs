@@ -145,6 +145,28 @@ impl ParsedRequest {
         }
         host
     }
+
+    /// Build an absolute URI for cache keying that includes scheme, host, port, and path/query.
+    pub fn cache_uri(&self) -> Result<Uri> {
+        let port = self.port.unwrap_or_else(|| self.scheme.default_port());
+        let authority = if self.host.contains(':') {
+            format!("[{}]:{}", self.host, port)
+        } else {
+            format!("{}:{}", self.host, port)
+        };
+        Uri::builder()
+            .scheme(scheme_name(self.scheme))
+            .authority(authority.as_str())
+            .path_and_query(self.path.as_str())
+            .build()
+            .with_context(|| {
+                format!(
+                    "failed to build cache URI for {}://{}",
+                    scheme_name(self.scheme),
+                    authority
+                )
+            })
+    }
 }
 
 #[cfg(test)]

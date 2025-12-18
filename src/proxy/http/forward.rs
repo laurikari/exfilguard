@@ -276,7 +276,13 @@ where
         && let Some(cache) = &app.cache
     {
         let method_obj = &request.method;
-        let uri_obj = request.path.parse::<http::Uri>().unwrap_or_default();
+        let cache_uri = match request.cache_uri() {
+            Ok(uri) => Some(uri),
+            Err(err) => {
+                debug!(peer = %peer, error = %err, host = %request.host, "skipping cache due to URI build failure");
+                None
+            }
+        };
 
         let mut req_headers_map = http::HeaderMap::new();
         for h in headers.forward_headers() {
@@ -296,7 +302,9 @@ where
             }
         }
 
-        if is_cacheable(method_obj, head.status, &resp_headers_map) {
+        if let Some(uri_obj) = cache_uri
+            && is_cacheable(method_obj, head.status, &resp_headers_map)
+        {
             let mut ttl = get_freshness_lifetime(&resp_headers_map).unwrap_or(Duration::ZERO);
             if let Some(forced) = cache_config.force_cache_duration
                 && ttl == Duration::ZERO
