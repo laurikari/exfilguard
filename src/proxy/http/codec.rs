@@ -94,6 +94,16 @@ impl HeaderAccumulator {
             .filter(move |header| !self.has_connection_token(header.lower_name()))
     }
 
+    pub fn has_header(&self, lower_name: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|header| header.lower_name() == lower_name)
+    }
+
+    pub fn has_sensitive_cache_headers(&self) -> bool {
+        self.has_header("authorization") || self.has_header("cookie")
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.sanitizer.total_bytes()
     }

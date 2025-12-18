@@ -66,8 +66,8 @@ pub fn is_cacheable(method: &Method, status: StatusCode, headers: &HeaderMap) ->
 
     let cc = parse_cache_control(headers);
 
-    // Never cache if no-store or private is present
-    if cc.no_store || cc.private {
+    // Never cache if no-store, no-cache, or private is present (no-cache requires revalidation).
+    if cc.no_store || cc.no_cache || cc.private {
         return false;
     }
 
@@ -159,6 +159,16 @@ mod tests {
         headers.insert(
             http::header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
+        );
+        assert!(!is_cacheable(&Method::GET, StatusCode::OK, &headers));
+    }
+
+    #[test]
+    fn test_not_cacheable_no_cache() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
         );
         assert!(!is_cacheable(&Method::GET, StatusCode::OK, &headers));
     }

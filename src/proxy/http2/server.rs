@@ -320,7 +320,7 @@ impl RequestHandler for Http2RequestHandler {
         match handled {
             policy_response::ForwardOutcome::Completed(success) => {
                 let stats = self.build_allow_log_stats(&success);
-                log_allow_success(log, &decision, stats);
+                log_allow_success(log, &decision, stats, None, None);
                 self.handle_forward_success(success).await
             }
             policy_response::ForwardOutcome::Responded(ctx) => {

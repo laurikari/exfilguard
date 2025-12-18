@@ -43,6 +43,8 @@ pub struct AccessLogEvent {
     pub scheme: String,
     pub host: String,
     pub path: String,
+    pub cache_lookup: Option<String>,
+    pub cache_store: Option<String>,
     pub client: Option<String>,
     pub status: u16,
     pub decision: String,
@@ -71,6 +73,8 @@ impl AccessLogBuilder {
                 scheme: String::new(),
                 host: String::new(),
                 path: String::new(),
+                cache_lookup: None,
+                cache_store: None,
                 client: None,
                 status: 0,
                 decision: String::from("UNKNOWN"),
@@ -108,6 +112,16 @@ impl AccessLogBuilder {
 
     pub fn client(mut self, client: impl Into<String>) -> Self {
         self.event.client = Some(client.into());
+        self
+    }
+
+    pub fn cache_lookup(mut self, value: impl Into<String>) -> Self {
+        self.event.cache_lookup = Some(value.into());
+        self
+    }
+
+    pub fn cache_store(mut self, value: impl Into<String>) -> Self {
+        self.event.cache_store = Some(value.into());
         self
     }
 
@@ -192,6 +206,8 @@ pub fn log_access(event: AccessLogEvent) {
         scheme,
         host,
         path,
+        cache_lookup,
+        cache_store,
         client,
         status,
         decision,
@@ -225,6 +241,8 @@ pub fn log_access(event: AccessLogEvent) {
         scheme,
         host,
         path,
+        cache_lookup = cache_lookup.unwrap_or_default(),
+        cache_store = cache_store.unwrap_or_default(),
         status,
         decision,
         policy = policy_field,
@@ -246,4 +264,96 @@ pub fn log_access(event: AccessLogEvent) {
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Duration::from_millis(elapsed_ms as u64),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct BufferWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufferWriter {
+        type Writer = BufferWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    #[test]
+    fn access_log_includes_cache_fields() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufferWriter {
+            buf: buffer.clone(),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_target(false)
+            .without_time()
+            .compact()
+            .finish();
+
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let event = AccessLogBuilder::new(peer)
+            .method("GET")
+            .scheme("http")
+            .host("example.com")
+            .path("/resource")
+            .decision("ALLOW")
+            .status(StatusCode::OK)
+            .cache_lookup("hit")
+            .cache_store("stored")
+            .build();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_access(event);
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let output = strip_ansi(&output);
+        assert!(
+            output.contains("cache_lookup=\"hit\""),
+            "missing cache_lookup in output: {output}"
+        );
+        assert!(
+            output.contains("cache_store=\"stored\""),
+            "missing cache_store in output: {output}"
+        );
+    }
 }

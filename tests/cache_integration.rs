@@ -189,6 +189,137 @@ where
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
+async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) -> Result<()> {
+    let temp = tempfile::TempDir::new()?;
+    let workspace = temp.path();
+    let ca_dir = workspace.join("ca");
+    let config_dir = workspace.join("config");
+    let cache_dir = workspace.join("http_cache");
+    std::fs::create_dir_all(&ca_dir)?;
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let upstream = MockUpstream::new(upstream_headers).await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let clients_path = config_dir.join("clients.toml");
+    let policies_path = config_dir.join("policies.toml");
+
+    std::fs::write(
+        &clients_path,
+        r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["cache-test"]
+catch_all = true
+"#,
+    )?;
+
+    std::fs::write(
+        &policies_path,
+        format!(
+            r#"[[policy]]
+name = "cache-test"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET"]
+  url_pattern = "http://127.0.0.1:{upstream_port}/**"
+  allow_private_connect = true
+  [policy.rule.cache]
+"#,
+        ),
+    )?;
+
+    let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
+    let config_doc = config::load_config(&clients_path, &policies_path)?;
+    let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
+    let snapshot = PolicySnapshot::new(compiled);
+    let (_policy_tx, policy_rx) = watch::channel(snapshot);
+    let policy_store = PolicyStore::new(policy_rx);
+
+    let proxy_port = find_free_port()?;
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
+        .parse()
+        .expect("valid listen address");
+    let settings = Arc::new(default_test_settings(
+        proxy_addr,
+        &ca_dir,
+        &clients_path,
+        &policies_path,
+        Some(&cache_dir),
+    ));
+
+    let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);
+    let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
+    let (proxy_client_config, proxy_client_h2_config) =
+        build_proxy_tls_configs(RootCertStore::empty())?;
+
+    let http_cache = Arc::new(exfilguard::proxy::cache::HttpCache::new(
+        100,
+        cache_dir.clone(),
+        1024 * 1024,
+        settings.cache_total_capacity,
+    )?);
+
+    let app = build_app_context(
+        settings.clone(),
+        policy_store,
+        ca.clone(),
+        tls_issuer,
+        proxy_client_config.clone(),
+        proxy_client_h2_config.clone(),
+        Some(http_cache),
+    );
+
+    let proxy_handle = tokio::spawn(async move {
+        if let Err(err) = proxy::run(app).await {
+            tracing::error!(error = ?err, "proxy run failed");
+        }
+    });
+
+    wait_for_listener(proxy_addr).await?;
+
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/resource HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n{request_headers}Connection: close\r\n\r\n"
+    );
+
+    // First Request (Miss)
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(response.contains("cached-response"));
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        1,
+        "Should hit upstream"
+    );
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    // Second Request (Should Miss due to bypass)
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.contains("cached-response"),
+        "Unexpected response: {}",
+        response
+    );
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        2,
+        "Should hit upstream again"
+    );
+
+    proxy_handle.abort();
+    upstream_task.abort();
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_hit_avoids_upstream() -> Result<()> {
     let _ = exfilguard::logging::init_logger(LogFormat::Text);
@@ -327,131 +458,28 @@ name = "cache-test"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_bypass_on_no_store() -> Result<()> {
-    let temp = tempfile::TempDir::new()?;
-    let workspace = temp.path();
-    let ca_dir = workspace.join("ca");
-    let config_dir = workspace.join("config");
-    let cache_dir = workspace.join("http_cache");
-    std::fs::create_dir_all(&ca_dir)?;
-    std::fs::create_dir_all(&config_dir)?;
-    std::fs::create_dir_all(&cache_dir)?;
+    run_cache_bypass_test("Cache-Control: no-store", "").await
+}
 
-    let upstream = MockUpstream::new("Cache-Control: no-store").await?;
-    let upstream_port = upstream.port();
-    let request_counter = upstream.requests.clone();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cache_bypass_on_no_cache() -> Result<()> {
+    run_cache_bypass_test("Cache-Control: no-cache", "").await
+}
 
-    let upstream_task = tokio::spawn(upstream.run());
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cache_bypass_on_authorization_header() -> Result<()> {
+    run_cache_bypass_test(
+        "Cache-Control: public, max-age=60",
+        "Authorization: Bearer token\r\n",
+    )
+    .await
+}
 
-    let clients_path = config_dir.join("clients.toml");
-    let policies_path = config_dir.join("policies.toml");
-
-    std::fs::write(
-        &clients_path,
-        r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["cache-test"]
-catch_all = true
-"#,
-    )?;
-
-    std::fs::write(
-        &policies_path,
-        format!(
-            r#"[[policy]]
-name = "cache-test"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
-  [policy.rule.cache]
-"#,
-        ),
-    )?;
-
-    let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
-    let config_doc = config::load_config(&clients_path, &policies_path)?;
-    let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
-    let snapshot = PolicySnapshot::new(compiled);
-    let (_policy_tx, policy_rx) = watch::channel(snapshot);
-    let policy_store = PolicyStore::new(policy_rx);
-
-    let proxy_port = find_free_port()?;
-    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
-        .parse()
-        .expect("valid listen address");
-    let settings = Arc::new(default_test_settings(
-        proxy_addr,
-        &ca_dir,
-        &clients_path,
-        &policies_path,
-        Some(&cache_dir),
-    ));
-
-    let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);
-    let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
-    let (proxy_client_config, proxy_client_h2_config) =
-        build_proxy_tls_configs(RootCertStore::empty())?;
-
-    let http_cache = Arc::new(exfilguard::proxy::cache::HttpCache::new(
-        100,
-        cache_dir.clone(),
-        1024 * 1024,
-        settings.cache_total_capacity,
-    )?);
-
-    let app = build_app_context(
-        settings.clone(),
-        policy_store,
-        ca.clone(),
-        tls_issuer,
-        proxy_client_config.clone(),
-        proxy_client_h2_config.clone(),
-        Some(http_cache),
-    );
-
-    let proxy_handle = tokio::spawn(async move {
-        if let Err(err) = proxy::run(app).await {
-            tracing::error!(error = ?err, "proxy run failed");
-        }
-    });
-
-    wait_for_listener(proxy_addr).await?;
-
-    // First Request (Miss)
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-    let request = format!(
-        "GET http://127.0.0.1:{upstream_port}/resource HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).await?;
-    let response = read_http_response(&mut stream).await?;
-    assert!(response.contains("cached-response"));
-    assert_eq!(
-        request_counter.load(Ordering::SeqCst),
-        1,
-        "Should hit upstream"
-    );
-
-    tokio::time::sleep(StdDuration::from_millis(200)).await;
-
-    // Second Request (Should Miss due to no-store)
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream.write_all(request.as_bytes()).await?;
-    let response = read_http_response(&mut stream).await?;
-    assert!(
-        response.contains("cached-response"),
-        "Unexpected response: {}",
-        response
-    );
-    assert_eq!(
-        request_counter.load(Ordering::SeqCst),
-        2,
-        "Should hit upstream again"
-    );
-
-    proxy_handle.abort();
-    upstream_task.abort();
-
-    Ok(())
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cache_bypass_on_cookie_header() -> Result<()> {
+    run_cache_bypass_test(
+        "Cache-Control: public, max-age=60",
+        "Cookie: session=abc\r\n",
+    )
+    .await
 }

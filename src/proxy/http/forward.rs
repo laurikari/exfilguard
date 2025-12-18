@@ -39,10 +39,28 @@ pub enum ResponseBodyPlan {
     UntilClose,
 }
 
+#[derive(Clone, Copy)]
+pub enum CacheStoreResult {
+    Stored,
+    Skipped,
+    Bypassed,
+}
+
+impl CacheStoreResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheStoreResult::Stored => "stored",
+            CacheStoreResult::Skipped => "skipped",
+            CacheStoreResult::Bypassed => "bypassed",
+        }
+    }
+}
+
 pub struct ForwardStats {
     pub bytes_to_client: u64,
     pub status: StatusCode,
     pub client_body_bytes: u64,
+    pub cache_store: CacheStoreResult,
 }
 
 pub struct ForwardResult {
@@ -271,58 +289,61 @@ where
     }
 
     // Check caching
+    let mut cache_store = CacheStoreResult::Bypassed;
     let mut cache_stream = None;
-    if let Some(cache_config) = &decision.cache
-        && let Some(cache) = &app.cache
-    {
-        let method_obj = &request.method;
-        let cache_uri = match request.cache_uri() {
-            Ok(uri) => Some(uri),
-            Err(err) => {
-                debug!(peer = %peer, error = %err, host = %request.host, "skipping cache due to URI build failure");
-                None
-            }
-        };
+    if let (Some(cache_config), Some(cache)) = (&decision.cache, &app.cache) {
+        cache_store = CacheStoreResult::Skipped;
 
-        let mut req_headers_map = http::HeaderMap::new();
-        for h in headers.forward_headers() {
-            if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
-                && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
-            {
-                req_headers_map.append(k, v);
-            }
-        }
+        if !headers.has_sensitive_cache_headers() {
+            let method_obj = &request.method;
+            let cache_uri = match request.cache_uri() {
+                Ok(uri) => Some(uri),
+                Err(err) => {
+                    debug!(peer = %peer, error = %err, host = %request.host, "skipping cache due to URI build failure");
+                    None
+                }
+            };
 
-        let mut resp_headers_map = http::HeaderMap::new();
-        for h in &head.headers {
-            if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
-                && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
-            {
-                resp_headers_map.append(k, v);
-            }
-        }
-
-        if let Some(uri_obj) = cache_uri
-            && is_cacheable(method_obj, head.status, &resp_headers_map)
-        {
-            let ttl = select_cache_ttl(
-                get_freshness_lifetime(&resp_headers_map),
-                cache_config.force_cache_duration,
-            );
-
-            if ttl > Duration::ZERO {
-                match cache
-                    .open_stream(method_obj, &uri_obj, &req_headers_map, &resp_headers_map)
-                    .await
+            let mut req_headers_map = http::HeaderMap::new();
+            for h in headers.forward_headers() {
+                if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
+                    && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
                 {
-                    Ok(Some(stream)) => {
-                        cache_stream = Some((stream, ttl, resp_headers_map));
-                    }
-                    Ok(None) => {
-                        tracing::debug!("skipping cache write due to Vary limits");
-                    }
-                    Err(e) => {
-                        tracing::debug!("failed to open cache stream: {}", e);
+                    req_headers_map.append(k, v);
+                }
+            }
+
+            let mut resp_headers_map = http::HeaderMap::new();
+            for h in &head.headers {
+                if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
+                    && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
+                {
+                    resp_headers_map.append(k, v);
+                }
+            }
+
+            if let Some(uri_obj) = cache_uri
+                && is_cacheable(method_obj, head.status, &resp_headers_map)
+            {
+                let ttl = select_cache_ttl(
+                    get_freshness_lifetime(&resp_headers_map),
+                    cache_config.force_cache_duration,
+                );
+
+                if ttl > Duration::ZERO {
+                    match cache
+                        .open_stream(method_obj, &uri_obj, &req_headers_map, &resp_headers_map)
+                        .await
+                    {
+                        Ok(Some(stream)) => {
+                            cache_stream = Some((stream, ttl, resp_headers_map));
+                        }
+                        Ok(None) => {
+                            tracing::debug!("skipping cache write due to Vary limits");
+                        }
+                        Err(e) => {
+                            tracing::debug!("failed to open cache stream: {}", e);
+                        }
                     }
                 }
             }
@@ -366,10 +387,16 @@ where
                 Ok(bytes) => {
                     if let Err(e) = stream.finish(head.status, resp_headers, ttl).await {
                         debug!("failed to commit cache entry: {}", e);
+                        cache_store = CacheStoreResult::Skipped;
+                    } else {
+                        cache_store = CacheStoreResult::Stored;
                     }
                     Ok(bytes)
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    cache_store = CacheStoreResult::Skipped;
+                    Err(e)
+                }
             }?
         } else {
             relay_body_generic(
@@ -403,6 +430,7 @@ where
             bytes_to_client,
             status: head.status,
             client_body_bytes,
+            cache_store,
         },
         reuse_upstream,
         client_close,

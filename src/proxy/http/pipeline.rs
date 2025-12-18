@@ -211,8 +211,9 @@ where
         let policy_eval::AllowOutcome { decision, log } = outcome;
 
         // Try Cache Lookup
-        if let Some(_cache_config) = &decision.cache
-            && let Some(cache) = &self.app.cache
+        let mut cache_lookup = Some("bypass");
+        if let (Some(_cache_config), Some(cache)) = (&decision.cache, &self.app.cache)
+            && !self.headers.has_sensitive_cache_headers()
         {
             let method_obj = &self.parsed.method;
             let uri_obj = match self.parsed.cache_uri() {
@@ -232,57 +233,61 @@ where
                 }
             }
 
-            if let Some(uri_obj) = uri_obj
-                && let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map)
-            {
-                // Serve from cache
-                let client_stream = self.reader.get_mut();
+            if let Some(uri_obj) = uri_obj {
+                if let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map) {
+                    // Serve from cache
+                    let client_stream = self.reader.get_mut();
 
-                // Write Status Line
-                let status_line = format!(
-                    "HTTP/1.1 {} {}\r\n",
-                    cached.status.as_u16(),
-                    cached.status.canonical_reason().unwrap_or("OK")
-                );
-                timeout_with_context(
-                    self.client_timeout,
-                    client_stream.write_all(status_line.as_bytes()),
-                    "writing status line to client",
-                )
-                .await?;
+                    // Write Status Line
+                    let status_line = format!(
+                        "HTTP/1.1 {} {}\r\n",
+                        cached.status.as_u16(),
+                        cached.status.canonical_reason().unwrap_or("OK")
+                    );
+                    timeout_with_context(
+                        self.client_timeout,
+                        client_stream.write_all(status_line.as_bytes()),
+                        "writing status line to client",
+                    )
+                    .await?;
 
-                // Write Headers
-                for (k, v) in cached.headers.iter() {
-                    client_stream.write_all(k.as_str().as_bytes()).await?;
-                    client_stream.write_all(b": ").await?;
-                    client_stream.write_all(v.as_bytes()).await?;
+                    // Write Headers
+                    for (k, v) in cached.headers.iter() {
+                        client_stream.write_all(k.as_str().as_bytes()).await?;
+                        client_stream.write_all(b": ").await?;
+                        client_stream.write_all(v.as_bytes()).await?;
+                        client_stream.write_all(b"\r\n").await?;
+                    }
                     client_stream.write_all(b"\r\n").await?;
+
+                    // Stream Body
+                    let mut file = tokio::fs::File::open(&cached.body_path).await?;
+                    let copied = tokio::io::copy(&mut file, client_stream).await?;
+
+                    shutdown_stream(client_stream, self.client_timeout).await?;
+
+                    // Log Cache Hit
+                    let log_builder = log
+                        .access_log_builder()
+                        .decision("CACHE_HIT")
+                        .client(decision.client.as_ref())
+                        .status(cached.status)
+                        .bytes(self.log_tracker.base_bytes(), copied)
+                        .cache_lookup("hit")
+                        .cache_store("bypassed");
+
+                    // Add policy info
+                    let log_builder = log_builder
+                        .policy(decision.policy.as_ref())
+                        .rule(decision.rule.as_ref())
+                        .inspect_payload(decision.inspect_payload);
+
+                    log_builder.log();
+
+                    return Ok(ClientDisposition::Close);
                 }
-                client_stream.write_all(b"\r\n").await?;
 
-                // Stream Body
-                let mut file = tokio::fs::File::open(&cached.body_path).await?;
-                let copied = tokio::io::copy(&mut file, client_stream).await?;
-
-                shutdown_stream(client_stream, self.client_timeout).await?;
-
-                // Log Cache Hit
-                let log_builder = log
-                    .access_log_builder()
-                    .decision("CACHE_HIT")
-                    .client(decision.client.as_ref())
-                    .status(cached.status)
-                    .bytes(self.log_tracker.base_bytes(), copied);
-
-                // Add policy info
-                let log_builder = log_builder
-                    .policy(decision.policy.as_ref())
-                    .rule(decision.rule.as_ref())
-                    .inspect_payload(decision.inspect_payload);
-
-                log_builder.log();
-
-                return Ok(ClientDisposition::Close);
+                cache_lookup = Some("miss");
             }
         }
 
@@ -298,7 +303,13 @@ where
         match handled {
             policy_response::ForwardOutcome::Completed(success) => {
                 let stats = self.build_allow_log_stats(&success);
-                log_allow_success(log, &decision, stats);
+                log_allow_success(
+                    log,
+                    &decision,
+                    stats,
+                    cache_lookup,
+                    Some(success.stats.cache_store.as_str()),
+                );
                 self.handle_forward_success(success).await
             }
             policy_response::ForwardOutcome::Responded(ctx) => {

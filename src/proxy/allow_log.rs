@@ -13,8 +13,15 @@ pub struct AllowLogStats {
     pub upstream_reused: bool,
 }
 
-pub fn log_allow_success(log: RequestLogContext, allow: &AllowDecision, stats: AllowLogStats) {
-    log.access_log_builder()
+pub fn log_allow_success(
+    log: RequestLogContext,
+    allow: &AllowDecision,
+    stats: AllowLogStats,
+    cache_lookup: Option<&str>,
+    cache_store: Option<&str>,
+) {
+    let mut builder = log
+        .access_log_builder()
         .status(stats.status)
         .decision("ALLOW")
         .client(allow.client.as_ref())
@@ -24,6 +31,14 @@ pub fn log_allow_success(log: RequestLogContext, allow: &AllowDecision, stats: A
         .bytes(stats.bytes_in, stats.bytes_out)
         .elapsed(stats.elapsed)
         .upstream_addr(stats.upstream_addr)
-        .upstream_reused(stats.upstream_reused)
-        .log();
+        .upstream_reused(stats.upstream_reused);
+
+    if let Some(value) = cache_lookup {
+        builder = builder.cache_lookup(value);
+    }
+    if let Some(value) = cache_store {
+        builder = builder.cache_store(value);
+    }
+
+    builder.log();
 }
