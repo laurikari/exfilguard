@@ -187,6 +187,14 @@ and store the CA on trusted disks.
   cargo test
   ```
 
+### Developer ergonomics
+
+- Install the pre-commit hook to enforce formatting locally:
+
+  ```shell
+  ln -sf ../../hooks/pre-commit .git/hooks/pre-commit
+  ```
+
 ## Debian packaging
 
 1. Build a release binary: `cargo build --release`.
