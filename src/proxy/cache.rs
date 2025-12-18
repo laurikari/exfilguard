@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -75,18 +75,18 @@ impl HttpCache {
         let capacity = std::num::NonZeroUsize::new(capacity)
             .ok_or_else(|| anyhow!("cache capacity must be greater than zero"))?;
         let cache = LruCache::new(capacity);
-
-        Ok(Self {
-            state: Arc::new(CacheState {
-                inner: Mutex::new(CacheInner {
-                    lru: cache,
-                    bytes_in_use: 0,
-                }),
-                disk_dir,
-                max_entry_size,
-                max_bytes,
+        let state = Arc::new(CacheState {
+            inner: Mutex::new(CacheInner {
+                lru: cache,
+                bytes_in_use: 0,
             }),
-        })
+            disk_dir,
+            max_entry_size,
+            max_bytes,
+        });
+        state.rebuild_from_disk()?;
+
+        Ok(Self { state })
     }
 
     pub fn lookup(
@@ -228,6 +228,30 @@ impl CacheState {
         let (first, remainder) = hash.split_at(2);
         let (second, _) = remainder.split_at(2);
         self.disk_dir.join(first).join(second).join(hash)
+    }
+
+    fn rebuild_from_disk(&self) -> Result<()> {
+        self.clean_dir(&self.disk_dir)?;
+        let mut guard = self.inner.lock();
+        guard.bytes_in_use = 0;
+        guard.lru.clear();
+        Ok(())
+    }
+
+    fn clean_dir(&self, dir: &Path) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                fs::remove_dir_all(&path).ok();
+            } else {
+                fs::remove_file(&path).ok();
+            }
+        }
+        Ok(())
     }
 
     fn insert_entry(&self, key_base: String, entry: CacheEntry) -> Vec<CacheEntry> {
@@ -662,6 +686,29 @@ mod tests {
         assert!(cache.lookup(&method, &uri, &req_headers).is_none());
         // temp should have been cleaned; cache dir should remain empty
         assert_eq!(fs::read_dir(dir.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clears_stale_disk_on_startup() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        // Write stray temp file and a hashed body shard
+        let tmp = dir.path().join("tmp_orphan");
+        fs::write(&tmp, b"junk")?;
+        let shard_dir = dir.path().join("aa").join("bb");
+        fs::create_dir_all(&shard_dir)?;
+        let body_path = shard_dir.join("aabbcc");
+        fs::write(&body_path, b"data")?;
+
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024, 1024 * 10)?;
+
+        // All stray files/directories should be removed and counters reset
+        assert_eq!(fs::read_dir(dir.path())?.count(), 0);
+        let inner = cache.state.inner.lock();
+        assert_eq!(inner.bytes_in_use, 0);
+        assert_eq!(inner.lru.len(), 0);
+        drop(inner);
         Ok(())
     }
 }
