@@ -315,8 +315,11 @@ where
                     .open_stream(method_obj, &uri_obj, &req_headers_map, &resp_headers_map)
                     .await
                 {
-                    Ok(stream) => {
+                    Ok(Some(stream)) => {
                         cache_stream = Some((stream, ttl, resp_headers_map));
+                    }
+                    Ok(None) => {
+                        tracing::debug!("skipping cache write due to Vary limits");
                     }
                     Err(e) => {
                         tracing::debug!("failed to open cache stream: {}", e);

@@ -14,6 +14,9 @@ use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{trace, warn};
 
+const MAX_VARY_HEADERS: usize = 8;
+const MAX_VARY_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     pub status: StatusCode,
@@ -145,9 +148,15 @@ impl HttpCache {
         uri: &Uri,
         req_headers: &HeaderMap,
         resp_headers: &HeaderMap,
-    ) -> Result<CacheStream> {
+    ) -> Result<Option<CacheStream>> {
         let key_base = format!("{}::{}", method, uri);
-        let vary_headers = self.extract_vary_headers(resp_headers, req_headers);
+        let vary_headers = match self.extract_vary_headers(resp_headers, req_headers) {
+            Some(map) => map,
+            None => {
+                trace!("skipping cache due to Vary header limits");
+                return Ok(None);
+            }
+        };
 
         // Use a random temp file name
         let temp_name = format!("tmp_{}", uuid::Uuid::new_v4());
@@ -155,7 +164,7 @@ impl HttpCache {
 
         let file = AsyncFile::create(&temp_path).await?;
 
-        Ok(CacheStream {
+        Ok(Some(CacheStream {
             file,
             hasher: Hasher::new(),
             temp_path,
@@ -164,7 +173,7 @@ impl HttpCache {
             key_base,
             vary_headers,
             discard: false,
-        })
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -178,10 +187,11 @@ impl HttpCache {
         body: &[u8],
         ttl: Duration,
     ) -> Result<()> {
-        let mut stream = self.open_stream(method, uri, req_headers, headers).await?;
-        stream.write_all(body).await?;
-        stream.finish(status, headers.clone(), ttl).await?;
-        crate::metrics::record_cache_store();
+        if let Some(mut stream) = self.open_stream(method, uri, req_headers, headers).await? {
+            stream.write_all(body).await?;
+            stream.finish(status, headers.clone(), ttl).await?;
+            crate::metrics::record_cache_store();
+        }
         Ok(())
     }
 
@@ -189,8 +199,13 @@ impl HttpCache {
         self.state.body_path(hash)
     }
 
-    fn extract_vary_headers(&self, resp_headers: &HeaderMap, req_headers: &HeaderMap) -> HeaderMap {
+    fn extract_vary_headers(
+        &self,
+        resp_headers: &HeaderMap,
+        req_headers: &HeaderMap,
+    ) -> Option<HeaderMap> {
         let mut vary_map = HeaderMap::new();
+        let mut vary_bytes = 0usize;
         for value in resp_headers.get_all(http::header::VARY) {
             if let Ok(s) = value.to_str() {
                 for header_name in s.split(',') {
@@ -201,12 +216,20 @@ impl HttpCache {
                     if let Ok(hdr) = http::header::HeaderName::from_bytes(header_name.as_bytes())
                         && let Some(req_val) = req_headers.get(&hdr)
                     {
+                        if vary_map.len() + 1 > MAX_VARY_HEADERS {
+                            return None;
+                        }
+                        let added_bytes = hdr.as_str().len() + req_val.as_bytes().len();
+                        if vary_bytes.saturating_add(added_bytes) > MAX_VARY_BYTES {
+                            return None;
+                        }
+                        vary_bytes += added_bytes;
                         vary_map.insert(hdr, req_val.clone());
                     }
                 }
             }
         }
-        vary_map
+        Some(vary_map)
     }
 
     fn vary_matches(&self, stored_vary: &HeaderMap, req_headers: &HeaderMap) -> bool {
@@ -709,6 +732,50 @@ mod tests {
         assert_eq!(inner.bytes_in_use, 0);
         assert_eq!(inner.lru.len(), 0);
         drop(inner);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_cache_when_vary_header_count_too_high() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/vary-limit");
+        let mut req_headers = HeaderMap::new();
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i"] {
+            req_headers.insert(name, "v".parse().unwrap());
+        }
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            http::header::VARY,
+            "a, b, c, d, e, f, g, h, i".parse().unwrap(),
+        );
+
+        let stream = cache
+            .open_stream(&method, &uri, &req_headers, &resp_headers)
+            .await?;
+        assert!(stream.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_cache_when_vary_value_bytes_too_large() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/vary-bytes");
+        let mut req_headers = HeaderMap::new();
+        let large_value = "x".repeat(MAX_VARY_BYTES + 1);
+        req_headers.insert("user-agent", large_value.parse().unwrap());
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(http::header::VARY, "User-Agent".parse().unwrap());
+
+        let stream = cache
+            .open_stream(&method, &uri, &req_headers, &resp_headers)
+            .await?;
+        assert!(stream.is_none());
         Ok(())
     }
 }
