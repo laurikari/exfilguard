@@ -305,12 +305,10 @@ where
         if let Some(uri_obj) = cache_uri
             && is_cacheable(method_obj, head.status, &resp_headers_map)
         {
-            let mut ttl = get_freshness_lifetime(&resp_headers_map).unwrap_or(Duration::ZERO);
-            if let Some(forced) = cache_config.force_cache_duration
-                && ttl == Duration::ZERO
-            {
-                ttl = forced;
-            }
+            let ttl = select_cache_ttl(
+                get_freshness_lifetime(&resp_headers_map),
+                cache_config.force_cache_duration,
+            );
 
             if ttl > Duration::ZERO {
                 match cache
@@ -469,6 +467,15 @@ pub fn determine_response_body_plan(
     ResponseBodyPlan::UntilClose
 }
 
+fn select_cache_ttl(origin_ttl: Option<Duration>, forced: Option<Duration>) -> Duration {
+    if let Some(ttl) = origin_ttl
+        && ttl > Duration::ZERO
+    {
+        return ttl;
+    }
+    forced.unwrap_or(Duration::ZERO)
+}
+
 pub fn build_upstream_request(
     request: &ParsedRequest,
     headers: &HeaderAccumulator,
@@ -511,4 +518,33 @@ pub fn build_upstream_request(
 
     buffer.extend_from_slice(b"\r\n");
     buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_cache_ttl;
+    use std::time::Duration;
+
+    #[test]
+    fn prefers_origin_ttl_when_present() {
+        let origin = Some(Duration::from_secs(30));
+        let forced = Some(Duration::from_secs(5));
+        assert_eq!(select_cache_ttl(origin, forced), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn falls_back_to_forced_when_origin_is_zero_or_missing() {
+        let forced = Some(Duration::from_secs(5));
+        assert_eq!(
+            select_cache_ttl(Some(Duration::ZERO), forced),
+            Duration::from_secs(5)
+        );
+        assert_eq!(select_cache_ttl(None, forced), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn returns_zero_without_origin_or_forced() {
+        assert_eq!(select_cache_ttl(None, None), Duration::ZERO);
+        assert_eq!(select_cache_ttl(Some(Duration::ZERO), None), Duration::ZERO);
+    }
 }
