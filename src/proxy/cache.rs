@@ -211,11 +211,18 @@ impl HttpCache {
                 for header_name in s.split(',') {
                     let header_name = header_name.trim();
                     if header_name == "*" {
-                        continue; // Cannot cache Vary: *
+                        // RFC: Vary:* response is not cacheable.
+                        return None;
                     }
-                    if let Ok(hdr) = http::header::HeaderName::from_bytes(header_name.as_bytes())
-                        && let Some(req_val) = req_headers.get(&hdr)
-                    {
+                    if let Ok(hdr) = http::header::HeaderName::from_bytes(header_name.as_bytes()) {
+                        let req_val = match req_headers.get(&hdr) {
+                            Some(val) => val,
+                            None => {
+                                // If the request didn't supply a header named in Vary, the
+                                // response representation cannot be cached safely.
+                                return None;
+                            }
+                        };
                         if vary_map.len() + 1 > MAX_VARY_HEADERS {
                             return None;
                         }
@@ -602,6 +609,80 @@ mod tests {
 
         assert!(cache.lookup(&method, &uri, &req_headers_2).is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_cache_when_vary_header_missing_from_request() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/vary-missing");
+
+        // Request does NOT include Accept-Language
+        let req_headers = HeaderMap::new();
+
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(http::header::VARY, "Accept-Language".parse()?);
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"body",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        assert!(
+            cache.lookup(&method, &uri, &req_headers).is_none(),
+            "cache should be skipped when request lacks header named in Vary"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path())?.count(),
+            0,
+            "cache directory should remain empty when entry is skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_cache_when_vary_star_present() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/vary-star");
+
+        let req_headers = HeaderMap::new();
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(http::header::VARY, "*".parse()?);
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"body",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        assert!(
+            cache.lookup(&method, &uri, &req_headers).is_none(),
+            "Vary:* responses must not be cached"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path())?.count(),
+            0,
+            "cache directory should remain empty when Vary:* skips caching"
+        );
         Ok(())
     }
 
