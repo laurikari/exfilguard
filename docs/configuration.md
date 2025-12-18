@@ -153,6 +153,7 @@ Response caching is disabled by default. Set `cache_dir` to enable.
 |-------|------|---------|-------------|
 | `cache_dir` | Path | None | Directory for response caching (enables caching when set) |
 | `cache_max_entry_size` | u64 | 10485760 (10 MiB) | Maximum size of individual cache entries |
+| `cache_max_entries` | usize | 10000 | Maximum number of cached responses (LRU) |
 | `cache_total_capacity` | u64 | 1073741824 (1 GiB) | Total cache capacity |
 
 ### Cache Behavior
@@ -242,5 +243,6 @@ max_body_size = 67108864
 # Cache (optional)
 cache_dir = "./cache"
 cache_max_entry_size = 10485760
+cache_max_entries = 10000
 cache_total_capacity = 1073741824
 ```

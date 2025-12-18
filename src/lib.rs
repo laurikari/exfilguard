@@ -63,10 +63,10 @@ pub async fn run(settings: Settings) -> Result<()> {
 
     let cache = if let Some(cache_dir) = &settings.cache_dir {
         Some(Arc::new(proxy::cache::HttpCache::new(
-            // TODO: Expose LRU capacity in settings. Using 10k entries for now.
-            10_000,
+            settings.cache_max_entries,
             cache_dir.clone(),
             settings.cache_max_entry_size,
+            settings.cache_total_capacity,
         )?))
     } else {
         None

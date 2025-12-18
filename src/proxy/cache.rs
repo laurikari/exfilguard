@@ -1,11 +1,11 @@
-use std::fs::{self};
+use std::fs;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use lru::LruCache;
@@ -24,9 +24,21 @@ pub struct CachedResponse {
 
 #[derive(Clone)]
 pub struct HttpCache {
-    inner: Arc<Mutex<LruCache<String, CacheEntry>>>,
+    state: Arc<CacheState>,
+}
+
+#[derive(Debug)]
+struct CacheState {
+    inner: Mutex<CacheInner>,
     disk_dir: PathBuf,
     max_entry_size: u64,
+    max_bytes: u64,
+}
+
+#[derive(Debug)]
+struct CacheInner {
+    lru: LruCache<String, CacheEntry>,
+    bytes_in_use: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,26 +55,37 @@ pub struct CacheStream {
     file: AsyncFile,
     hasher: Hasher,
     temp_path: PathBuf,
-    disk_dir: PathBuf,
-    max_entry_size: u64,
+    state: Arc<CacheState>,
     current_size: u64,
-    inner: Arc<Mutex<LruCache<String, CacheEntry>>>,
     key_base: String,
     vary_headers: HeaderMap,
     discard: bool,
 }
 
 impl HttpCache {
-    pub fn new(capacity: usize, disk_dir: PathBuf, max_entry_size: u64) -> Result<Self> {
+    pub fn new(
+        capacity: usize,
+        disk_dir: PathBuf,
+        max_entry_size: u64,
+        max_bytes: u64,
+    ) -> Result<Self> {
         fs::create_dir_all(&disk_dir)
             .with_context(|| format!("failed to create cache dir {}", disk_dir.display()))?;
 
-        let cache = LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap());
+        let capacity = std::num::NonZeroUsize::new(capacity)
+            .ok_or_else(|| anyhow!("cache capacity must be greater than zero"))?;
+        let cache = LruCache::new(capacity);
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(cache)),
-            disk_dir,
-            max_entry_size,
+            state: Arc::new(CacheState {
+                inner: Mutex::new(CacheInner {
+                    lru: cache,
+                    bytes_in_use: 0,
+                }),
+                disk_dir,
+                max_entry_size,
+                max_bytes,
+            }),
         })
     }
 
@@ -74,12 +97,15 @@ impl HttpCache {
     ) -> Option<CachedResponse> {
         let key_base = format!("{}::{}", method, uri);
 
-        let mut cache = self.inner.lock();
+        let mut guard = self.state.inner.lock();
+        let inner = &mut *guard;
 
-        if let Some(entry) = cache.get(&key_base) {
+        if let Some(entry) = inner.lru.get(&key_base) {
             if SystemTime::now() > entry.expires_at {
                 trace!("cache entry expired");
-                cache.pop(&key_base);
+                if let Some(removed) = inner.lru.pop(&key_base) {
+                    inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
+                }
                 crate::metrics::record_cache_lookup(false);
                 return None;
             }
@@ -93,7 +119,9 @@ impl HttpCache {
             let body_path = self.get_body_path(&entry.body_hash);
             if !body_path.exists() {
                 warn!("cache body missing on disk: {}", body_path.display());
-                cache.pop(&key_base);
+                if let Some(removed) = inner.lru.pop(&key_base) {
+                    inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
+                }
                 crate::metrics::record_cache_lookup(false);
                 return None;
             }
@@ -123,7 +151,7 @@ impl HttpCache {
 
         // Use a random temp file name
         let temp_name = format!("tmp_{}", uuid::Uuid::new_v4());
-        let temp_path = self.disk_dir.join(&temp_name);
+        let temp_path = self.state.disk_dir.join(&temp_name);
 
         let file = AsyncFile::create(&temp_path).await?;
 
@@ -131,10 +159,8 @@ impl HttpCache {
             file,
             hasher: Hasher::new(),
             temp_path,
-            disk_dir: self.disk_dir.clone(),
-            max_entry_size: self.max_entry_size,
+            state: self.state.clone(),
             current_size: 0,
-            inner: self.inner.clone(),
             key_base,
             vary_headers,
             discard: false,
@@ -160,9 +186,7 @@ impl HttpCache {
     }
 
     fn get_body_path(&self, hash: &str) -> PathBuf {
-        let (first, remainder) = hash.split_at(2);
-        let (second, _) = remainder.split_at(2);
-        self.disk_dir.join(first).join(second).join(hash)
+        self.state.body_path(hash)
     }
 
     fn extract_vary_headers(&self, resp_headers: &HeaderMap, req_headers: &HeaderMap) -> HeaderMap {
@@ -199,6 +223,38 @@ impl HttpCache {
     }
 }
 
+impl CacheState {
+    fn body_path(&self, hash: &str) -> PathBuf {
+        let (first, remainder) = hash.split_at(2);
+        let (second, _) = remainder.split_at(2);
+        self.disk_dir.join(first).join(second).join(hash)
+    }
+
+    fn insert_entry(&self, key_base: String, entry: CacheEntry) -> Vec<CacheEntry> {
+        let mut evicted = Vec::new();
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        inner.bytes_in_use = inner.bytes_in_use.saturating_add(entry.content_length);
+
+        if let Some((_key, removed)) = inner.lru.push(key_base, entry) {
+            inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
+            evicted.push(removed);
+        }
+
+        while inner.bytes_in_use > self.max_bytes {
+            if let Some((_key, removed)) = inner.lru.pop_lru() {
+                inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
+                evicted.push(removed);
+            } else {
+                break;
+            }
+        }
+
+        evicted
+    }
+}
+
 impl CacheStream {
     pub async fn finish(
         mut self,
@@ -214,13 +270,18 @@ impl CacheStream {
             return Ok(());
         }
 
+        if self.current_size > self.state.max_bytes {
+            tokio::fs::remove_file(&self.temp_path).await.ok();
+            return Ok(());
+        }
+
         let hash = self.hasher.finalize();
         let body_hash = hash.to_hex().to_string();
 
         // Construct final path
         let (first, remainder) = body_hash.split_at(2);
         let (second, _) = remainder.split_at(2);
-        let shard_dir = self.disk_dir.join(first).join(second);
+        let shard_dir = self.state.disk_dir.join(first).join(second);
         let final_path = shard_dir.join(&body_hash);
 
         // Move temp file to final path
@@ -241,17 +302,12 @@ impl CacheStream {
             content_length: self.current_size,
         };
 
-        let evicted = self.inner.lock().push(self.key_base.clone(), entry.clone());
+        let evicted = self.state.insert_entry(self.key_base.clone(), entry);
         trace!("stored cache entry for {}", self.key_base);
 
-        if let Some((_key, evicted_entry)) = evicted
-            && evicted_entry.body_hash != entry.body_hash
-        {
+        for evicted_entry in evicted {
             crate::metrics::record_cache_eviction();
-            let hash = evicted_entry.body_hash;
-            let (first, remainder) = hash.split_at(2);
-            let (second, _) = remainder.split_at(2);
-            let path = self.disk_dir.join(first).join(second).join(&hash);
+            let path = self.state.body_path(&evicted_entry.body_hash);
 
             trace!("removing evicted cache file: {}", path.display());
             if let Err(e) = tokio::fs::remove_file(path).await {
@@ -274,7 +330,7 @@ impl AsyncWrite for CacheStream {
         }
 
         // Check size limit
-        if self.current_size + buf.len() as u64 > self.max_entry_size {
+        if self.current_size + buf.len() as u64 > self.state.max_entry_size {
             self.discard = true;
             return Poll::Ready(Ok(buf.len()));
         }
@@ -316,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_lifecycle() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024)?;
+        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/test");
@@ -355,20 +411,12 @@ mod tests {
     #[tokio::test]
     async fn test_cache_expiration() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024)?;
+        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/expired");
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
-
-        // Store with 0 TTL (effectively expired immediately for test logic,
-        // though strictly SystemTime might be equal. Let's use a small check)
-        // Actually, let's inject a time or just wait. Waiting 1ms is risky in CI.
-        // Better: SystemTime is not mockable easily here.
-        // We rely on logic: expires_at = now + 0.
-        // lookup checks if now > expires_at.
-        // If we set TTL to 0, it expires instantly or very soon.
 
         cache
             .store(
@@ -395,7 +443,7 @@ mod tests {
     async fn test_cache_eviction_deletes_file() -> Result<()> {
         let dir = TempDir::new()?;
         // Capacity 2
-        let cache = HttpCache::new(2, dir.path().to_path_buf(), 1024 * 1024)?;
+        let cache = HttpCache::new(2, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -464,11 +512,10 @@ mod tests {
     }
 
     #[tokio::test]
-
     async fn test_vary_mismatch() -> Result<()> {
         let dir = TempDir::new()?;
 
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024)?;
+        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
 
         let method = Method::GET;
 
@@ -514,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn cache_keys_include_scheme_and_authority() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024)?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -542,6 +589,79 @@ mod tests {
         // Original host still hits
         assert!(cache.lookup(&method, &uri_a, &req_headers).is_some());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enforces_total_capacity_and_evicts_lru() -> Result<()> {
+        let dir = TempDir::new()?;
+        // Total cap of 6 bytes, entry cap large enough to not trigger first.
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024, 6)?;
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+        let method = Method::GET;
+
+        // Store first entry of 4 bytes
+        let uri_a = build_uri("example.com", 80, "/a");
+        cache
+            .store(
+                &method,
+                &uri_a,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"aaaa",
+                Duration::from_secs(60),
+            )
+            .await?;
+        let hit_a = cache.lookup(&method, &uri_a, &req_headers).unwrap();
+        assert!(hit_a.body_path.exists());
+
+        // Store second entry of 4 bytes -> should evict first to stay under 6 bytes
+        let uri_b = build_uri("example.com", 80, "/b");
+        cache
+            .store(
+                &method,
+                &uri_b,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"bbbb",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        assert!(cache.lookup(&method, &uri_a, &req_headers).is_none());
+        assert!(!hit_a.body_path.exists());
+        assert!(cache.lookup(&method, &uri_b, &req_headers).is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_entry_bigger_than_total_capacity() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(2, dir.path().to_path_buf(), 1024, 2)?;
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/too-big");
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"data",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        assert!(cache.lookup(&method, &uri, &req_headers).is_none());
+        // temp should have been cleaned; cache dir should remain empty
+        assert_eq!(fs::read_dir(dir.path())?.count(), 0);
         Ok(())
     }
 }

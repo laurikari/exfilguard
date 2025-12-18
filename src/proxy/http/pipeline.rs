@@ -580,6 +580,7 @@ name = "allow"
             max_body_size: 1024 * 1024,
             cache_dir: None,
             cache_max_entry_size: 10 * 1024 * 1024,
+            cache_max_entries: 10_000,
             cache_total_capacity: 1024 * 1024 * 1024,
             metrics_listen: None,
             metrics_tls_cert: None,

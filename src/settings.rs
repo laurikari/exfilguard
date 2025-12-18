@@ -85,6 +85,8 @@ pub struct Settings {
     pub cache_dir: Option<PathBuf>,
     #[serde(default = "default_cache_max_entry_size")]
     pub cache_max_entry_size: u64,
+    #[serde(default = "default_cache_max_entries")]
+    pub cache_max_entries: usize,
     #[serde(default = "default_cache_total_capacity")]
     pub cache_total_capacity: u64,
     #[serde(default)]
@@ -275,6 +277,11 @@ impl Settings {
                 self.cache_max_entry_size
             );
             ensure!(
+                self.cache_max_entries > 0,
+                "cache_max_entries must be greater than 0 (got {})",
+                self.cache_max_entries
+            );
+            ensure!(
                 self.cache_total_capacity > 0,
                 "cache_total_capacity must be greater than 0 (got {})",
                 self.cache_total_capacity
@@ -303,6 +310,10 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
 
 fn default_cache_max_entry_size() -> u64 {
     10 * 1024 * 1024 // 10 MiB
+}
+
+fn default_cache_max_entries() -> usize {
+    10_000
 }
 
 fn default_cache_total_capacity() -> u64 {
@@ -338,6 +349,7 @@ mod tests {
             // Cache enabled
             cache_dir: Some(PathBuf::from("cache")),
             cache_max_entry_size: 1024,
+            cache_max_entries: 1024,
             cache_total_capacity: 1024,
             metrics_listen: None,
             metrics_tls_cert: None,
@@ -369,6 +381,7 @@ mod tests {
             // Cache enabled but invalid
             cache_dir: Some(PathBuf::from("cache")),
             cache_max_entry_size: 0,
+            cache_max_entries: 1024,
             cache_total_capacity: 1024,
             metrics_listen: None,
             metrics_tls_cert: None,
@@ -404,6 +417,7 @@ mod tests {
             // Cache disabled (None), sizes should be ignored even if 0 (though defaults are non-zero)
             cache_dir: None,
             cache_max_entry_size: 0,
+            cache_max_entries: 0,
             cache_total_capacity: 0,
             metrics_listen: None,
             metrics_tls_cert: None,
