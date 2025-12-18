@@ -7,6 +7,7 @@ use tokio::{net::TcpStream, task::JoinHandle};
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use tracing::debug;
 
+use crate::util;
 use crate::{
     config::Scheme,
     proxy::{AppContext, connect::ResolvedTarget, request::ParsedRequest, upstream},
@@ -29,6 +30,7 @@ pub(super) struct UpstreamHandle {
     pub sender: client::SendRequest<Bytes>,
     pub peer: SocketAddr,
     pub reused: bool,
+    pub is_private_peer: bool,
     connection_task: JoinHandle<()>,
 }
 
@@ -39,6 +41,10 @@ pub(super) struct UpstreamCheckout {
 }
 
 impl Http2Upstream {
+    fn reuse_forbidden(handle: &UpstreamHandle, allow_private_connect: bool) -> bool {
+        handle.is_private_peer && !allow_private_connect
+    }
+
     pub(super) fn new(
         app: AppContext,
         binding: Option<ResolvedTarget>,
@@ -57,6 +63,12 @@ impl Http2Upstream {
         allow_private_connect: bool,
         request: &ParsedRequest,
     ) -> Result<UpstreamCheckout> {
+        if let Some(handle) = self.handle.as_ref()
+            && Self::reuse_forbidden(handle, allow_private_connect)
+        {
+            self.shutdown().await;
+        }
+
         if self.handle.is_none() {
             let handle = self
                 .establish_connection(allow_private_connect, request)
@@ -148,5 +160,40 @@ async fn make_handle_from_stream(
         connection_task: task,
         peer,
         reused: false,
+        is_private_peer: util::is_private_ip(peer.ip()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn reuse_forbidden_detects_private_peer() -> Result<()> {
+        let (_client_io, server_io) = duplex(1024);
+        let (sender, connection) = client::handshake(server_io).await?;
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let handle = UpstreamHandle {
+            sender,
+            peer: "10.0.0.5:443".parse().unwrap(),
+            reused: false,
+            is_private_peer: true,
+            connection_task,
+        };
+
+        assert!(
+            Http2Upstream::reuse_forbidden(&handle, false),
+            "private peer must not be reused when allow_private_connect is false"
+        );
+        assert!(
+            !Http2Upstream::reuse_forbidden(&handle, true),
+            "private peer may be reused when allow_private_connect is true"
+        );
+        handle.connection_task.abort();
+        Ok(())
+    }
 }

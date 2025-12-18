@@ -20,11 +20,12 @@ pub(super) struct UpstreamPool {
     entries: LruCache<UpstreamKey, UpstreamConnection>,
 }
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) struct UpstreamKey {
     scheme: Scheme,
     host: String,
     port: u16,
+    allow_private: bool,
 }
 
 pub(super) struct UpstreamConnection {
@@ -90,7 +91,7 @@ impl UpstreamPool {
 }
 
 impl UpstreamKey {
-    pub(super) fn from_request(request: &ParsedRequest) -> Self {
+    pub(super) fn from_request(request: &ParsedRequest, allow_private: bool) -> Self {
         let port = request
             .port
             .unwrap_or_else(|| request.scheme.default_port());
@@ -98,6 +99,17 @@ impl UpstreamKey {
             scheme: request.scheme,
             host: request.host.clone(),
             port,
+            allow_private,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new(scheme: Scheme, host: String, port: u16, allow_private: bool) -> Self {
+        Self {
+            scheme,
+            host,
+            port,
+            allow_private,
         }
     }
 }
@@ -152,5 +164,78 @@ impl UpstreamConnection {
 
     pub(super) async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
         shutdown_stream(&mut self.stream, timeout).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_key_includes_allow_private_flag() {
+        let request = ParsedRequest {
+            method: http::Method::GET,
+            scheme: Scheme::Https,
+            host: "example.com".to_string(),
+            port: Some(443),
+            path: "/".to_string(),
+        };
+
+        let key_allow = UpstreamKey::from_request(&request, true);
+        let key_disallow = UpstreamKey::from_request(&request, false);
+
+        assert_ne!(
+            key_allow, key_disallow,
+            "allow_private flag must contribute to the upstream pool key"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_does_not_reuse_private_allowed_conn_for_disallowing_request() -> Result<()> {
+        use crate::proxy::http::forward::UpstreamIo;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind listener")?;
+        let addr = listener.local_addr().context("local addr")?;
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let mut pool = UpstreamPool::new(std::num::NonZeroUsize::new(4).unwrap());
+        let client = tokio::net::TcpStream::connect(addr)
+            .await
+            .context("connect to listener")?;
+
+        // Complete accept so the client stream is valid.
+        let (_server_stream, _) = accept
+            .await
+            .expect("accept join")
+            .context("accept stream")?;
+
+        let allow_key = UpstreamKey::new(Scheme::Http, "example.com".into(), addr.port(), true);
+        let disallow_key = UpstreamKey::new(Scheme::Http, "example.com".into(), addr.port(), false);
+
+        pool.put(
+            allow_key.clone(),
+            UpstreamConnection {
+                stream: UpstreamIo::Plain(client),
+                peer: addr,
+                scheme: Scheme::Http,
+                host: "example.com".into(),
+                port: addr.port(),
+            },
+            Duration::from_millis(50),
+        );
+
+        assert!(
+            pool.take(&disallow_key).is_none(),
+            "connection made with allow_private=true must not be reused when allow_private=false"
+        );
+
+        // It should still be reusable when allow_private=true.
+        let mut reused = pool
+            .take(&allow_key)
+            .expect("allow_private=true connection should be reused when allowed");
+        reused.shutdown(Duration::from_millis(50)).await?;
+        Ok(())
     }
 }

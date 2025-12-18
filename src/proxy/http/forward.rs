@@ -116,7 +116,7 @@ pub async fn forward_to_upstream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let key = UpstreamKey::from_request(request);
+    let key = UpstreamKey::from_request(request, decision.allow_private_connect);
     let request_close = headers.wants_connection_close();
     let (mut connection, reused_existing) = match pool.take(&key) {
         Some(conn) => {
