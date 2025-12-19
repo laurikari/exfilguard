@@ -266,7 +266,7 @@ where
             if !request_cache_bypass(&req_headers_map)
                 && let Some(uri_obj) = uri_obj
             {
-                if let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map) {
+                if let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map).await {
                     // Serve from cache
                     let client_stream = self.reader.get_mut();
 

@@ -257,12 +257,15 @@ name = "cache-test"
     let (proxy_client_config, proxy_client_h2_config) =
         build_proxy_tls_configs(RootCertStore::empty())?;
 
-    let http_cache = Arc::new(exfilguard::proxy::cache::HttpCache::new(
-        100,
-        cache_dir.clone(),
-        1024 * 1024,
-        settings.cache_total_capacity,
-    )?);
+    let http_cache = Arc::new(
+        exfilguard::proxy::cache::HttpCache::new(
+            100,
+            cache_dir.clone(),
+            1024 * 1024,
+            settings.cache_total_capacity,
+        )
+        .await?,
+    );
 
     let app = build_app_context(
         settings.clone(),
@@ -390,12 +393,15 @@ name = "cache-test"
     let (proxy_client_config, proxy_client_h2_config) =
         build_proxy_tls_configs(RootCertStore::empty())?;
 
-    let http_cache = Arc::new(exfilguard::proxy::cache::HttpCache::new(
-        100,
-        cache_dir.clone(),
-        1024 * 1024,
-        settings.cache_total_capacity,
-    )?);
+    let http_cache = Arc::new(
+        exfilguard::proxy::cache::HttpCache::new(
+            100,
+            cache_dir.clone(),
+            1024 * 1024,
+            settings.cache_total_capacity,
+        )
+        .await?,
+    );
 
     let app = build_app_context(
         settings.clone(),

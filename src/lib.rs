@@ -62,12 +62,15 @@ pub async fn run(settings: Settings) -> Result<()> {
     let tls_context = Arc::new(proxy::TlsContext::new(ca, tls_issuer, http1, http2));
 
     let cache = if let Some(cache_dir) = &settings.cache_dir {
-        Some(Arc::new(proxy::cache::HttpCache::new(
-            settings.cache_max_entries,
-            cache_dir.clone(),
-            settings.cache_max_entry_size,
-            settings.cache_total_capacity,
-        )?))
+        Some(Arc::new(
+            proxy::cache::HttpCache::new(
+                settings.cache_max_entries,
+                cache_dir.clone(),
+                settings.cache_max_entry_size,
+                settings.cache_total_capacity,
+            )
+            .await?,
+        ))
     } else {
         None
     };

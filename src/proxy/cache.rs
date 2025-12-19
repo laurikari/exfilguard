@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +15,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::{fs as async_fs, task};
 use tracing::{trace, warn};
 
 const MAX_VARY_HEADERS: usize = 8;
@@ -38,6 +40,7 @@ struct CacheState {
     disk_dir: PathBuf,
     max_entry_size: u64,
     max_bytes: u64,
+    next_id: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -48,6 +51,7 @@ struct CacheInner {
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
+    pub id: u64,
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub vary_headers: HeaderMap,
@@ -102,13 +106,14 @@ pub struct CacheStream {
 }
 
 impl HttpCache {
-    pub fn new(
+    pub async fn new(
         capacity: usize,
         disk_dir: PathBuf,
         max_entry_size: u64,
         max_bytes: u64,
     ) -> Result<Self> {
-        fs::create_dir_all(&disk_dir)
+        async_fs::create_dir_all(&disk_dir)
+            .await
             .with_context(|| format!("failed to create cache dir {}", disk_dir.display()))?;
 
         let capacity = std::num::NonZeroUsize::new(capacity)
@@ -122,13 +127,20 @@ impl HttpCache {
             disk_dir,
             max_entry_size,
             max_bytes,
+            next_id: AtomicU64::new(1),
         });
-        state.rebuild_from_disk()?;
+        let rebuild = {
+            let state = state.clone();
+            task::spawn_blocking(move || state.rebuild_from_disk())
+        };
+        rebuild
+            .await
+            .map_err(|err| anyhow!("cache rebuild task failed: {err}"))??;
 
         Ok(Self { state })
     }
 
-    pub fn lookup(
+    pub async fn lookup(
         &self,
         method: &Method,
         uri: &Uri,
@@ -136,48 +148,59 @@ impl HttpCache {
     ) -> Option<CachedResponse> {
         let key_base = format!("{}::{}", method, uri);
 
-        let mut guard = self.state.inner.lock();
-        let inner = &mut *guard;
+        let entry = {
+            let mut guard = self.state.inner.lock();
+            guard.lru.get(&key_base).cloned()
+        };
 
-        if let Some(entry) = inner.lru.get(&key_base).cloned() {
-            if SystemTime::now() > entry.expires_at {
-                trace!("cache entry expired");
-                if let Some(removed) = inner.lru.pop(&key_base) {
-                    inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
-                }
-                drop(guard);
-                self.state.remove_entry_files_for_hash(&entry.body_hash);
+        let entry = match entry {
+            Some(entry) => entry,
+            None => {
                 crate::metrics::record_cache_lookup(false);
                 return None;
             }
+        };
 
-            if !self.vary_matches(&entry.vary_headers, req_headers) {
-                trace!("cache entry vary mismatch");
-                crate::metrics::record_cache_lookup(false);
-                return None;
+        if SystemTime::now() > entry.expires_at {
+            trace!("cache entry expired");
+            if self.state.remove_entry_if_id_matches(&key_base, entry.id) {
+                self.state
+                    .remove_entry_files_for_hash_async(&entry.body_hash)
+                    .await;
             }
-
-            let body_path = self.get_body_path(&entry.body_hash);
-            if !body_path.exists() {
-                warn!("cache body missing on disk: {}", body_path.display());
-                if let Some(removed) = inner.lru.pop(&key_base) {
-                    inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
-                }
-                crate::metrics::record_cache_lookup(false);
-                return None;
-            }
-
-            crate::metrics::record_cache_lookup(true);
-            return Some(CachedResponse {
-                status: entry.status,
-                headers: entry.headers.clone(),
-                body_path,
-                content_length: entry.content_length,
-            });
+            crate::metrics::record_cache_lookup(false);
+            return None;
         }
 
-        crate::metrics::record_cache_lookup(false);
-        None
+        if !self.vary_matches(&entry.vary_headers, req_headers) {
+            trace!("cache entry vary mismatch");
+            crate::metrics::record_cache_lookup(false);
+            return None;
+        }
+
+        let body_path = self.get_body_path(&entry.body_hash);
+        if let Err(err) = async_fs::metadata(&body_path).await {
+            warn!(
+                error = %err,
+                path = %body_path.display(),
+                "cache body missing on disk"
+            );
+            if self.state.remove_entry_if_id_matches(&key_base, entry.id) {
+                self.state
+                    .remove_entry_files_for_hash_async(&entry.body_hash)
+                    .await;
+            }
+            crate::metrics::record_cache_lookup(false);
+            return None;
+        }
+
+        crate::metrics::record_cache_lookup(true);
+        Some(CachedResponse {
+            status: entry.status,
+            headers: entry.headers.clone(),
+            body_path,
+            content_length: entry.content_length,
+        })
     }
 
     pub async fn open_stream(
@@ -302,6 +325,25 @@ impl CacheState {
         let mut path = self.body_path(hash);
         path.set_extension("meta");
         path
+    }
+
+    fn next_entry_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn remove_entry_if_id_matches(&self, key_base: &str, entry_id: u64) -> bool {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let matches = inner
+            .lru
+            .get(key_base)
+            .map(|entry| entry.id == entry_id)
+            .unwrap_or(false);
+        if matches && let Some(removed) = inner.lru.pop(key_base) {
+            inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
+            return true;
+        }
+        false
     }
 
     fn rebuild_from_disk(&self) -> Result<()> {
@@ -452,6 +494,7 @@ impl CacheState {
         let vary_headers = to_headermap(&persisted.vary_headers);
 
         let entry = CacheEntry {
+            id: self.next_entry_id(),
             status: StatusCode::from_u16(persisted.status).unwrap_or(StatusCode::OK),
             headers,
             vary_headers,
@@ -492,11 +535,6 @@ impl CacheState {
         fs::remove_file(meta_path).ok();
     }
 
-    fn remove_entry_files_for_hash(&self, body_hash: &str) {
-        let meta_path = self.meta_path(body_hash);
-        self.remove_entry_files_from_meta(&meta_path);
-    }
-
     fn remove_evicted_files(&self, evicted: Vec<CacheEntry>) {
         for evicted_entry in evicted {
             crate::metrics::record_cache_eviction();
@@ -510,14 +548,42 @@ impl CacheState {
         }
     }
 
-    fn write_metadata(&self, entry: &PersistedEntry) -> Result<()> {
+    async fn remove_entry_files_from_meta_async(&self, meta_path: &Path) {
+        if let Some(stem) = meta_path.file_stem().and_then(|s| s.to_str()) {
+            let body_path = self.body_path(stem);
+            let _ = async_fs::remove_file(&body_path).await;
+        }
+        let _ = async_fs::remove_file(meta_path).await;
+    }
+
+    async fn remove_entry_files_for_hash_async(&self, body_hash: &str) {
+        let meta_path = self.meta_path(body_hash);
+        self.remove_entry_files_from_meta_async(&meta_path).await;
+    }
+
+    async fn remove_evicted_files_async(&self, evicted: Vec<CacheEntry>) {
+        for evicted_entry in evicted {
+            crate::metrics::record_cache_eviction();
+            let path = self.body_path(&evicted_entry.body_hash);
+            let meta = self.meta_path(&evicted_entry.body_hash);
+            trace!("removing evicted cache file: {}", path.display());
+            if let Err(e) = async_fs::remove_file(&path).await {
+                warn!("failed to remove evicted cache file: {}", e);
+            }
+            let _ = async_fs::remove_file(&meta).await;
+        }
+    }
+
+    async fn write_metadata_async(&self, entry: &PersistedEntry) -> Result<()> {
         let meta_path = self.meta_path(&entry.body_hash);
         if let Some(parent) = meta_path.parent() {
-            fs::create_dir_all(parent)
+            async_fs::create_dir_all(parent)
+                .await
                 .with_context(|| format!("failed to create cache shard {}", parent.display()))?;
         }
         let data = serde_json::to_vec(entry)?;
-        fs::write(&meta_path, data)
+        async_fs::write(&meta_path, data)
+            .await
             .with_context(|| format!("failed to write cache metadata {}", meta_path.display()))?;
         Ok(())
     }
@@ -558,12 +624,12 @@ impl CacheStream {
 
         if self.discard {
             // Delete temp file
-            tokio::fs::remove_file(&self.temp_path).await.ok();
+            async_fs::remove_file(&self.temp_path).await.ok();
             return Ok(());
         }
 
         if self.current_size > self.state.max_bytes {
-            tokio::fs::remove_file(&self.temp_path).await.ok();
+            async_fs::remove_file(&self.temp_path).await.ok();
             return Ok(());
         }
 
@@ -577,15 +643,16 @@ impl CacheStream {
         let final_path = shard_dir.join(&body_hash);
 
         // Move temp file to final path
-        if !final_path.exists() {
-            tokio::fs::create_dir_all(&shard_dir).await?;
-            tokio::fs::rename(&self.temp_path, &final_path).await?;
+        if async_fs::metadata(&final_path).await.is_err() {
+            async_fs::create_dir_all(&shard_dir).await?;
+            async_fs::rename(&self.temp_path, &final_path).await?;
         } else {
             // Already exists, just delete temp
-            tokio::fs::remove_file(&self.temp_path).await?;
+            async_fs::remove_file(&self.temp_path).await?;
         }
 
         let entry = CacheEntry {
+            id: self.state.next_entry_id(),
             status,
             headers,
             vary_headers: self.vary_headers.clone(),
@@ -608,12 +675,12 @@ impl CacheStream {
             content_length: entry.content_length,
         };
 
-        if let Err(err) = self.state.write_metadata(&persisted) {
+        if let Err(err) = self.state.write_metadata_async(&persisted).await {
             warn!("failed to write cache metadata: {}", err);
-            tokio::fs::remove_file(&self.state.meta_path(&entry.body_hash))
+            async_fs::remove_file(&self.state.meta_path(&entry.body_hash))
                 .await
                 .ok();
-            tokio::fs::remove_file(self.state.body_path(&entry.body_hash))
+            async_fs::remove_file(self.state.body_path(&entry.body_hash))
                 .await
                 .ok();
             return Ok(());
@@ -622,7 +689,7 @@ impl CacheStream {
         let evicted = self.state.insert_entry(self.key_base.clone(), entry);
         trace!("stored cache entry for {}", self.key_base);
 
-        self.state.remove_evicted_files(evicted);
+        self.state.remove_evicted_files_async(evicted).await;
 
         Ok(())
     }
@@ -681,7 +748,8 @@ mod tests {
     #[tokio::test]
     async fn test_cache_lifecycle() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/test");
@@ -705,7 +773,7 @@ mod tests {
             .await?;
 
         // Lookup Hit
-        let hit = cache.lookup(&method, &uri, &req_headers);
+        let hit = cache.lookup(&method, &uri, &req_headers).await;
         assert!(hit.is_some());
         let hit = hit.unwrap();
         assert_eq!(hit.content_length, body.len() as u64);
@@ -720,7 +788,8 @@ mod tests {
     #[tokio::test]
     async fn test_cache_expiration() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/expired");
@@ -742,7 +811,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
 
         // Lookup Miss
-        let miss = cache.lookup(&method, &uri, &req_headers);
+        let miss = cache.lookup(&method, &uri, &req_headers).await;
         assert!(miss.is_none());
 
         Ok(())
@@ -751,7 +820,8 @@ mod tests {
     #[tokio::test]
     async fn test_expired_entries_cleanup_disk() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/expired-cleanup");
@@ -782,7 +852,7 @@ mod tests {
         assert!(meta_path.exists(), "expected cached metadata to exist");
 
         std::thread::sleep(Duration::from_millis(5));
-        let miss = cache.lookup(&method, &uri, &req_headers);
+        let miss = cache.lookup(&method, &uri, &req_headers).await;
         assert!(miss.is_none());
 
         assert!(!body_path.exists(), "expired body should be removed");
@@ -795,7 +865,8 @@ mod tests {
     async fn test_cache_eviction_deletes_file() -> Result<()> {
         let dir = TempDir::new()?;
         // Capacity 2
-        let cache = HttpCache::new(2, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(2, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -813,7 +884,7 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await?;
-        let hit_a = cache.lookup(&method, &uri_a, &req_headers).unwrap();
+        let hit_a = cache.lookup(&method, &uri_a, &req_headers).await.unwrap();
         assert!(hit_a.body_path.exists());
 
         // 2. Store Item B
@@ -829,7 +900,7 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await?;
-        let hit_b = cache.lookup(&method, &uri_b, &req_headers).unwrap();
+        let hit_b = cache.lookup(&method, &uri_b, &req_headers).await.unwrap();
         assert!(hit_b.body_path.exists());
 
         // 3. Store Item C -> Should evict A (LRU)
@@ -848,15 +919,15 @@ mod tests {
 
         // Assertions
         // A should be gone from index
-        assert!(cache.lookup(&method, &uri_a, &req_headers).is_none());
+        assert!(cache.lookup(&method, &uri_a, &req_headers).await.is_none());
         // A's file should be deleted
         assert!(!hit_a.body_path.exists(), "Evicted file should be deleted");
 
         // B and C should exist
-        assert!(cache.lookup(&method, &uri_b, &req_headers).is_some());
+        assert!(cache.lookup(&method, &uri_b, &req_headers).await.is_some());
         assert!(hit_b.body_path.exists());
 
-        let hit_c = cache.lookup(&method, &uri_c, &req_headers).unwrap();
+        let hit_c = cache.lookup(&method, &uri_c, &req_headers).await.unwrap();
 
         assert!(hit_c.body_path.exists());
 
@@ -867,7 +938,7 @@ mod tests {
     async fn rebuild_restores_persisted_entries() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
-        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/persist");
@@ -888,9 +959,10 @@ mod tests {
 
         drop(cache);
 
-        let rebuilt = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let rebuilt = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
         let hit = rebuilt
             .lookup(&method, &uri, &req_headers)
+            .await
             .expect("entry should be restored from disk");
         let body = fs::read(hit.body_path)?;
         assert_eq!(body, b"persisted");
@@ -901,7 +973,7 @@ mod tests {
     async fn rebuild_drops_entries_with_corrupted_body() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
-        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/corrupt");
@@ -921,15 +993,15 @@ mod tests {
             .await?;
 
         // Corrupt the body on disk
-        if let Some(hit) = cache.lookup(&method, &uri, &req_headers) {
+        if let Some(hit) = cache.lookup(&method, &uri, &req_headers).await {
             fs::write(hit.body_path, b"tampered")?;
         }
 
         drop(cache);
 
-        let rebuilt = HttpCache::new(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10)?;
+        let rebuilt = HttpCache::new(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
         assert!(
-            rebuilt.lookup(&method, &uri, &req_headers).is_none(),
+            rebuilt.lookup(&method, &uri, &req_headers).await.is_none(),
             "corrupted body should cause entry to be dropped"
         );
         Ok(())
@@ -939,7 +1011,7 @@ mod tests {
     async fn rebuild_prunes_expired_entries() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
-        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/expired-persisted");
@@ -961,9 +1033,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         drop(cache);
 
-        let rebuilt = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let rebuilt = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
         assert!(
-            rebuilt.lookup(&method, &uri, &req_headers).is_none(),
+            rebuilt.lookup(&method, &uri, &req_headers).await.is_none(),
             "expired entry should be pruned during rebuild"
         );
         let file_count = fs::read_dir(&disk_dir)?
@@ -987,7 +1059,8 @@ mod tests {
     async fn test_vary_mismatch() -> Result<()> {
         let dir = TempDir::new()?;
 
-        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
 
@@ -1017,7 +1090,7 @@ mod tests {
 
         // Hit for Mobile
 
-        assert!(cache.lookup(&method, &uri, &req_headers_1).is_some());
+        assert!(cache.lookup(&method, &uri, &req_headers_1).await.is_some());
 
         // Miss for Desktop
 
@@ -1025,7 +1098,7 @@ mod tests {
 
         req_headers_2.insert("user-agent", "desktop".parse()?);
 
-        assert!(cache.lookup(&method, &uri, &req_headers_2).is_none());
+        assert!(cache.lookup(&method, &uri, &req_headers_2).await.is_none());
 
         Ok(())
     }
@@ -1033,7 +1106,8 @@ mod tests {
     #[tokio::test]
     async fn skips_cache_when_vary_header_missing_from_request() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/vary-missing");
@@ -1057,7 +1131,7 @@ mod tests {
             .await?;
 
         assert!(
-            cache.lookup(&method, &uri, &req_headers).is_none(),
+            cache.lookup(&method, &uri, &req_headers).await.is_none(),
             "cache should be skipped when request lacks header named in Vary"
         );
         assert_eq!(
@@ -1071,7 +1145,8 @@ mod tests {
     #[tokio::test]
     async fn skips_cache_when_vary_star_present() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/vary-star");
@@ -1093,7 +1168,7 @@ mod tests {
             .await?;
 
         assert!(
-            cache.lookup(&method, &uri, &req_headers).is_none(),
+            cache.lookup(&method, &uri, &req_headers).await.is_none(),
             "Vary:* responses must not be cached"
         );
         assert_eq!(
@@ -1107,7 +1182,8 @@ mod tests {
     #[tokio::test]
     async fn cache_keys_include_scheme_and_authority() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -1128,12 +1204,12 @@ mod tests {
         // Different host with same path must not hit cache
         let uri_b = build_uri("beta.example.com", 80, "/shared");
         assert!(
-            cache.lookup(&method, &uri_b, &req_headers).is_none(),
+            cache.lookup(&method, &uri_b, &req_headers).await.is_none(),
             "cache should not mix hosts for identical paths"
         );
 
         // Original host still hits
-        assert!(cache.lookup(&method, &uri_a, &req_headers).is_some());
+        assert!(cache.lookup(&method, &uri_a, &req_headers).await.is_some());
 
         Ok(())
     }
@@ -1142,7 +1218,7 @@ mod tests {
     async fn enforces_total_capacity_and_evicts_lru() -> Result<()> {
         let dir = TempDir::new()?;
         // Total cap of 6 bytes, entry cap large enough to not trigger first.
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024, 6)?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024, 6).await?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -1160,7 +1236,7 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await?;
-        let hit_a = cache.lookup(&method, &uri_a, &req_headers).unwrap();
+        let hit_a = cache.lookup(&method, &uri_a, &req_headers).await.unwrap();
         assert!(hit_a.body_path.exists());
 
         // Store second entry of 4 bytes -> should evict first to stay under 6 bytes
@@ -1177,9 +1253,9 @@ mod tests {
             )
             .await?;
 
-        assert!(cache.lookup(&method, &uri_a, &req_headers).is_none());
+        assert!(cache.lookup(&method, &uri_a, &req_headers).await.is_none());
         assert!(!hit_a.body_path.exists());
-        assert!(cache.lookup(&method, &uri_b, &req_headers).is_some());
+        assert!(cache.lookup(&method, &uri_b, &req_headers).await.is_some());
 
         Ok(())
     }
@@ -1187,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn skips_entry_bigger_than_total_capacity() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(2, dir.path().to_path_buf(), 1024, 2)?;
+        let cache = HttpCache::new(2, dir.path().to_path_buf(), 1024, 2).await?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -1205,7 +1281,7 @@ mod tests {
             )
             .await?;
 
-        assert!(cache.lookup(&method, &uri, &req_headers).is_none());
+        assert!(cache.lookup(&method, &uri, &req_headers).await.is_none());
         // temp should have been cleaned; cache dir should remain empty
         assert_eq!(fs::read_dir(dir.path())?.count(), 0);
         Ok(())
@@ -1223,7 +1299,7 @@ mod tests {
         let body_path = shard_dir.join("aabbcc");
         fs::write(&body_path, b"data")?;
 
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024, 1024 * 10)?;
+        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024, 1024 * 10).await?;
 
         // All stray files/directories should be removed and counters reset
         assert_eq!(fs::read_dir(dir.path())?.count(), 0);
@@ -1237,7 +1313,8 @@ mod tests {
     #[tokio::test]
     async fn skips_cache_when_vary_header_count_too_high() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/vary-limit");
@@ -1261,7 +1338,8 @@ mod tests {
     #[tokio::test]
     async fn skips_cache_when_vary_value_bytes_too_large() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+        let cache =
+            HttpCache::new(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
 
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/vary-bytes");
