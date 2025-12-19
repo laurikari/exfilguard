@@ -28,7 +28,7 @@ use async_trait::async_trait;
 
 use super::{
     forward::{forward_request_to_upstream, send_error_response},
-    request::{SanitizedRequest, sanitize_request},
+    request::{SanitizedRequest, reject_expect_header, sanitize_request},
     upstream::{Http2Upstream, PrimedHttp2Upstream},
 };
 
@@ -115,6 +115,22 @@ async fn process_downstream_request(
     app: AppContext,
     upstream: Arc<Mutex<Http2Upstream>>,
 ) -> Result<()> {
+    if let Err(err) = reject_expect_header(request.headers()) {
+        warn!(
+            peer = %peer,
+            error = %err,
+            "HTTP/2 request contained unsupported Expect header"
+        );
+        let mut respond = respond;
+        send_error_response(
+            &mut respond,
+            http::StatusCode::EXPECTATION_FAILED,
+            "expectation failed",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let ctx = DownstreamRequestCtx::new(request, respond, peer, &app)?;
     ctx.handle(upstream).await
 }
