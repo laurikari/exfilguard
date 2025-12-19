@@ -459,6 +459,15 @@ impl CacheState {
             }
         };
 
+        if !Self::valid_body_hash(&persisted.body_hash) {
+            warn!(
+                "cache metadata {} has invalid body hash; removing entry",
+                meta_path.display()
+            );
+            fs::remove_file(meta_path).ok();
+            return Ok(None);
+        }
+
         // Basic validation
         let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.expires_at);
         if SystemTime::now() > expires_at {
@@ -546,6 +555,10 @@ impl CacheState {
             }
             fs::remove_file(meta).ok();
         }
+    }
+
+    fn valid_body_hash(value: &str) -> bool {
+        value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
     }
 
     async fn remove_entry_files_from_meta_async(&self, meta_path: &Path) {
@@ -1003,6 +1016,36 @@ mod tests {
         assert!(
             rebuilt.lookup(&method, &uri, &req_headers).await.is_none(),
             "corrupted body should cause entry to be dropped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_drops_invalid_body_hash_metadata() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let shard_dir = disk_dir.join("aa").join("bb");
+        fs::create_dir_all(&shard_dir)?;
+        let meta_path = shard_dir.join("broken.meta");
+        let persisted = PersistedEntry {
+            key_base: "GET::http://example.com:80/".to_string(),
+            status: 200,
+            headers: Vec::new(),
+            vary_headers: Vec::new(),
+            expires_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs()
+                + 60,
+            body_hash: "abc".to_string(),
+            content_length: 0,
+        };
+        let data = serde_json::to_vec(&persisted)?;
+        fs::write(&meta_path, data)?;
+
+        let _rebuilt = HttpCache::new(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        assert!(
+            !meta_path.exists(),
+            "invalid cache metadata should be removed"
         );
         Ok(())
     }
