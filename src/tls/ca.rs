@@ -401,7 +401,9 @@ impl<'a> CaPaths<'a> {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use rcgen::SanType;
     use std::fs;
+    use std::net::IpAddr;
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
 
@@ -468,6 +470,22 @@ mod tests {
         assert!(!minted.certified_key.cert.is_empty());
         assert!(!minted.private_key_der.is_empty());
         assert!(minted.expires_at > OffsetDateTime::now_utc());
+        Ok(())
+    }
+
+    #[test]
+    fn leaf_params_use_ip_san_for_literals() -> Result<()> {
+        let ttl = StdDuration::from_secs(60);
+        for literal in ["192.0.2.1", "2001:db8::1"] {
+            let (params, _) = build_leaf_params(&[literal], ttl)?;
+            assert_eq!(params.subject_alt_names.len(), 1);
+            match &params.subject_alt_names[0] {
+                SanType::IpAddress(ip) => {
+                    assert_eq!(ip, &literal.parse::<IpAddr>().unwrap());
+                }
+                other => panic!("expected IP SAN for {literal}, got {other:?}"),
+            }
+        }
         Ok(())
     }
 }
