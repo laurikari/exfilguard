@@ -50,6 +50,7 @@ impl PolicySnapshot {
     }
 
     pub fn resolve_client(&self, addr: IpAddr) -> Option<&ClientEntry> {
+        let addr = normalize_peer_ip(addr);
         if let Some(index) = self.compiled.ip_clients.get(&addr)
             && let Some(client) = self.compiled.clients.get(*index)
         {
@@ -73,6 +74,15 @@ impl PolicySnapshot {
             decision,
         })
     }
+}
+
+fn normalize_peer_ip(addr: IpAddr) -> IpAddr {
+    if let IpAddr::V6(v6) = addr
+        && let Some(mapped) = v6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(mapped);
+    }
+    addr
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +158,7 @@ mod tests {
     use crate::policy::compile::compile_config;
     use http::{Method, StatusCode};
     use ipnet::IpNet;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
     fn allow_policy() -> Policy {
@@ -396,6 +406,35 @@ mod tests {
             .resolve_client(IpAddr::from(Ipv4Addr::new(192, 168, 1, 1)))
             .expect("default client");
         assert_eq!(default.name.as_ref(), "default");
+    }
+
+    #[test]
+    fn resolve_client_maps_ipv4_mapped_ipv6() {
+        let policies = vec![allow_policy()];
+        let policy_refs: Arc<[Arc<str>]> =
+            Arc::from(vec![Arc::<str>::from("allow-api")].into_boxed_slice());
+        let clients = vec![
+            Client {
+                name: Arc::<str>::from("ipv4-client"),
+                selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
+                policies: policy_refs.clone(),
+                catch_all: false,
+            },
+            Client {
+                name: Arc::<str>::from("default"),
+                selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+                policies: policy_refs,
+                catch_all: true,
+            },
+        ];
+
+        let config = ValidatedConfig::new(Config { clients, policies }).expect("validate config");
+        let compiled = Arc::new(compile_config(&config).expect("compile config"));
+        let snapshot = PolicySnapshot::new(compiled);
+
+        let mapped = IpAddr::V6("::ffff:10.0.0.5".parse::<Ipv6Addr>().unwrap());
+        let resolved = snapshot.resolve_client(mapped).expect("mapped client");
+        assert_eq!(resolved.name.as_ref(), "ipv4-client");
     }
 
     #[test]
