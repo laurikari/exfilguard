@@ -12,7 +12,9 @@ use tracing::debug;
 use crate::io_util::{TeeWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::http::cache_control::{get_freshness_lifetime, is_cacheable};
+use crate::proxy::http::cache_control::{
+    get_freshness_lifetime, is_cacheable, request_cache_bypass,
+};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
@@ -314,36 +316,40 @@ where
                 }
             }
 
-            let mut resp_headers_map = http::HeaderMap::new();
-            for h in &head.headers {
-                if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
-                    && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
-                {
-                    resp_headers_map.append(k, v);
-                }
-            }
-
-            if let Some(uri_obj) = cache_uri
-                && is_cacheable(method_obj, head.status, &resp_headers_map)
-            {
-                let ttl = select_cache_ttl(
-                    get_freshness_lifetime(&resp_headers_map),
-                    cache_config.force_cache_duration,
-                );
-
-                if ttl > Duration::ZERO {
-                    match cache
-                        .open_stream(method_obj, &uri_obj, &req_headers_map, &resp_headers_map)
-                        .await
+            if request_cache_bypass(&req_headers_map) {
+                cache_store = CacheStoreResult::Bypassed;
+            } else {
+                let mut resp_headers_map = http::HeaderMap::new();
+                for h in &head.headers {
+                    if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
+                        && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
                     {
-                        Ok(Some(stream)) => {
-                            cache_stream = Some((stream, ttl, resp_headers_map));
-                        }
-                        Ok(None) => {
-                            tracing::debug!("skipping cache write due to Vary limits");
-                        }
-                        Err(e) => {
-                            tracing::debug!("failed to open cache stream: {}", e);
+                        resp_headers_map.append(k, v);
+                    }
+                }
+
+                if let Some(uri_obj) = cache_uri
+                    && is_cacheable(method_obj, head.status, &resp_headers_map)
+                {
+                    let ttl = select_cache_ttl(
+                        get_freshness_lifetime(&resp_headers_map),
+                        cache_config.force_cache_duration,
+                    );
+
+                    if ttl > Duration::ZERO {
+                        match cache
+                            .open_stream(method_obj, &uri_obj, &req_headers_map, &resp_headers_map)
+                            .await
+                        {
+                            Ok(Some(stream)) => {
+                                cache_stream = Some((stream, ttl, resp_headers_map));
+                            }
+                            Ok(None) => {
+                                tracing::debug!("skipping cache write due to Vary limits");
+                            }
+                            Err(e) => {
+                                tracing::debug!("failed to open cache stream: {}", e);
+                            }
                         }
                     }
                 }
@@ -357,7 +363,7 @@ where
         None
     };
 
-    let encoded_head = head.encode(override_connection);
+    let encoded_head = head.encode(response_body_plan, override_connection);
     {
         let client_stream = client_reader.get_mut();
         write_all_with_timeout(
@@ -491,6 +497,9 @@ pub fn determine_response_body_plan(
     if head.chunked {
         return ResponseBodyPlan::Chunked;
     }
+    if head.transfer_encoding_present {
+        return ResponseBodyPlan::UntilClose;
+    }
     if let Some(length) = head.content_length {
         if length == 0 {
             return ResponseBodyPlan::Empty;
@@ -555,7 +564,9 @@ pub fn build_upstream_request(
 
 #[cfg(test)]
 mod tests {
-    use super::select_cache_ttl;
+    use super::{ResponseBodyPlan, determine_response_body_plan, select_cache_ttl};
+    use crate::proxy::http::codec::ResponseHead;
+    use http::StatusCode;
     use std::time::Duration;
 
     #[test]
@@ -579,5 +590,20 @@ mod tests {
     fn returns_zero_without_origin_or_forced() {
         assert_eq!(select_cache_ttl(None, None), Duration::ZERO);
         assert_eq!(select_cache_ttl(Some(Duration::ZERO), None), Duration::ZERO);
+    }
+
+    #[test]
+    fn transfer_encoding_without_chunked_forces_until_close() {
+        let head = ResponseHead {
+            status_line: "HTTP/1.1 200 OK".to_string(),
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            content_length: Some(123),
+            chunked: false,
+            transfer_encoding_present: true,
+            connection_close: false,
+        };
+        let plan = determine_response_body_plan(&http::Method::GET, StatusCode::OK, &head);
+        assert!(matches!(plan, ResponseBodyPlan::UntilClose));
     }
 }

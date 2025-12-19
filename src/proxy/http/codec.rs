@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use http::{Method, StatusCode, Version};
+use http::{HeaderMap, Method, StatusCode, Version};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tracing::debug;
 
@@ -13,6 +14,8 @@ use crate::{
     },
     util::timeout_with_context,
 };
+
+use super::forward::ResponseBodyPlan;
 
 pub struct HeaderAccumulator {
     sanitizer: RequestHeaderSanitizer,
@@ -324,20 +327,101 @@ pub struct ResponseHead {
     pub headers: Vec<HeaderLine>,
     pub content_length: Option<u64>,
     pub chunked: bool,
+    pub transfer_encoding_present: bool,
     pub connection_close: bool,
 }
 
 impl ResponseHead {
-    pub fn encode(&self, override_connection: Option<ConnectionDirective>) -> Vec<u8> {
+    pub fn encode(
+        &self,
+        body_plan: ResponseBodyPlan,
+        override_connection: Option<ConnectionDirective>,
+    ) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(256);
         buffer.extend_from_slice(self.status_line.as_bytes());
         buffer.extend_from_slice(b"\r\n");
 
+        let mut connection_tokens = HashSet::new();
         for header in &self.headers {
+            if header.lower_name() == "connection" {
+                for token in header.value.split(',') {
+                    let token = token.trim();
+                    if token.is_empty() {
+                        continue;
+                    }
+                    connection_tokens.insert(token.to_ascii_lowercase());
+                }
+            }
+        }
+
+        let mut transfer_encodings = Vec::new();
+        let mut trailers = Vec::new();
+
+        for header in &self.headers {
+            let name_lower = header.lower_name();
+            if name_lower == "transfer-encoding" {
+                transfer_encodings.push(header.value.clone());
+                continue;
+            }
+            if name_lower == "trailer" {
+                trailers.push(header.value.clone());
+                continue;
+            }
+            if name_lower == "content-length" {
+                continue;
+            }
+            if name_lower == "connection"
+                || name_lower == "keep-alive"
+                || name_lower == "proxy-connection"
+                || name_lower == "proxy-authenticate"
+                || name_lower == "proxy-authorization"
+                || name_lower == "upgrade"
+                || connection_tokens.contains(name_lower)
+            {
+                continue;
+            }
+
             buffer.extend_from_slice(header.name.as_bytes());
             buffer.extend_from_slice(b": ");
             buffer.extend_from_slice(header.value.as_bytes());
             buffer.extend_from_slice(b"\r\n");
+        }
+
+        match body_plan {
+            ResponseBodyPlan::Chunked => {
+                let value = if transfer_encodings.is_empty() {
+                    "chunked".to_string()
+                } else {
+                    transfer_encodings.join(", ")
+                };
+                buffer.extend_from_slice(b"Transfer-Encoding: ");
+                buffer.extend_from_slice(value.as_bytes());
+                buffer.extend_from_slice(b"\r\n");
+                if !trailers.is_empty() {
+                    buffer.extend_from_slice(b"Trailer: ");
+                    buffer.extend_from_slice(trailers.join(", ").as_bytes());
+                    buffer.extend_from_slice(b"\r\n");
+                }
+            }
+            ResponseBodyPlan::Fixed(length) => {
+                buffer.extend_from_slice(b"Content-Length: ");
+                buffer.extend_from_slice(length.to_string().as_bytes());
+                buffer.extend_from_slice(b"\r\n");
+            }
+            ResponseBodyPlan::Empty => {
+                if let Some(length) = self.content_length {
+                    buffer.extend_from_slice(b"Content-Length: ");
+                    buffer.extend_from_slice(length.to_string().as_bytes());
+                    buffer.extend_from_slice(b"\r\n");
+                }
+            }
+            ResponseBodyPlan::UntilClose => {
+                if !transfer_encodings.is_empty() {
+                    buffer.extend_from_slice(b"Transfer-Encoding: ");
+                    buffer.extend_from_slice(transfer_encodings.join(", ").as_bytes());
+                    buffer.extend_from_slice(b"\r\n");
+                }
+            }
         }
 
         if let Some(connection) = override_connection {
@@ -349,6 +433,124 @@ impl ResponseHead {
         buffer.extend_from_slice(b"\r\n");
         buffer
     }
+}
+
+pub fn encode_cached_response(
+    status_line: &str,
+    headers: &HeaderMap,
+    body_plan: ResponseBodyPlan,
+    content_length: Option<u64>,
+    override_connection: Option<ConnectionDirective>,
+) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(256);
+    buffer.extend_from_slice(status_line.as_bytes());
+    buffer.extend_from_slice(b"\r\n");
+
+    let mut connection_tokens = HashSet::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for token in s.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                connection_tokens.insert(token.to_ascii_lowercase());
+            }
+        }
+    }
+
+    let mut transfer_encodings = Vec::new();
+    let mut trailers = Vec::new();
+    let mut content_length_header = None;
+
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        let name_lower = name_str.to_ascii_lowercase();
+        if name_lower == "transfer-encoding" {
+            transfer_encodings.push(value.as_bytes().to_vec());
+            continue;
+        }
+        if name_lower == "trailer" {
+            trailers.push(value.as_bytes().to_vec());
+            continue;
+        }
+        if name_lower == "content-length" {
+            if content_length_header.is_none() {
+                content_length_header = Some(value.as_bytes().to_vec());
+            }
+            continue;
+        }
+        if name_lower == "connection"
+            || name_lower == "keep-alive"
+            || name_lower == "proxy-connection"
+            || name_lower == "proxy-authenticate"
+            || name_lower == "proxy-authorization"
+            || name_lower == "upgrade"
+            || connection_tokens.contains(&name_lower)
+        {
+            continue;
+        }
+
+        buffer.extend_from_slice(name_str.as_bytes());
+        buffer.extend_from_slice(b": ");
+        buffer.extend_from_slice(value.as_bytes());
+        buffer.extend_from_slice(b"\r\n");
+    }
+
+    match body_plan {
+        ResponseBodyPlan::Chunked => {
+            if transfer_encodings.is_empty() {
+                buffer.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            } else {
+                for value in &transfer_encodings {
+                    buffer.extend_from_slice(b"Transfer-Encoding: ");
+                    buffer.extend_from_slice(value);
+                    buffer.extend_from_slice(b"\r\n");
+                }
+            }
+            for value in &trailers {
+                buffer.extend_from_slice(b"Trailer: ");
+                buffer.extend_from_slice(value);
+                buffer.extend_from_slice(b"\r\n");
+            }
+        }
+        ResponseBodyPlan::UntilClose => {
+            for value in &transfer_encodings {
+                buffer.extend_from_slice(b"Transfer-Encoding: ");
+                buffer.extend_from_slice(value);
+                buffer.extend_from_slice(b"\r\n");
+            }
+        }
+        ResponseBodyPlan::Fixed(length) => {
+            buffer.extend_from_slice(b"Content-Length: ");
+            if let Some(value) = content_length_header.as_ref() {
+                buffer.extend_from_slice(value);
+            } else {
+                buffer.extend_from_slice(length.to_string().as_bytes());
+            }
+            buffer.extend_from_slice(b"\r\n");
+        }
+        ResponseBodyPlan::Empty => {
+            if let Some(value) = content_length_header.as_ref() {
+                buffer.extend_from_slice(b"Content-Length: ");
+                buffer.extend_from_slice(value);
+                buffer.extend_from_slice(b"\r\n");
+            } else if let Some(length) = content_length {
+                buffer.extend_from_slice(b"Content-Length: ");
+                buffer.extend_from_slice(length.to_string().as_bytes());
+                buffer.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+
+    if let Some(connection) = override_connection {
+        buffer.extend_from_slice(b"Connection: ");
+        buffer.extend_from_slice(connection.as_str().as_bytes());
+        buffer.extend_from_slice(b"\r\n");
+    }
+
+    buffer.extend_from_slice(b"\r\n");
+    buffer
 }
 
 pub async fn read_response_head<S>(
@@ -388,6 +590,7 @@ where
     let mut headers = Vec::new();
     let mut content_length = None;
     let mut chunked = false;
+    let mut transfer_encoding_present = false;
     let mut connection_close = matches!(version, Version::HTTP_10);
 
     let mut header_line = String::new();
@@ -420,10 +623,11 @@ where
                 .with_context(|| format!("invalid Content-Length value '{value}'"))?;
             content_length = Some(parsed);
         }
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.to_ascii_lowercase().contains("chunked")
-        {
-            chunked = true;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding_present = true;
+            if value.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
         }
         if name.eq_ignore_ascii_case("connection") {
             let mut saw_close = false;
@@ -450,6 +654,7 @@ where
         headers,
         content_length,
         chunked,
+        transfer_encoding_present,
         connection_close,
     })
 }
@@ -483,6 +688,12 @@ pub(crate) fn parse_status_line(value: &str) -> Result<(Version, StatusCode, Str
 mod tests {
     use super::*;
 
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
     #[test]
     fn forward_headers_skip_connection_tokens() {
         let mut accumulator = HeaderAccumulator::new(256);
@@ -505,5 +716,132 @@ mod tests {
             !names.contains(&"Foo"),
             "Foo header should be skipped due to Connection token"
         );
+    }
+
+    #[test]
+    fn response_encode_strips_hop_by_hop_and_connection_tokens() {
+        let head = ResponseHead {
+            status_line: "HTTP/1.1 200 OK".to_string(),
+            status: StatusCode::OK,
+            headers: vec![
+                HeaderLine::new("Connection", "Foo, Upgrade"),
+                HeaderLine::new("Foo", "bar"),
+                HeaderLine::new("Upgrade", "websocket"),
+                HeaderLine::new("Transfer-Encoding", "chunked"),
+                HeaderLine::new("Trailer", "X-Trailer"),
+                HeaderLine::new("Content-Length", "123"),
+                HeaderLine::new("X-Test", "1"),
+            ],
+            content_length: Some(123),
+            chunked: true,
+            transfer_encoding_present: true,
+            connection_close: false,
+        };
+
+        let encoded = head.encode(ResponseBodyPlan::Chunked, None);
+        let text = String::from_utf8(encoded).unwrap();
+
+        assert!(!text.contains("Connection:"));
+        assert!(!text.contains("Foo:"));
+        assert!(!text.contains("Upgrade:"));
+        assert!(!text.contains("Content-Length:"));
+        assert!(text.contains("Transfer-Encoding: chunked"));
+        assert!(text.contains("Trailer: X-Trailer"));
+        assert!(text.contains("X-Test: 1"));
+    }
+
+    #[test]
+    fn response_encode_sets_content_length_for_fixed() {
+        let head = ResponseHead {
+            status_line: "HTTP/1.1 200 OK".to_string(),
+            status: StatusCode::OK,
+            headers: vec![HeaderLine::new("Transfer-Encoding", "chunked")],
+            content_length: Some(5),
+            chunked: false,
+            transfer_encoding_present: true,
+            connection_close: false,
+        };
+
+        let encoded = head.encode(ResponseBodyPlan::Fixed(5), Some(ConnectionDirective::Close));
+        let text = String::from_utf8(encoded).unwrap();
+
+        assert!(text.contains("Content-Length: 5"));
+        assert!(!text.contains("Transfer-Encoding:"));
+        assert!(text.contains("Connection: close"));
+    }
+
+    #[test]
+    fn encode_cached_response_preserves_bytes_and_strips_hop_by_hop() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("Foo, Upgrade"),
+        );
+        headers.insert(
+            http::header::HeaderName::from_static("foo"),
+            http::HeaderValue::from_static("bar"),
+        );
+        headers.insert(
+            http::header::UPGRADE,
+            http::HeaderValue::from_static("websocket"),
+        );
+        headers.insert(
+            http::header::TRANSFER_ENCODING,
+            http::HeaderValue::from_static("chunked"),
+        );
+        headers.insert(
+            http::header::TRAILER,
+            http::HeaderValue::from_static("X-Trailer"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("123"),
+        );
+        headers.insert(
+            http::header::HeaderName::from_static("x-test"),
+            http::HeaderValue::from_static("1"),
+        );
+        headers.insert(
+            http::header::HeaderName::from_static("x-binary"),
+            http::HeaderValue::from_bytes(b"foo\xffbar").unwrap(),
+        );
+
+        let encoded = encode_cached_response(
+            "HTTP/1.1 200 OK",
+            &headers,
+            ResponseBodyPlan::Chunked,
+            Some(123),
+            Some(ConnectionDirective::Close),
+        );
+
+        assert!(!contains_bytes(&encoded, b"Connection: Foo"));
+        assert!(!contains_bytes(&encoded, b"foo: bar\r\n"));
+        assert!(!contains_bytes(&encoded, b"upgrade: websocket\r\n"));
+        assert!(!contains_bytes(&encoded, b"Content-Length:"));
+        assert!(contains_bytes(&encoded, b"Transfer-Encoding: chunked\r\n"));
+        assert!(contains_bytes(&encoded, b"Trailer: X-Trailer\r\n"));
+        assert!(contains_bytes(&encoded, b"x-test: 1\r\n"));
+        assert!(contains_bytes(&encoded, b"x-binary: foo\xffbar\r\n"));
+        assert!(contains_bytes(&encoded, b"Connection: close\r\n"));
+    }
+
+    #[test]
+    fn encode_cached_response_uses_origin_content_length_for_empty() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("42"),
+        );
+
+        let encoded = encode_cached_response(
+            "HTTP/1.1 200 OK",
+            &headers,
+            ResponseBodyPlan::Empty,
+            Some(5),
+            Some(ConnectionDirective::Close),
+        );
+
+        assert!(contains_bytes(&encoded, b"Content-Length: 42\r\n"));
+        assert!(!contains_bytes(&encoded, b"Content-Length: 5\r\n"));
     }
 }

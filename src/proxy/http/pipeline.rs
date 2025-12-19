@@ -26,8 +26,11 @@ use crate::{
 };
 
 use super::body::BodyPlan;
-use super::codec::HeaderAccumulator;
-use super::forward::{ForwardResult, ForwardTimeouts, forward_to_upstream};
+use super::cache_control::request_cache_bypass;
+use super::codec::{ConnectionDirective, HeaderAccumulator, ResponseHead, encode_cached_response};
+use super::forward::{
+    ForwardResult, ForwardTimeouts, determine_response_body_plan, forward_to_upstream,
+};
 use super::upstream::UpstreamPool;
 
 pub enum ClientDisposition {
@@ -234,51 +237,80 @@ where
                 }
             }
 
-            if let Some(uri_obj) = uri_obj {
+            if !request_cache_bypass(&req_headers_map)
+                && let Some(uri_obj) = uri_obj
+            {
                 if let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map) {
                     // Serve from cache
                     let client_stream = self.reader.get_mut();
 
-                    // Write Status Line
                     let status_line = format!(
-                        "HTTP/1.1 {} {}\r\n",
+                        "HTTP/1.1 {} {}",
                         cached.status.as_u16(),
                         cached.status.canonical_reason().unwrap_or("OK")
                     );
-                    write_all_with_timeout(
-                        client_stream,
-                        status_line.as_bytes(),
-                        self.client_timeout,
-                        "writing status line to client",
-                    )
-                    .await?;
 
-                    // Write Headers
-                    let mut header_bytes = Vec::new();
-                    for (k, v) in cached.headers.iter() {
-                        header_bytes.extend_from_slice(k.as_str().as_bytes());
-                        header_bytes.extend_from_slice(b": ");
-                        header_bytes.extend_from_slice(v.as_bytes());
-                        header_bytes.extend_from_slice(b"\r\n");
+                    let mut transfer_encoding_present = false;
+                    let mut chunked = false;
+                    for value in cached
+                        .headers
+                        .get_all(http::header::TRANSFER_ENCODING)
+                        .iter()
+                    {
+                        transfer_encoding_present = true;
+                        if value
+                            .to_str()
+                            .ok()
+                            .map(|s| s.to_ascii_lowercase().contains("chunked"))
+                            .unwrap_or(false)
+                        {
+                            chunked = true;
+                        }
                     }
-                    header_bytes.extend_from_slice(b"\r\n");
+                    let has_content_length =
+                        cached.headers.contains_key(http::header::CONTENT_LENGTH);
+                    let content_length = if transfer_encoding_present || !has_content_length {
+                        None
+                    } else {
+                        Some(cached.content_length)
+                    };
+                    let head = ResponseHead {
+                        status_line: status_line.clone(),
+                        status: cached.status,
+                        headers: Vec::new(),
+                        content_length,
+                        chunked,
+                        transfer_encoding_present,
+                        connection_close: true,
+                    };
+                    let body_plan =
+                        determine_response_body_plan(&self.parsed.method, cached.status, &head);
+                    let encoded_head = encode_cached_response(
+                        &status_line,
+                        &cached.headers,
+                        body_plan,
+                        content_length,
+                        Some(ConnectionDirective::Close),
+                    );
                     write_all_with_timeout(
                         client_stream,
-                        &header_bytes,
+                        &encoded_head,
                         self.client_timeout,
-                        "writing cached response headers",
+                        "writing cached response head",
                     )
                     .await?;
 
-                    // Stream Body
-                    let mut file = tokio::fs::File::open(&cached.body_path).await?;
-                    let copied = copy_with_write_timeout(
-                        &mut file,
-                        client_stream,
-                        self.client_timeout,
-                        "writing cached response body",
-                    )
-                    .await?;
+                    let mut copied = 0u64;
+                    if !matches!(body_plan, super::forward::ResponseBodyPlan::Empty) {
+                        let mut file = tokio::fs::File::open(&cached.body_path).await?;
+                        copied = copy_with_write_timeout(
+                            &mut file,
+                            client_stream,
+                            self.client_timeout,
+                            "writing cached response body",
+                        )
+                        .await?;
+                    }
 
                     shutdown_stream(client_stream, self.client_timeout).await?;
 

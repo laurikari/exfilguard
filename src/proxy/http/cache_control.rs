@@ -115,6 +115,40 @@ pub fn get_freshness_lifetime(headers: &HeaderMap) -> Option<Duration> {
     None
 }
 
+pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
+    for value in headers.get_all(http::header::CACHE_CONTROL) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let lower = part.to_ascii_lowercase();
+                if lower == "no-cache" || lower == "no-store" {
+                    return true;
+                }
+                if let Some(stripped) = lower.strip_prefix("max-age=")
+                    && stripped.parse::<u64>().ok() == Some(0)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for value in headers.get_all(http::header::PRAGMA) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                if part.trim().eq_ignore_ascii_case("no-cache") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +228,52 @@ mod tests {
             get_freshness_lifetime(&headers),
             Some(Duration::from_secs(120))
         );
+    }
+
+    #[test]
+    fn request_cache_bypass_no_cache() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_no_store() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_max_age_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=0"),
+        );
+        assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_pragma_no_cache() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
+        assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_ignored_for_cacheable() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=60"),
+        );
+        assert!(!request_cache_bypass(&headers));
     }
 }

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -138,10 +138,31 @@ pub(super) async fn forward_request_to_upstream(
         max_response_header_bytes,
         "upstream response headers exceed configured limit",
     )?;
+    let mut connection_tokens = HashSet::new();
+    for value in response.headers().get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for token in s.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                connection_tokens.insert(token.to_ascii_lowercase());
+            }
+        }
+    }
     for (name, value) in response.headers().iter() {
         let name_str = name.as_str();
         let lower = name_str.to_ascii_lowercase();
-        if lower == "connection" || lower == "transfer-encoding" || lower == "keep-alive" {
+        if lower == "connection"
+            || lower == "transfer-encoding"
+            || lower == "keep-alive"
+            || lower == "proxy-connection"
+            || lower == "proxy-authenticate"
+            || lower == "proxy-authorization"
+            || lower == "trailer"
+            || lower == "upgrade"
+            || connection_tokens.contains(lower.as_str())
+        {
             continue;
         }
         header_budget.record(name_str.len() + value.as_bytes().len() + HEADER_PADDING)?;

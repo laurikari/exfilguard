@@ -160,6 +160,12 @@ Response caching is disabled by default. Set `cache_dir` to enable.
 
 The cache respects standard HTTP caching semantics from upstream servers.
 
+#### Scope
+
+The cache is shared across all clients. Responses are keyed by method + absolute URI, with
+`Vary` request headers used to decide cache hits. Enable caching only if cross-client sharing
+is acceptable for your deployment.
+
 #### Supported Headers
 
 - **Cache-Control**: `max-age`, `s-maxage`, `private`, `no-store`, `public`
@@ -179,7 +185,16 @@ Cache lifetime is determined in this order:
 
 - **Methods**: Only `GET` and `HEAD` requests
 - **Status codes**: 200, 203, 204, 205, 206, 301, 302
+- **Bypass**: Requests with `Authorization` or `Cookie` headers are never served from cache
+  and are not stored
 - **Not cached**: Responses with `no-store` or `private` directives
+
+#### Request Cache Directives
+
+Request-side cache controls are honored for bypass. If a request includes `Cache-Control:
+no-cache`, `Cache-Control: no-store`, `Cache-Control: max-age=0`, or `Pragma: no-cache`, the
+cache will not be used and the response will not be stored. Caching decisions otherwise
+follow upstream response headers plus `force_cache_duration` from policy rules.
 
 #### Eviction
 
