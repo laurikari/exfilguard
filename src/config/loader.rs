@@ -426,17 +426,17 @@ fn validate_host_pattern(host: &str) -> Result<()> {
         if label.is_empty() {
             bail!("host contains empty label");
         }
-        if label != "*" && label.chars().all(|c| c == '*') {
-            // allow lone '*'
+        if label == "*" || label == "**" {
+            continue;
+        }
+        if label.contains('*') {
+            bail!("'*' may only appear as entire host label");
         }
         for ch in label.chars() {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '*' {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
                 continue;
             }
             bail!("host label '{}' contains invalid character '{}'", label, ch);
-        }
-        if label.len() > 1 && label.starts_with('*') {
-            bail!("'*' may only appear as entire host label");
         }
     }
 

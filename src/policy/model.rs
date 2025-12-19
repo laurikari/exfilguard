@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
-use globset::GlobMatcher;
 use http::Method;
 use ipnet::IpNet;
 use regex::Regex;
@@ -255,7 +254,7 @@ impl UrlMatcher {
 pub enum HostMatcher {
     Any,
     Exact(String),
-    Glob(GlobMatcher),
+    Pattern(HostPattern),
 }
 
 impl HostMatcher {
@@ -263,8 +262,83 @@ impl HostMatcher {
         match self {
             HostMatcher::Any => true,
             HostMatcher::Exact(expected) => expected == &host.to_ascii_lowercase(),
-            HostMatcher::Glob(glob) => glob.is_match(host),
+            HostMatcher::Pattern(pattern) => pattern.matches(host),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HostPattern {
+    labels: Arc<[HostLabel]>,
+}
+
+#[derive(Debug, Clone)]
+pub enum HostLabel {
+    Exact(Arc<str>),
+    Single,
+    Multi,
+}
+
+impl HostPattern {
+    pub fn new(labels: Vec<HostLabel>) -> Self {
+        Self {
+            labels: Arc::from(labels.into_boxed_slice()),
+        }
+    }
+
+    pub fn matches(&self, host: &str) -> bool {
+        let host_lower = host.to_ascii_lowercase();
+        let labels: Vec<&str> = host_lower.split('.').collect();
+        self.matches_labels(&labels)
+    }
+
+    fn matches_labels(&self, labels: &[&str]) -> bool {
+        let mut memo = vec![vec![None; labels.len() + 1]; self.labels.len() + 1];
+        self.matches_from(0, 0, labels, &mut memo)
+    }
+
+    fn matches_from(
+        &self,
+        pattern_idx: usize,
+        label_idx: usize,
+        labels: &[&str],
+        memo: &mut Vec<Vec<Option<bool>>>,
+    ) -> bool {
+        if let Some(value) = memo[pattern_idx][label_idx] {
+            return value;
+        }
+
+        let result = if pattern_idx == self.labels.len() {
+            label_idx == labels.len()
+        } else {
+            match &self.labels[pattern_idx] {
+                HostLabel::Exact(expected) => {
+                    label_idx < labels.len()
+                        && labels[label_idx] == expected.as_ref()
+                        && self.matches_from(pattern_idx + 1, label_idx + 1, labels, memo)
+                }
+                HostLabel::Single => {
+                    label_idx < labels.len()
+                        && self.matches_from(pattern_idx + 1, label_idx + 1, labels, memo)
+                }
+                HostLabel::Multi => {
+                    if label_idx >= labels.len() {
+                        return false;
+                    }
+                    let mut next = label_idx + 1;
+                    while next <= labels.len() {
+                        if self.matches_from(pattern_idx + 1, next, labels, memo) {
+                            return true;
+                        }
+                        next += 1;
+                    }
+                    false
+                }
+            }
+        };
+
+        memo[pattern_idx][label_idx] = Some(result);
+        result
     }
 }
 
@@ -285,5 +359,53 @@ impl PathMatcher {
 
     pub fn original(&self) -> &Arc<str> {
         &self.original
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostLabel, HostPattern};
+    use std::sync::Arc;
+
+    #[test]
+    fn host_pattern_single_label_wildcard() {
+        let pattern = HostPattern::new(vec![
+            HostLabel::Single,
+            HostLabel::Exact(Arc::from("example")),
+            HostLabel::Exact(Arc::from("com")),
+        ]);
+
+        assert!(pattern.matches("foo.example.com"));
+        assert!(!pattern.matches("foo.bar.example.com"));
+        assert!(!pattern.matches("example.com"));
+    }
+
+    #[test]
+    fn host_pattern_multi_label_wildcard() {
+        let pattern = HostPattern::new(vec![
+            HostLabel::Multi,
+            HostLabel::Exact(Arc::from("example")),
+            HostLabel::Exact(Arc::from("com")),
+        ]);
+
+        assert!(pattern.matches("foo.example.com"));
+        assert!(pattern.matches("foo.bar.example.com"));
+        assert!(!pattern.matches("example.org"));
+        assert!(!pattern.matches("example.com"));
+    }
+
+    #[test]
+    fn host_pattern_multi_label_middle() {
+        let pattern = HostPattern::new(vec![
+            HostLabel::Exact(Arc::from("api")),
+            HostLabel::Multi,
+            HostLabel::Exact(Arc::from("example")),
+            HostLabel::Exact(Arc::from("com")),
+        ]);
+
+        assert!(pattern.matches("api.foo.example.com"));
+        assert!(pattern.matches("api.foo.bar.example.com"));
+        assert!(!pattern.matches("foo.api.example.com"));
+        assert!(!pattern.matches("api.example.com"));
     }
 }

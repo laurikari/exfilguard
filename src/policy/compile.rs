@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use globset::GlobBuilder;
 use regex::Regex;
 
 use crate::config::{
@@ -13,7 +12,7 @@ use crate::config::{
 
 use super::model::{
     CidrTrie, ClientEntry, CompiledCacheConfig, CompiledConfig, CompiledPolicy, CompiledRule,
-    HostMatcher, MethodMask, PathMatcher, UrlMatcher,
+    HostLabel, HostMatcher, HostPattern, MethodMask, PathMatcher, UrlMatcher,
 };
 
 /// Transforms a validated configuration into a performance-optimized memory model.
@@ -161,19 +160,21 @@ fn compile_host_pattern(host: &str) -> Result<HostMatcher> {
     if host == "*" {
         return Ok(HostMatcher::Any);
     }
-    if host.starts_with('[') {
+
+    if !host.contains('*') {
         return Ok(HostMatcher::Exact(host.to_ascii_lowercase()));
     }
-    if host.contains('*') {
-        let mut builder = GlobBuilder::new(host);
-        builder.case_insensitive(true).literal_separator(true);
-        let glob = builder
-            .build()
-            .with_context(|| format!("invalid host glob '{}'", host))?;
-        Ok(HostMatcher::Glob(glob.compile_matcher()))
-    } else {
-        Ok(HostMatcher::Exact(host.to_ascii_lowercase()))
-    }
+
+    let labels = host
+        .split('.')
+        .map(|label| match label {
+            "*" => HostLabel::Single,
+            "**" => HostLabel::Multi,
+            other => HostLabel::Exact(Arc::from(other.to_ascii_lowercase())),
+        })
+        .collect();
+
+    Ok(HostMatcher::Pattern(HostPattern::new(labels)))
 }
 
 fn compile_path_pattern(pattern: &Arc<str>) -> Result<PathMatcher> {

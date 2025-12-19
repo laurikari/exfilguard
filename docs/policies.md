@@ -151,13 +151,15 @@ URL patterns follow the format: `scheme://host[:port][/path]`
 | Pattern | Matches |
 |---------|---------|
 | `example.com` | Exact domain |
-| `*.example.com` | Any subdomain of example.com |
+| `*.example.com` | Exactly one subdomain label of example.com |
+| `**.example.com` | Any depth of subdomains of example.com (one or more) |
+| `example.**` | Any suffix depth under example |
 | `*` | Any host |
 | `192.0.2.1` | Exact IPv4 address |
 | `[2001:db8::1]` | Exact IPv6 address (bracketed) |
 
 !!! note
-    Host matching is case-insensitive. Wildcards can only appear as entire labels: `*.example.com` is valid, `a*b.com` is not.
+    Host matching is case-insensitive. Wildcards can only appear as entire labels: `*.example.com` and `**.example.com` are valid, `a*b.com` is not. `*` matches a single label and `**` matches one or more labels.
 
 ### Port
 
