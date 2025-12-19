@@ -139,12 +139,14 @@ impl HttpCache {
         let mut guard = self.state.inner.lock();
         let inner = &mut *guard;
 
-        if let Some(entry) = inner.lru.get(&key_base) {
+        if let Some(entry) = inner.lru.get(&key_base).cloned() {
             if SystemTime::now() > entry.expires_at {
                 trace!("cache entry expired");
                 if let Some(removed) = inner.lru.pop(&key_base) {
                     inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
                 }
+                drop(guard);
+                self.state.remove_entry_files_for_hash(&entry.body_hash);
                 crate::metrics::record_cache_lookup(false);
                 return None;
             }
@@ -490,6 +492,11 @@ impl CacheState {
         fs::remove_file(meta_path).ok();
     }
 
+    fn remove_entry_files_for_hash(&self, body_hash: &str) {
+        let meta_path = self.meta_path(body_hash);
+        self.remove_entry_files_from_meta(&meta_path);
+    }
+
     fn remove_evicted_files(&self, evicted: Vec<CacheEntry>) {
         for evicted_entry in evicted {
             crate::metrics::record_cache_eviction();
@@ -737,6 +744,49 @@ mod tests {
         // Lookup Miss
         let miss = cache.lookup(&method, &uri, &req_headers);
         assert!(miss.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_expired_entries_cleanup_disk() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = HttpCache::new(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10)?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/expired-cleanup");
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+        let body = b"expired-data";
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                body,
+                Duration::from_secs(0),
+            )
+            .await?;
+
+        let body_hash = blake3::hash(body).to_hex().to_string();
+        let (first, remainder) = body_hash.split_at(2);
+        let (second, _) = remainder.split_at(2);
+        let body_path = dir.path().join(first).join(second).join(&body_hash);
+        let mut meta_path = body_path.clone();
+        meta_path.set_extension("meta");
+
+        assert!(body_path.exists(), "expected cached body to exist");
+        assert!(meta_path.exists(), "expected cached metadata to exist");
+
+        std::thread::sleep(Duration::from_millis(5));
+        let miss = cache.lookup(&method, &uri, &req_headers);
+        assert!(miss.is_none());
+
+        assert!(!body_path.exists(), "expired body should be removed");
+        assert!(!meta_path.exists(), "expired metadata should be removed");
 
         Ok(())
     }
