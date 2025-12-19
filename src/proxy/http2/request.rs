@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use h2::RecvStream;
 use http::{self, HeaderName, HeaderValue, Uri};
 
@@ -30,13 +30,32 @@ pub(super) fn sanitize_request(
     );
 
     let uri = request.uri().clone();
-    if uri.authority().is_none() {
-        bail!("HTTP/2 request missing :authority pseudo header");
-    }
     let parsed = parse_uri_request(request.method().clone(), &uri, Scheme::Https)?;
 
     let mut forward_headers = Vec::new();
     let mut sanitizer = RequestHeaderSanitizer::new(max_header_bytes);
+    let authority = uri
+        .authority()
+        .map(|auth| auth.as_str())
+        .ok_or_else(|| anyhow!("HTTP/2 request missing :authority pseudo header"))?;
+    let scheme = match parsed.scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+    };
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+    sanitizer
+        .record_name_value(":method", request.method().as_str())
+        .context("invalid :method pseudo header")?;
+    sanitizer
+        .record_name_value(":scheme", scheme)
+        .context("invalid :scheme pseudo header")?;
+    sanitizer
+        .record_name_value(":authority", authority)
+        .context("invalid :authority pseudo header")?;
+    sanitizer
+        .record_name_value(":path", path)
+        .context("invalid :path pseudo header")?;
 
     for (name, value) in request.headers().iter() {
         let name_str = name.as_str();

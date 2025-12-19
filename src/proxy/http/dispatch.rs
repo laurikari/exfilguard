@@ -1,16 +1,21 @@
 use std::{net::SocketAddr, time::Instant};
 
 use anyhow::Result;
-use http::Method;
+use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tracing::warn;
 
 use crate::config::Scheme;
+use crate::logging::AccessLogBuilder;
 
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
+use crate::proxy::request::scheme_name;
 
 use super::codec::{RequestHead, read_request_head};
-use super::pipeline::{ClientDisposition, RequestContext, handle_non_connect};
+use super::pipeline::{
+    ClientDisposition, RequestContext, handle_non_connect, respond_with_access_log,
+};
 use super::upstream::UpstreamPool;
 
 pub(super) struct HttpLoopOptions {
@@ -54,16 +59,43 @@ where
 
     loop {
         let start = Instant::now();
-        let Some(RequestHead {
+        let request_head =
+            match read_request_head(&mut reader, peer, client_timeout, max_header_size).await {
+                Ok(Some(head)) => head,
+                Ok(None) => break,
+                Err(err) => {
+                    let err_message = err.to_string();
+                    if err_message.starts_with("timed out") {
+                        warn!(peer = %peer, error = %err, "client request timed out");
+                        break;
+                    }
+                    warn!(peer = %peer, error = %err, "invalid request");
+                    respond_with_access_log(
+                        reader.get_mut(),
+                        StatusCode::BAD_REQUEST,
+                        None,
+                        b"invalid request\r\n",
+                        client_timeout,
+                        0,
+                        start.elapsed(),
+                        AccessLogBuilder::new(peer)
+                            .method("UNKNOWN")
+                            .scheme(scheme_name(fallback_scheme))
+                            .host("")
+                            .path("")
+                            .decision("ERROR"),
+                    )
+                    .await?;
+                    break;
+                }
+            };
+        let RequestHead {
             method,
             target,
             headers,
             request_line_bytes,
             header_bytes,
-        }) = read_request_head(&mut reader, peer, client_timeout, max_header_size).await?
-        else {
-            break;
-        };
+        } = request_head;
 
         if allow_connect && method == Method::CONNECT {
             let host_header = headers.host().map(|h| h.to_owned());

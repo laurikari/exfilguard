@@ -155,21 +155,28 @@ where
     let target = parts
         .next()
         .ok_or_else(|| anyhow!("malformed request line: missing target"))?;
-    let _version = parts
+    let version = parts
         .next()
         .ok_or_else(|| anyhow!("malformed request line: missing version"))?;
+    match version {
+        "HTTP/1.1" | "HTTP/1.0" => {}
+        other => bail!("invalid HTTP version '{other}'"),
+    }
 
     let method = Method::from_bytes(method_str.as_bytes())
         .with_context(|| format!("invalid method '{method_str}'"))?;
     let target = target.to_string();
 
-    let mut headers = HeaderAccumulator::new(max_header_bytes);
+    let remaining = max_header_bytes
+        .checked_sub(request_line_bytes)
+        .ok_or_else(|| anyhow!("request headers exceed configured limit"))?;
+    ensure!(remaining > 0, "request headers exceed configured limit");
+    let mut headers = HeaderAccumulator::new(remaining);
     let mut header_line = String::new();
     loop {
         header_line.clear();
         let read =
-            read_line_with_timeout(reader, &mut header_line, timeout, peer, max_header_bytes)
-                .await?;
+            read_line_with_timeout(reader, &mut header_line, timeout, peer, remaining).await?;
         if read == 0 {
             break;
         }
