@@ -22,6 +22,7 @@ nav:
   - Home: index.md
   - Configuration: configuration.md
   - Policies: policies.md
+  - HTTP/1.1 Framing: http-framing.md
 
 markdown_extensions:
   - admonition
