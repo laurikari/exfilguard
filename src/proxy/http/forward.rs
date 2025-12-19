@@ -289,9 +289,10 @@ where
     .await?;
 
     let mut upstream_reader = BufReader::new(&mut connection.stream);
-    let head = read_response_head(
+    let (head, informational_bytes) = read_final_response_head(
         &mut upstream_reader,
-        timeouts.upstream,
+        client_reader.get_mut(),
+        timeouts,
         connection.peer,
         max_response_header_bytes,
     )
@@ -386,7 +387,7 @@ where
         )
         .await?;
     }
-    let mut bytes_to_client = encoded_head.len() as u64;
+    let mut bytes_to_client = informational_bytes.saturating_add(encoded_head.len() as u64);
 
     {
         let client_stream = client_reader.get_mut();
@@ -489,6 +490,56 @@ where
         ResponseBodyPlan::UntilClose => {
             relay_until_close(upstream, client, upstream_timeout, client_timeout, peer).await
         }
+    }
+}
+
+async fn read_final_response_head<S, C>(
+    upstream: &mut BufReader<S>,
+    client: &mut C,
+    timeouts: &ForwardTimeouts,
+    peer: SocketAddr,
+    max_response_header_bytes: usize,
+) -> Result<(ResponseHead, u64)>
+where
+    S: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    let mut bytes_to_client = 0u64;
+    loop {
+        let mut head =
+            read_response_head(upstream, timeouts.upstream, peer, max_response_header_bytes)
+                .await?;
+        if head.status == StatusCode::SWITCHING_PROTOCOLS {
+            anyhow::bail!("upstream attempted protocol upgrade (101 Switching Protocols)");
+        }
+        if head.status.is_informational() {
+            if head.transfer_encoding_present {
+                anyhow::bail!("informational response must not include a body");
+            }
+            if let Some(length) = head.content_length
+                && length > 0
+            {
+                anyhow::bail!("informational response must not include a body");
+            }
+            head.content_length = None;
+            let encoded = head.encode(ResponseBodyPlan::Empty, None);
+            write_all_with_timeout(
+                client,
+                &encoded,
+                timeouts.client,
+                "writing informational response to client",
+            )
+            .await?;
+            timeout_with_context(
+                timeouts.client,
+                client.flush(),
+                "flushing informational response to client",
+            )
+            .await?;
+            bytes_to_client = bytes_to_client.saturating_add(encoded.len() as u64);
+            continue;
+        }
+        return Ok((head, bytes_to_client));
     }
 }
 
@@ -605,7 +656,9 @@ pub fn build_upstream_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{ResponseBodyPlan, determine_response_body_plan, select_cache_ttl};
+    use super::{
+        ForwardTimeouts, ResponseBodyPlan, determine_response_body_plan, select_cache_ttl,
+    };
     use crate::proxy::http::codec::ResponseHead;
     use http::StatusCode;
     use std::time::Duration;
@@ -666,5 +719,122 @@ mod tests {
         };
         let plan = determine_response_body_plan(&http::Method::GET, StatusCode::OK, &head);
         assert!(matches!(plan, ResponseBodyPlan::UntilClose));
+    }
+
+    #[tokio::test]
+    async fn forwards_informational_responses_before_final() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
+
+        let (mut upstream_writer, upstream_reader) = duplex(1024);
+        let (mut client_reader, client_writer) = duplex(1024);
+
+        let response = concat!(
+            "HTTP/1.1 100 Continue\r\nX-Test: one\r\n\r\n",
+            "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        );
+        upstream_writer.write_all(response.as_bytes()).await?;
+        drop(upstream_writer);
+
+        let mut upstream_reader = BufReader::new(upstream_reader);
+        let mut client_writer = client_writer;
+        let timeouts = ForwardTimeouts {
+            connect: Duration::from_secs(1),
+            upstream: Duration::from_secs(1),
+            client: Duration::from_secs(1),
+        };
+        let (head, bytes) = super::read_final_response_head(
+            &mut upstream_reader,
+            &mut client_writer,
+            &timeouts,
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await?;
+
+        assert_eq!(head.status, StatusCode::OK);
+        assert!(bytes > 0);
+        drop(client_writer);
+
+        let mut buf = Vec::new();
+        client_reader.read_to_end(&mut buf).await?;
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("HTTP/1.1 100"));
+        assert!(text.contains("HTTP/1.1 103"));
+        assert!(!text.contains("HTTP/1.1 200"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_switching_protocols() -> anyhow::Result<()> {
+        use tokio::io::{AsyncWriteExt, BufReader, duplex};
+
+        let (mut upstream_writer, upstream_reader) = duplex(512);
+        let (_client_reader, mut client_writer) = duplex(512);
+        let response = concat!(
+            "HTTP/1.1 101 Switching Protocols\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n\r\n"
+        );
+        upstream_writer.write_all(response.as_bytes()).await?;
+        drop(upstream_writer);
+
+        let mut upstream_reader = BufReader::new(upstream_reader);
+        let timeouts = ForwardTimeouts {
+            connect: Duration::from_secs(1),
+            upstream: Duration::from_secs(1),
+            client: Duration::from_secs(1),
+        };
+        let result = super::read_final_response_head(
+            &mut upstream_reader,
+            &mut client_writer,
+            &timeouts,
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("expected 101 to be rejected"),
+            Err(err) => {
+                assert!(err.to_string().contains("Switching Protocols"));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_informational_with_body_indicators() -> anyhow::Result<()> {
+        use tokio::io::{AsyncWriteExt, BufReader, duplex};
+
+        let (mut upstream_writer, upstream_reader) = duplex(512);
+        let (_client_reader, mut client_writer) = duplex(512);
+        let response = concat!("HTTP/1.1 100 Continue\r\n", "Content-Length: 5\r\n", "\r\n");
+        upstream_writer.write_all(response.as_bytes()).await?;
+        drop(upstream_writer);
+
+        let mut upstream_reader = BufReader::new(upstream_reader);
+        let timeouts = ForwardTimeouts {
+            connect: Duration::from_secs(1),
+            upstream: Duration::from_secs(1),
+            client: Duration::from_secs(1),
+        };
+        let result = super::read_final_response_head(
+            &mut upstream_reader,
+            &mut client_writer,
+            &timeouts,
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("expected informational response to be rejected"),
+            Err(err) => {
+                assert!(
+                    err.to_string()
+                        .contains("informational response must not include a body")
+                );
+            }
+        }
+        Ok(())
     }
 }

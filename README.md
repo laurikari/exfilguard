@@ -107,6 +107,11 @@ certificates instead of providing a custom trust store.
 4. Allowed requests are proxied upstream with pooled TCP/TLS clients; denied
    requests receive a 403 and a structured log entry.
 
+## Limitations
+
+- WebSocket and HTTP/1.1 Upgrade flows are not supported; upstream `101 Switching Protocols`
+  responses are rejected rather than tunneled.
+
 ### TLS inspection vs. pass-through
 
 Each policy rule declares whether ExfilGuard bumps TLS:
