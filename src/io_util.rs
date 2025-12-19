@@ -23,11 +23,11 @@ impl<W1, W2> TeeWriter<W1, W2> {
     }
 }
 
-pub async fn write_all_with_timeout<W: AsyncWrite + Unpin>(
+pub async fn write_all_with_timeout<W: AsyncWrite + Unpin, C: Into<String>>(
     writer: &mut W,
     buf: &[u8],
     timeout: Duration,
-    context: &'static str,
+    context: C,
 ) -> Result<()> {
     timeout_with_context(timeout, writer.write_all(buf), context).await
 }
@@ -36,7 +36,7 @@ pub async fn copy_with_write_timeout<R: AsyncRead + Unpin, W: AsyncWrite + Unpin
     reader: &mut R,
     writer: &mut W,
     timeout: Duration,
-    context: &'static str,
+    context: &str,
 ) -> Result<u64> {
     let mut total = 0u64;
     let mut buffer = [0u8; 8192];

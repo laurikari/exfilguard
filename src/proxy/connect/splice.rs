@@ -6,6 +6,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::{
+    io_util::write_all_with_timeout,
     proxy::{AppContext, upstream},
     util::timeout_with_context,
 };
@@ -69,9 +70,10 @@ pub async fn send_connect_established(
     client_timeout: Duration,
 ) -> Result<u64> {
     let established = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: exfilguard\r\n\r\n";
-    timeout_with_context(
+    write_all_with_timeout(
+        stream,
+        established,
         client_timeout,
-        stream.write_all(established),
         "writing CONNECT response",
     )
     .await?;
@@ -140,9 +142,10 @@ where
             break;
         }
 
-        timeout_with_context(
+        write_all_with_timeout(
+            writer,
+            &buffer[..read],
             write_timeout,
-            writer.write_all(&buffer[..read]),
             format!("forwarding to {write_label} during CONNECT splice"),
         )
         .await?;

@@ -512,15 +512,16 @@ where
         reason_text,
         body.len()
     );
-    timeout_with_context(
+    write_all_with_timeout(
+        stream,
+        header.as_bytes(),
         timeout_dur,
-        stream.write_all(header.as_bytes()),
         "writing response header",
     )
     .await?;
     let mut written = header.len();
     if !body.is_empty() {
-        timeout_with_context(timeout_dur, stream.write_all(body), "writing response body").await?;
+        write_all_with_timeout(stream, body, timeout_dur, "writing response body").await?;
         written += body.len();
     }
     Ok(written)

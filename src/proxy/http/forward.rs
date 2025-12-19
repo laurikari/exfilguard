@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
 
-use crate::io_util::TeeWriter;
+use crate::io_util::{TeeWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
 use crate::proxy::http::cache_control::{get_freshness_lifetime, is_cacheable};
@@ -233,9 +233,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request_bytes = build_upstream_request(request, headers, request_close, &body_plan);
-    timeout_with_context(
+    write_all_with_timeout(
+        &mut connection.stream,
+        &request_bytes,
         timeouts.upstream,
-        connection.stream.write_all(&request_bytes),
         "sending request headers to upstream",
     )
     .await?;
@@ -359,9 +360,10 @@ where
     let encoded_head = head.encode(override_connection);
     {
         let client_stream = client_reader.get_mut();
-        timeout_with_context(
+        write_all_with_timeout(
+            client_stream,
+            &encoded_head,
             timeouts.client,
-            client_stream.write_all(&encoded_head),
             "writing response head to client",
         )
         .await?;

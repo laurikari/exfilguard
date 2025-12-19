@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 
 use crate::{
+    io_util::write_all_with_timeout,
     proxy::{forward_limits::BodySizeTracker, http::codec::read_line_with_timeout},
     util::timeout_with_context,
 };
@@ -50,9 +51,10 @@ where
             bail!("unexpected EOF while reading request body from client");
         }
         remaining -= read;
-        timeout_with_context(
+        write_all_with_timeout(
+            upstream,
+            &buffer[..read],
             upstream_timeout,
-            upstream.write_all(&buffer[..read]),
             "writing request body to upstream",
         )
         .await?;
@@ -98,9 +100,10 @@ where
             limit_tracker.record(chunk_size)?;
         }
 
-        timeout_with_context(
+        write_all_with_timeout(
+            writer,
+            line.as_bytes(),
             write_timeout,
-            writer.write_all(line.as_bytes()),
             format!("forwarding chunk size {write_target}"),
         )
         .await?;
@@ -119,9 +122,10 @@ where
                 if trailer_bytes == 0 {
                     bail!("unexpected EOF while reading chunk trailer from {peer}");
                 }
-                timeout_with_context(
+                write_all_with_timeout(
+                    writer,
+                    line.as_bytes(),
                     write_timeout,
-                    writer.write_all(line.as_bytes()),
                     format!("forwarding chunk trailer {write_target}"),
                 )
                 .await?;
@@ -147,9 +151,10 @@ where
                 bail!("unexpected EOF while reading chunk data from {peer}");
             }
             remaining -= read;
-            timeout_with_context(
+            write_all_with_timeout(
+                writer,
+                &buffer[..read],
                 write_timeout,
-                writer.write_all(&buffer[..read]),
                 format!("forwarding chunk data {write_target}"),
             )
             .await?;
@@ -166,9 +171,10 @@ where
         if &crlf != b"\r\n" {
             bail!("invalid chunk terminator when reading from {peer}");
         }
-        timeout_with_context(
+        write_all_with_timeout(
+            writer,
+            &crlf,
             write_timeout,
-            writer.write_all(&crlf),
             format!("forwarding chunk terminator {write_target}"),
         )
         .await?;
@@ -229,9 +235,10 @@ where
             bail!("upstream closed connection early while sending response body");
         }
         remaining -= read as u64;
-        timeout_with_context(
+        write_all_with_timeout(
+            client,
+            &buffer[..read],
             client_timeout,
-            client.write_all(&buffer[..read]),
             "writing response body to client",
         )
         .await?;
@@ -286,9 +293,10 @@ where
         if read == 0 {
             break;
         }
-        timeout_with_context(
+        write_all_with_timeout(
+            client,
+            &buffer[..read],
             client_timeout,
-            client.write_all(&buffer[..read]),
             "writing response body to client",
         )
         .await?;
