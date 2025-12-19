@@ -51,6 +51,8 @@ pub async fn handle_bump(
             Some(PrimedHttp2Upstream {
                 stream: *stream,
                 peer,
+                host: target.host.clone(),
+                port: target.port,
             }),
         ),
         UpstreamProbe::Http1 => (false, None),

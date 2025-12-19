@@ -34,6 +34,13 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             decision: "DENY",
             extra_client_bytes: 0,
         },
+        ForwardErrorKind::MisdirectedRequest(_) => ForwardErrorSpec {
+            status: StatusCode::MISDIRECTED_REQUEST,
+            body_http1: b"misdirected request\r\n",
+            body_http2: "misdirected request",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+        },
         ForwardErrorKind::Other => ForwardErrorSpec {
             status: StatusCode::BAD_GATEWAY,
             body_http1: b"upstream request failed\r\n",
@@ -85,6 +92,7 @@ pub async fn handle_forward_result<'a, T>(
             let kind_label = match kind {
                 ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
                 ForwardErrorKind::PrivateAddress(_) => "private_address",
+                ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
                 ForwardErrorKind::Other => "other",
             };
             crate::metrics::record_upstream_error(kind_label);
@@ -171,6 +179,7 @@ mod tests {
     use crate::{
         config::Scheme,
         proxy::{
+            forward_error::MisdirectedRequest,
             policy_eval::{AllowDecision, DenyDecision},
             request::ParsedRequest,
         },
@@ -279,5 +288,20 @@ mod tests {
         assert!(spec.reason.is_none());
         assert_eq!(spec.body_http2, DEFAULT_DENY_BODY_HTTP2);
         assert_eq!(spec.body_http1, DEFAULT_DENY_BODY_HTTP1);
+    }
+
+    #[test]
+    fn misdirected_request_maps_to_421() {
+        let err = anyhow::Error::new(MisdirectedRequest::new(
+            "upstream.test".to_string(),
+            443,
+            "requested.test".to_string(),
+            8443,
+        ));
+        let kind = classify_forward_error(&err);
+        let spec = forward_error_spec(&kind);
+        assert_eq!(spec.status, StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(spec.body_http2, "misdirected request");
+        assert_eq!(spec.body_http1, b"misdirected request\r\n");
     }
 }

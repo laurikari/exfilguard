@@ -10,13 +10,18 @@ use tracing::debug;
 use crate::util;
 use crate::{
     config::Scheme,
-    proxy::{AppContext, connect::ResolvedTarget, request::ParsedRequest, upstream},
+    proxy::{
+        AppContext, connect::ResolvedTarget, forward_error::MisdirectedRequest,
+        request::ParsedRequest, upstream,
+    },
 };
 use rustls::pki_types::ServerName;
 
 pub struct PrimedHttp2Upstream {
     pub stream: ClientTlsStream<TcpStream>,
     pub peer: SocketAddr,
+    pub host: String,
+    pub port: u16,
 }
 
 pub(super) struct Http2Upstream {
@@ -29,6 +34,9 @@ pub(super) struct Http2Upstream {
 pub(super) struct UpstreamHandle {
     pub sender: client::SendRequest<Bytes>,
     pub peer: SocketAddr,
+    pub host: String,
+    pub port: u16,
+    pub scheme: Scheme,
     pub reused: bool,
     pub is_private_peer: bool,
     connection_task: JoinHandle<()>,
@@ -63,10 +71,11 @@ impl Http2Upstream {
         allow_private_connect: bool,
         request: &ParsedRequest,
     ) -> Result<UpstreamCheckout> {
-        if let Some(handle) = self.handle.as_ref()
-            && Self::reuse_forbidden(handle, allow_private_connect)
-        {
-            self.shutdown().await;
+        if let Some(handle) = self.handle.as_ref() {
+            ensure_request_matches(handle, request)?;
+            if Self::reuse_forbidden(handle, allow_private_connect) {
+                self.shutdown().await;
+            }
         }
 
         if self.handle.is_none() {
@@ -90,12 +99,35 @@ impl Http2Upstream {
         allow_private_connect: bool,
         request: &ParsedRequest,
     ) -> Result<UpstreamHandle> {
+        let port = request.port.unwrap_or(request.scheme.default_port());
+        if request.scheme != Scheme::Https {
+            bail!("HTTP/2 upstream requires HTTPS scheme");
+        }
+
+        if let Some(primed) = self.primed.as_ref()
+            && (primed.host != request.host || primed.port != port)
+        {
+            return Err(MisdirectedRequest::new(
+                primed.host.clone(),
+                primed.port,
+                request.host.clone(),
+                port,
+            )
+            .into());
+        }
+
         if let Some(primed) = self.primed.take() {
-            return make_handle_from_stream(primed.stream, primed.peer).await;
+            return make_handle_from_stream(
+                primed.stream,
+                primed.peer,
+                primed.host,
+                primed.port,
+                request.scheme,
+            )
+            .await;
         }
 
         let connect_timeout = self.app.settings.upstream_connect_timeout();
-        let port = request.port.unwrap_or(request.scheme.default_port());
         let addresses = upstream::resolve_or_use_binding(
             &request.host,
             port,
@@ -106,10 +138,6 @@ impl Http2Upstream {
         )
         .await?;
         let (tcp_stream, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;
-
-        if request.scheme != Scheme::Https {
-            bail!("HTTP/2 upstream requires HTTPS scheme");
-        }
 
         let connector = TlsConnector::from(self.app.tls.client_http2.clone());
         let server_name = ServerName::try_from(request.host.clone())
@@ -130,7 +158,7 @@ impl Http2Upstream {
             );
         }
 
-        make_handle_from_stream(tls_stream, peer).await
+        make_handle_from_stream(tls_stream, peer, request.host.clone(), port, request.scheme).await
     }
 
     pub(super) async fn shutdown(&mut self) {
@@ -144,6 +172,9 @@ impl Http2Upstream {
 async fn make_handle_from_stream(
     tls_stream: ClientTlsStream<TcpStream>,
     peer: SocketAddr,
+    host: String,
+    port: u16,
+    scheme: Scheme,
 ) -> Result<UpstreamHandle> {
     let (sender, connection) = client::handshake(tls_stream)
         .await
@@ -159,9 +190,26 @@ async fn make_handle_from_stream(
         sender,
         connection_task: task,
         peer,
+        host,
+        port,
+        scheme,
         reused: false,
         is_private_peer: util::is_private_ip(peer.ip()),
     })
+}
+
+fn ensure_request_matches(handle: &UpstreamHandle, request: &ParsedRequest) -> Result<()> {
+    let port = request.port.unwrap_or(request.scheme.default_port());
+    if handle.scheme != request.scheme || handle.host != request.host || handle.port != port {
+        return Err(MisdirectedRequest::new(
+            handle.host.clone(),
+            handle.port,
+            request.host.clone(),
+            port,
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -180,6 +228,9 @@ mod tests {
         let handle = UpstreamHandle {
             sender,
             peer: "10.0.0.5:443".parse().unwrap(),
+            host: "example.com".to_string(),
+            port: 443,
+            scheme: Scheme::Https,
             reused: false,
             is_private_peer: true,
             connection_task,
