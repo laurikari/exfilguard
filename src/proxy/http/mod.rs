@@ -125,10 +125,27 @@ mod tests {
         let target = "http://[fd00:1234::1]:8080/data";
         let parsed = parse_http1_request(method, target, None, Scheme::Http)?;
         let headers = HeaderAccumulator::new(2048);
-        let request_bytes = build_upstream_request(&parsed, &headers, false, &BodyPlan::Empty);
+        let request_bytes =
+            build_upstream_request(&parsed, &headers, false, &BodyPlan::Empty, false);
         let request_text = String::from_utf8(request_bytes)?;
         assert!(request_text.contains("Host: [fd00:1234::1]:8080"));
         assert!(request_text.starts_with("GET /data HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_upstream_request_strips_expect_continue() -> anyhow::Result<()> {
+        let method = Method::POST;
+        let target = "http://example.com/upload";
+        let parsed = parse_http1_request(method, target, None, Scheme::Http)?;
+        let mut headers = HeaderAccumulator::new(2048);
+        headers.push_line("Expect: 100-continue\r\n")?;
+        headers.push_line("\r\n")?;
+
+        let request_bytes =
+            build_upstream_request(&parsed, &headers, false, &BodyPlan::Fixed(1), true);
+        let request_text = String::from_utf8(request_bytes)?;
+        assert!(!request_text.contains("Expect:"));
         Ok(())
     }
 

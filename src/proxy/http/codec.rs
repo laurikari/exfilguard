@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use http::{HeaderMap, Method, StatusCode, Version};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     proxy::{
@@ -105,6 +105,23 @@ impl HeaderAccumulator {
 
     pub fn has_sensitive_cache_headers(&self) -> bool {
         self.has_header("authorization") || self.has_header("cookie")
+    }
+
+    pub fn expect_continue(&self) -> Result<bool> {
+        let mut seen = false;
+        for header in &self.headers {
+            if header.lower_name() != "expect" {
+                continue;
+            }
+            if seen {
+                bail!("multiple Expect headers are not supported");
+            }
+            if !header.value.eq_ignore_ascii_case("100-continue") {
+                bail!("unsupported Expect header value '{}'", header.value);
+            }
+            seen = true;
+        }
+        Ok(seen)
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -596,6 +613,7 @@ where
 
     let mut headers = Vec::new();
     let mut content_length = None;
+    let mut content_length_seen = false;
     let mut chunked = false;
     let mut transfer_encoding_present = false;
     let mut connection_close = matches!(version, Version::HTTP_10);
@@ -624,11 +642,15 @@ where
             .ok_or_else(|| anyhow!("header missing ':' separator from upstream"))?;
         let name = name.trim();
         let value = value.trim();
-        if name.eq_ignore_ascii_case("content-length") && content_length.is_none() {
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length_seen {
+                bail!("multiple Content-Length headers from upstream are not supported");
+            }
             let parsed: u64 = value
                 .parse()
                 .with_context(|| format!("invalid Content-Length value '{value}'"))?;
             content_length = Some(parsed);
+            content_length_seen = true;
         }
         if name.eq_ignore_ascii_case("transfer-encoding") {
             transfer_encoding_present = true;
@@ -653,6 +675,14 @@ where
             }
         }
         headers.push(HeaderLine::new(name, value));
+    }
+
+    if transfer_encoding_present && content_length_seen {
+        warn!(
+            peer = %peer,
+            "upstream response contained both Transfer-Encoding and Content-Length; rejecting"
+        );
+        bail!("upstream response must not include both Transfer-Encoding and Content-Length");
     }
 
     Ok(ResponseHead {
@@ -694,6 +724,8 @@ pub(crate) fn parse_status_line(value: &str) -> Result<(Version, StatusCode, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use std::time::Duration;
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
@@ -775,6 +807,78 @@ mod tests {
         assert!(text.contains("Content-Length: 5"));
         assert!(!text.contains("Transfer-Encoding:"));
         assert!(text.contains("Connection: close"));
+    }
+
+    #[test]
+    fn expect_continue_detects_header() -> Result<()> {
+        let mut accumulator = HeaderAccumulator::new(256);
+        assert!(matches!(
+            accumulator.push_line("Expect: 100-continue\r\n"),
+            Ok(true)
+        ));
+        assert!(matches!(accumulator.push_line("\r\n"), Ok(false)));
+        assert!(accumulator.expect_continue()?);
+        Ok(())
+    }
+
+    #[test]
+    fn expect_continue_rejects_unknown_value() {
+        let mut accumulator = HeaderAccumulator::new(256);
+        accumulator
+            .push_line("Expect: something-else\r\n")
+            .expect("header accepted");
+        accumulator.push_line("\r\n").expect("header end");
+        let err = accumulator
+            .expect_continue()
+            .expect_err("unsupported Expect should error");
+        assert!(
+            err.to_string().contains("unsupported Expect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_response_head_rejects_duplicate_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
+        let mut reader = tokio::io::BufReader::new(&response[..]);
+        let result = read_response_head(
+            &mut reader,
+            Duration::from_secs(1),
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await;
+        if let Err(err) = result {
+            assert!(
+                err.to_string().contains("multiple Content-Length"),
+                "unexpected error: {err}"
+            );
+        } else {
+            panic!("duplicate Content-Length should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_head_rejects_transfer_encoding_with_content_length() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n";
+        let mut reader = tokio::io::BufReader::new(&response[..]);
+        let result = read_response_head(
+            &mut reader,
+            Duration::from_secs(1),
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await;
+        if let Err(err) = result {
+            assert!(
+                err.to_string()
+                    .contains("must not include both Transfer-Encoding and Content-Length"),
+                "unexpected error: {err}"
+            );
+        } else {
+            panic!("Transfer-Encoding with Content-Length should be rejected");
+        }
     }
 
     #[test]

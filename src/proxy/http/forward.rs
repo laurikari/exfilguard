@@ -128,6 +128,7 @@ pub async fn forward_to_upstream<S>(
     body_plan: BodyPlan,
     connect_binding: Option<&ResolvedTarget>,
     timeouts: &ForwardTimeouts,
+    expect_continue: bool,
     decision: &AllowDecision,
     peer: SocketAddr,
     max_body_size: usize,
@@ -172,6 +173,7 @@ where
         headers,
         body_plan,
         timeouts,
+        expect_continue,
         peer,
         max_body_size,
         request_close,
@@ -224,6 +226,7 @@ pub async fn forward_with_connection<S>(
     headers: &HeaderAccumulator,
     body_plan: BodyPlan,
     timeouts: &ForwardTimeouts,
+    expect_continue: bool,
     peer: SocketAddr,
     max_body_size: usize,
     request_close: bool,
@@ -234,12 +237,21 @@ pub async fn forward_with_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request_bytes = build_upstream_request(request, headers, request_close, &body_plan);
+    let request_bytes =
+        build_upstream_request(request, headers, request_close, &body_plan, expect_continue);
     write_all_with_timeout(
         &mut connection.stream,
         &request_bytes,
         timeouts.upstream,
         "sending request headers to upstream",
+    )
+    .await?;
+
+    send_continue_if_needed(
+        client_reader.get_mut(),
+        expect_continue,
+        body_plan,
+        timeouts.client,
     )
     .await?;
 
@@ -480,6 +492,31 @@ where
     }
 }
 
+async fn send_continue_if_needed<S>(
+    client: &mut S,
+    expect_continue: bool,
+    body_plan: BodyPlan,
+    timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !expect_continue || matches!(body_plan, BodyPlan::Empty) {
+        return Ok(());
+    }
+
+    let response = b"HTTP/1.1 100 Continue\r\n\r\n";
+    write_all_with_timeout(
+        client,
+        response,
+        timeout,
+        "writing 100-continue response to client",
+    )
+    .await?;
+    timeout_with_context(timeout, client.flush(), "flushing 100-continue response").await?;
+    Ok(())
+}
+
 pub fn determine_response_body_plan(
     method: &Method,
     status: StatusCode,
@@ -523,12 +560,16 @@ pub fn build_upstream_request(
     headers: &HeaderAccumulator,
     close: bool,
     body_plan: &BodyPlan,
+    expect_continue: bool,
 ) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(512);
     buffer
         .extend_from_slice(format!("{} {} HTTP/1.1\r\n", request.method, request.path).as_bytes());
 
     for header in headers.forward_headers() {
+        if expect_continue && header.lower_name() == "expect" {
+            continue;
+        }
         buffer.extend_from_slice(header.name.as_bytes());
         buffer.extend_from_slice(b": ");
         buffer.extend_from_slice(header.value.as_bytes());
@@ -568,6 +609,26 @@ mod tests {
     use crate::proxy::http::codec::ResponseHead;
     use http::StatusCode;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn send_continue_writes_expected_response() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, duplex};
+
+        let (mut client, mut server) = duplex(64);
+        super::send_continue_if_needed(
+            &mut server,
+            true,
+            super::BodyPlan::Fixed(1),
+            Duration::from_secs(1),
+        )
+        .await?;
+        drop(server);
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await?;
+        assert_eq!(buf, b"HTTP/1.1 100 Continue\r\n\r\n");
+        Ok(())
+    }
 
     #[test]
     fn prefers_origin_ttl_when_present() {

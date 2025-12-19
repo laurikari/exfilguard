@@ -101,6 +101,30 @@ where
         }
     };
 
+    let expect_continue = match headers.expect_continue() {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(peer = %peer, error = %err, "unsupported Expect header");
+            respond_with_access_log(
+                reader.get_mut(),
+                StatusCode::EXPECTATION_FAILED,
+                None,
+                b"expectation failed\r\n",
+                client_timeout,
+                total_request_bytes,
+                start.elapsed(),
+                AccessLogBuilder::new(peer)
+                    .method(method.as_str())
+                    .scheme(scheme_name(fallback_scheme))
+                    .host(headers.host().unwrap_or(""))
+                    .path(target.clone())
+                    .decision("ERROR"),
+            )
+            .await?;
+            return Ok(ClientDisposition::Close);
+        }
+    };
+
     if !headers.is_chunked()
         && let Some(length) = content_length
         && length > app.settings.max_body_size
@@ -175,6 +199,7 @@ where
         peer,
         client_timeout,
         parsed: &parsed,
+        expect_continue,
     };
 
     request_pipeline::process_request(
@@ -202,6 +227,7 @@ where
     peer: SocketAddr,
     client_timeout: Duration,
     parsed: &'a ParsedRequest,
+    expect_continue: bool,
 }
 
 #[async_trait]
@@ -396,6 +422,7 @@ where
                 upstream: self.app.settings.upstream_timeout(),
                 client: self.client_timeout,
             },
+            self.expect_continue,
             decision,
             self.peer,
             self.app.settings.max_body_size,
@@ -725,6 +752,44 @@ name = "allow"
         let body = String::from_utf8_lossy(&buf);
         assert!(body.starts_with("HTTP/1.1 400"));
         assert!(body.contains("invalid request target"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_expect_header_returns_417() -> Result<()> {
+        let temp = TempDir::new()?;
+        let app = build_test_app(&temp)?;
+        let (mut client_side, server_side) = tokio::io::duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut reader = BufReader::new(server_side);
+        let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
+
+        let mut headers = HeaderAccumulator::new(1024);
+        headers.push_line("Host: example.com\r\n")?;
+        headers.push_line("Expect: custom\r\n")?;
+        headers.push_line("Content-Length: 10\r\n")?;
+        headers.push_line("\r\n")?;
+        let header_bytes = headers.total_bytes();
+        let ctx = RequestContext {
+            method: Method::POST,
+            target: "/".to_string(),
+            headers,
+            request_line_bytes: 18,
+            header_bytes,
+            start: Instant::now(),
+            fallback_scheme: Scheme::Http,
+        };
+
+        let result =
+            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None).await?;
+        assert!(matches!(result, ClientDisposition::Close));
+
+        drop(reader);
+        let mut buf = Vec::new();
+        client_side.read_to_end(&mut buf).await?;
+        let body = String::from_utf8_lossy(&buf);
+        assert!(body.starts_with("HTTP/1.1 417"));
+        assert!(body.contains("expectation failed"));
         Ok(())
     }
 }
