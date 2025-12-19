@@ -100,6 +100,19 @@ pub fn parse_host_header(value: &str) -> Result<(String, Option<u16>)> {
     if trimmed.is_empty() {
         bail!("empty Host header");
     }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        bail!("authority must not contain whitespace");
+    }
+    if trimmed.contains('@') {
+        bail!("authority must not contain userinfo");
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.contains('\\')
+    {
+        bail!("authority must not contain path or query");
+    }
     let uri: Uri = format!("http://{trimmed}")
         .parse()
         .with_context(|| format!("invalid Host header '{trimmed}'"))?;
@@ -198,5 +211,23 @@ mod tests {
         let parsed = parse_uri_request(Method::GET, &uri, Scheme::Https)?;
         assert_eq!(parsed.authority_host(), "[fd00::1]:8443");
         Ok(())
+    }
+
+    #[test]
+    fn parse_host_header_rejects_userinfo() {
+        let err = parse_host_header("user@example.com").unwrap_err();
+        assert!(
+            err.to_string().contains("userinfo"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_host_header_rejects_path() {
+        let err = parse_host_header("example.com/path").unwrap_err();
+        assert!(
+            err.to_string().contains("path or query"),
+            "unexpected error: {err:?}"
+        );
     }
 }
