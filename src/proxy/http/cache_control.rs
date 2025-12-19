@@ -19,24 +19,32 @@ pub fn parse_cache_control(headers: &HeaderMap) -> CacheControl {
         if let Ok(s) = value.to_str() {
             for part in s.split(',') {
                 let part = part.trim();
-                if part.eq_ignore_ascii_case("public") {
-                    cc.public = true;
-                } else if part.eq_ignore_ascii_case("private") {
-                    cc.private = true;
-                } else if part.eq_ignore_ascii_case("no-cache") {
-                    cc.no_cache = true;
-                } else if part.eq_ignore_ascii_case("no-store") {
-                    cc.no_store = true;
-                } else if part.eq_ignore_ascii_case("must-revalidate") {
-                    cc.must_revalidate = true;
-                } else if let Some(stripped) = part.strip_prefix("max-age=") {
-                    if let Ok(secs) = stripped.parse::<u64>() {
-                        cc.max_age = Some(Duration::from_secs(secs));
+                if part.is_empty() {
+                    continue;
+                }
+
+                let (name, value) = split_directive(part);
+                match name.as_str() {
+                    "public" => cc.public = true,
+                    "private" => cc.private = true,
+                    "no-cache" => cc.no_cache = true,
+                    "no-store" => cc.no_store = true,
+                    "must-revalidate" => cc.must_revalidate = true,
+                    "max-age" => {
+                        if let Some(value) = value
+                            && let Ok(secs) = normalize_cc_value(value).parse::<u64>()
+                        {
+                            cc.max_age = Some(Duration::from_secs(secs));
+                        }
                     }
-                } else if let Some(stripped) = part.strip_prefix("s-maxage=")
-                    && let Ok(secs) = stripped.parse::<u64>()
-                {
-                    cc.s_maxage = Some(Duration::from_secs(secs));
+                    "s-maxage" => {
+                        if let Some(value) = value
+                            && let Ok(secs) = normalize_cc_value(value).parse::<u64>()
+                        {
+                            cc.s_maxage = Some(Duration::from_secs(secs));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -123,12 +131,13 @@ pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
                 if part.is_empty() {
                     continue;
                 }
-                let lower = part.to_ascii_lowercase();
-                if lower == "no-cache" || lower == "no-store" {
+                let (name, value) = split_directive(part);
+                if name == "no-cache" || name == "no-store" {
                     return true;
                 }
-                if let Some(stripped) = lower.strip_prefix("max-age=")
-                    && stripped.parse::<u64>().ok() == Some(0)
+                if name == "max-age"
+                    && let Some(value) = value
+                    && normalize_cc_value(value).parse::<u64>().ok() == Some(0)
                 {
                     return true;
                 }
@@ -149,6 +158,22 @@ pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
     false
 }
 
+fn split_directive(part: &str) -> (String, Option<&str>) {
+    if let Some((name, value)) = part.split_once('=') {
+        (name.trim().to_ascii_lowercase(), Some(value.trim()))
+    } else {
+        (part.trim().to_ascii_lowercase(), None)
+    }
+}
+
+fn normalize_cc_value(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +190,18 @@ mod tests {
         assert!(cc.public);
         assert_eq!(cc.max_age, Some(Duration::from_secs(3600)));
         assert!(!cc.private);
+    }
+
+    #[test]
+    fn test_parse_cache_control_case_insensitive_with_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("Max-Age = 120, S-Maxage= 240"),
+        );
+        let cc = parse_cache_control(&headers);
+        assert_eq!(cc.max_age, Some(Duration::from_secs(120)));
+        assert_eq!(cc.s_maxage, Some(Duration::from_secs(240)));
     }
 
     #[test]
@@ -255,7 +292,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::CACHE_CONTROL,
-            HeaderValue::from_static("max-age=0"),
+            HeaderValue::from_static("Max-Age = 0"),
         );
         assert!(request_cache_bypass(&headers));
     }
