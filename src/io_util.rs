@@ -1,6 +1,11 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::AsyncWrite;
+use std::time::Duration;
+
+use anyhow::Result;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::util::timeout_with_context;
 
 pub struct TeeWriter<W1, W2> {
     writer1: W1,
@@ -16,6 +21,34 @@ impl<W1, W2> TeeWriter<W1, W2> {
             pending: None,
         }
     }
+}
+
+pub async fn write_all_with_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    buf: &[u8],
+    timeout: Duration,
+    context: &'static str,
+) -> Result<()> {
+    timeout_with_context(timeout, writer.write_all(buf), context).await
+}
+
+pub async fn copy_with_write_timeout<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    timeout: Duration,
+    context: &'static str,
+) -> Result<u64> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        write_all_with_timeout(writer, &buffer[..read], timeout, context).await?;
+        total = total.saturating_add(read as u64);
+    }
+    Ok(total)
 }
 
 struct PendingWrite {
@@ -159,10 +192,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::TeeWriter;
+    use super::{TeeWriter, copy_with_write_timeout, write_all_with_timeout};
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
 
     struct ChunkWriter {
         max_chunk: usize,
@@ -175,6 +211,26 @@ mod tests {
                 max_chunk,
                 data: Vec::new(),
             }
+        }
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -214,5 +270,47 @@ mod tests {
         assert_eq!(writer1.data, payload);
         assert_eq!(writer2.data, payload);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_with_write_timeout_handles_partial_writes() -> Result<()> {
+        let (mut reader, mut writer) = duplex(16);
+        let payload = b"abcdefghijklmnopqrstuvwxyz";
+        let write_task = tokio::spawn(async move {
+            writer.write_all(payload).await?;
+            writer.shutdown().await
+        });
+
+        let mut sink = ChunkWriter::new(4);
+        let copied = copy_with_write_timeout(
+            &mut reader,
+            &mut sink,
+            Duration::from_secs(1),
+            "writing cached response body",
+        )
+        .await?;
+
+        write_task.await??;
+        assert_eq!(copied as usize, payload.len());
+        assert_eq!(sink.data, payload);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_all_with_timeout_times_out_on_stalled_writer() {
+        let handle = tokio::spawn(async {
+            let mut writer = PendingWriter;
+            write_all_with_timeout(
+                &mut writer,
+                b"payload",
+                Duration::from_secs(1),
+                "writing cached response headers",
+            )
+            .await
+        });
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("timed out"));
     }
 }

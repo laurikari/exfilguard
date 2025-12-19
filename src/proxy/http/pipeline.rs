@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use async_trait::async_trait;
 
+use crate::io_util::{copy_with_write_timeout, write_all_with_timeout};
 use crate::{
     config::Scheme,
     logging::AccessLogBuilder,
@@ -244,25 +245,40 @@ where
                         cached.status.as_u16(),
                         cached.status.canonical_reason().unwrap_or("OK")
                     );
-                    timeout_with_context(
+                    write_all_with_timeout(
+                        client_stream,
+                        status_line.as_bytes(),
                         self.client_timeout,
-                        client_stream.write_all(status_line.as_bytes()),
                         "writing status line to client",
                     )
                     .await?;
 
                     // Write Headers
+                    let mut header_bytes = Vec::new();
                     for (k, v) in cached.headers.iter() {
-                        client_stream.write_all(k.as_str().as_bytes()).await?;
-                        client_stream.write_all(b": ").await?;
-                        client_stream.write_all(v.as_bytes()).await?;
-                        client_stream.write_all(b"\r\n").await?;
+                        header_bytes.extend_from_slice(k.as_str().as_bytes());
+                        header_bytes.extend_from_slice(b": ");
+                        header_bytes.extend_from_slice(v.as_bytes());
+                        header_bytes.extend_from_slice(b"\r\n");
                     }
-                    client_stream.write_all(b"\r\n").await?;
+                    header_bytes.extend_from_slice(b"\r\n");
+                    write_all_with_timeout(
+                        client_stream,
+                        &header_bytes,
+                        self.client_timeout,
+                        "writing cached response headers",
+                    )
+                    .await?;
 
                     // Stream Body
                     let mut file = tokio::fs::File::open(&cached.body_path).await?;
-                    let copied = tokio::io::copy(&mut file, client_stream).await?;
+                    let copied = copy_with_write_timeout(
+                        &mut file,
+                        client_stream,
+                        self.client_timeout,
+                        "writing cached response body",
+                    )
+                    .await?;
 
                     shutdown_stream(client_stream, self.client_timeout).await?;
 
