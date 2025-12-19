@@ -79,6 +79,11 @@ pub fn is_cacheable(method: &Method, status: StatusCode, headers: &HeaderMap) ->
         return false;
     }
 
+    // Shared proxy caches must not store Set-Cookie responses.
+    if headers.contains_key(http::header::SET_COOKIE) {
+        return false;
+    }
+
     // Requires explicit freshness info (max-age, s-maxage, or Expires)
     // or explicit 'public' (though public usually implies some default cacheability,
     // we want to be safe and require explicit lifetime or public indication).
@@ -220,6 +225,20 @@ mod tests {
         headers.insert(
             http::header::CACHE_CONTROL,
             HeaderValue::from_static("private, max-age=60"),
+        );
+        assert!(!is_cacheable(&Method::GET, StatusCode::OK, &headers));
+    }
+
+    #[test]
+    fn test_not_cacheable_set_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        headers.insert(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("session=abc123; Path=/; HttpOnly"),
         );
         assert!(!is_cacheable(&Method::GET, StatusCode::OK, &headers));
     }

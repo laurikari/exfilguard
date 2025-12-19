@@ -341,6 +341,15 @@ where
                     }
                 }
 
+                if resp_headers_map.contains_key(http::header::SET_COOKIE) {
+                    debug!(
+                        peer = %peer,
+                        host = %request.host,
+                        status = head.status.as_u16(),
+                        "skipping cache write due to Set-Cookie response header"
+                    );
+                }
+
                 if let Some(uri_obj) = cache_uri
                     && is_cacheable(method_obj, head.status, &resp_headers_map)
                 {
