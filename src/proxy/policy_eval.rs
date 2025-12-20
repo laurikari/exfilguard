@@ -134,7 +134,7 @@ pub fn evaluate_request<'a>(
         scheme: parsed.scheme,
         host: &parsed.host,
         port: parsed.port,
-        path: &parsed.path,
+        path: parsed.path_without_query(),
     };
 
     match snapshot.evaluate_request(peer.ip(), &policy_request) {
@@ -303,4 +303,74 @@ pub struct DenyDecision {
     pub status: StatusCode,
     pub reason: Option<Arc<str>>,
     pub body: Option<Arc<str>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        Client, ClientSelector, Config, MethodMatch, Policy, Rule, RuleAction, Scheme, UrlPattern,
+        ValidatedConfig,
+    };
+    use crate::policy::compile::compile_config;
+    use crate::policy::matcher::PolicySnapshot;
+    use http::Method;
+    use ipnet::IpNet;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    fn build_snapshot() -> PolicySnapshot {
+        let policy = Policy {
+            name: Arc::<str>::from("allow-api"),
+            rules: Arc::from(
+                vec![Rule {
+                    id: Arc::<str>::from("allow-api#0"),
+                    action: RuleAction::Allow,
+                    methods: MethodMatch::List(vec![Method::GET]),
+                    url_pattern: Some(UrlPattern {
+                        scheme: Scheme::Https,
+                        host: Arc::<str>::from("example.com"),
+                        port: None,
+                        path: Some(Arc::<str>::from("/api/**")),
+                        original: Arc::<str>::from("https://example.com/api/**"),
+                    }),
+                    inspect_payload: true,
+                    allow_private_connect: false,
+                    cache: None,
+                }]
+                .into_boxed_slice(),
+            ),
+        };
+        let clients = vec![Client {
+            name: Arc::<str>::from("default"),
+            selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+            policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            catch_all: true,
+        }];
+        let config = Config {
+            clients,
+            policies: vec![policy],
+        };
+        let validated = ValidatedConfig::new(config).expect("validate config");
+        let compiled = Arc::new(compile_config(&validated).expect("compile config"));
+        PolicySnapshot::new(compiled)
+    }
+
+    #[test]
+    fn policy_eval_ignores_query_in_path() {
+        let snapshot = build_snapshot();
+        let parsed = ParsedRequest {
+            method: Method::GET,
+            scheme: Scheme::Https,
+            host: "example.com".to_string(),
+            port: None,
+            path: "/api/v1/items?token=abc".to_string(),
+        };
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
+        match outcome {
+            PolicyOutcome::Allow(_) => {}
+            _ => panic!("expected allow decision"),
+        }
+    }
 }

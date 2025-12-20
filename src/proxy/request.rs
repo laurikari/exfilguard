@@ -167,6 +167,11 @@ impl ParsedRequest {
         host
     }
 
+    /// Return the request path without query parameters for policy evaluation.
+    pub fn path_without_query(&self) -> &str {
+        self.path.split('?').next().unwrap_or("/")
+    }
+
     /// Build an absolute URI for cache keying that includes scheme, host, port, and path/query.
     pub fn cache_uri(&self) -> Result<Uri> {
         let port = self.port.unwrap_or_else(|| self.scheme.default_port());

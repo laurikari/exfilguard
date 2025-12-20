@@ -178,6 +178,9 @@ url_pattern = "https://example.com:8443/api/**"
 | `/api/**` | Any depth: `/api/v1`, `/api/v1/users/123` |
 | `/users/*/profile` | `/users/123/profile`, `/users/abc/profile` |
 
+!!! note
+    Query strings are ignored when evaluating path patterns.
+
 ### Complete Examples
 
 ```toml
