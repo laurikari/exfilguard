@@ -50,7 +50,7 @@ fn default_test_settings(
         upstream_connect_timeout: 5,
         upstream_timeout: 10,
         upstream_pool_capacity: 32,
-        max_header_size: 32 * 1024,
+        max_request_header_size: 32 * 1024,
         max_response_header_size: 4096,
         max_request_body_size: 1024 * 1024,
         cache_dir: cache_dir.map(|p| p.to_path_buf()),

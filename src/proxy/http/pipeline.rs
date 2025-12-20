@@ -662,7 +662,7 @@ name = "allow"
             upstream_connect_timeout: 1,
             upstream_timeout: 1,
             upstream_pool_capacity: 4,
-            max_header_size: 4096,
+            max_request_header_size: 4096,
             max_response_header_size: 4096,
             max_request_body_size: 1024 * 1024,
             cache_dir: None,

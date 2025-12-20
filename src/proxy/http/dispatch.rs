@@ -52,7 +52,7 @@ where
         connect_binding,
     } = options;
     let client_timeout = app.settings.client_timeout();
-    let max_header_size = app.settings.max_header_size;
+    let max_request_header_size = app.settings.max_request_header_size;
     let mut reader = BufReader::new(stream);
     let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
     let binding = connect_binding.as_ref();
@@ -60,7 +60,9 @@ where
     loop {
         let start = Instant::now();
         let request_head =
-            match read_request_head(&mut reader, peer, client_timeout, max_header_size).await {
+            match read_request_head(&mut reader, peer, client_timeout, max_request_header_size)
+                .await
+            {
                 Ok(Some(head)) => head,
                 Ok(None) => break,
                 Err(err) => {

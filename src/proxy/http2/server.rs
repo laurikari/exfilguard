@@ -158,8 +158,8 @@ impl DownstreamRequestCtx {
     ) -> Result<Self> {
         let start = Instant::now();
         let snapshot = app.policies.snapshot();
-        let max_header_size = app.settings.max_header_size;
-        let (meta, body) = sanitize_request(request, max_header_size)
+        let max_request_header_size = app.settings.max_request_header_size;
+        let (meta, body) = sanitize_request(request, max_request_header_size)
             .context("failed to sanitize HTTP/2 request")?;
         let log_queries = app.settings.log_queries;
         let request_base = meta.request_line_bytes + meta.header_bytes as u64;

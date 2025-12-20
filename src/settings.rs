@@ -33,7 +33,7 @@ fn default_upstream_pool_capacity() -> usize {
     32
 }
 
-fn default_max_header_size() -> usize {
+fn default_max_request_header_size() -> usize {
     32 * 1024
 }
 
@@ -75,8 +75,8 @@ pub struct Settings {
     pub upstream_timeout: u64,
     #[serde(default = "default_upstream_pool_capacity")]
     pub upstream_pool_capacity: usize,
-    #[serde(default = "default_max_header_size")]
-    pub max_header_size: usize,
+    #[serde(default = "default_max_request_header_size")]
+    pub max_request_header_size: usize,
     #[serde(default = "default_max_response_header_size")]
     pub max_response_header_size: usize,
     #[serde(default = "default_max_request_body_size")]
@@ -244,9 +244,9 @@ impl Settings {
             self.upstream_pool_capacity
         );
         ensure!(
-            self.max_header_size > 0,
-            "max_header_size must be greater than 0 (got {})",
-            self.max_header_size
+            self.max_request_header_size > 0,
+            "max_request_header_size must be greater than 0 (got {})",
+            self.max_request_header_size
         );
         ensure!(
             self.max_response_header_size > 0,
@@ -369,7 +369,7 @@ mod tests {
             upstream_connect_timeout: 5,
             upstream_timeout: 60,
             upstream_pool_capacity: 32,
-            max_header_size: 1024,
+            max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
             // Cache enabled
@@ -403,7 +403,7 @@ mod tests {
             upstream_connect_timeout: 5,
             upstream_timeout: 60,
             upstream_pool_capacity: 32,
-            max_header_size: 1024,
+            max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
             // Cache enabled but invalid
@@ -441,7 +441,7 @@ mod tests {
             upstream_connect_timeout: 5,
             upstream_timeout: 60,
             upstream_pool_capacity: 32,
-            max_header_size: 1024,
+            max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
             // Cache disabled (None), sizes should be ignored even if 0 (though defaults are non-zero)
