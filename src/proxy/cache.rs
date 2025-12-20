@@ -52,11 +52,12 @@ struct CacheInner {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     pub id: u64,
+    pub entry_id: String,
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub vary_headers: HeaderMap,
     pub expires_at: SystemTime,
-    pub body_hash: String,
+    pub content_hash: String,
     pub content_length: u64,
 }
 
@@ -67,8 +68,12 @@ struct PersistedEntry {
     headers: Vec<(String, String)>,
     vary_headers: Vec<(String, String)>,
     expires_at: u64,
-    body_hash: String,
+    content_hash: String,
     content_length: u64,
+}
+
+fn entry_id_for_key(key_base: &str) -> String {
+    blake3::hash(key_base.as_bytes()).to_hex().to_string()
 }
 
 fn to_headermap(items: &[(String, String)]) -> HeaderMap {
@@ -101,6 +106,7 @@ pub struct CacheStream {
     state: Arc<CacheState>,
     current_size: u64,
     key_base: String,
+    entry_id: String,
     vary_headers: HeaderMap,
     discard: bool,
 }
@@ -165,7 +171,7 @@ impl HttpCache {
             trace!("cache entry expired");
             if self.state.remove_entry_if_id_matches(&key_base, entry.id) {
                 self.state
-                    .remove_entry_files_for_hash_async(&entry.body_hash)
+                    .remove_entry_files_for_entry_id_async(&entry.entry_id)
                     .await;
             }
             crate::metrics::record_cache_lookup(false);
@@ -178,7 +184,7 @@ impl HttpCache {
             return None;
         }
 
-        let body_path = self.get_body_path(&entry.body_hash);
+        let body_path = self.get_body_path(&entry.entry_id);
         if let Err(err) = async_fs::metadata(&body_path).await {
             warn!(
                 error = %err,
@@ -187,7 +193,7 @@ impl HttpCache {
             );
             if self.state.remove_entry_if_id_matches(&key_base, entry.id) {
                 self.state
-                    .remove_entry_files_for_hash_async(&entry.body_hash)
+                    .remove_entry_files_for_entry_id_async(&entry.entry_id)
                     .await;
             }
             crate::metrics::record_cache_lookup(false);
@@ -211,6 +217,7 @@ impl HttpCache {
         resp_headers: &HeaderMap,
     ) -> Result<Option<CacheStream>> {
         let key_base = format!("{}::{}", method, uri);
+        let entry_id = entry_id_for_key(&key_base);
         let vary_headers = match self.extract_vary_headers(resp_headers, req_headers) {
             Some(map) => map,
             None => {
@@ -232,6 +239,7 @@ impl HttpCache {
             state: self.state.clone(),
             current_size: 0,
             key_base,
+            entry_id,
             vary_headers,
             discard: false,
         }))
@@ -256,8 +264,8 @@ impl HttpCache {
         Ok(())
     }
 
-    fn get_body_path(&self, hash: &str) -> PathBuf {
-        self.state.body_path(hash)
+    fn get_body_path(&self, entry_id: &str) -> PathBuf {
+        self.state.body_path(entry_id)
     }
 
     fn extract_vary_headers(
@@ -315,14 +323,14 @@ impl HttpCache {
 }
 
 impl CacheState {
-    fn body_path(&self, hash: &str) -> PathBuf {
-        let (first, remainder) = hash.split_at(2);
+    fn body_path(&self, entry_id: &str) -> PathBuf {
+        let (first, remainder) = entry_id.split_at(2);
         let (second, _) = remainder.split_at(2);
-        self.disk_dir.join(first).join(second).join(hash)
+        self.disk_dir.join(first).join(second).join(entry_id)
     }
 
-    fn meta_path(&self, hash: &str) -> PathBuf {
-        let mut path = self.body_path(hash);
+    fn meta_path(&self, entry_id: &str) -> PathBuf {
+        let mut path = self.body_path(entry_id);
         path.set_extension("meta");
         path
     }
@@ -459,9 +467,21 @@ impl CacheState {
             }
         };
 
-        if !Self::valid_body_hash(&persisted.body_hash) {
+        let entry_id = entry_id_for_key(&persisted.key_base);
+        let file_stem = meta_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if entry_id != file_stem {
             warn!(
-                "cache metadata {} has invalid body hash; removing entry",
+                expected = entry_id,
+                actual = file_stem,
+                "cache metadata key mismatch; removing entry"
+            );
+            self.remove_entry_files_from_meta(meta_path);
+            return Ok(None);
+        }
+
+        if !Self::valid_content_hash(&persisted.content_hash) {
+            warn!(
+                "cache metadata {} has invalid content hash; removing entry",
                 meta_path.display()
             );
             fs::remove_file(meta_path).ok();
@@ -475,15 +495,15 @@ impl CacheState {
             return Ok(None);
         }
 
-        let body_path = self.body_path(&persisted.body_hash);
+        let body_path = self.body_path(&entry_id);
         if !body_path.exists() {
             self.remove_entry_files_from_meta(meta_path);
             return Ok(None);
         }
 
-        if !self.body_hash_matches(&body_path, &persisted.body_hash) {
+        if !self.content_hash_matches(&body_path, &persisted.content_hash) {
             warn!(
-                "cache body hash mismatch for {}; removing entry",
+                "cache content hash mismatch for {}; removing entry",
                 body_path.display()
             );
             self.remove_entry_files_from_meta(meta_path);
@@ -508,16 +528,17 @@ impl CacheState {
             headers,
             vary_headers,
             expires_at,
-            body_hash: persisted.body_hash.clone(),
+            entry_id: entry_id.clone(),
+            content_hash: persisted.content_hash.clone(),
             content_length: persisted.content_length,
         };
 
         let evicted = self.insert_entry(persisted.key_base.clone(), entry);
         self.remove_evicted_files(evicted);
-        Ok(Some(persisted.body_hash))
+        Ok(Some(entry_id))
     }
 
-    fn body_hash_matches(&self, path: &Path, expected_hex: &str) -> bool {
+    fn content_hash_matches(&self, path: &Path, expected_hex: &str) -> bool {
         let mut file = match fs::File::open(path) {
             Ok(f) => f,
             Err(_) => return false,
@@ -547,8 +568,8 @@ impl CacheState {
     fn remove_evicted_files(&self, evicted: Vec<CacheEntry>) {
         for evicted_entry in evicted {
             crate::metrics::record_cache_eviction();
-            let path = self.body_path(&evicted_entry.body_hash);
-            let meta = self.meta_path(&evicted_entry.body_hash);
+            let path = self.body_path(&evicted_entry.entry_id);
+            let meta = self.meta_path(&evicted_entry.entry_id);
             trace!("removing evicted cache file: {}", path.display());
             if let Err(e) = fs::remove_file(path) {
                 warn!("failed to remove evicted cache file: {}", e);
@@ -557,7 +578,7 @@ impl CacheState {
         }
     }
 
-    fn valid_body_hash(value: &str) -> bool {
+    fn valid_content_hash(value: &str) -> bool {
         value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
     }
 
@@ -569,16 +590,16 @@ impl CacheState {
         let _ = async_fs::remove_file(meta_path).await;
     }
 
-    async fn remove_entry_files_for_hash_async(&self, body_hash: &str) {
-        let meta_path = self.meta_path(body_hash);
+    async fn remove_entry_files_for_entry_id_async(&self, entry_id: &str) {
+        let meta_path = self.meta_path(entry_id);
         self.remove_entry_files_from_meta_async(&meta_path).await;
     }
 
     async fn remove_evicted_files_async(&self, evicted: Vec<CacheEntry>) {
         for evicted_entry in evicted {
             crate::metrics::record_cache_eviction();
-            let path = self.body_path(&evicted_entry.body_hash);
-            let meta = self.meta_path(&evicted_entry.body_hash);
+            let path = self.body_path(&evicted_entry.entry_id);
+            let meta = self.meta_path(&evicted_entry.entry_id);
             trace!("removing evicted cache file: {}", path.display());
             if let Err(e) = async_fs::remove_file(&path).await {
                 warn!("failed to remove evicted cache file: {}", e);
@@ -587,8 +608,8 @@ impl CacheState {
         }
     }
 
-    async fn write_metadata_async(&self, entry: &PersistedEntry) -> Result<()> {
-        let meta_path = self.meta_path(&entry.body_hash);
+    async fn write_metadata_async(&self, entry_id: &str, entry: &PersistedEntry) -> Result<()> {
+        let meta_path = self.meta_path(entry_id);
         if let Some(parent) = meta_path.parent() {
             async_fs::create_dir_all(parent)
                 .await
@@ -647,22 +668,17 @@ impl CacheStream {
         }
 
         let hash = self.hasher.finalize();
-        let body_hash = hash.to_hex().to_string();
-
-        // Construct final path
-        let (first, remainder) = body_hash.split_at(2);
-        let (second, _) = remainder.split_at(2);
-        let shard_dir = self.state.disk_dir.join(first).join(second);
-        let final_path = shard_dir.join(&body_hash);
+        let content_hash = hash.to_hex().to_string();
+        let final_path = self.state.body_path(&self.entry_id);
+        let shard_dir = final_path
+            .parent()
+            .map(|path| path.to_path_buf())
+            .ok_or_else(|| anyhow!("cache entry path missing parent"))?;
 
         // Move temp file to final path
-        if async_fs::metadata(&final_path).await.is_err() {
-            async_fs::create_dir_all(&shard_dir).await?;
-            async_fs::rename(&self.temp_path, &final_path).await?;
-        } else {
-            // Already exists, just delete temp
-            async_fs::remove_file(&self.temp_path).await?;
-        }
+        async_fs::create_dir_all(&shard_dir).await?;
+        let _ = async_fs::remove_file(&final_path).await;
+        async_fs::rename(&self.temp_path, &final_path).await?;
 
         let entry = CacheEntry {
             id: self.state.next_entry_id(),
@@ -670,7 +686,8 @@ impl CacheStream {
             headers,
             vary_headers: self.vary_headers.clone(),
             expires_at: SystemTime::now() + ttl,
-            body_hash,
+            entry_id: self.entry_id.clone(),
+            content_hash,
             content_length: self.current_size,
         };
 
@@ -684,16 +701,20 @@ impl CacheStream {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            body_hash: entry.body_hash.clone(),
+            content_hash: entry.content_hash.clone(),
             content_length: entry.content_length,
         };
 
-        if let Err(err) = self.state.write_metadata_async(&persisted).await {
+        if let Err(err) = self
+            .state
+            .write_metadata_async(&self.entry_id, &persisted)
+            .await
+        {
             warn!("failed to write cache metadata: {}", err);
-            async_fs::remove_file(&self.state.meta_path(&entry.body_hash))
+            async_fs::remove_file(&self.state.meta_path(&entry.entry_id))
                 .await
                 .ok();
-            async_fs::remove_file(self.state.body_path(&entry.body_hash))
+            async_fs::remove_file(self.state.body_path(&entry.entry_id))
                 .await
                 .ok();
             return Ok(());
@@ -854,10 +875,11 @@ mod tests {
             )
             .await?;
 
-        let body_hash = blake3::hash(body).to_hex().to_string();
-        let (first, remainder) = body_hash.split_at(2);
+        let key_base = format!("{}::{}", method, uri);
+        let entry_id = entry_id_for_key(&key_base);
+        let (first, remainder) = entry_id.split_at(2);
         let (second, _) = remainder.split_at(2);
-        let body_path = dir.path().join(first).join(second).join(&body_hash);
+        let body_path = dir.path().join(first).join(second).join(&entry_id);
         let mut meta_path = body_path.clone();
         meta_path.set_extension("meta");
 
@@ -983,6 +1005,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_keeps_distinct_entries_with_same_body() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let cache = HttpCache::new(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
+
+        let method = Method::GET;
+        let uri_a = build_uri("example.com", 80, "/same-body-a");
+        let uri_b = build_uri("example.com", 80, "/same-body-b");
+        let req_headers = HeaderMap::new();
+        let body = b"identical";
+
+        let mut resp_headers_a = HeaderMap::new();
+        resp_headers_a.insert("x-variant", "a".parse()?);
+        let mut resp_headers_b = HeaderMap::new();
+        resp_headers_b.insert("x-variant", "b".parse()?);
+
+        cache
+            .store(
+                &method,
+                &uri_a,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers_a,
+                body,
+                Duration::from_secs(60),
+            )
+            .await?;
+        cache
+            .store(
+                &method,
+                &uri_b,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers_b,
+                body,
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        drop(cache);
+
+        let rebuilt = HttpCache::new(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        let hit_a = rebuilt
+            .lookup(&method, &uri_a, &req_headers)
+            .await
+            .expect("entry A should be restored from disk");
+        let hit_b = rebuilt
+            .lookup(&method, &uri_b, &req_headers)
+            .await
+            .expect("entry B should be restored from disk");
+
+        let header_a = hit_a
+            .headers
+            .get("x-variant")
+            .and_then(|value| value.to_str().ok());
+        let header_b = hit_b
+            .headers
+            .get("x-variant")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(header_a, Some("a"));
+        assert_eq!(header_b, Some("b"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_drops_entries_with_corrupted_body() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
@@ -1021,14 +1108,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_drops_invalid_body_hash_metadata() -> Result<()> {
+    async fn rebuild_drops_invalid_content_hash_metadata() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
-        let shard_dir = disk_dir.join("aa").join("bb");
+        let key_base = "GET::http://example.com:80/".to_string();
+        let entry_id = entry_id_for_key(&key_base);
+        let shard_dir = disk_dir.join(&entry_id[0..2]).join(&entry_id[2..4]);
         fs::create_dir_all(&shard_dir)?;
-        let meta_path = shard_dir.join("broken.meta");
+        let meta_path = shard_dir.join(format!("{entry_id}.meta"));
         let persisted = PersistedEntry {
-            key_base: "GET::http://example.com:80/".to_string(),
+            key_base,
             status: 200,
             headers: Vec::new(),
             vary_headers: Vec::new(),
@@ -1036,7 +1125,7 @@ mod tests {
                 .duration_since(SystemTime::UNIX_EPOCH)?
                 .as_secs()
                 + 60,
-            body_hash: "abc".to_string(),
+            content_hash: "abc".to_string(),
             content_length: 0,
         };
         let data = serde_json::to_vec(&persisted)?;
