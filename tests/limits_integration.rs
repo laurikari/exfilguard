@@ -1,169 +1,29 @@
+mod support;
+
 use std::{
     io::ErrorKind,
-    net::{Ipv4Addr, SocketAddr},
-    path::Path,
-    sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    net::Ipv4Addr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration as StdDuration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::watch,
-    time::{sleep, timeout},
+    time::sleep,
 };
 
-use exfilguard::{
-    cli::LogFormat,
-    config,
-    policy::{self, matcher::PolicySnapshot},
-    proxy::{self, AppContext, PolicyStore},
-    settings::Settings,
-    tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
-};
-
-const CERT_CACHE_CAPACITY: usize = 512;
-use rustls::{RootCertStore, client::ClientConfig, crypto::ring};
-
-// --- Helper Functions (Duplicated from bump_integration.rs for isolation) ---
-
-fn default_test_settings(
-    listen: SocketAddr,
-    ca_dir: &Path,
-    clients: &Path,
-    policies: &Path,
-) -> Settings {
-    Settings {
-        listen,
-        ca_dir: ca_dir.to_path_buf(),
-        clients: clients.to_path_buf(),
-        clients_dir: None,
-        policies: policies.to_path_buf(),
-        policies_dir: None,
-        cert_cache_dir: None,
-        log: LogFormat::Text,
-        leaf_ttl: 3_600,
-        log_queries: false,
-        client_timeout: 10,
-        upstream_connect_timeout: 5,
-        upstream_timeout: 10,
-        upstream_pool_capacity: 32,
-        max_request_header_size: 32 * 1024,
-        max_response_header_size: 4096,
-        max_request_body_size: 1024 * 1024,
-        cache_dir: None,
-        cache_max_entry_size: 10 * 1024 * 1024,
-        cache_max_entries: 10_000,
-        cache_total_capacity: 1024 * 1024 * 1024,
-        cache_sweeper_interval: 300,
-        cache_sweeper_batch_size: 1000,
-        metrics_listen: None,
-        metrics_tls_cert: None,
-        metrics_tls_key: None,
-    }
-}
-
-fn find_free_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
-
-async fn wait_for_listener(addr: SocketAddr) -> Result<()> {
-    for _ in 0..50 {
-        match timeout(StdDuration::from_millis(50), TcpStream::connect(addr)).await {
-            Ok(Ok(mut stream)) => {
-                stream.shutdown().await.ok();
-                return Ok(());
-            }
-            _ => sleep(StdDuration::from_millis(50)).await,
-        }
-    }
-    Err(anyhow::anyhow!("listener {addr} did not become ready"))
-}
-
-async fn read_response_status(reader: &mut BufReader<TcpStream>) -> Result<u16> {
-    let mut line = String::new();
-    let bytes = timeout(StdDuration::from_secs(2), reader.read_line(&mut line)).await??;
-    if bytes == 0 {
-        return Err(anyhow!("connection closed before response status line"));
-    }
-    let status = line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing status code in response line"))?
-        .parse::<u16>()
-        .map_err(|err| anyhow!("invalid status code: {err}"))?;
-    loop {
-        line.clear();
-        let n = timeout(StdDuration::from_secs(2), reader.read_line(&mut line)).await??;
-        if n == 0 || line == "\r\n" {
-            break;
-        }
-    }
-    Ok(status)
-}
-
-fn build_app_context(
-    settings: Arc<Settings>,
-    policy_store: PolicyStore,
-    ca: Arc<CertificateAuthority>,
-    tls_issuer: Arc<TlsIssuer>,
-    client_http1: Arc<ClientConfig>,
-    client_http2: Arc<ClientConfig>,
-) -> AppContext {
-    let tls = Arc::new(proxy::TlsContext::new(
-        ca,
-        tls_issuer,
-        client_http1,
-        client_http2,
-    ));
-    AppContext::new(settings, policy_store, tls, None)
-}
-
-fn build_proxy_tls_configs(
-    root_store: RootCertStore,
-) -> Result<(Arc<ClientConfig>, Arc<ClientConfig>)> {
-    let http1 = build_client_tls(root_store.clone())?;
-    // For these tests we don't strictly need h2, but we follow standard setup
-    let http2 =
-        build_client_tls_with_protocols(root_store, vec![b"h2".to_vec(), b"http/1.1".to_vec()])?;
-    Ok((http1, http2))
-}
-
-fn build_client_tls(root_store: RootCertStore) -> Result<Arc<ClientConfig>> {
-    build_client_tls_with_protocols(root_store, vec![b"http/1.1".to_vec()])
-}
-
-fn build_client_tls_with_protocols(
-    root_store: RootCertStore,
-    protocols: Vec<Vec<u8>>,
-) -> Result<Arc<ClientConfig>> {
-    let provider = ring::default_provider();
-    let builder = ClientConfig::builder_with_provider(provider.into());
-    let builder = builder.with_safe_default_protocol_versions()?;
-    let builder = builder.with_root_certificates(Arc::new(root_store));
-    let mut config = builder.with_no_client_auth();
-    config.alpn_protocols = protocols;
-    Ok(Arc::new(config))
-}
+use support::*;
 
 // --- Tests ---
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_max_request_body_size_enforced() -> Result<()> {
-    let temp = tempfile::TempDir::new()?;
-    let workspace = temp.path();
-    let ca_dir = workspace.join("ca");
-    let config_dir = workspace.join("config");
-    std::fs::create_dir_all(&ca_dir)?;
-    std::fs::create_dir_all(&config_dir)?;
-
-    let clients_path = config_dir.join("clients.toml");
-    let policies_path = config_dir.join("policies.toml");
+    let dirs = TestDirs::new()?;
 
     // Setup upstream that just reads everything
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -182,20 +42,15 @@ async fn test_max_request_body_size_enforced() -> Result<()> {
         }
     });
 
-    std::fs::write(
-        &clients_path,
-        r#"[[client]]
+    let clients = r#"[[client]]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-upload"]
 catch_all = true
-"#,
-    )?;
+"#;
 
-    std::fs::write(
-        &policies_path,
-        format!(
-            r###"[[policy]]
+    let policies = format!(
+        r###"[[policy]]
 name = "allow-upload"
   [[policy.rule]]
   action = "ALLOW"
@@ -203,50 +58,14 @@ name = "allow-upload"
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
   allow_private_connect = true
 "###
-        ),
-    )?;
-
-    let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
-    let config_doc = config::load_config(&clients_path, &policies_path)?;
-    let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
-    let snapshot = PolicySnapshot::new(compiled);
-    let (policy_tx, policy_rx) = watch::channel(snapshot);
-    let policy_store = PolicyStore::new(policy_rx);
-
-    let proxy_port = find_free_port()?;
-    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
-        .parse()
-        .expect("valid listen address");
-
-    // Set max body size to small value (1KB)
-    let mut settings = default_test_settings(proxy_addr, &ca_dir, &clients_path, &policies_path);
-    settings.max_request_body_size = 1024;
-    let settings = Arc::new(settings);
-
-    let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);
-    let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
-    let (proxy_client_config, proxy_client_h2_config) =
-        build_proxy_tls_configs(RootCertStore::empty())?;
-
-    let app = build_app_context(
-        settings.clone(),
-        policy_store,
-        ca.clone(),
-        tls_issuer,
-        proxy_client_config.clone(),
-        proxy_client_h2_config.clone(),
     );
 
-    let proxy_handle = tokio::spawn(async move {
-        if let Err(err) = proxy::run(app).await {
-            tracing::error!(error = ?err, "proxy run failed");
-        }
-    });
-    let _policy_tx = policy_tx;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+        .with_settings(|settings| settings.max_request_body_size = 1024)
+        .spawn()
+        .await?;
 
-    wait_for_listener(proxy_addr).await?;
-
-    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let mut stream = TcpStream::connect(harness.addr).await?;
     // Send a large body > 1KB
     let body_size = 2048;
     let body = vec![b'A'; body_size];
@@ -283,8 +102,7 @@ name = "allow-upload"
     }
 
     stream.shutdown().await.ok();
-    proxy_handle.abort();
-    let _ = proxy_handle.await;
+    harness.shutdown().await;
     upstream_task.abort();
     let _ = upstream_task.await;
 
@@ -293,15 +111,7 @@ name = "allow-upload"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
-    let temp = tempfile::TempDir::new()?;
-    let workspace = temp.path();
-    let ca_dir = workspace.join("ca");
-    let config_dir = workspace.join("config");
-    std::fs::create_dir_all(&ca_dir)?;
-    std::fs::create_dir_all(&config_dir)?;
-
-    let clients_path = config_dir.join("clients.toml");
-    let policies_path = config_dir.join("policies.toml");
+    let dirs = TestDirs::new()?;
 
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_port = upstream_listener.local_addr()?.port();
@@ -356,20 +166,15 @@ async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
         }
     });
 
-    std::fs::write(
-        &clients_path,
-        r#"[[client]]
+    let clients = r#"[[client]]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
 catch_all = true
-"#,
-    )?;
+"#;
 
-    std::fs::write(
-        &policies_path,
-        format!(
-            r###"[[policy]]
+    let policies = format!(
+        r###"[[policy]]
 name = "allow"
   [[policy.rule]]
   action = "ALLOW"
@@ -377,52 +182,13 @@ name = "allow"
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
   allow_private_connect = true
 "###
-        ),
-    )?;
-
-    let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
-    let config_doc = config::load_config(&clients_path, &policies_path)?;
-    let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
-    let snapshot = PolicySnapshot::new(compiled);
-    let (policy_tx, policy_rx) = watch::channel(snapshot);
-    let policy_store = PolicyStore::new(policy_rx);
-
-    let proxy_port = find_free_port()?;
-    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
-        .parse()
-        .expect("valid listen address");
-
-    let settings = Arc::new(default_test_settings(
-        proxy_addr,
-        &ca_dir,
-        &clients_path,
-        &policies_path,
-    ));
-
-    let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);
-    let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
-    let (proxy_client_config, proxy_client_h2_config) =
-        build_proxy_tls_configs(RootCertStore::empty())?;
-
-    let app = build_app_context(
-        settings.clone(),
-        policy_store,
-        ca.clone(),
-        tls_issuer,
-        proxy_client_config.clone(),
-        proxy_client_h2_config.clone(),
     );
 
-    let proxy_handle = tokio::spawn(async move {
-        if let Err(err) = proxy::run(app).await {
-            tracing::error!(error = ?err, "proxy run failed");
-        }
-    });
-    let _policy_tx = policy_tx;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+        .spawn()
+        .await?;
 
-    wait_for_listener(proxy_addr).await?;
-
-    let client = TcpStream::connect(proxy_addr).await?;
+    let client = TcpStream::connect(harness.addr).await?;
     let mut reader = BufReader::new(client);
 
     let head_request = format!(
@@ -455,84 +221,34 @@ name = "allow"
     );
 
     upstream_task.abort();
-    proxy_handle.abort();
+    harness.shutdown().await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_client_idle_timeout() -> Result<()> {
-    let temp = tempfile::TempDir::new()?;
-    let workspace = temp.path();
-    let ca_dir = workspace.join("ca");
-    let config_dir = workspace.join("config");
-    std::fs::create_dir_all(&ca_dir)?;
-    std::fs::create_dir_all(&config_dir)?;
-
-    let clients_path = config_dir.join("clients.toml");
-    let policies_path = config_dir.join("policies.toml");
-
-    // Minimal config
-    std::fs::write(
-        &clients_path,
-        r#"[[client]]
+    let dirs = TestDirs::new()?;
+    let clients = r#"[[client]]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["dummy"]
 catch_all = true
-"#,
-    )?;
-    std::fs::write(
-        &policies_path,
-        r#"
+"#;
+    let policies = r#"
 [[policy]]
 name = "dummy"
   [[policy.rule]]
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "http://dummy/**"
-"#,
-    )?;
+"#;
 
-    let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
-    let config_doc = config::load_config(&clients_path, &policies_path)?;
-    let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
-    let snapshot = PolicySnapshot::new(compiled);
-    let (policy_tx, policy_rx) = watch::channel(snapshot);
-    let policy_store = PolicyStore::new(policy_rx);
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+        .with_settings(|settings| settings.client_timeout = 1)
+        .spawn()
+        .await?;
 
-    let proxy_port = find_free_port()?;
-    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
-        .parse()
-        .expect("valid listen address");
-
-    let mut settings = default_test_settings(proxy_addr, &ca_dir, &clients_path, &policies_path);
-    settings.client_timeout = 1; // 1 second timeout
-    let settings = Arc::new(settings);
-
-    let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);
-    let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
-    let (proxy_client_config, proxy_client_h2_config) =
-        build_proxy_tls_configs(RootCertStore::empty())?;
-
-    let app = build_app_context(
-        settings.clone(),
-        policy_store,
-        ca.clone(),
-        tls_issuer,
-        proxy_client_config.clone(),
-        proxy_client_h2_config.clone(),
-    );
-
-    let proxy_handle = tokio::spawn(async move {
-        if let Err(err) = proxy::run(app).await {
-            tracing::error!(error = ?err, "proxy run failed");
-        }
-    });
-    let _policy_tx = policy_tx;
-
-    wait_for_listener(proxy_addr).await?;
-
-    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let mut stream = TcpStream::connect(harness.addr).await?;
 
     // Write nothing. Wait for timeout + buffer.
     sleep(StdDuration::from_secs(2)).await;
@@ -548,8 +264,7 @@ name = "dummy"
         Err(e) => panic!("Unexpected error: {:?}", e),
     }
 
-    proxy_handle.abort();
-    let _ = proxy_handle.await;
+    harness.shutdown().await;
 
     Ok(())
 }
