@@ -132,6 +132,51 @@ static CACHE_EVICTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     counter
 });
 
+static CACHE_SWEEP_RUNS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter =
+        IntCounter::new("cache_sweep_runs_total", "HTTP cache sweep runs").expect("create counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register cache_sweep_runs_total");
+    counter
+});
+
+static CACHE_SWEEP_EXPIRED_ENTRIES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "cache_sweep_expired_entries_total",
+        "Expired cache entries removed by sweeper",
+    )
+    .expect("create counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register cache_sweep_expired_entries_total");
+    counter
+});
+
+static CACHE_SWEEP_BYTES_RECLAIMED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "cache_sweep_bytes_reclaimed_total",
+        "Bytes reclaimed by cache sweeper",
+    )
+    .expect("create counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register cache_sweep_bytes_reclaimed_total");
+    counter
+});
+
+static CACHE_CLEANUP_DIRS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "cache_cleanup_dirs_total",
+        "Old cache directories removed after version upgrade",
+    )
+    .expect("create counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register cache_cleanup_dirs_total");
+    counter
+});
+
 static INFLIGHT_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
     let gauge =
         IntGauge::new("inflight_requests", "Current inflight requests").expect("create gauge");
@@ -307,6 +352,23 @@ pub fn record_cache_store() {
 
 pub fn record_cache_eviction() {
     CACHE_EVICTIONS_TOTAL.inc();
+}
+
+pub fn record_cache_sweep_run() {
+    CACHE_SWEEP_RUNS_TOTAL.inc();
+}
+
+pub fn record_cache_sweep_removed(entries: u64, bytes: u64) {
+    if entries > 0 {
+        CACHE_SWEEP_EXPIRED_ENTRIES_TOTAL.inc_by(entries);
+    }
+    if bytes > 0 {
+        CACHE_SWEEP_BYTES_RECLAIMED_TOTAL.inc_by(bytes);
+    }
+}
+
+pub fn record_cache_cleanup_dir() {
+    CACHE_CLEANUP_DIRS_TOTAL.inc();
 }
 
 pub fn set_pool_capacity(capacity: usize) {

@@ -155,6 +155,8 @@ Response caching is disabled by default. Set `cache_dir` to enable.
 | `cache_max_entry_size` | u64 | 10485760 (10 MiB) | Maximum size of individual cache entries |
 | `cache_max_entries` | usize | 10000 | Maximum number of cached responses (LRU) |
 | `cache_total_capacity` | u64 | 1073741824 (1 GiB) | Total cache capacity |
+| `cache_sweeper_interval` | u64 | 300 | Interval in seconds between cache sweeper runs |
+| `cache_sweeper_batch_size` | usize | 1000 | Maximum metadata entries inspected per sweep |
 
 ### Cache Behavior
 
@@ -199,6 +201,14 @@ follow upstream response headers plus `force_cache_duration` from policy rules.
 #### Eviction
 
 Uses LRU (Least Recently Used) eviction when capacity is reached. Expired entries are removed on lookup.
+
+#### Layout and Sweeping
+
+Cache entries live under a versioned subdirectory (`cache_dir/v1`). When the layout
+version changes, old version directories are deleted asynchronously. A background
+sweeper runs every `cache_sweeper_interval` seconds and inspects up to
+`cache_sweeper_batch_size` entries, removing expired entries and pruning empty shard
+directories.
 
 !!! note
     The cache does not support conditional revalidation (ETag/If-None-Match, Last-Modified/If-Modified-Since). Stale entries are discarded and fetched fresh from upstream.
@@ -260,4 +270,6 @@ cache_dir = "./cache"
 cache_max_entry_size = 10485760
 cache_max_entries = 10000
 cache_total_capacity = 1073741824
+cache_sweeper_interval = 300
+cache_sweeper_batch_size = 1000
 ```

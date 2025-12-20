@@ -57,6 +57,8 @@ fn default_test_settings(
         cache_max_entry_size: 10 * 1024 * 1024,
         cache_max_entries: 10_000,
         cache_total_capacity: 1024 * 1024 * 1024,
+        cache_sweeper_interval: 300,
+        cache_sweeper_batch_size: 1000,
         metrics_listen: None,
         metrics_tls_cert: None,
         metrics_tls_key: None,
@@ -263,6 +265,8 @@ name = "cache-test"
             cache_dir.clone(),
             1024 * 1024,
             settings.cache_total_capacity,
+            StdDuration::from_secs(settings.cache_sweeper_interval),
+            settings.cache_sweeper_batch_size,
         )
         .await?,
     );
@@ -399,6 +403,8 @@ name = "cache-test"
             cache_dir.clone(),
             1024 * 1024,
             settings.cache_total_capacity,
+            StdDuration::from_secs(settings.cache_sweeper_interval),
+            settings.cache_sweeper_batch_size,
         )
         .await?,
     );

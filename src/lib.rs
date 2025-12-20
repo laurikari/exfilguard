@@ -68,6 +68,8 @@ pub async fn run(settings: Settings) -> Result<()> {
                 cache_dir.clone(),
                 settings.cache_max_entry_size,
                 settings.cache_total_capacity,
+                settings.cache_sweeper_interval(),
+                settings.cache_sweeper_batch_size,
             )
             .await?,
         ))

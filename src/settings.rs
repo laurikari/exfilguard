@@ -89,6 +89,10 @@ pub struct Settings {
     pub cache_max_entries: usize,
     #[serde(default = "default_cache_total_capacity")]
     pub cache_total_capacity: u64,
+    #[serde(default = "default_cache_sweeper_interval")]
+    pub cache_sweeper_interval: u64,
+    #[serde(default = "default_cache_sweeper_batch_size")]
+    pub cache_sweeper_batch_size: usize,
     #[serde(default)]
     pub metrics_listen: Option<SocketAddr>,
     #[serde(default)]
@@ -151,6 +155,10 @@ impl Settings {
 
     pub fn upstream_timeout(&self) -> Duration {
         Duration::from_secs(self.upstream_timeout)
+    }
+
+    pub fn cache_sweeper_interval(&self) -> Duration {
+        Duration::from_secs(self.cache_sweeper_interval)
     }
 
     pub fn upstream_pool_capacity_nonzero(&self) -> std::num::NonZeroUsize {
@@ -286,6 +294,16 @@ impl Settings {
                 "cache_total_capacity must be greater than 0 (got {})",
                 self.cache_total_capacity
             );
+            ensure!(
+                self.cache_sweeper_interval > 0,
+                "cache_sweeper_interval must be greater than 0 seconds (got {})",
+                self.cache_sweeper_interval
+            );
+            ensure!(
+                self.cache_sweeper_batch_size > 0,
+                "cache_sweeper_batch_size must be greater than 0 (got {})",
+                self.cache_sweeper_batch_size
+            );
         }
         let tls_cert_set = self.metrics_tls_cert.is_some();
         let tls_key_set = self.metrics_tls_key.is_some();
@@ -320,6 +338,14 @@ fn default_cache_total_capacity() -> u64 {
     1024 * 1024 * 1024 // 1 GiB
 }
 
+fn default_cache_sweeper_interval() -> u64 {
+    300
+}
+
+fn default_cache_sweeper_batch_size() -> usize {
+    1000
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cli::LogFormat;
@@ -351,6 +377,8 @@ mod tests {
             cache_max_entry_size: 1024,
             cache_max_entries: 1024,
             cache_total_capacity: 1024,
+            cache_sweeper_interval: 300,
+            cache_sweeper_batch_size: 1000,
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
@@ -383,6 +411,8 @@ mod tests {
             cache_max_entry_size: 0,
             cache_max_entries: 1024,
             cache_total_capacity: 1024,
+            cache_sweeper_interval: 300,
+            cache_sweeper_batch_size: 1000,
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
@@ -419,6 +449,8 @@ mod tests {
             cache_max_entry_size: 0,
             cache_max_entries: 0,
             cache_total_capacity: 0,
+            cache_sweeper_interval: 0,
+            cache_sweeper_batch_size: 0,
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
