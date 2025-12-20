@@ -31,6 +31,14 @@ pub fn parse_http1_request(
         return parse_uri_request(method, &uri, fallback_scheme);
     }
 
+    if target == "*" {
+        if method != Method::OPTIONS {
+            bail!("asterisk-form request target is only valid for OPTIONS");
+        }
+    } else if !target.starts_with('/') {
+        bail!("request target must be origin-form (start with '/')");
+    }
+
     let host_header = host_header
         .ok_or_else(|| anyhow!("request missing Host header required for origin-form request"))?;
     let (host, port) = parse_host_header(host_header)?;
@@ -211,6 +219,38 @@ mod tests {
         let parsed = parse_uri_request(Method::GET, &uri, Scheme::Https)?;
         assert_eq!(parsed.authority_host(), "[fd00::1]:8443");
         Ok(())
+    }
+
+    #[test]
+    fn reject_non_origin_form_target() {
+        let err = parse_http1_request(
+            Method::GET,
+            "example.com:443",
+            Some("example.com"),
+            Scheme::Https,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("origin-form"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn allow_options_asterisk_form() -> Result<()> {
+        let parsed = parse_http1_request(Method::OPTIONS, "*", Some("example.com"), Scheme::Http)?;
+        assert_eq!(parsed.path, "*");
+        Ok(())
+    }
+
+    #[test]
+    fn reject_asterisk_form_for_non_options() {
+        let err =
+            parse_http1_request(Method::GET, "*", Some("example.com"), Scheme::Http).unwrap_err();
+        assert!(
+            err.to_string().contains("asterisk-form"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
