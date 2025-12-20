@@ -481,8 +481,11 @@ where
 
     drop(upstream_reader);
 
-    let reuse_upstream =
-        !client_close && !matches!(response_body_plan, ResponseBodyPlan::UntilClose);
+    // Avoid reusing upstream after HEAD: some servers incorrectly send a body,
+    // which would desync the next response on a keep-alive connection.
+    let reuse_upstream = request.method != Method::HEAD
+        && !client_close
+        && !matches!(response_body_plan, ResponseBodyPlan::UntilClose);
 
     Ok((
         ForwardStats {

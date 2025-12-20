@@ -3,12 +3,13 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration as StdDuration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::watch,
     time::{sleep, timeout},
@@ -82,6 +83,28 @@ async fn wait_for_listener(addr: SocketAddr) -> Result<()> {
         }
     }
     Err(anyhow::anyhow!("listener {addr} did not become ready"))
+}
+
+async fn read_response_status(reader: &mut BufReader<TcpStream>) -> Result<u16> {
+    let mut line = String::new();
+    let bytes = timeout(StdDuration::from_secs(2), reader.read_line(&mut line)).await??;
+    if bytes == 0 {
+        return Err(anyhow!("connection closed before response status line"));
+    }
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow!("missing status code in response line"))?
+        .parse::<u16>()
+        .map_err(|err| anyhow!("invalid status code: {err}"))?;
+    loop {
+        line.clear();
+        let n = timeout(StdDuration::from_secs(2), reader.read_line(&mut line)).await??;
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+    }
+    Ok(status)
 }
 
 fn build_app_context(
@@ -265,6 +288,174 @@ name = "allow-upload"
     upstream_task.abort();
     let _ = upstream_task.await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
+    let temp = tempfile::TempDir::new()?;
+    let workspace = temp.path();
+    let ca_dir = workspace.join("ca");
+    let config_dir = workspace.join("config");
+    std::fs::create_dir_all(&ca_dir)?;
+    std::fs::create_dir_all(&config_dir)?;
+
+    let clients_path = config_dir.join("clients.toml");
+    let policies_path = config_dir.join("policies.toml");
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_connections = Arc::new(AtomicUsize::new(0));
+    let upstream_connections_clone = upstream_connections.clone();
+
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match upstream_listener.accept().await {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            upstream_connections_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let bytes = match reader.read_line(&mut line).await {
+                        Ok(bytes) => bytes,
+                        Err(_) => break,
+                    };
+                    if bytes == 0 {
+                        break;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    loop {
+                        line.clear();
+                        let n = match reader.read_line(&mut line).await {
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        if n == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+
+                    let response = match method.as_str() {
+                        "HEAD" => b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" as &[u8],
+                        "GET" => b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                        _ => b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                    };
+
+                    if reader.get_mut().write_all(response).await.is_err() {
+                        break;
+                    }
+                    if reader.get_mut().flush().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    std::fs::write(
+        &clients_path,
+        r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+catch_all = true
+"#,
+    )?;
+
+    std::fs::write(
+        &policies_path,
+        format!(
+            r###"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["ANY"]
+  url_pattern = "http://127.0.0.1:{upstream_port}/**"
+  allow_private_connect = true
+"###
+        ),
+    )?;
+
+    let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
+    let config_doc = config::load_config(&clients_path, &policies_path)?;
+    let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
+    let snapshot = PolicySnapshot::new(compiled);
+    let (policy_tx, policy_rx) = watch::channel(snapshot);
+    let policy_store = PolicyStore::new(policy_rx);
+
+    let proxy_port = find_free_port()?;
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
+        .parse()
+        .expect("valid listen address");
+
+    let settings = Arc::new(default_test_settings(
+        proxy_addr,
+        &ca_dir,
+        &clients_path,
+        &policies_path,
+    ));
+
+    let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);
+    let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
+    let (proxy_client_config, proxy_client_h2_config) =
+        build_proxy_tls_configs(RootCertStore::empty())?;
+
+    let app = build_app_context(
+        settings.clone(),
+        policy_store,
+        ca.clone(),
+        tls_issuer,
+        proxy_client_config.clone(),
+        proxy_client_h2_config.clone(),
+    );
+
+    let proxy_handle = tokio::spawn(async move {
+        if let Err(err) = proxy::run(app).await {
+            tracing::error!(error = ?err, "proxy run failed");
+        }
+    });
+    let _policy_tx = policy_tx;
+
+    wait_for_listener(proxy_addr).await?;
+
+    let client = TcpStream::connect(proxy_addr).await?;
+    let mut reader = BufReader::new(client);
+
+    let head_request = format!(
+        "HEAD http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+    );
+    reader.get_mut().write_all(head_request.as_bytes()).await?;
+    reader.get_mut().flush().await?;
+    let status = read_response_status(&mut reader).await?;
+    assert_eq!(status, 200);
+
+    let get_request = format!(
+        "GET http://127.0.0.1:{upstream_port}/data HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+    );
+    reader.get_mut().write_all(get_request.as_bytes()).await?;
+    reader.get_mut().flush().await?;
+    let status = read_response_status(&mut reader).await?;
+    assert_eq!(status, 200);
+
+    drop(reader);
+
+    for _ in 0..50 {
+        if upstream_connections.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        sleep(StdDuration::from_millis(50)).await;
+    }
+    assert!(
+        upstream_connections.load(Ordering::SeqCst) >= 2,
+        "expected separate upstream connections for HEAD and GET"
+    );
+
+    upstream_task.abort();
+    proxy_handle.abort();
     Ok(())
 }
 
