@@ -23,6 +23,89 @@ impl<W1, W2> TeeWriter<W1, W2> {
     }
 }
 
+pub struct BestEffortWriter<W> {
+    inner: W,
+    error: Option<std::io::Error>,
+}
+
+impl<W> BestEffortWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner, error: None }
+    }
+
+    pub fn error(&self) -> Option<&std::io::Error> {
+        self.error.as_ref()
+    }
+
+    pub fn take_error(&mut self) -> Option<std::io::Error> {
+        self.error.take()
+    }
+
+    fn record_error(&mut self, err: std::io::Error) {
+        if self.error.is_none() {
+            self.error = Some(err);
+        }
+    }
+}
+
+impl<W> AsyncWrite for BestEffortWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.error.is_some() {
+            return Poll::Ready(Ok(buf.len()));
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(0)) => {
+                self.record_error(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "best effort writer wrote zero bytes",
+                ));
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
+            Poll::Ready(Err(err)) => {
+                self.record_error(err);
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.error.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => {
+                self.record_error(err);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.error.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.inner).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => {
+                self.record_error(err);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 pub async fn write_all_with_timeout<W: AsyncWrite + Unpin, C: Into<String>>(
     writer: &mut W,
     buf: &[u8],
@@ -192,7 +275,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{TeeWriter, copy_with_write_timeout, write_all_with_timeout};
+    use super::{BestEffortWriter, TeeWriter, copy_with_write_timeout, write_all_with_timeout};
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
@@ -254,6 +337,44 @@ mod tests {
         }
     }
 
+    struct FailingWriter {
+        fail_after: usize,
+        written: usize,
+    }
+
+    impl FailingWriter {
+        fn new(fail_after: usize) -> Self {
+            Self {
+                fail_after,
+                written: 0,
+            }
+        }
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.written >= self.fail_after {
+                return Poll::Ready(Err(std::io::Error::other("boom")));
+            }
+            let remaining = self.fail_after - self.written;
+            let to_write = remaining.min(buf.len());
+            self.written += to_write;
+            Poll::Ready(Ok(to_write))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn tee_writer_keeps_outputs_in_sync() -> std::io::Result<()> {
         let writer1 = ChunkWriter::new(1024);
@@ -269,6 +390,22 @@ mod tests {
 
         assert_eq!(writer1.data, payload);
         assert_eq!(writer2.data, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn best_effort_writer_ignores_secondary_errors() -> std::io::Result<()> {
+        let writer1 = ChunkWriter::new(1024);
+        let failing = FailingWriter::new(3);
+        let mut best_effort = BestEffortWriter::new(failing);
+        let mut tee = TeeWriter::new(writer1, &mut best_effort);
+
+        let payload = b"abcdefghijklmnopqrstuvwxyz";
+        tokio::io::AsyncWriteExt::write_all(&mut tee, payload).await?;
+
+        let TeeWriter { writer1, .. } = tee;
+        assert_eq!(writer1.data, payload);
+        assert!(best_effort.error().is_some());
         Ok(())
     }
 

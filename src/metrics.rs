@@ -123,6 +123,15 @@ static CACHE_STORE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     counter
 });
 
+static CACHE_STORE_ERRORS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new("cache_store_errors_total", "HTTP cache store errors")
+        .expect("create cache_store_errors_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register cache_store_errors_total");
+    counter
+});
+
 static CACHE_EVICTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     let counter =
         IntCounter::new("cache_evictions_total", "HTTP cache evictions").expect("create counter");
@@ -348,6 +357,10 @@ pub fn record_cache_lookup(hit: bool) {
 
 pub fn record_cache_store() {
     CACHE_STORE_TOTAL.inc();
+}
+
+pub fn record_cache_store_error() {
+    CACHE_STORE_ERRORS_TOTAL.inc();
 }
 
 pub fn record_cache_eviction() {

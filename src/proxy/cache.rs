@@ -888,6 +888,10 @@ impl CacheState {
 }
 
 impl CacheStream {
+    pub fn discard(&mut self) {
+        self.discard = true;
+    }
+
     pub async fn finish(
         mut self,
         status: StatusCode,

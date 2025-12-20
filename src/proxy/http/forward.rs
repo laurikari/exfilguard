@@ -7,9 +7,9 @@ use anyhow::Result;
 use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_rustls::client::TlsStream;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::io_util::{TeeWriter, write_all_with_timeout};
+use crate::io_util::{BestEffortWriter, TeeWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
 use crate::proxy::http::cache_control::{
@@ -402,21 +402,50 @@ where
         let client_stream = client_reader.get_mut();
 
         let body_bytes = if let Some((mut stream, ttl, resp_headers)) = cache_stream {
-            let mut tee = TeeWriter::new(client_stream, &mut stream);
-            let res = relay_body_generic(
-                &mut upstream_reader,
-                &mut tee,
-                response_body_plan,
-                timeouts.upstream,
-                timeouts.client,
-                connection.peer,
-            )
-            .await;
+            let (res, cache_error) = {
+                let mut cache_writer = BestEffortWriter::new(&mut stream);
+                let res = {
+                    let mut tee = TeeWriter::new(client_stream, &mut cache_writer);
+                    relay_body_generic(
+                        &mut upstream_reader,
+                        &mut tee,
+                        response_body_plan,
+                        timeouts.upstream,
+                        timeouts.client,
+                        connection.peer,
+                    )
+                    .await
+                };
+                (res, cache_writer.take_error())
+            };
+
+            let mut cache_failed = false;
+            if let Some(err) = cache_error.as_ref() {
+                cache_failed = true;
+                warn!(
+                    peer = %peer,
+                    host = %request.host,
+                    error = %err,
+                    "cache write failed; continuing without cache"
+                );
+                crate::metrics::record_cache_store_error();
+                stream.discard();
+            }
 
             match res {
                 Ok(bytes) => {
-                    if let Err(e) = stream.finish(head.status, resp_headers, ttl).await {
-                        debug!("failed to commit cache entry: {}", e);
+                    if let Err(err) = stream.finish(head.status, resp_headers, ttl).await {
+                        if !cache_failed {
+                            warn!(
+                                peer = %peer,
+                                host = %request.host,
+                                error = %err,
+                                "failed to commit cache entry"
+                            );
+                            crate::metrics::record_cache_store_error();
+                        }
+                        cache_store = CacheStoreResult::Skipped;
+                    } else if cache_failed {
                         cache_store = CacheStoreResult::Skipped;
                     } else {
                         cache_store = CacheStoreResult::Stored;
