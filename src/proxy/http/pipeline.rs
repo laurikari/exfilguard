@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::body::BodyPlan;
-use super::cache_control::request_cache_bypass;
+use super::cache_decision::build_cache_request_context;
 use super::codec::{ConnectionDirective, HeaderAccumulator, ResponseHead, encode_cached_response};
 use super::forward::{
     ForwardResult, ForwardTimeouts, determine_response_body_plan, forward_to_upstream,
@@ -245,28 +245,25 @@ where
         if let (Some(_cache_config), Some(cache)) = (&decision.cache, &self.app.cache)
             && !self.headers.has_sensitive_cache_headers()
         {
-            let method_obj = &self.parsed.method;
-            let uri_obj = match self.parsed.cache_uri() {
-                Ok(uri) => Some(uri),
+            let cache_request = match build_cache_request_context(self.parsed, &self.headers) {
+                Ok(context) => Some(context),
                 Err(err) => {
                     debug!(peer = %self.peer, error = %err, "skipping cache lookup due to URI build failure");
                     None
                 }
             };
 
-            let mut req_headers_map = http::HeaderMap::new();
-            for h in self.headers.forward_headers() {
-                if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
-                    && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
-                {
-                    req_headers_map.append(k, v);
-                }
-            }
-
-            if !request_cache_bypass(&req_headers_map)
-                && let Some(uri_obj) = uri_obj
+            if let Some(cache_request) = cache_request
+                && !cache_request.bypass
             {
-                if let Some(cached) = cache.lookup(method_obj, &uri_obj, &req_headers_map).await {
+                if let Some(cached) = cache
+                    .lookup(
+                        &self.parsed.method,
+                        &cache_request.uri,
+                        &cache_request.headers,
+                    )
+                    .await
+                {
                     // Serve from cache
                     let client_stream = self.reader.get_mut();
 

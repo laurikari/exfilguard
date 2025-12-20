@@ -12,9 +12,7 @@ use tracing::{debug, warn};
 use crate::io_util::{BestEffortWriter, TeeWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::http::cache_control::{
-    get_freshness_lifetime, is_cacheable, request_cache_bypass,
-};
+use crate::proxy::http::cache_control::{get_freshness_lifetime, is_cacheable};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
@@ -24,6 +22,7 @@ use super::body::{
     BodyPlan, relay_chunked_body, relay_fixed_body, relay_until_close, stream_chunked_body,
     stream_fixed_body,
 };
+use super::cache_decision::{build_cache_request_context, header_lines_to_map};
 use super::codec::{ConnectionDirective, HeaderAccumulator, ResponseHead, read_response_head};
 use super::upstream::{UpstreamConnection, UpstreamKey, UpstreamPool};
 
@@ -312,65 +311,54 @@ where
 
         if !headers.has_sensitive_cache_headers() {
             let method_obj = &request.method;
-            let cache_uri = match request.cache_uri() {
-                Ok(uri) => Some(uri),
+            let cache_request = match build_cache_request_context(request, headers) {
+                Ok(context) => Some(context),
                 Err(err) => {
                     debug!(peer = %peer, error = %err, host = %request.host, "skipping cache due to URI build failure");
                     None
                 }
             };
 
-            let mut req_headers_map = http::HeaderMap::new();
-            for h in headers.forward_headers() {
-                if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
-                    && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
-                {
-                    req_headers_map.append(k, v);
-                }
-            }
+            if let Some(cache_request) = cache_request {
+                if cache_request.bypass {
+                    cache_store = CacheStoreResult::Bypassed;
+                } else {
+                    let resp_headers_map = header_lines_to_map(head.headers.iter());
 
-            if request_cache_bypass(&req_headers_map) {
-                cache_store = CacheStoreResult::Bypassed;
-            } else {
-                let mut resp_headers_map = http::HeaderMap::new();
-                for h in &head.headers {
-                    if let Ok(k) = http::header::HeaderName::from_bytes(h.name.as_bytes())
-                        && let Ok(v) = http::header::HeaderValue::from_bytes(h.value.as_bytes())
-                    {
-                        resp_headers_map.append(k, v);
+                    if resp_headers_map.contains_key(http::header::SET_COOKIE) {
+                        debug!(
+                            peer = %peer,
+                            host = %request.host,
+                            status = head.status.as_u16(),
+                            "skipping cache write due to Set-Cookie response header"
+                        );
                     }
-                }
 
-                if resp_headers_map.contains_key(http::header::SET_COOKIE) {
-                    debug!(
-                        peer = %peer,
-                        host = %request.host,
-                        status = head.status.as_u16(),
-                        "skipping cache write due to Set-Cookie response header"
-                    );
-                }
+                    if is_cacheable(method_obj, head.status, &resp_headers_map) {
+                        let ttl = select_cache_ttl(
+                            get_freshness_lifetime(&resp_headers_map),
+                            cache_config.force_cache_duration,
+                        );
 
-                if let Some(uri_obj) = cache_uri
-                    && is_cacheable(method_obj, head.status, &resp_headers_map)
-                {
-                    let ttl = select_cache_ttl(
-                        get_freshness_lifetime(&resp_headers_map),
-                        cache_config.force_cache_duration,
-                    );
-
-                    if ttl > Duration::ZERO {
-                        match cache
-                            .open_stream(method_obj, &uri_obj, &req_headers_map, &resp_headers_map)
-                            .await
-                        {
-                            Ok(Some(stream)) => {
-                                cache_stream = Some((stream, ttl, resp_headers_map));
-                            }
-                            Ok(None) => {
-                                tracing::debug!("skipping cache write due to Vary limits");
-                            }
-                            Err(e) => {
-                                tracing::debug!("failed to open cache stream: {}", e);
+                        if ttl > Duration::ZERO {
+                            match cache
+                                .open_stream(
+                                    method_obj,
+                                    &cache_request.uri,
+                                    &cache_request.headers,
+                                    &resp_headers_map,
+                                )
+                                .await
+                            {
+                                Ok(Some(stream)) => {
+                                    cache_stream = Some((stream, ttl, resp_headers_map));
+                                }
+                                Ok(None) => {
+                                    tracing::debug!("skipping cache write due to Vary limits");
+                                }
+                                Err(e) => {
+                                    tracing::debug!("failed to open cache stream: {}", e);
+                                }
                             }
                         }
                     }
