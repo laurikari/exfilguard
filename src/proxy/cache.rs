@@ -357,7 +357,13 @@ impl HttpCache {
         let temp_name = format!("tmp_{}", uuid::Uuid::new_v4());
         let temp_path = self.state.disk_dir.join(&temp_name);
 
-        let file = AsyncFile::create(&temp_path).await?;
+        let mut options = async_fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let file = options.open(&temp_path).await?;
 
         Ok(Some(CacheStream {
             file,
@@ -856,9 +862,18 @@ impl CacheState {
                 .with_context(|| format!("failed to create cache shard {}", parent.display()))?;
         }
         let data = serde_json::to_vec(entry)?;
-        async_fs::write(&meta_path, data)
+        let mut options = async_fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&meta_path)
             .await
             .with_context(|| format!("failed to write cache metadata {}", meta_path.display()))?;
+        file.write_all(&data).await?;
+        file.flush().await?;
         Ok(())
     }
 
@@ -1080,6 +1095,44 @@ mod tests {
         let disk_body = fs::read(hit.body_path)?;
         assert_eq!(disk_body, body);
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_files_use_restrictive_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new()?;
+        let cache =
+            build_cache(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/perm");
+        let req_headers = HeaderMap::new();
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("content-type", "text/plain".parse()?);
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"payload",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        let hit = cache.lookup(&method, &uri, &req_headers).await.unwrap();
+        let body_mode = fs::metadata(&hit.body_path)?.permissions().mode() & 0o777;
+        assert_eq!(body_mode, 0o600);
+
+        let entry_id = entry_id_for_key(&format!("{}::{}", method, uri));
+        let meta_path = cache.state.meta_path(&entry_id);
+        let meta_mode = fs::metadata(&meta_path)?.permissions().mode() & 0o777;
+        assert_eq!(meta_mode, 0o600);
         Ok(())
     }
 

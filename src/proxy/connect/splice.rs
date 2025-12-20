@@ -161,3 +161,58 @@ where
 
     Ok(transferred)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use tokio::net::TcpListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn client_timeout_applies_to_upstream_read() -> Result<()> {
+        let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+
+        let client_addr = client_listener.local_addr()?;
+        let upstream_addr = upstream_listener.local_addr()?;
+
+        let client_accept = tokio::spawn(async move { client_listener.accept().await });
+        let upstream_accept = tokio::spawn(async move { upstream_listener.accept().await });
+
+        let client_peer = TcpStream::connect(client_addr).await?;
+        let upstream_peer = TcpStream::connect(upstream_addr).await?;
+
+        let (mut client_stream, _) = client_accept.await??;
+        let (mut upstream_stream, _) = upstream_accept.await??;
+
+        let client_timeout = Duration::from_secs(1);
+        let upstream_timeout = Duration::from_secs(10);
+
+        let handle = tokio::spawn(async move {
+            relay_with_idle_timeouts(
+                &mut client_stream,
+                &mut upstream_stream,
+                client_timeout,
+                upstream_timeout,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(handle.is_finished(), "expected client timeout to trigger");
+
+        let err = handle.await.expect("join should succeed").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timed out reading from upstream server during CONNECT splice"),
+            "unexpected error: {err}"
+        );
+
+        drop(client_peer);
+        drop(upstream_peer);
+        Ok(())
+    }
+}

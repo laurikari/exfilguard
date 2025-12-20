@@ -19,6 +19,10 @@ use zeroize::Zeroizing;
 
 use super::ca::MintedLeaf;
 
+const MAX_CHAIN_ENTRIES: u32 = 16;
+const MAX_CERT_BYTES: usize = 256 * 1024;
+const MAX_CHAIN_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct CertificateCache {
     inner: Arc<Mutex<LruCache<String, CachedEntry>>>,
@@ -256,10 +260,33 @@ fn read_chain_file(path: &Path) -> Result<Vec<Vec<u8>>> {
     let mut count_buf = [0u8; 4];
     file.read_exact(&mut count_buf)?;
     let count = u32::from_be_bytes(count_buf);
+    if count == 0 {
+        return Err(anyhow!("cached certificate chain is empty"));
+    }
+    if count > MAX_CHAIN_ENTRIES {
+        return Err(anyhow!(
+            "cached certificate chain has too many entries ({count})"
+        ));
+    }
     let mut chain = Vec::with_capacity(count as usize);
+    let mut total_bytes = 0usize;
     for _ in 0..count {
         file.read_exact(&mut count_buf)?;
         let len = u32::from_be_bytes(count_buf) as usize;
+        if len == 0 {
+            return Err(anyhow!("cached certificate entry is empty"));
+        }
+        if len > MAX_CERT_BYTES {
+            return Err(anyhow!("cached certificate entry too large ({len} bytes)"));
+        }
+        total_bytes = total_bytes
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("cached certificate chain size overflow"))?;
+        if total_bytes > MAX_CHAIN_BYTES {
+            return Err(anyhow!(
+                "cached certificate chain exceeds size limit ({total_bytes} bytes)"
+            ));
+        }
         let mut cert = vec![0u8; len];
         file.read_exact(&mut cert)?;
         chain.push(cert);
@@ -354,6 +381,7 @@ fn hashed_name(name: &str) -> HashedLocation {
 mod tests {
     use super::*;
     use crate::tls::ca::CertificateAuthority;
+    use std::io::Write;
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
     use time::Duration;
@@ -452,6 +480,24 @@ mod tests {
         } else {
             panic!("expected cache metadata to exist");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn read_chain_rejects_oversized_entry() -> Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("chain");
+        let mut file = File::create(&path)?;
+        file.write_all(&1u32.to_be_bytes())?;
+        let oversized = (MAX_CERT_BYTES as u32) + 1;
+        file.write_all(&oversized.to_be_bytes())?;
+        file.flush()?;
+
+        let err = read_chain_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("certificate entry too large"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 }

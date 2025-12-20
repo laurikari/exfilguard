@@ -599,13 +599,49 @@ where
         anyhow::bail!("max_bytes must be greater than zero");
     }
     buf.clear();
-    let bytes = timeout(timeout_dur, reader.read_line(buf))
-        .await
-        .map_err(|_| anyhow!("timed out {context}"))??;
+    let mut collected = Vec::new();
+    loop {
+        let available = timeout(timeout_dur, reader.fill_buf())
+            .await
+            .map_err(|_| anyhow!("timed out {context}"))??;
+        if available.is_empty() {
+            if collected.is_empty() {
+                return Ok(0);
+            }
+            anyhow::bail!("connection closed while {context}");
+        }
+
+        let newline_pos = available.iter().position(|byte| *byte == b'\n');
+        let consume = newline_pos.map(|idx| idx + 1).unwrap_or(available.len());
+
+        let remaining = max_bytes
+            .checked_sub(*total)
+            .ok_or_else(|| anyhow!("metrics request exceeded allowed size"))?;
+        if collected
+            .len()
+            .checked_add(consume)
+            .ok_or_else(|| anyhow!("metrics request length overflow"))?
+            > remaining
+        {
+            anyhow::bail!("metrics request exceeded allowed size");
+        }
+
+        collected.extend_from_slice(&available[..consume]);
+        reader.consume(consume);
+
+        if newline_pos.is_some() {
+            break;
+        }
+    }
+
+    let string = String::from_utf8(collected)
+        .map_err(|_| anyhow!("metrics request contained invalid bytes"))?;
+    let bytes = string.len();
     *total = total
         .checked_add(bytes)
         .ok_or_else(|| anyhow!("metrics request length overflow"))?;
     ensure!(*total <= max_bytes, "metrics request exceeded allowed size");
+    *buf = string;
     Ok(bytes)
 }
 
@@ -652,6 +688,25 @@ mod tests {
         )
         .await
         .expect_err("oversized request should be rejected");
+        assert!(
+            err.to_string().contains("exceeded allowed size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_header_line() {
+        let (mut client, server) = tokio::io::duplex(2048);
+        let oversized = format!(
+            "GET /metrics HTTP/1.1\r\nX-Test: {}\r\n\r\n",
+            "a".repeat(128)
+        );
+        client.write_all(oversized.as_bytes()).await.unwrap();
+        drop(client);
+
+        let err = super::handle_stream_with_limits(server, "/metrics", Duration::from_secs(1), 64)
+            .await
+            .expect_err("oversized header should be rejected");
         assert!(
             err.to_string().contains("exceeded allowed size"),
             "unexpected error: {err}"
