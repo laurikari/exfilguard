@@ -11,13 +11,18 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use http::{HeaderMap, Method, StatusCode, Uri};
-use lru::LruCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{fs as async_fs, task};
 use tracing::{trace, warn};
+
+mod index;
+mod store;
+
+use index::CacheIndex;
+use store::CacheStore;
 
 const MAX_VARY_HEADERS: usize = 8;
 const MAX_VARY_BYTES: usize = 8 * 1024;
@@ -40,17 +45,11 @@ pub struct HttpCache {
 
 #[derive(Debug)]
 struct CacheState {
-    inner: Mutex<CacheInner>,
-    disk_dir: PathBuf,
+    index: Mutex<CacheIndex>,
+    store: CacheStore,
     max_entry_size: u64,
     max_bytes: u64,
     next_id: AtomicU64,
-}
-
-#[derive(Debug)]
-struct CacheInner {
-    lru: LruCache<String, CacheEntry>,
-    bytes_in_use: u64,
 }
 
 #[derive(Debug, Default)]
@@ -249,13 +248,11 @@ impl HttpCache {
 
         let capacity = std::num::NonZeroUsize::new(capacity)
             .ok_or_else(|| anyhow!("cache capacity must be greater than zero"))?;
-        let cache = LruCache::new(capacity);
+        let index = CacheIndex::new(capacity, max_bytes);
+        let store = CacheStore::new(disk_dir.clone());
         let state = Arc::new(CacheState {
-            inner: Mutex::new(CacheInner {
-                lru: cache,
-                bytes_in_use: 0,
-            }),
-            disk_dir,
+            index: Mutex::new(index),
+            store,
             max_entry_size,
             max_bytes,
             next_id: AtomicU64::new(1),
@@ -282,8 +279,8 @@ impl HttpCache {
         let key_base = format!("{}::{}", method, uri);
 
         let entry = {
-            let mut guard = self.state.inner.lock();
-            guard.lru.get(&key_base).cloned()
+            let mut guard = self.state.index.lock();
+            guard.get(&key_base)
         };
 
         let entry = match entry {
@@ -355,7 +352,7 @@ impl HttpCache {
 
         // Use a random temp file name
         let temp_name = format!("tmp_{}", uuid::Uuid::new_v4());
-        let temp_path = self.state.disk_dir.join(&temp_name);
+        let temp_path = self.state.store.temp_path(&temp_name);
 
         let mut options = async_fs::OpenOptions::new();
         options.create(true).truncate(true).write(true);
@@ -457,15 +454,11 @@ impl HttpCache {
 
 impl CacheState {
     fn body_path(&self, entry_id: &str) -> PathBuf {
-        let (first, remainder) = entry_id.split_at(2);
-        let (second, _) = remainder.split_at(2);
-        self.disk_dir.join(first).join(second).join(entry_id)
+        self.store.body_path(entry_id)
     }
 
     fn meta_path(&self, entry_id: &str) -> PathBuf {
-        let mut path = self.body_path(entry_id);
-        path.set_extension("meta");
-        path
+        self.store.meta_path(entry_id)
     }
 
     fn next_entry_id(&self) -> u64 {
@@ -473,39 +466,26 @@ impl CacheState {
     }
 
     fn remove_entry_if_id_matches(&self, key_base: &str, entry_id: u64) -> bool {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
-        let matches = inner
-            .lru
-            .get(key_base)
-            .map(|entry| entry.id == entry_id)
-            .unwrap_or(false);
-        if matches && let Some(removed) = inner.lru.pop(key_base) {
-            inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
-            return true;
-        }
-        false
+        let mut guard = self.index.lock();
+        guard.remove_if_id_matches(key_base, entry_id).is_some()
     }
 
     fn remove_entry_by_key_base(&self, key_base: &str) {
-        let mut guard = self.inner.lock();
-        if let Some(removed) = guard.lru.pop(key_base) {
-            guard.bytes_in_use = guard.bytes_in_use.saturating_sub(removed.content_length);
-        }
+        let mut guard = self.index.lock();
+        guard.remove_by_key(key_base);
     }
 
     fn rebuild_from_disk(&self) -> Result<()> {
-        self.remove_temp_files()?;
-        let mut guard = self.inner.lock();
-        guard.bytes_in_use = 0;
-        guard.lru.clear();
+        self.store.remove_temp_files()?;
+        let mut guard = self.index.lock();
+        guard.reset();
         drop(guard);
 
-        if !self.disk_dir.exists() {
+        if !self.store.disk_dir().exists() {
             return Ok(());
         }
 
-        for shard1 in fs::read_dir(&self.disk_dir)? {
+        for shard1 in fs::read_dir(self.store.disk_dir())? {
             let shard1 = shard1?;
             if !shard1.file_type()?.is_dir() {
                 continue;
@@ -556,26 +536,6 @@ impl CacheState {
             }
             if fs::read_dir(shard1.path())?.next().is_none() {
                 fs::remove_dir_all(shard1.path()).ok();
-            }
-        }
-        Ok(())
-    }
-
-    fn remove_temp_files(&self) -> Result<()> {
-        if !self.disk_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&self.disk_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|name| name.starts_with("tmp_"))
-                    .unwrap_or(false)
-            {
-                fs::remove_file(&path).ok();
             }
         }
         Ok(())
@@ -641,7 +601,10 @@ impl CacheState {
             return Ok(None);
         }
 
-        if !self.content_hash_matches(&body_path, &persisted.content_hash) {
+        if !self
+            .store
+            .content_hash_matches(&body_path, &persisted.content_hash)
+        {
             warn!(
                 "cache content hash mismatch for {}; removing entry",
                 body_path.display()
@@ -678,31 +641,8 @@ impl CacheState {
         Ok(Some(entry_id))
     }
 
-    fn content_hash_matches(&self, path: &Path, expected_hex: &str) -> bool {
-        let mut file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-        let mut hasher = Hasher::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match std::io::Read::read(&mut file, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    hasher.update(&buf[..n]);
-                }
-                Err(_) => return false,
-            }
-        }
-        hasher.finalize().to_hex().to_string() == expected_hex
-    }
-
     fn remove_entry_files_from_meta(&self, meta_path: &Path) {
-        if let Some(stem) = meta_path.file_stem().and_then(|s| s.to_str()) {
-            let body_path = self.body_path(stem);
-            fs::remove_file(body_path).ok();
-        }
-        fs::remove_file(meta_path).ok();
+        self.store.remove_entry_files_from_meta(meta_path);
     }
 
     fn remove_evicted_files(&self, evicted: Vec<CacheEntry>) {
@@ -723,49 +663,19 @@ impl CacheState {
     }
 
     async fn remove_entry_files_from_meta_async(&self, meta_path: &Path) {
-        if let Some(stem) = meta_path.file_stem().and_then(|s| s.to_str()) {
-            let body_path = self.body_path(stem);
-            let _ = async_fs::remove_file(&body_path).await;
-        }
-        let _ = async_fs::remove_file(meta_path).await;
+        self.store
+            .remove_entry_files_from_meta_async(meta_path)
+            .await;
     }
 
     async fn remove_entry_files_for_entry_id_async(&self, entry_id: &str) {
-        let meta_path = self.meta_path(entry_id);
-        self.remove_entry_files_from_meta_async(&meta_path).await;
-    }
-
-    async fn dir_is_empty(path: &Path) -> bool {
-        let mut entries = match async_fs::read_dir(path).await {
-            Ok(entries) => entries,
-            Err(_) => return false,
-        };
-        match entries.next_entry().await {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
-        }
+        self.store
+            .remove_entry_files_for_entry_id_async(entry_id)
+            .await;
     }
 
     async fn prune_empty_shards(&self, entry_id: &str) {
-        let body_path = self.body_path(entry_id);
-        let shard2 = match body_path.parent() {
-            Some(path) => path.to_path_buf(),
-            None => return,
-        };
-        if Self::dir_is_empty(&shard2).await {
-            let _ = async_fs::remove_dir(&shard2).await;
-        }
-        let shard1 = match shard2.parent() {
-            Some(path) => path.to_path_buf(),
-            None => return,
-        };
-        if shard1 == self.disk_dir {
-            return;
-        }
-        if Self::dir_is_empty(&shard1).await {
-            let _ = async_fs::remove_dir(&shard1).await;
-        }
+        self.store.prune_empty_shards(entry_id).await;
     }
 
     async fn sweep_expired_entries(&self, batch_size: usize) -> Result<SweepStats> {
@@ -774,7 +684,7 @@ impl CacheState {
             return Ok(stats);
         }
         let now = SystemTime::now();
-        let mut shard1_entries = match async_fs::read_dir(&self.disk_dir).await {
+        let mut shard1_entries = match async_fs::read_dir(self.store.disk_dir()).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(stats),
             Err(err) => return Err(err.into()),
@@ -855,50 +765,12 @@ impl CacheState {
     }
 
     async fn write_metadata_async(&self, entry_id: &str, entry: &PersistedEntry) -> Result<()> {
-        let meta_path = self.meta_path(entry_id);
-        if let Some(parent) = meta_path.parent() {
-            async_fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create cache shard {}", parent.display()))?;
-        }
-        let data = serde_json::to_vec(entry)?;
-        let mut options = async_fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&meta_path)
-            .await
-            .with_context(|| format!("failed to write cache metadata {}", meta_path.display()))?;
-        file.write_all(&data).await?;
-        file.flush().await?;
-        Ok(())
+        self.store.write_metadata_async(entry_id, entry).await
     }
 
     fn insert_entry(&self, key_base: String, entry: CacheEntry) -> Vec<CacheEntry> {
-        let mut evicted = Vec::new();
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
-
-        inner.bytes_in_use = inner.bytes_in_use.saturating_add(entry.content_length);
-
-        if let Some((_key, removed)) = inner.lru.push(key_base, entry) {
-            inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
-            evicted.push(removed);
-        }
-
-        while inner.bytes_in_use > self.max_bytes {
-            if let Some((_key, removed)) = inner.lru.pop_lru() {
-                inner.bytes_in_use = inner.bytes_in_use.saturating_sub(removed.content_length);
-                evicted.push(removed);
-            } else {
-                break;
-            }
-        }
-
-        evicted
+        let mut guard = self.index.lock();
+        guard.insert(key_base, entry)
     }
 }
 
@@ -1194,16 +1066,8 @@ mod tests {
 
         let key_base = format!("{}::{}", method, uri);
         let entry_id = entry_id_for_key(&key_base);
-        let (first, remainder) = entry_id.split_at(2);
-        let (second, _) = remainder.split_at(2);
-        let body_path = cache
-            .state
-            .disk_dir
-            .join(first)
-            .join(second)
-            .join(&entry_id);
-        let mut meta_path = body_path.clone();
-        meta_path.set_extension("meta");
+        let body_path = cache.state.store.body_path(&entry_id);
+        let meta_path = cache.state.store.meta_path(&entry_id);
 
         assert!(body_path.exists(), "expected cached body to exist");
         assert!(meta_path.exists(), "expected cached metadata to exist");
@@ -1519,7 +1383,7 @@ mod tests {
 
         let cache = build_cache(4, dir.path().to_path_buf(), 1024, 1024 * 10).await?;
         let active_dir = cache_version_dir(dir.path());
-        assert_eq!(cache.state.disk_dir, active_dir);
+        assert_eq!(cache.state.store.disk_dir(), active_dir);
         assert!(!old_dir.exists(), "old cache version should be tombstoned");
 
         let active_name = active_dir
@@ -1839,10 +1703,10 @@ mod tests {
 
         // All stray files/directories should be removed and counters reset
         assert_eq!(fs::read_dir(&versioned_dir)?.count(), 0);
-        let inner = cache.state.inner.lock();
-        assert_eq!(inner.bytes_in_use, 0);
-        assert_eq!(inner.lru.len(), 0);
-        drop(inner);
+        let index = cache.state.index.lock();
+        assert_eq!(index.bytes_in_use(), 0);
+        assert_eq!(index.len(), 0);
+        drop(index);
         Ok(())
     }
 
