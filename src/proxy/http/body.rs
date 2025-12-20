@@ -190,13 +190,13 @@ pub async fn stream_chunked_body<S, U>(
     client_timeout: Duration,
     upstream_timeout: Duration,
     peer: SocketAddr,
-    max_body_size: usize,
+    max_request_body_size: usize,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
-    let mut tracker = BodySizeTracker::new(max_body_size);
+    let mut tracker = BodySizeTracker::new(max_request_body_size);
     relay_chunked_body_generic(
         reader,
         upstream,

@@ -41,7 +41,7 @@ fn default_max_response_header_size() -> usize {
     32 * 1024
 }
 
-fn default_max_body_size() -> usize {
+fn default_max_request_body_size() -> usize {
     64 * 1024 * 1024
 }
 
@@ -79,8 +79,8 @@ pub struct Settings {
     pub max_header_size: usize,
     #[serde(default = "default_max_response_header_size")]
     pub max_response_header_size: usize,
-    #[serde(default = "default_max_body_size")]
-    pub max_body_size: usize,
+    #[serde(default = "default_max_request_body_size")]
+    pub max_request_body_size: usize,
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
     #[serde(default = "default_cache_max_entry_size")]
@@ -254,9 +254,9 @@ impl Settings {
             self.max_response_header_size
         );
         ensure!(
-            self.max_body_size > 0,
-            "max_body_size must be greater than 0 (got {})",
-            self.max_body_size
+            self.max_request_body_size > 0,
+            "max_request_body_size must be greater than 0 (got {})",
+            self.max_request_body_size
         );
         ensure!(
             self.client_timeout > 0,
@@ -371,7 +371,7 @@ mod tests {
             upstream_pool_capacity: 32,
             max_header_size: 1024,
             max_response_header_size: 1024,
-            max_body_size: 1024,
+            max_request_body_size: 1024,
             // Cache enabled
             cache_dir: Some(PathBuf::from("cache")),
             cache_max_entry_size: 1024,
@@ -405,7 +405,7 @@ mod tests {
             upstream_pool_capacity: 32,
             max_header_size: 1024,
             max_response_header_size: 1024,
-            max_body_size: 1024,
+            max_request_body_size: 1024,
             // Cache enabled but invalid
             cache_dir: Some(PathBuf::from("cache")),
             cache_max_entry_size: 0,
@@ -443,7 +443,7 @@ mod tests {
             upstream_pool_capacity: 32,
             max_header_size: 1024,
             max_response_header_size: 1024,
-            max_body_size: 1024,
+            max_request_body_size: 1024,
             // Cache disabled (None), sizes should be ignored even if 0 (though defaults are non-zero)
             cache_dir: None,
             cache_max_entry_size: 0,

@@ -51,7 +51,7 @@ fn default_test_settings(
         upstream_pool_capacity: 32,
         max_header_size: 32 * 1024,
         max_response_header_size: 4096,
-        max_body_size: 1024 * 1024,
+        max_request_body_size: 1024 * 1024,
         cache_dir: None,
         cache_max_entry_size: 10 * 1024 * 1024,
         cache_max_entries: 10_000,
@@ -131,7 +131,7 @@ fn build_client_tls_with_protocols(
 // --- Tests ---
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_max_body_size_enforced() -> Result<()> {
+async fn test_max_request_body_size_enforced() -> Result<()> {
     let temp = tempfile::TempDir::new()?;
     let workspace = temp.path();
     let ca_dir = workspace.join("ca");
@@ -197,7 +197,7 @@ name = "allow-upload"
 
     // Set max body size to small value (1KB)
     let mut settings = default_test_settings(proxy_addr, &ca_dir, &clients_path, &policies_path);
-    settings.max_body_size = 1024;
+    settings.max_request_body_size = 1024;
     let settings = Arc::new(settings);
 
     let cert_cache = Arc::new(CertificateCache::new(CERT_CACHE_CAPACITY, None)?);

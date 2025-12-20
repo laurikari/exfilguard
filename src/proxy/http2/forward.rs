@@ -54,7 +54,7 @@ pub(super) async fn forward_request_to_upstream(
     respond: &mut SendResponse<Bytes>,
     client_timeout: Duration,
     upstream_timeout: Duration,
-    max_body_size: usize,
+    max_request_body_size: usize,
     max_response_header_bytes: usize,
 ) -> Result<ForwardOutcome> {
     let mut sender = checkout.sender;
@@ -87,7 +87,7 @@ pub(super) async fn forward_request_to_upstream(
         .send_request(request, end_of_stream)
         .context("failed to send headers to upstream over HTTP/2")?;
 
-    let mut body_tracker = BodySizeTracker::new(max_body_size);
+    let mut body_tracker = BodySizeTracker::new(max_request_body_size);
 
     if !end_of_stream {
         while let Some(frame) = timeout(client_timeout, body.data())

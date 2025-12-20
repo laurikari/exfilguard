@@ -127,12 +127,12 @@ where
 
     if !headers.is_chunked()
         && let Some(length) = content_length
-        && length > app.settings.max_body_size
+        && length > app.settings.max_request_body_size
     {
         warn!(
             peer = %peer,
             length,
-            max = app.settings.max_body_size,
+            max = app.settings.max_request_body_size,
             "request body exceeds limit"
         );
         respond_with_access_log(
@@ -425,7 +425,7 @@ where
             self.expect_continue,
             decision,
             self.peer,
-            self.app.settings.max_body_size,
+            self.app.settings.max_request_body_size,
             self.app,
         )
         .await
@@ -664,7 +664,7 @@ name = "allow"
             upstream_pool_capacity: 4,
             max_header_size: 4096,
             max_response_header_size: 4096,
-            max_body_size: 1024 * 1024,
+            max_request_body_size: 1024 * 1024,
             cache_dir: None,
             cache_max_entry_size: 10 * 1024 * 1024,
             cache_max_entries: 10_000,

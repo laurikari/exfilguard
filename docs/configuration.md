@@ -121,7 +121,7 @@ All size values are in bytes and must be greater than 0.
 |-------|------|---------|-------------|
 | `max_header_size` | usize | 32768 (32 KiB) | Maximum HTTP request header size |
 | `max_response_header_size` | usize | 32768 (32 KiB) | Maximum HTTP response header size |
-| `max_body_size` | usize | 67108864 (64 MiB) | Maximum HTTP body size |
+| `max_request_body_size` | usize | 67108864 (64 MiB) | Maximum HTTP request body size |
 
 ---
 
@@ -263,7 +263,7 @@ upstream_pool_capacity = 32
 # Size limits (bytes)
 max_header_size = 32768
 max_response_header_size = 32768
-max_body_size = 67108864
+max_request_body_size = 67108864
 
 # Cache (optional)
 cache_dir = "./cache"

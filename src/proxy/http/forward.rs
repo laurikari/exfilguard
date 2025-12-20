@@ -131,7 +131,7 @@ pub async fn forward_to_upstream<S>(
     expect_continue: bool,
     decision: &AllowDecision,
     peer: SocketAddr,
-    max_body_size: usize,
+    max_request_body_size: usize,
     app: &AppContext,
 ) -> Result<ForwardResult>
 where
@@ -175,7 +175,7 @@ where
         timeouts,
         expect_continue,
         peer,
-        max_body_size,
+        max_request_body_size,
         request_close,
         app.settings.max_response_header_size,
         decision,
@@ -228,7 +228,7 @@ pub async fn forward_with_connection<S>(
     timeouts: &ForwardTimeouts,
     expect_continue: bool,
     peer: SocketAddr,
-    max_body_size: usize,
+    max_request_body_size: usize,
     request_close: bool,
     max_response_header_bytes: usize,
     decision: &AllowDecision,
@@ -275,7 +275,7 @@ where
                 timeouts.client,
                 timeouts.upstream,
                 peer,
-                max_body_size,
+                max_request_body_size,
             )
             .await?;
         }

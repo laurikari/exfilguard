@@ -143,7 +143,7 @@ struct DownstreamRequestCtx {
     snapshot: PolicySnapshot,
     client_timeout: Duration,
     upstream_timeout: Duration,
-    max_body_size: usize,
+    max_request_body_size: usize,
     max_response_header_bytes: usize,
     log_queries: bool,
     log_tracker: AllowLogTracker,
@@ -171,7 +171,7 @@ impl DownstreamRequestCtx {
             snapshot,
             client_timeout: app.settings.client_timeout(),
             upstream_timeout: app.settings.upstream_timeout(),
-            max_body_size: app.settings.max_body_size,
+            max_request_body_size: app.settings.max_request_body_size,
             max_response_header_bytes: app.settings.max_response_header_size,
             log_queries,
             log_tracker: AllowLogTracker::new(request_base, start),
@@ -283,7 +283,7 @@ impl Http2RequestHandler {
             &mut self.ctx.respond,
             self.ctx.client_timeout,
             self.ctx.upstream_timeout,
-            self.ctx.max_body_size,
+            self.ctx.max_request_body_size,
             self.ctx.max_response_header_bytes,
         )
         .await
