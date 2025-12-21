@@ -19,13 +19,13 @@ use tokio::{fs as async_fs, task};
 use tracing::{trace, warn};
 
 mod index;
+mod key;
 mod store;
 
 use index::CacheIndex;
+use key::{CacheKey, VaryKey};
 use store::CacheStore;
 
-const MAX_VARY_HEADERS: usize = 8;
-const MAX_VARY_BYTES: usize = 8 * 1024;
 const CACHE_LAYOUT_VERSION: u32 = 1;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
@@ -65,7 +65,7 @@ struct CacheEntry {
     pub entry_id: String,
     pub status: StatusCode,
     pub headers: HeaderMap,
-    pub vary_headers: HeaderMap,
+    pub vary: VaryKey,
     pub expires_at: SystemTime,
     pub content_hash: String,
     pub content_length: u64,
@@ -80,10 +80,6 @@ struct PersistedEntry {
     expires_at: u64,
     content_hash: String,
     content_length: u64,
-}
-
-fn entry_id_for_key(key_base: &str) -> String {
-    blake3::hash(key_base.as_bytes()).to_hex().to_string()
 }
 
 fn to_headermap(items: &[(String, String)]) -> HeaderMap {
@@ -228,9 +224,8 @@ pub struct CacheStream {
     temp_path: PathBuf,
     state: Arc<CacheState>,
     current_size: u64,
-    key_base: String,
-    entry_id: String,
-    vary_headers: HeaderMap,
+    key: CacheKey,
+    vary: VaryKey,
     discard: bool,
 }
 
@@ -276,11 +271,11 @@ impl HttpCache {
         uri: &Uri,
         req_headers: &HeaderMap,
     ) -> Option<CachedResponse> {
-        let key_base = format!("{}::{}", method, uri);
+        let cache_key = CacheKey::new(method, uri);
 
         let entry = {
             let mut guard = self.state.index.lock();
-            guard.get(&key_base)
+            guard.get(cache_key.key_base())
         };
 
         let entry = match entry {
@@ -293,7 +288,10 @@ impl HttpCache {
 
         if SystemTime::now() > entry.expires_at {
             trace!("cache entry expired");
-            if self.state.remove_entry_if_id_matches(&key_base, entry.id) {
+            if self
+                .state
+                .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
+            {
                 self.state
                     .remove_entry_files_for_entry_id_async(&entry.entry_id)
                     .await;
@@ -302,7 +300,7 @@ impl HttpCache {
             return None;
         }
 
-        if !self.vary_matches(&entry.vary_headers, req_headers) {
+        if !entry.vary.matches(req_headers) {
             trace!("cache entry vary mismatch");
             crate::metrics::record_cache_lookup(false);
             return None;
@@ -315,7 +313,10 @@ impl HttpCache {
                 path = %body_path.display(),
                 "cache body missing on disk"
             );
-            if self.state.remove_entry_if_id_matches(&key_base, entry.id) {
+            if self
+                .state
+                .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
+            {
                 self.state
                     .remove_entry_files_for_entry_id_async(&entry.entry_id)
                     .await;
@@ -340,9 +341,8 @@ impl HttpCache {
         req_headers: &HeaderMap,
         resp_headers: &HeaderMap,
     ) -> Result<Option<CacheStream>> {
-        let key_base = format!("{}::{}", method, uri);
-        let entry_id = entry_id_for_key(&key_base);
-        let vary_headers = match self.extract_vary_headers(resp_headers, req_headers) {
+        let cache_key = CacheKey::new(method, uri);
+        let vary = match VaryKey::from_response(resp_headers, req_headers) {
             Some(map) => map,
             None => {
                 trace!("skipping cache due to Vary header limits");
@@ -368,9 +368,8 @@ impl HttpCache {
             temp_path,
             state: self.state.clone(),
             current_size: 0,
-            key_base,
-            entry_id,
-            vary_headers,
+            key: cache_key,
+            vary,
             discard: false,
         }))
     }
@@ -396,59 +395,6 @@ impl HttpCache {
 
     fn get_body_path(&self, entry_id: &str) -> PathBuf {
         self.state.body_path(entry_id)
-    }
-
-    fn extract_vary_headers(
-        &self,
-        resp_headers: &HeaderMap,
-        req_headers: &HeaderMap,
-    ) -> Option<HeaderMap> {
-        let mut vary_map = HeaderMap::new();
-        let mut vary_bytes = 0usize;
-        for value in resp_headers.get_all(http::header::VARY) {
-            if let Ok(s) = value.to_str() {
-                for header_name in s.split(',') {
-                    let header_name = header_name.trim();
-                    if header_name == "*" {
-                        // RFC: Vary:* response is not cacheable.
-                        return None;
-                    }
-                    if let Ok(hdr) = http::header::HeaderName::from_bytes(header_name.as_bytes()) {
-                        let req_val = match req_headers.get(&hdr) {
-                            Some(val) => val,
-                            None => {
-                                // If the request didn't supply a header named in Vary, the
-                                // response representation cannot be cached safely.
-                                return None;
-                            }
-                        };
-                        if vary_map.len() + 1 > MAX_VARY_HEADERS {
-                            return None;
-                        }
-                        let added_bytes = hdr.as_str().len() + req_val.as_bytes().len();
-                        if vary_bytes.saturating_add(added_bytes) > MAX_VARY_BYTES {
-                            return None;
-                        }
-                        vary_bytes += added_bytes;
-                        vary_map.insert(hdr, req_val.clone());
-                    }
-                }
-            }
-        }
-        Some(vary_map)
-    }
-
-    fn vary_matches(&self, stored_vary: &HeaderMap, req_headers: &HeaderMap) -> bool {
-        for (name, value) in stored_vary.iter() {
-            if let Some(req_value) = req_headers.get(name) {
-                if req_value != value {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        true
     }
 }
 
@@ -567,7 +513,8 @@ impl CacheState {
             }
         };
 
-        let entry_id = entry_id_for_key(&persisted.key_base);
+        let key = CacheKey::from_key_base(persisted.key_base.clone());
+        let entry_id = key.entry_id();
         let file_stem = meta_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         if entry_id != file_stem {
             warn!(
@@ -595,7 +542,7 @@ impl CacheState {
             return Ok(None);
         }
 
-        let body_path = self.body_path(&entry_id);
+        let body_path = self.body_path(entry_id);
         if !body_path.exists() {
             self.remove_entry_files_from_meta(meta_path);
             return Ok(None);
@@ -624,21 +571,22 @@ impl CacheState {
 
         let headers = to_headermap(&persisted.headers);
         let vary_headers = to_headermap(&persisted.vary_headers);
+        let vary = VaryKey::new(vary_headers);
 
         let entry = CacheEntry {
             id: self.next_entry_id(),
             status: StatusCode::from_u16(persisted.status).unwrap_or(StatusCode::OK),
             headers,
-            vary_headers,
+            vary,
             expires_at,
-            entry_id: entry_id.clone(),
+            entry_id: entry_id.to_string(),
             content_hash: persisted.content_hash.clone(),
             content_length: persisted.content_length,
         };
 
-        let evicted = self.insert_entry(persisted.key_base.clone(), entry);
+        let evicted = self.insert_entry(key.key_base().to_string(), entry);
         self.remove_evicted_files(evicted);
-        Ok(Some(entry_id))
+        Ok(Some(entry_id.to_string()))
     }
 
     fn remove_entry_files_from_meta(&self, meta_path: &Path) {
@@ -800,7 +748,7 @@ impl CacheStream {
 
         let hash = self.hasher.finalize();
         let content_hash = hash.to_hex().to_string();
-        let final_path = self.state.body_path(&self.entry_id);
+        let final_path = self.state.body_path(self.key.entry_id());
         let shard_dir = final_path
             .parent()
             .map(|path| path.to_path_buf())
@@ -815,18 +763,18 @@ impl CacheStream {
             id: self.state.next_entry_id(),
             status,
             headers,
-            vary_headers: self.vary_headers.clone(),
+            vary: self.vary.clone(),
             expires_at: SystemTime::now() + ttl,
-            entry_id: self.entry_id.clone(),
+            entry_id: self.key.entry_id().to_string(),
             content_hash,
             content_length: self.current_size,
         };
 
         let persisted = PersistedEntry {
-            key_base: self.key_base.clone(),
+            key_base: self.key.key_base().to_string(),
             status: status.as_u16(),
             headers: headermap_to_vec(&entry.headers),
-            vary_headers: headermap_to_vec(&entry.vary_headers),
+            vary_headers: headermap_to_vec(entry.vary.headers()),
             expires_at: entry
                 .expires_at
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -838,7 +786,7 @@ impl CacheStream {
 
         if let Err(err) = self
             .state
-            .write_metadata_async(&self.entry_id, &persisted)
+            .write_metadata_async(self.key.entry_id(), &persisted)
             .await
         {
             warn!("failed to write cache metadata: {}", err);
@@ -851,8 +799,10 @@ impl CacheStream {
             return Ok(());
         }
 
-        let evicted = self.state.insert_entry(self.key_base.clone(), entry);
-        trace!("stored cache entry for {}", self.key_base);
+        let evicted = self
+            .state
+            .insert_entry(self.key.key_base().to_string(), entry);
+        trace!("stored cache entry for {}", self.key.key_base());
 
         self.state.remove_evicted_files_async(evicted).await;
 
@@ -1001,7 +951,7 @@ mod tests {
         let body_mode = fs::metadata(&hit.body_path)?.permissions().mode() & 0o777;
         assert_eq!(body_mode, 0o600);
 
-        let entry_id = entry_id_for_key(&format!("{}::{}", method, uri));
+        let entry_id = CacheKey::new(&method, &uri).entry_id().to_string();
         let meta_path = cache.state.meta_path(&entry_id);
         let meta_mode = fs::metadata(&meta_path)?.permissions().mode() & 0o777;
         assert_eq!(meta_mode, 0o600);
@@ -1064,8 +1014,7 @@ mod tests {
             )
             .await?;
 
-        let key_base = format!("{}::{}", method, uri);
-        let entry_id = entry_id_for_key(&key_base);
+        let entry_id = CacheKey::new(&method, &uri).entry_id().to_string();
         let body_path = cache.state.store.body_path(&entry_id);
         let meta_path = cache.state.store.meta_path(&entry_id);
 
@@ -1297,7 +1246,7 @@ mod tests {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
         let key_base = "GET::http://example.com:80/".to_string();
-        let entry_id = entry_id_for_key(&key_base);
+        let entry_id = CacheKey::entry_id_for_key(&key_base);
         let versioned_dir = cache_version_dir(&disk_dir);
         let shard_dir = versioned_dir.join(&entry_id[0..2]).join(&entry_id[2..4]);
         fs::create_dir_all(&shard_dir)?;
@@ -1432,8 +1381,7 @@ mod tests {
             .await?;
 
         std::thread::sleep(Duration::from_millis(5));
-        let key_base = format!("{}::{}", method, uri);
-        let entry_id = entry_id_for_key(&key_base);
+        let entry_id = CacheKey::new(&method, &uri).entry_id().to_string();
         let body_path = cache.state.body_path(&entry_id);
         assert!(body_path.exists(), "expected cached body to exist");
 
@@ -1742,7 +1690,7 @@ mod tests {
         let method = Method::GET;
         let uri = build_uri("example.com", 80, "/vary-bytes");
         let mut req_headers = HeaderMap::new();
-        let large_value = "x".repeat(MAX_VARY_BYTES + 1);
+        let large_value = "x".repeat(super::key::MAX_VARY_BYTES + 1);
         req_headers.insert("user-agent", large_value.parse().unwrap());
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert(http::header::VARY, "User-Agent".parse().unwrap());
