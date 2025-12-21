@@ -24,15 +24,31 @@ pub(super) fn sanitize_request(
     request: http::Request<RecvStream>,
     max_header_bytes: usize,
 ) -> Result<(SanitizedRequest, RecvStream)> {
+    let sanitized = sanitize_request_parts(
+        request.method(),
+        request.uri(),
+        request.headers(),
+        max_header_bytes,
+    )?;
+    let body = request.into_body();
+
+    Ok((sanitized, body))
+}
+
+fn sanitize_request_parts(
+    method: &http::Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    max_header_bytes: usize,
+) -> Result<SanitizedRequest> {
     ensure!(
         max_header_bytes > 0,
         "configured header limit must be greater than zero"
     );
 
-    reject_expect_header(request.headers())?;
+    reject_expect_header(headers)?;
 
-    let uri = request.uri().clone();
-    let parsed = parse_uri_request(request.method().clone(), &uri, Scheme::Https)?;
+    let parsed = parse_uri_request(method.clone(), uri, Scheme::Https)?;
 
     let mut forward_headers = Vec::new();
     let mut sanitizer = RequestHeaderSanitizer::new(max_header_bytes);
@@ -47,7 +63,7 @@ pub(super) fn sanitize_request(
     let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     sanitizer
-        .record_name_value(":method", request.method().as_str())
+        .record_name_value(":method", method.as_str())
         .context("invalid :method pseudo header")?;
     sanitizer
         .record_name_value(":scheme", scheme)
@@ -59,7 +75,7 @@ pub(super) fn sanitize_request(
         .record_name_value(":path", path)
         .context("invalid :path pseudo header")?;
 
-    for (name, value) in request.headers().iter() {
+    for (name, value) in headers.iter() {
         let name_str = name.as_str();
         let lower = name_str.to_ascii_lowercase();
         let value_str = value
@@ -80,17 +96,24 @@ pub(super) fn sanitize_request(
     }
 
     let request_line_bytes = (parsed.method.as_str().len() + parsed.path.len()) as u64;
-    let body = request.into_body();
 
-    Ok((
-        SanitizedRequest {
-            parsed,
-            forward_headers,
-            header_bytes: sanitizer.total_bytes(),
-            request_line_bytes,
-        },
-        body,
-    ))
+    Ok(SanitizedRequest {
+        parsed,
+        forward_headers,
+        header_bytes: sanitizer.total_bytes(),
+        request_line_bytes,
+    })
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn sanitize_request_for_fuzz(
+    method: &http::Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    max_header_bytes: usize,
+) -> Result<()> {
+    let _ = sanitize_request_parts(method, uri, headers, max_header_bytes)?;
+    Ok(())
 }
 
 pub(super) fn reject_expect_header(headers: &HeaderMap) -> Result<()> {

@@ -1,0 +1,44 @@
+[package]
+name = "exfilguard-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1.48", features = ["rt", "time", "io-util"] }
+exfilguard = { path = "..", features = ["fuzzing"] }
+http = "1.3"
+
+[[bin]]
+name = "http1_request_head"
+path = "fuzz_targets/http1_request_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http1_chunked_body"
+path = "fuzz_targets/http1_chunked_body.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "connect_target"
+path = "fuzz_targets/connect_target.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http1_response_head"
+path = "fuzz_targets/http1_response_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http2_request_sanitize"
+path = "fuzz_targets/http2_request_sanitize.rs"
+test = false
+doc = false

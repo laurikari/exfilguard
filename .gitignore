@@ -1,4 +1,7 @@
 .DS_Store
 /target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
 *.asc
 *.gpg

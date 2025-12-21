@@ -195,6 +195,24 @@ and store the CA on trusted disks.
   cargo test
   ```
 
+### Fuzzing
+
+ExfilGuard fuzzes critical untrusted input paths (HTTP/1 request/response
+parsing, chunked bodies, HTTP/2 request sanitization, CONNECT targets). Targets
+live under `fuzz/fuzz_targets/`.
+
+Run a target:
+
+```shell
+cargo fuzz run http1_request_head
+```
+
+Parallel workers example:
+
+```shell
+cargo fuzz run http1_request_head -- -jobs=8 -workers=8
+```
+
 ### Developer ergonomics
 
 - Install the pre-commit hook to enforce formatting locally:

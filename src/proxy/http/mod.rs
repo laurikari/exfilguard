@@ -11,6 +11,55 @@ pub(crate) use codec::{HeaderAccumulator, HeaderLine, ResponseHead};
 pub use pipeline::{respond_with_access_log, send_response, shutdown_stream};
 pub use server::{handle_decrypted_https, handle_http};
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use tokio::io::{AsyncRead, BufReader};
+
+    pub use super::body::stream_chunked_body;
+
+    pub async fn parse_http1_request_head<S>(
+        reader: &mut BufReader<S>,
+        peer: SocketAddr,
+        timeout: Duration,
+        max_header_bytes: usize,
+    ) -> Result<()>
+    where
+        S: AsyncRead + Unpin,
+    {
+        if let Some(head) =
+            super::codec::read_request_head(reader, peer, timeout, max_header_bytes).await?
+        {
+            let host = head.headers.host();
+            let _ = crate::proxy::request::parse_http1_request(
+                head.method.clone(),
+                &head.target,
+                host,
+                crate::config::Scheme::Http,
+            );
+            let _ = head.headers.expect_continue();
+            let _ = head.headers.content_length();
+        }
+        Ok(())
+    }
+
+    pub async fn parse_http1_response_head<S>(
+        reader: &mut BufReader<S>,
+        timeout: Duration,
+        peer: SocketAddr,
+        max_header_bytes: usize,
+    ) -> Result<()>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let _ = super::codec::read_response_head(reader, timeout, peer, max_header_bytes).await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::proxy::request::parse_http1_request;
