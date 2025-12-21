@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use http::{HeaderMap, Method, StatusCode, Version};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::{
@@ -155,8 +156,9 @@ where
     S: AsyncRead + Unpin,
 {
     let request_line_limit = max_header_bytes;
+    let deadline = Instant::now() + timeout;
     let Some((request_line, request_line_bytes)) =
-        read_request_line(reader, peer, timeout, request_line_limit).await?
+        read_request_line(reader, peer, deadline, request_line_limit).await?
     else {
         debug!(peer = %peer, "connection closed before request line");
         return Ok(None);
@@ -193,7 +195,7 @@ where
     loop {
         header_line.clear();
         let read =
-            read_line_with_timeout(reader, &mut header_line, timeout, peer, remaining).await?;
+            read_line_with_deadline(reader, &mut header_line, deadline, peer, remaining).await?;
         if read == 0 {
             break;
         }
@@ -218,7 +220,7 @@ where
 pub async fn read_request_line<S>(
     reader: &mut BufReader<S>,
     peer: SocketAddr,
-    timeout_dur: Duration,
+    deadline: Instant,
     max_len: usize,
 ) -> Result<Option<(String, usize)>>
 where
@@ -230,14 +232,12 @@ where
 
     let mut line = Vec::new();
     let mut total = 0usize;
+    let context = format!("reading request line from {peer}");
 
     loop {
-        let available = timeout_with_context(
-            timeout_dur,
-            reader.fill_buf(),
-            format!("reading request line from {peer}"),
-        )
-        .await?;
+        let remaining = remaining_deadline(deadline, &context)?;
+        let available =
+            timeout_with_context(remaining, reader.fill_buf(), context.as_str()).await?;
 
         if available.is_empty() {
             if line.is_empty() {
@@ -274,6 +274,60 @@ where
     }
 
     Ok(Some((string, total)))
+}
+
+pub async fn read_line_with_deadline<S>(
+    reader: &mut BufReader<S>,
+    buf: &mut String,
+    deadline: Instant,
+    peer: SocketAddr,
+    max_len: usize,
+) -> Result<usize>
+where
+    S: AsyncRead + Unpin,
+{
+    ensure!(max_len > 0, "line length limit must be greater than zero");
+    buf.clear();
+    let mut collected = Vec::new();
+    let context = format!("reading line from {peer}");
+
+    loop {
+        let remaining = remaining_deadline(deadline, &context)?;
+        let available =
+            timeout_with_context(remaining, reader.fill_buf(), context.as_str()).await?;
+
+        if available.is_empty() {
+            if collected.is_empty() {
+                return Ok(0);
+            }
+            bail!("connection closed while reading line from {peer}");
+        }
+
+        let newline_pos = available.iter().position(|byte| *byte == b'\n');
+        let consume = newline_pos.map(|idx| idx + 1).unwrap_or(available.len());
+
+        if collected
+            .len()
+            .checked_add(consume)
+            .ok_or_else(|| anyhow!("line length overflow for {peer}"))?
+            > max_len
+        {
+            bail!("line from {peer} exceeds configured limit of {max_len} bytes");
+        }
+
+        collected.extend_from_slice(&available[..consume]);
+        reader.consume(consume);
+
+        if newline_pos.is_some() {
+            break;
+        }
+    }
+
+    let string = String::from_utf8(collected)
+        .map_err(|_| anyhow!("line from {peer} contained invalid bytes"))?;
+    let len = string.len();
+    *buf = string;
+    Ok(len)
 }
 
 pub async fn read_line_with_timeout<S>(
@@ -330,6 +384,12 @@ where
     let len = string.len();
     *buf = string;
     Ok(len)
+}
+
+fn remaining_deadline(deadline: Instant, context: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("timed out {context}"))
 }
 
 #[derive(Clone, Copy)]
@@ -725,7 +785,9 @@ pub(crate) fn parse_status_line(value: &str) -> Result<(Version, StatusCode, Str
 mod tests {
     use super::*;
     use anyhow::Result;
+    use std::net::SocketAddr;
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
@@ -835,6 +897,37 @@ mod tests {
             err.to_string().contains("unsupported Expect"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_request_head_times_out_on_partial_line() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            read_request_head(&mut reader, peer, Duration::from_millis(50), 1024).await
+        });
+
+        tokio::task::yield_now().await;
+        client
+            .write_all(b"GET / HTTP/1.1")
+            .await
+            .expect("write partial line");
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        let result = handle.await.expect("request head join");
+        match result {
+            Ok(_) => panic!("expected timeout on partial line"),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("timed out"),
+                    "unexpected error: {err}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
