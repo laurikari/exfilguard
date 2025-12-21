@@ -1,5 +1,4 @@
 mod body;
-mod cache_decision;
 mod codec;
 mod dispatch;
 mod forward;
@@ -8,6 +7,7 @@ mod server;
 pub mod upstream;
 
 pub use body::BodyTooLarge;
+pub(crate) use codec::{HeaderAccumulator, HeaderLine, ResponseHead};
 pub use pipeline::{respond_with_access_log, send_response, shutdown_stream};
 pub use server::{handle_decrypted_https, handle_http};
 

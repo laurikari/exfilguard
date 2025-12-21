@@ -1,15 +1,10 @@
 use std::time::Duration;
 
-use http::{HeaderMap, Method, StatusCode, Uri};
+use http::{HeaderMap, Method, StatusCode};
 
 use crate::proxy::http::cache_control::{get_freshness_lifetime, is_cacheable};
 
-#[derive(Debug)]
-pub(crate) struct CacheRequestContext {
-    pub uri: Uri,
-    pub headers: HeaderMap,
-    pub bypass: bool,
-}
+use super::CacheRequestContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheSkipReason {

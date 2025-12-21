@@ -1,13 +1,18 @@
 use anyhow::Result;
-use http::HeaderMap;
+use http::{HeaderMap, Uri};
 
-use crate::proxy::cache::CacheRequestContext;
+use crate::proxy::http::cache_control::request_cache_bypass;
+use crate::proxy::http::{HeaderAccumulator, HeaderLine};
 use crate::proxy::request::ParsedRequest;
 
-use super::cache_control::request_cache_bypass;
-use super::codec::{HeaderAccumulator, HeaderLine};
+#[derive(Debug)]
+pub(crate) struct CacheRequestContext {
+    pub uri: Uri,
+    pub headers: HeaderMap,
+    pub bypass: bool,
+}
 
-pub(super) fn build_cache_request_context(
+pub(crate) fn build_cache_request_context(
     request: &ParsedRequest,
     headers: &HeaderAccumulator,
 ) -> Result<CacheRequestContext> {
@@ -21,7 +26,7 @@ pub(super) fn build_cache_request_context(
     })
 }
 
-pub(super) fn header_lines_to_map<'a, I>(headers: I) -> HeaderMap
+pub(crate) fn header_lines_to_map<'a, I>(headers: I) -> HeaderMap
 where
     I: Iterator<Item = &'a HeaderLine>,
 {

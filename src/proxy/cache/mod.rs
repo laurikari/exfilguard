@@ -16,21 +16,23 @@ mod admission;
 mod entry;
 mod index;
 mod key;
+mod lookup;
 mod maintenance;
 mod reader;
+mod request;
 mod store;
 mod writer;
 
-pub(crate) use admission::{
-    CacheRequestContext, CacheSkipReason, CacheStorePlan, CacheWritePlan, plan_cache_write,
-};
+pub(crate) use admission::{CacheSkipReason, CacheStorePlan, CacheWritePlan, plan_cache_write};
 use entry::{CacheEntry, PersistedEntry};
 use index::CacheIndex;
 use key::{CacheKey, VaryKey};
+pub(crate) use lookup::CacheLookupOutcome;
 #[cfg(test)]
 use maintenance::cache_version_dir;
 use maintenance::{prepare_versioned_cache_dir, spawn_cache_dir_cleanup, spawn_cache_sweeper};
 use reader::CacheReader;
+pub(crate) use request::{CacheRequestContext, build_cache_request_context, header_lines_to_map};
 use store::CacheStore;
 pub(super) use writer::CacheWriter;
 

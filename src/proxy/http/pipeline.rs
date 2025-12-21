@@ -26,12 +26,12 @@ use crate::{
 };
 
 use super::body::BodyPlan;
-use super::cache_decision::build_cache_request_context;
-use super::codec::{ConnectionDirective, HeaderAccumulator, ResponseHead, encode_cached_response};
+use super::codec::{ConnectionDirective, HeaderAccumulator, encode_cached_response};
 use super::forward::{
     ForwardResult, ForwardTimeouts, determine_response_body_plan, forward_to_upstream,
 };
 use super::upstream::UpstreamPool;
+use crate::proxy::cache::CacheLookupOutcome;
 
 pub enum ClientDisposition {
     Continue,
@@ -242,77 +242,22 @@ where
 
         // Try Cache Lookup
         let mut cache_lookup = Some("bypass");
-        if let (Some(_cache_config), Some(cache)) = (&decision.cache, &self.app.cache)
-            && !self.headers.has_sensitive_cache_headers()
-        {
-            let cache_request = match build_cache_request_context(self.parsed, &self.headers) {
-                Ok(context) => Some(context),
-                Err(err) => {
-                    debug!(peer = %self.peer, error = %err, "skipping cache lookup due to URI build failure");
-                    None
-                }
-            };
-
-            if let Some(cache_request) = cache_request
-                && !cache_request.bypass
-            {
-                if let Some(cached) = cache
-                    .lookup(
-                        &self.parsed.method,
-                        &cache_request.uri,
-                        &cache_request.headers,
-                    )
-                    .await
-                {
+        if let (Some(_cache_config), Some(cache)) = (&decision.cache, &self.app.cache) {
+            match cache.lookup_for_request(self.parsed, &self.headers).await {
+                Ok(CacheLookupOutcome::Hit(hit)) => {
                     // Serve from cache
                     let client_stream = self.reader.get_mut();
+                    let hit = *hit;
+                    let cached = hit.cached;
+                    let head = hit.head;
 
-                    let status_line = format!(
-                        "HTTP/1.1 {} {}",
-                        cached.status.as_u16(),
-                        cached.status.canonical_reason().unwrap_or("OK")
-                    );
-
-                    let mut transfer_encoding_present = false;
-                    let mut chunked = false;
-                    for value in cached
-                        .headers
-                        .get_all(http::header::TRANSFER_ENCODING)
-                        .iter()
-                    {
-                        transfer_encoding_present = true;
-                        if value
-                            .to_str()
-                            .ok()
-                            .map(|s| s.to_ascii_lowercase().contains("chunked"))
-                            .unwrap_or(false)
-                        {
-                            chunked = true;
-                        }
-                    }
-                    let has_content_length =
-                        cached.headers.contains_key(http::header::CONTENT_LENGTH);
-                    let content_length = if transfer_encoding_present || !has_content_length {
-                        None
-                    } else {
-                        Some(cached.content_length)
-                    };
-                    let head = ResponseHead {
-                        status_line: status_line.clone(),
-                        status: cached.status,
-                        headers: Vec::new(),
-                        content_length,
-                        chunked,
-                        transfer_encoding_present,
-                        connection_close: true,
-                    };
                     let body_plan =
                         determine_response_body_plan(&self.parsed.method, cached.status, &head);
                     let encoded_head = encode_cached_response(
-                        &status_line,
+                        &head.status_line,
                         &cached.headers,
                         body_plan,
-                        content_length,
+                        head.content_length,
                         Some(ConnectionDirective::Close),
                     );
                     write_all_with_timeout(
@@ -357,8 +302,17 @@ where
 
                     return Ok(ClientDisposition::Close);
                 }
-
-                cache_lookup = Some("miss");
+                Ok(CacheLookupOutcome::Miss) => {
+                    cache_lookup = Some("miss");
+                }
+                Ok(CacheLookupOutcome::Bypass) => {}
+                Err(err) => {
+                    debug!(
+                        peer = %self.peer,
+                        error = %err,
+                        "skipping cache lookup due to URI build failure"
+                    );
+                }
             }
         }
 

@@ -22,9 +22,9 @@ use super::body::{
     BodyPlan, relay_chunked_body, relay_fixed_body, relay_until_close, stream_chunked_body,
     stream_fixed_body,
 };
-use super::cache_decision::{build_cache_request_context, header_lines_to_map};
 use super::codec::{ConnectionDirective, HeaderAccumulator, ResponseHead, read_response_head};
 use super::upstream::{UpstreamConnection, UpstreamKey, UpstreamPool};
+use crate::proxy::cache::{build_cache_request_context, header_lines_to_map};
 
 pub struct ForwardTimeouts {
     pub connect: Duration,
