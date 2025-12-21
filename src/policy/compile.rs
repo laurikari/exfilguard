@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use ipnet::IpNet;
 use regex::Regex;
 
 use crate::config::{
@@ -62,29 +62,23 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         .iter()
         .position(|client| client.catch_all)
         .expect("validate_clients guarantees a catch-all client");
-    let (ip_clients, cidr_trie) = build_client_maps(&config.clients)?;
+    let cidr_trie = build_client_trie(&config.clients);
 
     Ok(CompiledConfig {
         clients: compiled_clients,
         policies: Arc::from(policies.into_boxed_slice()),
-        ip_clients,
         cidr_trie,
         default_client: catch_all_index,
     })
 }
 
-fn build_client_maps(clients: &[Client]) -> Result<(HashMap<IpAddr, usize>, CidrTrie)> {
-    let mut ip_clients: HashMap<IpAddr, usize> = HashMap::new();
+fn build_client_trie(clients: &[Client]) -> CidrTrie {
     let mut cidr_trie = CidrTrie::new();
 
     for (index, client) in clients.iter().enumerate() {
         match &client.selector {
             ClientSelector::Ip(addr) => {
-                let prev = ip_clients.insert(*addr, index);
-                debug_assert!(
-                    prev.is_none(),
-                    "validate_clients should prevent duplicate IP claims"
-                );
+                cidr_trie.insert(IpNet::from(*addr), index);
             }
             ClientSelector::Cidr(net) => {
                 cidr_trie.insert(*net, index);
@@ -92,7 +86,7 @@ fn build_client_maps(clients: &[Client]) -> Result<(HashMap<IpAddr, usize>, Cidr
         }
     }
 
-    Ok((ip_clients, cidr_trie))
+    cidr_trie
 }
 
 fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {

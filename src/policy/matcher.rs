@@ -51,12 +51,6 @@ impl PolicySnapshot {
 
     pub fn resolve_client(&self, addr: IpAddr) -> Option<&ClientEntry> {
         let addr = normalize_peer_ip(addr);
-        if let Some(index) = self.compiled.ip_clients.get(&addr)
-            && let Some(client) = self.compiled.clients.get(*index)
-        {
-            return Some(client);
-        }
-
         if let Some(index) = self.compiled.cidr_trie.find(addr)
             && let Some(client) = self.compiled.clients.get(index)
         {

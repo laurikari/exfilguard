@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -14,7 +13,6 @@ use crate::config::{RuleAction, Scheme};
 pub struct CompiledConfig {
     pub clients: Vec<ClientEntry>,
     pub policies: Arc<[Arc<CompiledPolicy>]>,
-    pub ip_clients: HashMap<IpAddr, usize>,
     pub cidr_trie: CidrTrie,
     pub default_client: usize,
 }
