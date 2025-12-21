@@ -1,19 +1,19 @@
 # ExfilGuard clients configuration
 #
-# Clients map source IP ranges to policies. When a connection arrives,
-# the most specific matching client (by CIDR) determines which policies apply.
+# Clients map source IPs to policies. Selectors must not overlap; if none match,
+# the fallback client determines which policies apply.
 #
 # Recommended: Add your clients in /etc/exfilguard/clients.d/*.toml
 # rather than editing this file, so package upgrades don't conflict.
 #
 # See https://laurikari.github.io/exfilguard/configuration/ for full documentation.
 
-# Default catch-all denies all traffic. Add specific client rules above this.
+# Default fallback denies all traffic. Add specific client rules above this.
 [[client]]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["deny-all"]
-catch_all = true
+fallback = true
 
 # Example: Allow specific subnet with custom policies (uncomment to enable)
 # [[client]]

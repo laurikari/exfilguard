@@ -57,18 +57,18 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         });
     }
 
-    let catch_all_index = config
+    let fallback_index = config
         .clients
         .iter()
-        .position(|client| client.catch_all)
-        .expect("validate_clients guarantees a catch-all client");
+        .position(|client| client.fallback)
+        .expect("validate_clients guarantees a fallback client");
     let cidr_trie = build_client_trie(&config.clients);
 
     Ok(CompiledConfig {
         clients: compiled_clients,
         policies: Arc::from(policies.into_boxed_slice()),
         cidr_trie,
-        default_client: catch_all_index,
+        fallback_client: fallback_index,
     })
 }
 
@@ -291,7 +291,7 @@ mod tests {
                 vec![Arc::<str>::from("allow-api"), Arc::<str>::from("deny-all")]
                     .into_boxed_slice(),
             ),
-            catch_all: true,
+            fallback: true,
         }];
 
         let policies = vec![
@@ -331,13 +331,13 @@ mod tests {
                 name: Arc::<str>::from("a"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
-                catch_all: false,
+                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("b"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
-                catch_all: false,
+                fallback: false,
             },
         ];
         let config = Config { clients, policies };
@@ -356,13 +356,13 @@ mod tests {
                 name: Arc::<str>::from("finance"),
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
-                catch_all: false,
+                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("ops"),
                 selector: ClientSelector::Cidr("10.10.1.128/25".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
-                catch_all: false,
+                fallback: false,
             },
         ];
         let config = Config { clients, policies };
@@ -378,13 +378,13 @@ mod tests {
                 name: Arc::<str>::from("range"),
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
-                catch_all: false,
+                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("pin"),
                 selector: ClientSelector::Ip("10.10.1.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
-                catch_all: false,
+                fallback: false,
             },
         ];
         let config = Config { clients, policies };

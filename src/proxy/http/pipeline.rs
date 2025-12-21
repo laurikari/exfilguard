@@ -585,7 +585,7 @@ mod tests {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 "#,
         )?;
 

@@ -101,7 +101,7 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["cache-test"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -176,7 +176,7 @@ async fn test_cache_hit_avoids_upstream() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["cache-test"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -258,7 +258,7 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["cache-test"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(

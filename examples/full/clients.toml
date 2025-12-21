@@ -24,11 +24,11 @@ policies = [
   "fallback-egress-deny",
 ]
 
-# Fallback catch-all for anything not mapped above.
+# Fallback for anything not mapped above.
 [[client]]
-name = "catch-all"
+name = "fallback"
 cidr = "0.0.0.0/0"
 policies = [
   "fallback-egress-deny",
 ]
-catch_all = true
+fallback = true

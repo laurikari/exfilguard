@@ -345,7 +345,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
-            catch_all: true,
+            fallback: true,
         }];
         let config = Config {
             clients,

@@ -14,7 +14,7 @@ pub struct CompiledConfig {
     pub clients: Vec<ClientEntry>,
     pub policies: Arc<[Arc<CompiledPolicy>]>,
     pub cidr_trie: CidrTrie,
-    pub default_client: usize,
+    pub fallback_client: usize,
 }
 
 #[derive(Debug, Clone)]

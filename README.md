@@ -148,10 +148,11 @@ The loader aborts if the inspection settings are inconsistent (for example:
 
 ### Policy evaluation
 
-1. ExfilGuard maps the request's downstream address to a client: exact IP, then
-   CIDR, then the `catch_all` client.
-2. It evaluates that client's policies in-order; the first matching rule wins.
-3. Rules that disable inspection still use the same logging path—they simply skip
+1. ExfilGuard maps the request's downstream address to a client. Non-fallback
+   selectors must not overlap, so the match is unambiguous.
+2. If no selector matches, the `fallback` client is used.
+3. It evaluates that client's policies in-order; the first matching rule wins.
+4. Rules that disable inspection still use the same logging path—they simply skip
    the TLS bump step and stream bytes once allowed.
 
 ## Configuration Basics
@@ -164,11 +165,11 @@ The loader aborts if the inspection settings are inconsistent (for example:
   `.toml` file in those directories loads in alphabetical order after the base
   file. Names must be unique across all files.
 
-### Catch-all client
+### Fallback client
 
-Exactly one client must set `catch_all = true`. That client handles requests that
+Exactly one client must set `fallback = true`. That client handles requests that
 do not match any specific IP or CIDR. Config loading fails if zero or multiple
-catch-all clients exist.
+fallback clients exist.
 
 ## Certificate storage and permissions
 

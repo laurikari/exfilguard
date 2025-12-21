@@ -14,7 +14,7 @@ cidr = "fd00:1234::/48"
 policies = ["allow-rfc4193"]
 
 [[client]]
-name = "catch-all"
+name = "fallback"
 cidr = "::/0"
 policies = ["deny-loopback"]
-catch_all = true
+fallback = true

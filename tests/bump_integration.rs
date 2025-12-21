@@ -39,7 +39,7 @@ async fn http_default_deny_returns_403() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-listed"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = r#"[[policy]]
@@ -82,7 +82,7 @@ async fn http_private_ip_blocked_by_default() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-loopback"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = r#"[[policy]]
@@ -133,7 +133,7 @@ async fn http_upstream_failure_returns_502() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-local"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -203,7 +203,7 @@ async fn connect_splice_stays_open_past_timeout() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["connect-splice"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -277,7 +277,7 @@ async fn http_private_ip_allowed_with_flag() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-loopback"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -327,7 +327,7 @@ async fn http_explicit_deny_returns_configured_status() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["egress"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = r#"[[policy]]
@@ -377,7 +377,7 @@ async fn connect_default_deny_returns_403() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-listed"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = r#"[[policy]]
@@ -421,7 +421,7 @@ async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["connect"]
-catch_all = true
+fallback = true
 "#;
 
     let target_port = find_free_port()?;
@@ -474,7 +474,7 @@ async fn connect_splice_relays_payload() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-splice"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = r#"[[policy]]
@@ -554,7 +554,7 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-listed"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = r#"[[policy]]
@@ -603,7 +603,7 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-http"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -719,7 +719,7 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-bump"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -870,7 +870,7 @@ async fn connect_bump_relays_https_response() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-searchkit"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -1019,7 +1019,7 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-http1-only"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -1154,7 +1154,7 @@ async fn connect_bump_supports_http2() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-h2"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -1346,7 +1346,7 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["h2-policy"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(

@@ -46,7 +46,7 @@ async fn test_max_request_body_size_enforced() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow-upload"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -170,7 +170,7 @@ async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 "#;
 
     let policies = format!(
@@ -232,7 +232,7 @@ async fn test_client_idle_timeout() -> Result<()> {
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["dummy"]
-catch_all = true
+fallback = true
 "#;
     let policies = r#"
 [[policy]]

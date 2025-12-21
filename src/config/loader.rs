@@ -59,7 +59,7 @@ fn load_clients(path: &Path, dir: Option<&Path>, policies: &[Policy]) -> Result<
             ip,
             cidr,
             policies: policy_names,
-            catch_all,
+            fallback,
         } = client;
 
         if !seen_names.insert(name.clone()) {
@@ -99,7 +99,7 @@ fn load_clients(path: &Path, dir: Option<&Path>, policies: &[Policy]) -> Result<
             name: arc_name,
             selector,
             policies: Arc::from(policy_refs.into_boxed_slice()),
-            catch_all,
+            fallback,
         });
     }
 
@@ -486,7 +486,7 @@ struct RawClient {
     #[serde(default)]
     policies: Vec<String>,
     #[serde(default)]
-    catch_all: bool,
+    fallback: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -622,7 +622,7 @@ policies = ["allow"]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["deny"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -653,7 +653,7 @@ name = "allow"
 name = "test"
 ip = "127.0.0.1"
 policies = ["missing"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -676,7 +676,7 @@ name = "only"
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["deny"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -706,7 +706,7 @@ name = "deny"
 name = "a"
 ip = "10.0.0.5"
 policies = ["allow"]
-catch_all = true
+fallback = true
 
 [[client]]
 name = "b"
@@ -732,7 +732,7 @@ name = "allow"
 name = "finance"
 cidr = "10.10.1.0/24"
 policies = ["allow"]
-catch_all = false
+fallback = false
 
 [[client]]
 name = "ops"
@@ -743,7 +743,7 @@ policies = ["allow"]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -774,7 +774,7 @@ policies = ["allow"]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -789,13 +789,13 @@ name = "allow"
     }
 
     #[test]
-    fn catch_all_overlap_is_allowed_regardless_of_order() {
+    fn fallback_overlap_is_allowed_regardless_of_order() {
         let clients = write_temp(
             r#"[[client]]
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 
 [[client]]
 name = "finance"
@@ -821,7 +821,7 @@ name = "allow"
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["pass"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -848,7 +848,7 @@ name = "pass"
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["pass"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -875,7 +875,7 @@ name = "pass"
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 "#,
         );
         let clients_dir = TempDir::new().unwrap();
@@ -912,7 +912,7 @@ name = "allow"
 name = "default"
 cidr = "0.0.0.0/0"
 policies = ["allow"]
-catch_all = true
+fallback = true
 "#,
         );
         let policies = write_temp(

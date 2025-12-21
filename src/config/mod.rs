@@ -16,31 +16,31 @@ pub use model::{
 use crate::util::cidrs_overlap;
 
 /// Ensures that client selectors do not conflict (duplicate IPs or overlapping CIDRs except for the
-/// designated catch-all). This validation is shared by both the configuration loader and
+/// designated fallback). This validation is shared by both the configuration loader and
 /// the policy compiler so that hot reloads and programmatic configs get identical guarantees.
 pub fn validate_clients(clients: &[Client]) -> Result<()> {
     struct CidrClaim<'a> {
         name: &'a str,
         net: IpNet,
-        catch_all: bool,
+        fallback: bool,
     }
 
     struct IpClaim<'a> {
         name: &'a str,
-        catch_all: bool,
+        fallback: bool,
     }
 
-    let mut catch_all_seen = false;
+    let mut fallback_seen = false;
     let mut ip_claims: HashMap<IpAddr, IpClaim<'_>> = HashMap::new();
     let mut cidr_claims: Vec<CidrClaim<'_>> = Vec::new();
 
     for client in clients {
-        if client.catch_all {
+        if client.fallback {
             ensure!(
-                !catch_all_seen,
-                "multiple catch-all clients defined; exactly one client must set catch_all=true"
+                !fallback_seen,
+                "multiple fallback clients defined; exactly one client must set fallback=true"
             );
-            catch_all_seen = true;
+            fallback_seen = true;
         }
 
         match &client.selector {
@@ -49,7 +49,7 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                     *addr,
                     IpClaim {
                         name: client.name.as_ref(),
-                        catch_all: client.catch_all,
+                        fallback: client.fallback,
                     },
                 ) {
                     bail!(
@@ -60,7 +60,7 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                     );
                 }
                 for claim in &cidr_claims {
-                    if client.catch_all || claim.catch_all {
+                    if client.fallback || claim.fallback {
                         continue;
                     }
                     if claim.net.contains(addr) {
@@ -76,7 +76,7 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
             }
             ClientSelector::Cidr(net) => {
                 for claim in &cidr_claims {
-                    if client.catch_all || claim.catch_all {
+                    if client.fallback || claim.fallback {
                         continue;
                     }
                     if cidrs_overlap(&claim.net, net) {
@@ -90,7 +90,7 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                     }
                 }
                 for (addr, claim) in &ip_claims {
-                    if client.catch_all || claim.catch_all {
+                    if client.fallback || claim.fallback {
                         continue;
                     }
                     if net.contains(addr) {
@@ -106,15 +106,15 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                 cidr_claims.push(CidrClaim {
                     name: client.name.as_ref(),
                     net: *net,
-                    catch_all: client.catch_all,
+                    fallback: client.fallback,
                 });
             }
         }
     }
 
     ensure!(
-        catch_all_seen,
-        "exactly one client must set catch_all=true to act as the fallback"
+        fallback_seen,
+        "exactly one client must set fallback=true to act as the fallback"
     );
 
     Ok(())

@@ -16,22 +16,19 @@ Clients map source IP addresses to policies. Defined in `clients.toml` or files 
 | `ip` | String | One of ip/cidr | Single IP address (e.g., `"127.0.0.1"`, `"::1"`) |
 | `cidr` | String | One of ip/cidr | CIDR block (e.g., `"10.0.0.0/8"`, `"2001:db8::/32"`) |
 | `policies` | Array | Yes | List of policy names to apply in order |
-| `catch_all` | Boolean | No | Mark as fallback client (exactly one required) |
+| `fallback` | Boolean | No | Mark as fallback client (exactly one required) |
 
-### Matching Order
+### Matching
 
-When a request arrives, ExfilGuard determines the client by source IP:
-
-1. **Exact IP match** - Direct IP lookup (O(1))
-2. **CIDR match** - Longest prefix match using prefix trie
-3. **Catch-all** - Fallback client if no other match
+Client selectors must not overlap, so each source IP maps to at most one
+non-fallback client. If no selector matches, the fallback client is used.
 
 ### Validation Rules
 
 - Client names must be unique
 - Either `ip` or `cidr` must be specified, not both
-- Non-catch-all CIDRs must not overlap
-- Exactly one client must have `catch_all = true`
+- Non-fallback selectors must not overlap (IP vs IP, IP vs CIDR, CIDR vs CIDR)
+- Exactly one client must have `fallback = true`
 - All referenced policies must exist
 
 ### Example
@@ -55,12 +52,12 @@ name = "loopback"
 ip = "127.0.0.1"
 policies = ["local-allow"]
 
-# Catch-all: deny everything else
+# Fallback: deny everything else
 [[client]]
-name = "catch-all"
+name = "fallback"
 cidr = "0.0.0.0/0"
 policies = ["default-deny"]
-catch_all = true
+fallback = true
 ```
 
 ---
