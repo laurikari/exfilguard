@@ -81,7 +81,6 @@ impl CacheWriter {
 
         // Move temp file to final path
         async_fs::create_dir_all(&shard_dir).await?;
-        let _ = async_fs::remove_file(&final_path).await;
         async_fs::rename(&self.temp_path, &final_path).await?;
 
         let entry = CacheEntry {
