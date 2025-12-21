@@ -3,19 +3,20 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::{fs as async_fs, task};
-use tracing::{trace, warn};
+use tracing::trace;
 
 mod entry;
 mod index;
 mod key;
 mod maintenance;
+mod reader;
 mod store;
 mod writer;
 
@@ -25,6 +26,7 @@ use key::{CacheKey, VaryKey};
 #[cfg(test)]
 use maintenance::cache_version_dir;
 use maintenance::{prepare_versioned_cache_dir, spawn_cache_dir_cleanup, spawn_cache_sweeper};
+use reader::CacheReader;
 use store::CacheStore;
 pub(super) use writer::CacheWriter;
 
@@ -99,67 +101,9 @@ impl HttpCache {
         uri: &Uri,
         req_headers: &HeaderMap,
     ) -> Option<CachedResponse> {
-        let cache_key = CacheKey::new(method, uri);
-
-        let entry = {
-            let mut guard = self.state.index.lock();
-            guard.get(cache_key.key_base())
-        };
-
-        let entry = match entry {
-            Some(entry) => entry,
-            None => {
-                crate::metrics::record_cache_lookup(false);
-                return None;
-            }
-        };
-
-        if SystemTime::now() > entry.expires_at {
-            trace!("cache entry expired");
-            if self
-                .state
-                .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
-            {
-                self.state
-                    .remove_entry_files_for_entry_id_async(&entry.entry_id)
-                    .await;
-            }
-            crate::metrics::record_cache_lookup(false);
-            return None;
-        }
-
-        if !entry.vary.matches(req_headers) {
-            trace!("cache entry vary mismatch");
-            crate::metrics::record_cache_lookup(false);
-            return None;
-        }
-
-        let body_path = self.get_body_path(&entry.entry_id);
-        if let Err(err) = async_fs::metadata(&body_path).await {
-            warn!(
-                error = %err,
-                path = %body_path.display(),
-                "cache body missing on disk"
-            );
-            if self
-                .state
-                .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
-            {
-                self.state
-                    .remove_entry_files_for_entry_id_async(&entry.entry_id)
-                    .await;
-            }
-            crate::metrics::record_cache_lookup(false);
-            return None;
-        }
-
-        crate::metrics::record_cache_lookup(true);
-        Some(CachedResponse {
-            status: entry.status,
-            headers: entry.headers.clone(),
-            body_path,
-            content_length: entry.content_length,
-        })
+        CacheReader::new(self.state.clone())
+            .lookup(method, uri, req_headers)
+            .await
     }
 
     pub(super) async fn open_stream(
@@ -217,10 +161,6 @@ impl HttpCache {
         }
         Ok(())
     }
-
-    fn get_body_path(&self, entry_id: &str) -> PathBuf {
-        self.state.body_path(entry_id)
-    }
 }
 
 impl CacheState {
@@ -259,6 +199,7 @@ impl CacheState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     fn build_uri(host: &str, port: u16, path: &str) -> Uri {
