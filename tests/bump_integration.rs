@@ -143,7 +143,7 @@ name = "allow-local"
   action = "ALLOW"
   methods = ["GET"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#,
     );
 
@@ -213,7 +213,7 @@ name = "connect-splice"
   action = "ALLOW"
   methods = ["CONNECT"]
   inspect_payload = false
-  allow_private_connect = true
+  allow_private_upstream = true
   url_pattern = "https://127.0.0.1:{upstream_port}/**"
 "#,
     );
@@ -287,7 +287,7 @@ name = "allow-loopback"
   action = "ALLOW"
   methods = ["GET"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#
     );
 
@@ -484,7 +484,7 @@ name = "allow-splice"
   methods = ["CONNECT"]
   url_pattern = "https://localhost/**"
   inspect_payload = false
-  allow_private_connect = true
+  allow_private_upstream = true
 "#;
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_addr = upstream_listener.local_addr()?;
@@ -613,7 +613,7 @@ name = "allow-http"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "http://{host}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#,
         host = upstream_host
     );
@@ -729,7 +729,7 @@ name = "allow-bump"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "https://{host}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#,
         host = upstream_host
     );
@@ -880,7 +880,7 @@ name = "allow-searchkit"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "https://{host}/privacy-policy/"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#,
         host = upstream_host
     );
@@ -1029,7 +1029,7 @@ name = "allow-http1-only"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "https://{host}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#,
         host = upstream_host
     );
@@ -1164,7 +1164,7 @@ name = "allow-h2"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "https://{host}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "#,
         host = upstream_host
     );
@@ -1356,7 +1356,7 @@ name = "h2-policy"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://{host}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 
   [[policy.rule]]
   action = "DENY"

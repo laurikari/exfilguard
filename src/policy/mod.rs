@@ -14,7 +14,7 @@ pub enum Decision {
         policy: Arc<str>,
         rule: Arc<str>,
         inspect_payload: bool,
-        allow_private_connect: bool,
+        allow_private_upstream: bool,
         cache: Option<CompiledCacheConfig>,
     },
     Deny {

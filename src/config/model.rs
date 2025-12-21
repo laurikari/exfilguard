@@ -37,7 +37,7 @@ pub struct Rule {
     pub methods: MethodMatch,
     pub url_pattern: Option<UrlPattern>,
     pub inspect_payload: bool,
-    pub allow_private_connect: bool,
+    pub allow_private_upstream: bool,
     pub cache: Option<CacheConfig>,
 }
 

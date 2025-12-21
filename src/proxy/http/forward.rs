@@ -136,7 +136,7 @@ pub async fn forward_to_upstream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let key = UpstreamKey::from_request(request, decision.allow_private_connect);
+    let key = UpstreamKey::from_request(request, decision.allow_private_upstream);
     let request_close = headers.wants_connection_close();
     let (mut connection, reused_existing) = match pool.take(&key) {
         Some(conn) => {
@@ -156,7 +156,7 @@ where
                 app,
                 timeouts.connect,
                 connect_binding,
-                decision.allow_private_connect,
+                decision.allow_private_upstream,
             )
             .await?;
             crate::metrics::record_pool_reuse(false);

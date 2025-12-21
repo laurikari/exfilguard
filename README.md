@@ -140,7 +140,7 @@ name = "pinned-payments-egress"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/payments/**"
   inspect_payload = false
-  allow_private_connect = true
+  allow_private_upstream = true
 ```
 
 The loader aborts if the inspection settings are inconsistent (for example:

@@ -49,8 +49,8 @@ pub(super) struct UpstreamCheckout {
 }
 
 impl Http2Upstream {
-    fn reuse_forbidden(handle: &UpstreamHandle, allow_private_connect: bool) -> bool {
-        handle.is_private_peer && !allow_private_connect
+    fn reuse_forbidden(handle: &UpstreamHandle, allow_private_upstream: bool) -> bool {
+        handle.is_private_peer && !allow_private_upstream
     }
 
     pub(super) fn new(
@@ -68,19 +68,19 @@ impl Http2Upstream {
 
     pub(super) async fn checkout_sender(
         &mut self,
-        allow_private_connect: bool,
+        allow_private_upstream: bool,
         request: &ParsedRequest,
     ) -> Result<UpstreamCheckout> {
         if let Some(handle) = self.handle.as_ref() {
             ensure_request_matches(handle, request)?;
-            if Self::reuse_forbidden(handle, allow_private_connect) {
+            if Self::reuse_forbidden(handle, allow_private_upstream) {
                 self.shutdown().await;
             }
         }
 
         if self.handle.is_none() {
             let handle = self
-                .establish_connection(allow_private_connect, request)
+                .establish_connection(allow_private_upstream, request)
                 .await?;
             self.handle = Some(handle);
         }
@@ -96,7 +96,7 @@ impl Http2Upstream {
 
     async fn establish_connection(
         &mut self,
-        allow_private_connect: bool,
+        allow_private_upstream: bool,
         request: &ParsedRequest,
     ) -> Result<UpstreamHandle> {
         let port = request.port.unwrap_or(request.scheme.default_port());
@@ -133,8 +133,8 @@ impl Http2Upstream {
             port,
             self.binding.as_ref(),
             connect_timeout,
-            allow_private_connect,
-            "policy allow_private_connect permitted private upstream address",
+            allow_private_upstream,
+            "policy allow_private_upstream permitted private upstream address",
         )
         .await?;
         let (tcp_stream, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;
@@ -238,11 +238,11 @@ mod tests {
 
         assert!(
             Http2Upstream::reuse_forbidden(&handle, false),
-            "private peer must not be reused when allow_private_connect is false"
+            "private peer must not be reused when allow_private_upstream is false"
         );
         assert!(
             !Http2Upstream::reuse_forbidden(&handle, true),
-            "private peer may be reused when allow_private_connect is true"
+            "private peer may be reused when allow_private_upstream is true"
         );
         handle.connection_task.abort();
         Ok(())

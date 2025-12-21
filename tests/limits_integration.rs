@@ -56,7 +56,7 @@ name = "allow-upload"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "###
     );
 
@@ -180,7 +180,7 @@ name = "allow"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
 "###
     );
 

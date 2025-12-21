@@ -120,7 +120,7 @@ impl UpstreamConnection {
         app: &AppContext,
         connect_timeout: Duration,
         binding: Option<&ResolvedTarget>,
-        allow_private_connect: bool,
+        allow_private_upstream: bool,
     ) -> Result<Self> {
         let port = request
             .port
@@ -130,8 +130,8 @@ impl UpstreamConnection {
             port,
             binding,
             connect_timeout,
-            allow_private_connect,
-            "policy allow_private_connect permitted private upstream address",
+            allow_private_upstream,
+            "policy allow_private_upstream permitted private upstream address",
         )
         .await?;
         let (upstream_tcp, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;

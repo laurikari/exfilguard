@@ -273,7 +273,7 @@ impl Http2RequestHandler {
         let checkout = {
             let mut upstream = self.upstream.lock().await;
             upstream
-                .checkout_sender(decision.allow_private_connect, &forward_meta.parsed)
+                .checkout_sender(decision.allow_private_upstream, &forward_meta.parsed)
                 .await?
         };
         forward_request_to_upstream(

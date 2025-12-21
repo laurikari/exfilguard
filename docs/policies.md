@@ -90,7 +90,7 @@ Rules are evaluated in order. The first matching rule determines the action.
 | `methods` | Array | `["ANY"]` | HTTP methods to match |
 | `url_pattern` | String | None | URL pattern to match (see syntax below) |
 | `inspect_payload` | Boolean | true | Whether to inspect request/response bodies |
-| `allow_private_connect` | Boolean | false | Allow CONNECT to private IPs (ALLOW only) |
+| `allow_private_upstream` | Boolean | false | Allow upstream requests to private IPs (ALLOW only) |
 | `cache` | Table | None | Cache configuration (see below) |
 | `status` | u16 | Required for DENY | HTTP status code for denial response |
 | `reason` | String | None | HTTP reason phrase (DENY only) |
@@ -103,14 +103,14 @@ Rules are evaluated in order. The first matching rule determines the action.
 - Permit the request to proceed upstream
 - Must not set `status`, `reason`, or `body`
 - Can use `inspect_payload = false` for tunnel mode
-- Can set `allow_private_connect = true`
+- Can set `allow_private_upstream = true`
 
 #### DENY Rules
 
 - Block the request with specified response
 - Must set `status` (HTTP status code)
 - Optional: `reason` and `body`
-- Cannot use `allow_private_connect`
+- Cannot use `allow_private_upstream`
 
 ---
 
@@ -294,7 +294,7 @@ name = "pinned-payments"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/**"
   inspect_payload = false
-  allow_private_connect = true
+  allow_private_upstream = true
 ```
 
 ### Cached Static Content

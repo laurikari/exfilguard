@@ -111,7 +111,7 @@ name = "cache-test"
   action = "ALLOW"
   methods = ["GET"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
   [policy.rule.cache]
 "#,
     );
@@ -186,7 +186,7 @@ name = "cache-test"
   action = "ALLOW"
   methods = ["GET"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
   [policy.rule.cache]
 "#,
     );
@@ -268,7 +268,7 @@ name = "cache-test"
   action = "ALLOW"
   methods = ["GET"]
   url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_connect = true
+  allow_private_upstream = true
   [policy.rule.cache]
 "#,
     );

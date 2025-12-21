@@ -155,9 +155,9 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
                     idx
                 );
             }
-            if rule.allow_private_connect && !matches!(action, RuleAction::Allow) {
+            if rule.allow_private_upstream && !matches!(action, RuleAction::Allow) {
                 bail!(
-                    "policy '{}' rule {}: allow_private_connect may only be used with ALLOW action",
+                    "policy '{}' rule {}: allow_private_upstream may only be used with ALLOW action",
                     name,
                     idx
                 );
@@ -177,7 +177,7 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
                 methods,
                 url_pattern,
                 inspect_payload: rule.inspect_payload,
-                allow_private_connect: rule.allow_private_connect,
+                allow_private_upstream: rule.allow_private_upstream,
                 cache: rule.cache.map(|c| CacheConfig {
                     force_cache_duration: c.force_cache_duration,
                 }),
@@ -527,7 +527,7 @@ struct RawRule {
     #[serde(default)]
     splice: Option<bool>,
     #[serde(default)]
-    allow_private_connect: bool,
+    allow_private_upstream: bool,
     #[serde(default)]
     cache: Option<RawCacheConfig>,
 }

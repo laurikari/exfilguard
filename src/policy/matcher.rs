@@ -122,7 +122,7 @@ fn make_decision(
             policy: policy.name.clone(),
             rule: rule.id.clone(),
             inspect_payload: rule.inspect_payload,
-            allow_private_connect: rule.allow_private_connect,
+            allow_private_upstream: rule.allow_private_upstream,
             cache: rule.cache.clone(),
         },
         RuleAction::Deny {
@@ -177,7 +177,7 @@ mod tests {
                         original: Arc::<str>::from("https://*.example.com/api/**"),
                     }),
                     inspect_payload: false,
-                    allow_private_connect: false,
+                    allow_private_upstream: false,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -199,7 +199,7 @@ mod tests {
                     methods: MethodMatch::Any,
                     url_pattern: None,
                     inspect_payload: false,
-                    allow_private_connect: false,
+                    allow_private_upstream: false,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -316,7 +316,7 @@ mod tests {
                         original: Arc::<str>::from("https://example.com/privacy-policy/"),
                     }),
                     inspect_payload: false,
-                    allow_private_connect: false,
+                    allow_private_upstream: false,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -480,7 +480,7 @@ mod tests {
                         original: Arc::<str>::from("https://api.example.com:443/v1/**"),
                     }),
                     inspect_payload: false,
-                    allow_private_connect: false,
+                    allow_private_upstream: false,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -530,7 +530,7 @@ mod tests {
                         original: Arc::<str>::from("https://[2001:db8::10]:443/"),
                     }),
                     inspect_payload: false,
-                    allow_private_connect: false,
+                    allow_private_upstream: false,
                     cache: None,
                 }]
                 .into_boxed_slice(),
