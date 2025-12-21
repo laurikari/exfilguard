@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::{fs as async_fs, task};
 use tracing::trace;
 
+mod admission;
 mod entry;
 mod index;
 mod key;
@@ -20,6 +21,9 @@ mod reader;
 mod store;
 mod writer;
 
+pub(crate) use admission::{
+    CacheRequestContext, CacheSkipReason, CacheStorePlan, CacheWritePlan, plan_cache_write,
+};
 use entry::{CacheEntry, PersistedEntry};
 use index::CacheIndex;
 use key::{CacheKey, VaryKey};

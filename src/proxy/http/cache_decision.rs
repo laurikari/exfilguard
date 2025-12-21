@@ -1,17 +1,11 @@
 use anyhow::Result;
-use http::{HeaderMap, Uri};
+use http::HeaderMap;
 
+use crate::proxy::cache::CacheRequestContext;
 use crate::proxy::request::ParsedRequest;
 
 use super::cache_control::request_cache_bypass;
 use super::codec::{HeaderAccumulator, HeaderLine};
-
-#[derive(Debug)]
-pub(super) struct CacheRequestContext {
-    pub uri: Uri,
-    pub headers: HeaderMap,
-    pub bypass: bool,
-}
 
 pub(super) fn build_cache_request_context(
     request: &ParsedRequest,

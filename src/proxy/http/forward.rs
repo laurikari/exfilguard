@@ -11,8 +11,8 @@ use tracing::{debug, warn};
 
 use crate::io_util::{BestEffortWriter, TeeWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
+use crate::proxy::cache::{CacheSkipReason, CacheStorePlan, CacheWritePlan, plan_cache_write};
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::http::cache_control::{get_freshness_lifetime, is_cacheable};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
@@ -309,58 +309,67 @@ where
     if let (Some(cache_config), Some(cache)) = (&decision.cache, &app.cache) {
         cache_store = CacheStoreResult::Skipped;
 
-        if !headers.has_sensitive_cache_headers() {
-            let method_obj = &request.method;
-            let cache_request = match build_cache_request_context(request, headers) {
+        let method_obj = &request.method;
+        let has_sensitive_headers = headers.has_sensitive_cache_headers();
+        let cache_request = if has_sensitive_headers {
+            None
+        } else {
+            match build_cache_request_context(request, headers) {
                 Ok(context) => Some(context),
                 Err(err) => {
                     debug!(peer = %peer, error = %err, host = %request.host, "skipping cache due to URI build failure");
                     None
                 }
-            };
+            }
+        };
 
-            if let Some(cache_request) = cache_request {
-                if cache_request.bypass {
-                    cache_store = CacheStoreResult::Bypassed;
-                } else {
-                    let resp_headers_map = header_lines_to_map(head.headers.iter());
+        let resp_headers_map = header_lines_to_map(head.headers.iter());
+        let plan = plan_cache_write(
+            method_obj,
+            cache_request,
+            head.status,
+            resp_headers_map,
+            cache_config.force_cache_duration,
+            has_sensitive_headers,
+        );
 
-                    if resp_headers_map.contains_key(http::header::SET_COOKIE) {
-                        debug!(
-                            peer = %peer,
-                            host = %request.host,
-                            status = head.status.as_u16(),
-                            "skipping cache write due to Set-Cookie response header"
-                        );
+        match plan {
+            CacheWritePlan::Bypass => {
+                cache_store = CacheStoreResult::Bypassed;
+            }
+            CacheWritePlan::Skip(reason) => {
+                if reason == CacheSkipReason::ResponseSetCookie {
+                    debug!(
+                        peer = %peer,
+                        host = %request.host,
+                        status = head.status.as_u16(),
+                        "skipping cache write due to Set-Cookie response header"
+                    );
+                }
+            }
+            CacheWritePlan::Store(plan) => {
+                let CacheStorePlan {
+                    request,
+                    response_headers,
+                    ttl,
+                } = *plan;
+                match cache
+                    .open_stream(
+                        method_obj,
+                        &request.uri,
+                        &request.headers,
+                        &response_headers,
+                    )
+                    .await
+                {
+                    Ok(Some(stream)) => {
+                        cache_stream = Some((stream, ttl, response_headers));
                     }
-
-                    if is_cacheable(method_obj, head.status, &resp_headers_map) {
-                        let ttl = select_cache_ttl(
-                            get_freshness_lifetime(&resp_headers_map),
-                            cache_config.force_cache_duration,
-                        );
-
-                        if ttl > Duration::ZERO {
-                            match cache
-                                .open_stream(
-                                    method_obj,
-                                    &cache_request.uri,
-                                    &cache_request.headers,
-                                    &resp_headers_map,
-                                )
-                                .await
-                            {
-                                Ok(Some(stream)) => {
-                                    cache_stream = Some((stream, ttl, resp_headers_map));
-                                }
-                                Ok(None) => {
-                                    tracing::debug!("skipping cache write due to Vary limits");
-                                }
-                                Err(e) => {
-                                    tracing::debug!("failed to open cache stream: {}", e);
-                                }
-                            }
-                        }
+                    Ok(None) => {
+                        tracing::debug!("skipping cache write due to Vary limits");
+                    }
+                    Err(e) => {
+                        tracing::debug!("failed to open cache stream: {}", e);
                     }
                 }
             }
@@ -626,15 +635,6 @@ pub fn determine_response_body_plan(
     ResponseBodyPlan::UntilClose
 }
 
-fn select_cache_ttl(origin_ttl: Option<Duration>, forced: Option<Duration>) -> Duration {
-    if let Some(ttl) = origin_ttl
-        && ttl > Duration::ZERO
-    {
-        return ttl;
-    }
-    forced.unwrap_or(Duration::ZERO)
-}
-
 pub fn build_upstream_request(
     request: &ParsedRequest,
     headers: &HeaderAccumulator,
@@ -685,9 +685,7 @@ pub fn build_upstream_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ForwardTimeouts, ResponseBodyPlan, determine_response_body_plan, select_cache_ttl,
-    };
+    use super::{ForwardTimeouts, ResponseBodyPlan, determine_response_body_plan};
     use crate::proxy::http::codec::ResponseHead;
     use http::StatusCode;
     use std::time::Duration;
@@ -710,29 +708,6 @@ mod tests {
         client.read_to_end(&mut buf).await?;
         assert_eq!(buf, b"HTTP/1.1 100 Continue\r\n\r\n");
         Ok(())
-    }
-
-    #[test]
-    fn prefers_origin_ttl_when_present() {
-        let origin = Some(Duration::from_secs(30));
-        let forced = Some(Duration::from_secs(5));
-        assert_eq!(select_cache_ttl(origin, forced), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn falls_back_to_forced_when_origin_is_zero_or_missing() {
-        let forced = Some(Duration::from_secs(5));
-        assert_eq!(
-            select_cache_ttl(Some(Duration::ZERO), forced),
-            Duration::from_secs(5)
-        );
-        assert_eq!(select_cache_ttl(None, forced), Duration::from_secs(5));
-    }
-
-    #[test]
-    fn returns_zero_without_origin_or_forced() {
-        assert_eq!(select_cache_ttl(None, None), Duration::ZERO);
-        assert_eq!(select_cache_ttl(Some(Duration::ZERO), None), Duration::ZERO);
     }
 
     #[test]
