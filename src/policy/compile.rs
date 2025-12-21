@@ -375,4 +375,26 @@ mod tests {
         let err = ValidatedConfig::new(config).unwrap_err();
         assert!(err.to_string().contains("overlaps with client"));
     }
+
+    #[test]
+    fn reject_ip_overlaps_cidr_clients() {
+        let policies = vec![sample_policy()];
+        let clients = vec![
+            Client {
+                name: Arc::<str>::from("range"),
+                selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
+                policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                catch_all: false,
+            },
+            Client {
+                name: Arc::<str>::from("pin"),
+                selector: ClientSelector::Ip("10.10.1.5".parse().unwrap()),
+                policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                catch_all: false,
+            },
+        ];
+        let config = Config { clients, policies };
+        let err = ValidatedConfig::new(config).unwrap_err();
+        assert!(err.to_string().contains("overlaps with client"));
+    }
 }

@@ -758,6 +758,37 @@ name = "allow"
     }
 
     #[test]
+    fn reject_ip_overlaps_cidr() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "range"
+cidr = "10.10.1.0/24"
+policies = ["allow"]
+
+[[client]]
+name = "pin"
+ip = "10.10.1.5"
+policies = ["allow"]
+
+[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+catch_all = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        assert!(err.to_string().contains("overlaps"));
+    }
+
+    #[test]
     fn catch_all_overlap_is_allowed_regardless_of_order() {
         let clients = write_temp(
             r#"[[client]]

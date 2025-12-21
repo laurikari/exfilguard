@@ -359,7 +359,7 @@ mod tests {
         let clients = vec![
             Client {
                 name: Arc::<str>::from("exact"),
-                selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 0, 5))),
+                selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
                 catch_all: false,
             },
@@ -388,7 +388,7 @@ mod tests {
         let snapshot = PolicySnapshot::new(compiled);
 
         let exact = snapshot
-            .resolve_client(IpAddr::from(Ipv4Addr::new(10, 0, 0, 5)))
+            .resolve_client(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5)))
             .expect("exact client");
         assert_eq!(exact.name.as_ref(), "exact");
 

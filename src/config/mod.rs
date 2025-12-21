@@ -25,8 +25,13 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
         catch_all: bool,
     }
 
+    struct IpClaim<'a> {
+        name: &'a str,
+        catch_all: bool,
+    }
+
     let mut catch_all_seen = false;
-    let mut ip_claims: HashMap<IpAddr, &str> = HashMap::new();
+    let mut ip_claims: HashMap<IpAddr, IpClaim<'_>> = HashMap::new();
     let mut cidr_claims: Vec<CidrClaim<'_>> = Vec::new();
 
     for client in clients {
@@ -40,13 +45,33 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
 
         match &client.selector {
             ClientSelector::Ip(addr) => {
-                if let Some(existing) = ip_claims.insert(*addr, client.name.as_ref()) {
+                if let Some(existing) = ip_claims.insert(
+                    *addr,
+                    IpClaim {
+                        name: client.name.as_ref(),
+                        catch_all: client.catch_all,
+                    },
+                ) {
                     bail!(
                         "client '{}' specifies IP {} which is already claimed by client '{}'",
                         client.name,
                         addr,
-                        existing
+                        existing.name
                     );
+                }
+                for claim in &cidr_claims {
+                    if client.catch_all || claim.catch_all {
+                        continue;
+                    }
+                    if claim.net.contains(addr) {
+                        bail!(
+                            "client '{}' IP {} overlaps with client '{}' CIDR {}",
+                            client.name,
+                            addr,
+                            claim.name,
+                            claim.net
+                        );
+                    }
                 }
             }
             ClientSelector::Cidr(net) => {
@@ -61,6 +86,20 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                             net,
                             claim.name,
                             claim.net
+                        );
+                    }
+                }
+                for (addr, claim) in &ip_claims {
+                    if client.catch_all || claim.catch_all {
+                        continue;
+                    }
+                    if net.contains(addr) {
+                        bail!(
+                            "client '{}' CIDR {} overlaps with client '{}' IP {}",
+                            client.name,
+                            net,
+                            claim.name,
+                            addr
                         );
                     }
                 }
