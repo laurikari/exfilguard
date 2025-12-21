@@ -179,6 +179,9 @@ where
     let version = parts
         .next()
         .ok_or_else(|| anyhow!("malformed request line: missing version"))?;
+    if parts.next().is_some() {
+        bail!("malformed request line: unexpected data");
+    }
     match version {
         "HTTP/1.1" => {}
         "HTTP/1.0" => bail!("HTTP/1.0 requests are not supported"),
@@ -961,6 +964,27 @@ mod tests {
         };
         assert!(
             err.to_string().contains("HTTP/1.0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_extra_tokens() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1 extra\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("write request");
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = match read_request_head(&mut reader, peer, Duration::from_secs(1), 1024).await {
+            Ok(_) => panic!("request line with extra tokens should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unexpected data"),
             "unexpected error: {err}"
         );
     }
