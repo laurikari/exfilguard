@@ -111,6 +111,8 @@ certificates instead of providing a custom trust store.
 
 - WebSocket and HTTP/1.1 Upgrade flows are not supported; upstream `101 Switching Protocols`
   responses are rejected rather than tunneled.
+- HTTP/1.0 requests and upstream HTTP/1.0 responses are rejected; ExfilGuard only supports
+  HTTP/1.1 framing.
 
 ### TLS inspection vs. pass-through
 

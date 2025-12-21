@@ -163,7 +163,18 @@ mod tests {
     fn parse_status_line_rejects_invalid_version() {
         let err = parse_status_line("BAD 200 OK").unwrap_err();
         assert!(
-            err.to_string().contains("invalid upstream HTTP version"),
+            err.to_string()
+                .contains("unsupported upstream HTTP version"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_status_line_rejects_http10() {
+        let err = parse_status_line("HTTP/1.0 200 OK").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported upstream HTTP version"),
             "unexpected error: {err:?}"
         );
     }

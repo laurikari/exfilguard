@@ -1,6 +1,7 @@
 # HTTP/1.1 Request Framing
 
 ExfilGuard parses HTTP/1.1 request bodies according to RFC 9112:
+HTTP/1.0 requests are not supported.
 
 - If `Transfer-Encoding` is present, it defines the body framing.
 - Else if `Content-Length` is present, it defines the body length.

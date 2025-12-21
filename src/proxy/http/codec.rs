@@ -178,7 +178,8 @@ where
         .next()
         .ok_or_else(|| anyhow!("malformed request line: missing version"))?;
     match version {
-        "HTTP/1.1" | "HTTP/1.0" => {}
+        "HTTP/1.1" => {}
+        "HTTP/1.0" => bail!("HTTP/1.0 requests are not supported"),
         other => bail!("invalid HTTP version '{other}'"),
     }
 
@@ -768,8 +769,7 @@ pub(crate) fn parse_status_line(value: &str) -> Result<(Version, StatusCode, Str
 
     let version = match version {
         "HTTP/1.1" => Version::HTTP_11,
-        "HTTP/1.0" => Version::HTTP_10,
-        other => bail!("invalid upstream HTTP version '{other}'"),
+        other => bail!("unsupported upstream HTTP version '{other}'"),
     };
 
     let status_code: u16 = status
@@ -928,6 +928,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_http10() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("write request");
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = match read_request_head(&mut reader, peer, Duration::from_secs(1), 1024).await {
+            Ok(_) => panic!("HTTP/1.0 should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("HTTP/1.0"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
