@@ -8,17 +8,18 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Result, anyhow};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::{fs as async_fs, task};
 use tracing::{trace, warn};
 
+mod entry;
 mod index;
 mod key;
 mod maintenance;
 mod store;
 mod writer;
 
+use entry::{CacheEntry, PersistedEntry};
 use index::CacheIndex;
 use key::{CacheKey, VaryKey};
 #[cfg(test)]
@@ -54,52 +55,6 @@ struct SweepStats {
     inspected: usize,
     removed: u64,
     bytes_reclaimed: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    pub id: u64,
-    pub entry_id: String,
-    pub status: StatusCode,
-    pub headers: HeaderMap,
-    pub vary: VaryKey,
-    pub expires_at: SystemTime,
-    pub content_hash: String,
-    pub content_length: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedEntry {
-    key_base: String,
-    status: u16,
-    headers: Vec<(String, String)>,
-    vary_headers: Vec<(String, String)>,
-    expires_at: u64,
-    content_hash: String,
-    content_length: u64,
-}
-
-fn to_headermap(items: &[(String, String)]) -> HeaderMap {
-    let mut map = HeaderMap::new();
-    for (name, value) in items {
-        if let (Ok(name), Ok(value)) = (
-            http::header::HeaderName::try_from(name.as_str()),
-            http::HeaderValue::from_str(value),
-        ) {
-            map.append(name, value);
-        }
-    }
-    map
-}
-
-fn headermap_to_vec(map: &HeaderMap) -> Vec<(String, String)> {
-    let mut items = Vec::new();
-    for (name, value) in map.iter() {
-        if let Ok(value_str) = value.to_str() {
-            items.push((name.as_str().to_string(), value_str.to_string()));
-        }
-    }
-    items
 }
 
 impl HttpCache {

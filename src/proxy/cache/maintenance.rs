@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use tokio::fs as async_fs;
 use tracing::{trace, warn};
 
-use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats, VaryKey, to_headermap};
+use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 
 const CACHE_LAYOUT_VERSION: u32 = 1;
 const CACHE_VERSION_PREFIX: &str = "v";
@@ -277,20 +277,8 @@ impl CacheState {
             return Ok(None);
         }
 
-        let headers = to_headermap(&persisted.headers);
-        let vary_headers = to_headermap(&persisted.vary_headers);
-        let vary = VaryKey::new(vary_headers);
-
-        let entry = CacheEntry {
-            id: self.next_entry_id(),
-            status: http::StatusCode::from_u16(persisted.status).unwrap_or(http::StatusCode::OK),
-            headers,
-            vary,
-            expires_at,
-            entry_id: entry_id.to_string(),
-            content_hash: persisted.content_hash.clone(),
-            content_length: persisted.content_length,
-        };
+        let entry =
+            CacheEntry::from_persisted(&persisted, entry_id, self.next_entry_id(), expires_at);
 
         let evicted = self.insert_entry(key.key_base().to_string(), entry);
         self.remove_evicted_files(evicted);

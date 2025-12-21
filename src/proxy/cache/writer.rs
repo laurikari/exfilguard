@@ -11,7 +11,7 @@ use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{trace, warn};
 
-use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, VaryKey, headermap_to_vec};
+use super::{CacheEntry, CacheKey, CacheState, VaryKey};
 
 pub(crate) struct CacheWriter {
     file: AsyncFile,
@@ -95,19 +95,7 @@ impl CacheWriter {
             content_length: self.current_size,
         };
 
-        let persisted = PersistedEntry {
-            key_base: self.key.key_base().to_string(),
-            status: status.as_u16(),
-            headers: headermap_to_vec(&entry.headers),
-            vary_headers: headermap_to_vec(entry.vary.headers()),
-            expires_at: entry
-                .expires_at
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            content_hash: entry.content_hash.clone(),
-            content_length: entry.content_length,
-        };
+        let persisted = entry.to_persisted(self.key.key_base());
 
         if let Err(err) = self
             .state
