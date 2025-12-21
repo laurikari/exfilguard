@@ -14,7 +14,7 @@ use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    time::timeout,
+    time::{Instant, timeout},
 };
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -486,10 +486,11 @@ where
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     let mut total_bytes = 0usize;
+    let deadline = Instant::now() + read_timeout;
     let bytes = read_line_with_limits(
         &mut reader,
         &mut request_line,
-        read_timeout,
+        deadline,
         max_bytes,
         &mut total_bytes,
         "reading metrics request line",
@@ -509,7 +510,7 @@ where
         let n = read_line_with_limits(
             &mut reader,
             &mut line,
-            read_timeout,
+            deadline,
             max_bytes,
             &mut total_bytes,
             "reading metrics request headers",
@@ -587,7 +588,7 @@ fn build_tls_acceptor(
 async fn read_line_with_limits<R>(
     reader: &mut BufReader<R>,
     buf: &mut String,
-    timeout_dur: Duration,
+    deadline: Instant,
     max_bytes: usize,
     total: &mut usize,
     context: &str,
@@ -601,7 +602,8 @@ where
     buf.clear();
     let mut collected = Vec::new();
     loop {
-        let available = timeout(timeout_dur, reader.fill_buf())
+        let remaining = remaining_deadline(deadline, context)?;
+        let available = timeout(remaining, reader.fill_buf())
             .await
             .map_err(|_| anyhow!("timed out {context}"))??;
         if available.is_empty() {
@@ -643,6 +645,12 @@ where
     ensure!(*total <= max_bytes, "metrics request exceeded allowed size");
     *buf = string;
     Ok(bytes)
+}
+
+fn remaining_deadline(deadline: Instant, context: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("timed out {context}"))
 }
 
 #[cfg(test)]
