@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use http::{HeaderMap, Method, StatusCode, Version};
+use http::{HeaderMap, Method, StatusCode, Version, header::HeaderName};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -71,6 +71,8 @@ impl HeaderAccumulator {
         if name.is_empty() {
             bail!("header name must not be empty");
         }
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| anyhow!("invalid header name '{name}'"))?;
         match self.sanitizer.record(name, value, line_len)? {
             HeaderAction::Forward => {
                 self.headers.push(HeaderLine::new(name, value));
@@ -895,6 +897,18 @@ mod tests {
             .expect_err("unsupported Expect should error");
         assert!(
             err.to_string().contains("unsupported Expect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_header_name() {
+        let mut accumulator = HeaderAccumulator::new(256);
+        let err = accumulator
+            .push_line("Bad Name: value\r\n")
+            .expect_err("invalid header name should error");
+        assert!(
+            err.to_string().contains("invalid header name"),
             "unexpected error: {err}"
         );
     }
