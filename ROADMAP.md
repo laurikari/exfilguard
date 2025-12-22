@@ -15,6 +15,12 @@
 - Optional integrations with secret managers (Vault, etc.) to fetch CA material
   or policy variables at runtime, minimizing long-lived secrets on disk.
 
+## Body Inspection
+- Inspect request and response bodies for sensitive patterns (credit card numbers,
+  API keys, PII) and block or flag matches.
+- Content-type aware scanning (JSON, form data, multipart uploads).
+- Configurable pattern sets per policy.
+
 ## Nice-to-haves
 - “Why was this blocked?” tooling that can replay a request through the matcher
   and produce a human-readable explanation before rollout.

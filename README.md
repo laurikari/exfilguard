@@ -107,6 +107,47 @@ certificates instead of providing a custom trust store.
 4. Allowed requests are proxied upstream with pooled TCP/TLS clients; denied
    requests receive a 403 and a structured log entry.
 
+## Security
+
+ExfilGuard controls what outbound traffic is allowed and logs everything for
+review. It blocks requests to destinations not on your allow list and records
+any blocked attempts.
+
+### What it does and doesn't do
+
+**Does:**
+- Block outbound requests to hosts/paths you haven't allowed
+- Log all traffic (allowed and blocked)
+- Drop slow or stalled connections via timeouts
+
+**Doesn't:**
+- Inspect request or response bodies
+- Stop data from leaving through allowed destinations
+- Detect compromised clients misusing allowed routes
+
+### Defense in depth
+
+The proxy doesn't fully trust clients or upstreams. Malformed requests, slow
+connections, and oversized headers/bodies are rejected early. Parsing is strict
+and policy checks run before any upstream connection is made. The goal is that
+a misbehaving or malicious client can't bypass rules or degrade the proxy for
+others.
+
+### Hardening tips
+
+- Use the `.deb` package for production—it creates a dedicated user and sets
+  sane defaults.
+- Run as a non-root user and only listen on the interfaces you need. Put a
+  firewall in front.
+- Lock down `ca_dir` with strict file permissions. Back up and rotate the CA
+  files regularly.
+- Review timeout and size limits for your setup (see `docs/configuration.md`).
+- Set `max_request_body_size`, `max_request_header_size`, and
+  `max_response_header_size` to reasonable values.
+- Leave `allow_private_upstream = false` unless you need to reach private IPs.
+- Treat logs and metrics as sensitive—they contain internal hostnames and can
+  reveal unusual traffic patterns.
+
 ## Limitations
 
 - WebSocket and HTTP/1.1 Upgrade flows are not supported; upstream `101 Switching Protocols`
