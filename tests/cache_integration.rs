@@ -241,6 +241,89 @@ name = "cache-test"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cache_hit_keeps_connection_open() -> Result<()> {
+    let _ = exfilguard::logging::init_logger(exfilguard::cli::LogFormat::Text);
+
+    let upstream = MockUpstream::new("Cache-Control: public, max-age=60").await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let clients = r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["cache-test"]
+fallback = true
+"#;
+
+    let policies = format!(
+        r#"[[policy]]
+name = "cache-test"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET"]
+  url_pattern = "http://127.0.0.1:{upstream_port}/**"
+  allow_private_upstream = true
+  [policy.rule.cache]
+"#,
+    );
+
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+        .spawn()
+        .await?;
+
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/resource HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+
+    // Warm the cache on a throwaway connection.
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.contains("cached-response"),
+        "Unexpected response: {}",
+        response
+    );
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        1,
+        "Should hit upstream once"
+    );
+
+    tokio::time::sleep(StdDuration::from_millis(2000)).await;
+
+    // Cache hit should keep the downstream connection open.
+    let keepalive_request = format!(
+        "GET http://127.0.0.1:{upstream_port}/resource HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(keepalive_request.as_bytes()).await?;
+    let response_one = read_http_response_with_length(&mut stream).await?;
+    assert!(response_one.contains("cached-response"));
+
+    stream.write_all(keepalive_request.as_bytes()).await?;
+    let response_two = read_http_response_with_length(&mut stream).await?;
+    assert!(response_two.contains("cached-response"));
+
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        1,
+        "Cache hits should avoid upstream and keep the connection open"
+    );
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
     let _ = exfilguard::logging::init_logger(exfilguard::cli::LogFormat::Text);
 

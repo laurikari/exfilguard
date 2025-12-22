@@ -253,12 +253,19 @@ where
 
                     let body_plan =
                         determine_response_body_plan(&self.parsed.method, cached.status, &head);
+                    let should_close = self.headers.wants_connection_close()
+                        || matches!(body_plan, super::forward::ResponseBodyPlan::UntilClose);
+                    let override_connection = if should_close {
+                        Some(ConnectionDirective::Close)
+                    } else {
+                        None
+                    };
                     let encoded_head = encode_cached_response(
                         &head.status_line,
                         &cached.headers,
                         body_plan,
                         head.content_length,
-                        Some(ConnectionDirective::Close),
+                        override_connection,
                     );
                     write_all_with_timeout(
                         client_stream,
@@ -280,7 +287,9 @@ where
                         .await?;
                     }
 
-                    shutdown_stream(client_stream, self.client_timeout).await?;
+                    if should_close {
+                        shutdown_stream(client_stream, self.client_timeout).await?;
+                    }
 
                     // Log Cache Hit
                     let log_builder = log
@@ -300,7 +309,11 @@ where
 
                     log_builder.log();
 
-                    return Ok(ClientDisposition::Close);
+                    return Ok(if should_close {
+                        ClientDisposition::Close
+                    } else {
+                        ClientDisposition::Continue
+                    });
                 }
                 Ok(CacheLookupOutcome::Miss) => {
                     cache_lookup = Some("miss");
