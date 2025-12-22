@@ -15,6 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 use time::OffsetDateTime;
 use tracing::{trace, warn};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::ca::MintedLeaf;
@@ -112,7 +113,10 @@ impl CertificateCache {
 
         let meta_text = match fs::read_to_string(&paths.meta) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_dir_all(&paths.entry_dir);
+                return Ok(None);
+            }
             Err(err) => {
                 warn!(
                     name,
@@ -200,34 +204,69 @@ impl CertificateCache {
     fn disk_paths(&self, name: &str) -> Option<DiskPaths> {
         let base = self.disk_dir.as_ref()?;
         let HashedLocation { shard_path, hex } = hashed_name(name);
-        let dir = base.join(&shard_path);
+        let shard_dir = base.join(&shard_path);
+        let entry_dir = shard_dir.join(&hex);
         Some(DiskPaths {
-            dir: dir.clone(),
-            chain: dir.join(format!("{hex}.chain")),
-            key: dir.join(format!("{hex}.key")),
-            meta: dir.join(format!("{hex}.meta")),
+            shard_dir,
+            entry_dir: entry_dir.clone(),
+            chain: entry_dir.join("chain"),
+            key: entry_dir.join("key"),
+            meta: entry_dir.join("meta"),
         })
     }
 }
 
 struct DiskPaths {
-    dir: PathBuf,
+    shard_dir: PathBuf,
+    entry_dir: PathBuf,
     chain: PathBuf,
     key: PathBuf,
     meta: PathBuf,
 }
 
 fn persist_to_disk(paths: &DiskPaths, host: &str, minted: &MintedLeaf) -> Result<()> {
-    fs::create_dir_all(&paths.dir).with_context(|| {
+    fs::create_dir_all(&paths.shard_dir).with_context(|| {
         format!(
             "failed to create certificate cache shard directory {}",
-            paths.dir.display()
+            paths.shard_dir.display()
         )
     })?;
-    write_chain_file(&paths.chain, &minted.chain_der)?;
-    write_private_key(&paths.key, minted.private_key_der.as_slice())?;
-    write_meta(&paths.meta, host, minted.expires_at)?;
+    let temp_dir = create_temp_entry_dir(&paths.entry_dir)?;
+    let write_result = write_chain_file(&temp_dir.join("chain"), &minted.chain_der)
+        .and_then(|_| write_private_key(&temp_dir.join("key"), minted.private_key_der.as_slice()))
+        .and_then(|_| write_meta(&temp_dir.join("meta"), host, minted.expires_at));
+    if let Err(err) = write_result {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&temp_dir, &paths.entry_dir) {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            let _ = fs::remove_dir_all(&paths.entry_dir);
+            if let Err(err) = fs::rename(&temp_dir, &paths.entry_dir) {
+                let _ = fs::remove_dir_all(&temp_dir);
+                return Err(err).context("failed to replace existing certificate cache entry");
+            }
+        } else {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(err.into());
+        }
+    }
     Ok(())
+}
+
+fn create_temp_entry_dir(entry_dir: &Path) -> Result<PathBuf> {
+    let parent = entry_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing parent for certificate cache entry"))?;
+    let name = entry_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("entry");
+    let temp_dir = parent.join(format!("{name}.tmp-{}", Uuid::new_v4()));
+    fs::create_dir(&temp_dir)
+        .with_context(|| format!("failed to create temp cache entry {}", temp_dir.display()))?;
+    Ok(temp_dir)
 }
 
 fn write_chain_file(path: &Path, chain: &[Vec<u8>]) -> Result<()> {
@@ -314,7 +353,7 @@ fn write_meta(path: &Path, host: &str, expires_at: OffsetDateTime) -> Result<()>
         .open(path)
         .with_context(|| format!("failed to write cache metadata {}", path.display()))?;
     let content = format!(
-        "version=2\nhost={}\nexpires_at={}\n",
+        "host={}\nexpires_at={}\n",
         host,
         expires_at.unix_timestamp()
     );
@@ -339,6 +378,8 @@ fn parse_meta(meta: &str) -> Result<MetaInfo> {
                 .parse()
                 .map_err(|err| anyhow!("invalid expiration timestamp: {err}"))?;
             expires = Some(ts);
+        } else {
+            return Err(anyhow!("cache metadata contains unexpected field"));
         }
     }
     let host = host.ok_or_else(|| anyhow!("cache metadata missing host"))?;
@@ -348,11 +389,9 @@ fn parse_meta(meta: &str) -> Result<MetaInfo> {
 }
 
 fn remove_disk_entry(paths: &DiskPaths) -> Result<()> {
-    let _ = fs::remove_file(&paths.chain);
-    let _ = fs::remove_file(&paths.key);
-    let _ = fs::remove_file(&paths.meta);
-    let _ = fs::remove_dir(&paths.dir);
-    if let Some(parent) = paths.dir.parent() {
+    let _ = fs::remove_dir_all(&paths.entry_dir);
+    let _ = fs::remove_dir(&paths.shard_dir);
+    if let Some(parent) = paths.shard_dir.parent() {
         let _ = fs::remove_dir(parent);
         if let Some(grand) = parent.parent() {
             let _ = fs::remove_dir(grand);
