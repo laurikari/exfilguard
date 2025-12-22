@@ -7,6 +7,10 @@ use tracing::warn;
 use crate::{proxy::http::BodyTooLarge, proxy::resolver::PrivateAddressError};
 
 #[derive(Debug, Error)]
+#[error("request timed out")]
+pub struct RequestTimeout;
+
+#[derive(Debug, Error)]
 #[error(
     "HTTP/2 request for {requested_host}:{requested_port} does not match upstream {upstream_host}:{upstream_port}"
 )]
@@ -35,6 +39,7 @@ impl MisdirectedRequest {
 
 /// Normalized classification of forwarding failures so HTTP/1.1 and HTTP/2 can react consistently.
 pub enum ForwardErrorKind<'a> {
+    RequestTimeout,
     BodyTooLarge(&'a BodyTooLarge),
     PrivateAddress(&'a PrivateAddressError),
     MisdirectedRequest(&'a MisdirectedRequest),
@@ -42,7 +47,9 @@ pub enum ForwardErrorKind<'a> {
 }
 
 pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
-    if let Some(body) = err.downcast_ref::<BodyTooLarge>() {
+    if err.downcast_ref::<RequestTimeout>().is_some() {
+        ForwardErrorKind::RequestTimeout
+    } else if let Some(body) = err.downcast_ref::<BodyTooLarge>() {
         ForwardErrorKind::BodyTooLarge(body)
     } else if let Some(private) = err.downcast_ref::<PrivateAddressError>() {
         ForwardErrorKind::PrivateAddress(private)
@@ -55,6 +62,11 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
 
 pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &str, err: &Error) {
     match kind {
+        ForwardErrorKind::RequestTimeout => warn!(
+            peer = %peer,
+            host,
+            "request timed out before response headers"
+        ),
         ForwardErrorKind::PrivateAddress(private_err) => warn!(
             peer = %peer,
             host,

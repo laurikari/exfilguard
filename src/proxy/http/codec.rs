@@ -151,14 +151,26 @@ pub struct RequestHead {
 pub async fn read_request_head<S>(
     reader: &mut BufReader<S>,
     peer: SocketAddr,
-    timeout: Duration,
+    idle_timeout: Duration,
+    header_timeout: Duration,
     max_header_bytes: usize,
 ) -> Result<Option<RequestHead>>
 where
     S: AsyncRead + Unpin,
 {
     let request_line_limit = max_header_bytes;
-    let deadline = Instant::now() + timeout;
+    let available = match tokio::time::timeout(idle_timeout, reader.fill_buf()).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(err)) => {
+            return Err(err).with_context(|| format!("waiting for request data from {peer}"));
+        }
+        Err(_) => return Ok(None),
+    };
+    if available.is_empty() {
+        return Ok(None);
+    }
+
+    let deadline = Instant::now() + header_timeout;
     let Some((request_line, request_line_bytes)) =
         read_request_line(reader, peer, deadline, request_line_limit).await?
     else {
@@ -923,7 +935,14 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let mut reader = BufReader::new(server);
-            read_request_head(&mut reader, peer, Duration::from_millis(50), 1024).await
+            read_request_head(
+                &mut reader,
+                peer,
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                1024,
+            )
+            .await
         });
 
         tokio::task::yield_now().await;
@@ -958,7 +977,15 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let err = match read_request_head(&mut reader, peer, Duration::from_secs(1), 1024).await {
+        let err = match read_request_head(
+            &mut reader,
+            peer,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        {
             Ok(_) => panic!("HTTP/1.0 should be rejected"),
             Err(err) => err,
         };
@@ -979,7 +1006,15 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let err = match read_request_head(&mut reader, peer, Duration::from_secs(1), 1024).await {
+        let err = match read_request_head(
+            &mut reader,
+            peer,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        {
             Ok(_) => panic!("request line with extra tokens should be rejected"),
             Err(err) => err,
         };

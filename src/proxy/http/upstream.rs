@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use lru::LruCache;
 use rustls::pki_types::ServerName;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 
@@ -129,7 +130,7 @@ impl UpstreamConnection {
             &request.host,
             port,
             binding,
-            connect_timeout,
+            app.settings.dns_resolve_timeout(),
             allow_private_upstream,
             "policy allow_private_upstream permitted private upstream address",
         )
@@ -140,15 +141,18 @@ impl UpstreamConnection {
                 .map_err(|_| anyhow!("invalid upstream host for TLS '{}'", request.host))?
                 .to_owned();
             let connector = TlsConnector::from(app.tls.client_http1.clone());
-            let tls = connector
-                .connect(server_name, upstream_tcp)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to establish TLS with upstream {}:{}",
-                        request.host, port
-                    )
-                })?;
+            let tls = timeout(
+                app.settings.tls_handshake_timeout(),
+                connector.connect(server_name, upstream_tcp),
+            )
+            .await
+            .map_err(|_| anyhow!("TLS handshake with upstream timed out"))?
+            .with_context(|| {
+                format!(
+                    "failed to establish TLS with upstream {}:{}",
+                    request.host, port
+                )
+            })?;
             UpstreamIo::Tls(Box::new(tls))
         } else {
             UpstreamIo::Plain(upstream_tcp)

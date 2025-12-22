@@ -22,7 +22,7 @@ use crate::{
 use super::{
     bump::handle_bump,
     resolve::{ResolvedTarget, resolve_connect_target},
-    splice::handle_splice,
+    splice::{ConnectTunnelTimeout, handle_splice},
     target::ConnectTarget,
 };
 
@@ -40,7 +40,7 @@ pub struct ConnectSession {
     target: String,
     bytes_in: u64,
     start: Instant,
-    client_timeout: Duration,
+    response_timeout: Duration,
 }
 
 impl ConnectSession {
@@ -50,7 +50,7 @@ impl ConnectSession {
         parsed: ConnectTarget,
         bytes_in: u64,
         start: Instant,
-        client_timeout: Duration,
+        response_timeout: Duration,
     ) -> Self {
         let literal_ip = parsed.host.parse::<IpAddr>().ok();
         Self {
@@ -60,7 +60,7 @@ impl ConnectSession {
             target,
             bytes_in,
             start,
-            client_timeout,
+            response_timeout,
         }
     }
 
@@ -81,7 +81,7 @@ impl ConnectSession {
     ) -> Result<()> {
         log_allow(&self.peer, &self.parsed, &allow);
 
-        let resolve_timeout = app.settings.upstream_connect_timeout();
+        let resolve_timeout = app.settings.dns_resolve_timeout();
         let resolved = match resolve_connect_target(
             &self.parsed,
             resolve_timeout,
@@ -236,6 +236,28 @@ impl ConnectSession {
                 app,
             )
             .await;
+        if let Err(err) = splice_result.as_ref()
+            && err.downcast_ref::<ConnectTunnelTimeout>().is_some()
+        {
+            warn!(
+                peer = %self.peer,
+                host = %self.parsed.host,
+                port = self.parsed.port,
+                "CONNECT tunnel exceeded max lifetime"
+            );
+            self.access_log_builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .decision("ERROR")
+                .client(allow.client.as_ref())
+                .policy(allow.policy.as_ref())
+                .rule(allow.rule.as_ref())
+                .inspect_payload(false)
+                .bytes(self.bytes_in, 0)
+                .elapsed(self.start.elapsed())
+                .upstream_reused(false)
+                .log();
+            return Ok(());
+        }
         let stream_for_error = stream_holder;
         match policy_response::handle_forward_result(
             &allow,
@@ -298,7 +320,7 @@ impl ConnectSession {
             spec.status,
             None,
             spec.body_http1,
-            self.client_timeout,
+            self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),
             policy_response::forward_error_log_builder(log.access_log_builder(), &allow, &spec),
@@ -399,7 +421,7 @@ impl ConnectSession {
             status,
             reason,
             body,
-            self.client_timeout,
+            self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),
             build(self.access_log_builder()).decision(decision),

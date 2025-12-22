@@ -29,8 +29,8 @@ pub async fn handle_bump(
     peer: SocketAddr,
 ) -> Result<BumpStats> {
     let mut stream = stream;
-    let client_timeout = app.settings.client_timeout();
-    let handshake_bytes = send_connect_established(&mut stream, client_timeout).await?;
+    let tunnel_idle_timeout = app.settings.connect_tunnel_idle_timeout();
+    let handshake_bytes = send_connect_established(&mut stream, tunnel_idle_timeout).await?;
 
     let probe = match probe_upstream_http2(&resolved, app).await {
         Ok(outcome) => outcome,
@@ -60,27 +60,41 @@ pub async fn handle_bump(
 
     let server_config = build_server_config(app, &target.host, supports_h2)?;
     let acceptor = TlsAcceptor::from(server_config);
-    let tls_stream = acceptor
-        .accept(stream)
-        .await
-        .context("failed to complete TLS handshake with client during CONNECT bump")?;
+    let tls_stream = timeout(
+        app.settings.tls_handshake_timeout(),
+        acceptor.accept(stream),
+    )
+    .await
+    .map_err(|_| anyhow!("TLS handshake with client timed out"))?
+    .context("failed to complete TLS handshake with client during CONNECT bump")?;
     let negotiated = tls_stream
         .get_ref()
         .1
         .alpn_protocol()
         .map(|proto| proto.to_vec());
 
-    if supports_h2 && negotiated.as_deref() == Some(b"h2") {
-        http2::serve_bumped_http2(
-            tls_stream,
-            peer,
-            app.clone(),
-            Some(resolved.clone()),
-            primed,
-        )
-        .await?;
+    let serve = async {
+        if supports_h2 && negotiated.as_deref() == Some(b"h2") {
+            http2::serve_bumped_http2(
+                tls_stream,
+                peer,
+                app.clone(),
+                Some(resolved.clone()),
+                primed,
+            )
+            .await
+        } else {
+            handle_decrypted_https(tls_stream, peer, app.clone(), Some(resolved)).await
+        }
+    };
+
+    if let Some(limit) = app.settings.connect_tunnel_max_lifetime() {
+        match timeout(limit, serve).await {
+            Ok(result) => result?,
+            Err(_) => return Err(anyhow!("CONNECT tunnel max lifetime exceeded")),
+        }
     } else {
-        handle_decrypted_https(tls_stream, peer, app.clone(), Some(resolved)).await?;
+        serve.await?;
     }
 
     Ok(BumpStats { handshake_bytes })
@@ -123,7 +137,7 @@ async fn probe_upstream_http2(
 
     let connector = TlsConnector::from(app.tls.client_http2.clone());
     let tls_stream = match timeout(
-        app.settings.upstream_timeout(),
+        app.settings.tls_handshake_timeout(),
         connector.connect(server_name, tcp),
     )
     .await

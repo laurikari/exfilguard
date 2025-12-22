@@ -31,7 +31,8 @@ pub mod fuzzing {
         S: AsyncRead + Unpin,
     {
         if let Some(head) =
-            super::codec::read_request_head(reader, peer, timeout, max_header_bytes).await?
+            super::codec::read_request_head(reader, peer, timeout, timeout, max_header_bytes)
+                .await?
         {
             let host = head.headers.host();
             let _ = crate::proxy::request::parse_http1_request(
@@ -93,6 +94,7 @@ mod tests {
             &mut upstream_sink,
             Duration::from_secs(1),
             Duration::from_secs(1),
+            None,
             peer,
             2,
         )
@@ -115,6 +117,7 @@ mod tests {
         let head = read_request_head(
             &mut reader,
             "127.0.0.1:12345".parse().unwrap(),
+            Duration::from_secs(1),
             Duration::from_secs(1),
             1024,
         )
@@ -141,6 +144,7 @@ mod tests {
         let result = read_request_head(
             &mut reader,
             "127.0.0.1:12345".parse().unwrap(),
+            Duration::from_secs(1),
             Duration::from_secs(1),
             512,
         )

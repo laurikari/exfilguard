@@ -20,6 +20,13 @@ pub struct ForwardErrorSpec {
 
 pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
     match kind {
+        ForwardErrorKind::RequestTimeout => ForwardErrorSpec {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            body_http1: b"request timed out\r\n",
+            body_http2: "request timed out",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+        },
         ForwardErrorKind::BodyTooLarge(body) => ForwardErrorSpec {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             body_http1: b"request body exceeds configured limit\r\n",
@@ -90,6 +97,7 @@ pub async fn handle_forward_result<'a, T>(
         Err(err) => {
             let kind = classify_forward_error(&err);
             let kind_label = match kind {
+                ForwardErrorKind::RequestTimeout => "request_timeout",
                 ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
                 ForwardErrorKind::PrivateAddress(_) => "private_address",
                 ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",

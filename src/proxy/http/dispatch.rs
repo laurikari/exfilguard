@@ -51,7 +51,9 @@ where
         fallback_scheme,
         connect_binding,
     } = options;
-    let client_timeout = app.settings.client_timeout();
+    let keepalive_timeout = app.settings.client_keepalive_idle_timeout();
+    let header_timeout = app.settings.request_header_timeout();
+    let response_timeout = app.settings.response_body_idle_timeout();
     let max_request_header_size = app.settings.max_request_header_size;
     let mut reader = BufReader::new(stream);
     let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
@@ -59,38 +61,43 @@ where
 
     loop {
         let start = Instant::now();
-        let request_head =
-            match read_request_head(&mut reader, peer, client_timeout, max_request_header_size)
-                .await
-            {
-                Ok(Some(head)) => head,
-                Ok(None) => break,
-                Err(err) => {
-                    let err_message = err.to_string();
-                    if err_message.starts_with("timed out") {
-                        warn!(peer = %peer, error = %err, "client request timed out");
-                        break;
-                    }
-                    warn!(peer = %peer, error = %err, "invalid request");
-                    respond_with_access_log(
-                        reader.get_mut(),
-                        StatusCode::BAD_REQUEST,
-                        None,
-                        b"invalid request\r\n",
-                        client_timeout,
-                        0,
-                        start.elapsed(),
-                        AccessLogBuilder::new(peer)
-                            .method("UNKNOWN")
-                            .scheme(scheme_name(fallback_scheme))
-                            .host("")
-                            .path("")
-                            .decision("ERROR"),
-                    )
-                    .await?;
+        let request_head = match read_request_head(
+            &mut reader,
+            peer,
+            keepalive_timeout,
+            header_timeout,
+            max_request_header_size,
+        )
+        .await
+        {
+            Ok(Some(head)) => head,
+            Ok(None) => break,
+            Err(err) => {
+                let err_message = err.to_string();
+                if err_message.starts_with("timed out") {
+                    warn!(peer = %peer, error = %err, "client request timed out");
                     break;
                 }
-            };
+                warn!(peer = %peer, error = %err, "invalid request");
+                respond_with_access_log(
+                    reader.get_mut(),
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    b"invalid request\r\n",
+                    response_timeout,
+                    0,
+                    start.elapsed(),
+                    AccessLogBuilder::new(peer)
+                        .method("UNKNOWN")
+                        .scheme(scheme_name(fallback_scheme))
+                        .host("")
+                        .path("")
+                        .decision("ERROR"),
+                )
+                .await?;
+                break;
+            }
+        };
         let RequestHead {
             method,
             target,
@@ -104,7 +111,7 @@ where
             let request_bytes = request_line_bytes + header_bytes;
             let stream = reader.into_inner();
             upstream_pool
-                .shutdown_all(app.settings.upstream_timeout())
+                .shutdown_all(app.settings.response_body_idle_timeout())
                 .await?;
             return Ok(LoopOutcome::Connect(ConnectRequest {
                 stream,
@@ -132,7 +139,7 @@ where
     }
 
     upstream_pool
-        .shutdown_all(app.settings.upstream_timeout())
+        .shutdown_all(app.settings.response_body_idle_timeout())
         .await?;
     Ok(LoopOutcome::Completed)
 }

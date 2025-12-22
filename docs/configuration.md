@@ -103,13 +103,22 @@ To integrate with an existing PKI so clients already trust ExfilGuard's certific
 
 ## Timeout Settings
 
-All timeout values are in seconds and must be greater than 0.
+All timeout values are in seconds. Use `0` to disable `request_total_timeout` and
+`connect_tunnel_max_lifetime`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `client_timeout` | u64 | 30 | Maximum time to wait for client responses |
-| `upstream_connect_timeout` | u64 | 5 | Maximum time to establish upstream connections |
-| `upstream_timeout` | u64 | 60 | Maximum time to wait for upstream responses |
+| `dns_resolve_timeout` | u64 | 2 | Maximum time to resolve DNS for upstream hosts |
+| `upstream_connect_timeout` | u64 | 5 | Maximum time to establish upstream TCP connections |
+| `tls_handshake_timeout` | u64 | 10 | Maximum time for TLS handshakes (client or upstream) |
+| `request_header_timeout` | u64 | 10 | Maximum time to read an HTTP request line + headers |
+| `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |
+| `response_header_timeout` | u64 | 30 | Maximum time to receive upstream response headers |
+| `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
+| `request_total_timeout` | u64 | 0 | Maximum time from request start to upstream response headers (0 disables) |
+| `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an idle client keep-alive connection |
+| `connect_tunnel_idle_timeout` | u64 | 60 | Maximum idle time for CONNECT tunnels |
+| `connect_tunnel_max_lifetime` | u64 | 0 | Maximum lifetime for CONNECT tunnels (0 disables) |
 
 ---
 
@@ -253,9 +262,17 @@ log_queries = false
 leaf_ttl = 86400
 
 # Timeouts (seconds)
-client_timeout = 30
+dns_resolve_timeout = 2
 upstream_connect_timeout = 5
-upstream_timeout = 60
+tls_handshake_timeout = 10
+request_header_timeout = 10
+request_body_idle_timeout = 30
+response_header_timeout = 30
+response_body_idle_timeout = 60
+request_total_timeout = 0
+client_keepalive_idle_timeout = 30
+connect_tunnel_idle_timeout = 60
+connect_tunnel_max_lifetime = 0
 
 # Connection pool
 upstream_pool_capacity = 32

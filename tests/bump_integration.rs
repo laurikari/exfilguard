@@ -19,7 +19,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -221,7 +221,7 @@ name = "connect-splice"
     let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
         .with_settings(|settings| {
             settings.upstream_connect_timeout = 1;
-            settings.upstream_timeout = 1;
+            settings.response_body_idle_timeout = 1;
             settings.upstream_pool_capacity = 4;
         })
         .spawn()
@@ -248,6 +248,87 @@ name = "connect-splice"
     let mut echoed = vec![0u8; payload.len()];
     stream.read_exact(&mut echoed).await?;
     assert_eq!(echoed.as_slice(), payload);
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_splice_max_lifetime_closes_without_http_response() -> Result<()> {
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = upstream_listener.accept().await {
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let dirs = TestDirs::new()?;
+    let clients = r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["connect-splice"]
+fallback = true
+"#;
+
+    let policies = format!(
+        r#"[[policy]]
+name = "connect-splice"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT"]
+  inspect_payload = false
+  allow_private_upstream = true
+  url_pattern = "https://127.0.0.1:{upstream_port}/**"
+"#,
+    );
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+        .with_settings(|settings| {
+            settings.connect_tunnel_idle_timeout = 60;
+            settings.connect_tunnel_max_lifetime = 1;
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = read_until_double_crlf(&mut stream).await?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected CONNECT response: {response}"
+    );
+
+    sleep(StdDuration::from_secs(2)).await;
+
+    let mut buf = [0u8; 64];
+    let read = timeout(StdDuration::from_secs(2), stream.read(&mut buf)).await??;
+    assert!(
+        read == 0,
+        "expected tunnel to close without extra response, got: {}",
+        String::from_utf8_lossy(&buf[..read])
+    );
 
     stream.shutdown().await.ok();
     harness.shutdown().await;

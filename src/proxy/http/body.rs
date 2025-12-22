@@ -1,13 +1,18 @@
+use std::future::Future;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::time::timeout;
 
 use crate::{
     io_util::write_all_with_timeout,
-    proxy::{forward_limits::BodySizeTracker, http::codec::read_line_with_timeout},
+    proxy::{
+        forward_error::RequestTimeout, forward_limits::BodySizeTracker,
+        http::codec::read_line_with_timeout,
+    },
     util::timeout_with_context,
 };
 
@@ -26,12 +31,47 @@ pub enum BodyPlan {
     Chunked,
 }
 
+async fn with_total_deadline<F, T>(total_deadline: Option<Instant>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    if let Some(deadline) = total_deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RequestTimeout.into());
+        }
+        let remaining = deadline - now;
+        match timeout(remaining, future).await {
+            Ok(result) => result,
+            Err(_) => Err(RequestTimeout.into()),
+        }
+    } else {
+        future.await
+    }
+}
+
+async fn with_idle_and_total<F, T, E>(
+    idle_timeout: Duration,
+    total_deadline: Option<Instant>,
+    future: F,
+    context: impl Into<String>,
+) -> Result<T>
+where
+    F: Future<Output = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let context = context.into();
+    let idle_fut = timeout_with_context(idle_timeout, future, context);
+    with_total_deadline(total_deadline, idle_fut).await
+}
+
 pub async fn stream_fixed_body<S, U>(
     reader: &mut BufReader<S>,
     upstream: &mut U,
     mut remaining: usize,
-    client_timeout: Duration,
-    upstream_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
+    total_deadline: Option<Instant>,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -41,8 +81,9 @@ where
     let mut buffer = [0u8; 8192];
     while remaining > 0 {
         let to_read = remaining.min(buffer.len());
-        let read = timeout_with_context(
-            client_timeout,
+        let read = with_idle_and_total(
+            read_timeout,
+            total_deadline,
             reader.read(&mut buffer[..to_read]),
             "reading request body from client",
         )
@@ -51,11 +92,14 @@ where
             bail!("unexpected EOF while reading request body from client");
         }
         remaining -= read;
-        write_all_with_timeout(
-            upstream,
-            &buffer[..read],
-            upstream_timeout,
-            "writing request body to upstream",
+        with_total_deadline(
+            total_deadline,
+            write_all_with_timeout(
+                upstream,
+                &buffer[..read],
+                write_timeout,
+                "writing request body to upstream",
+            ),
         )
         .await?;
         transferred = transferred.saturating_add(read as u64);
@@ -63,11 +107,13 @@ where
     Ok(transferred)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_chunked_body_generic<R, W>(
     reader: &mut BufReader<R>,
     writer: &mut W,
     read_timeout: Duration,
     write_timeout: Duration,
+    total_deadline: Option<Instant>,
     peer: SocketAddr,
     write_target: &str,
     mut limit: Option<&mut BodySizeTracker>,
@@ -81,9 +127,11 @@ where
 
     loop {
         line.clear();
-        let size_bytes =
-            read_line_with_timeout(reader, &mut line, read_timeout, peer, MAX_CHUNK_LINE_LENGTH)
-                .await?;
+        let size_bytes = with_total_deadline(
+            total_deadline,
+            read_line_with_timeout(reader, &mut line, read_timeout, peer, MAX_CHUNK_LINE_LENGTH),
+        )
+        .await?;
         if size_bytes == 0 {
             bail!("unexpected EOF while reading chunk size from {peer}");
         }
@@ -100,33 +148,42 @@ where
             limit_tracker.record(chunk_size)?;
         }
 
-        write_all_with_timeout(
-            writer,
-            line.as_bytes(),
-            write_timeout,
-            format!("forwarding chunk size {write_target}"),
+        with_total_deadline(
+            total_deadline,
+            write_all_with_timeout(
+                writer,
+                line.as_bytes(),
+                write_timeout,
+                format!("forwarding chunk size {write_target}"),
+            ),
         )
         .await?;
 
         if chunk_size == 0 {
             loop {
                 line.clear();
-                let trailer_bytes = read_line_with_timeout(
-                    reader,
-                    &mut line,
-                    read_timeout,
-                    peer,
-                    MAX_CHUNK_LINE_LENGTH,
+                let trailer_bytes = with_total_deadline(
+                    total_deadline,
+                    read_line_with_timeout(
+                        reader,
+                        &mut line,
+                        read_timeout,
+                        peer,
+                        MAX_CHUNK_LINE_LENGTH,
+                    ),
                 )
                 .await?;
                 if trailer_bytes == 0 {
                     bail!("unexpected EOF while reading chunk trailer from {peer}");
                 }
-                write_all_with_timeout(
-                    writer,
-                    line.as_bytes(),
-                    write_timeout,
-                    format!("forwarding chunk trailer {write_target}"),
+                with_total_deadline(
+                    total_deadline,
+                    write_all_with_timeout(
+                        writer,
+                        line.as_bytes(),
+                        write_timeout,
+                        format!("forwarding chunk trailer {write_target}"),
+                    ),
                 )
                 .await?;
                 total_bytes = total_bytes.saturating_add(trailer_bytes as u64);
@@ -141,8 +198,9 @@ where
         let mut buffer = [0u8; 8192];
         while remaining > 0 {
             let to_read = remaining.min(buffer.len());
-            let read = timeout_with_context(
+            let read = with_idle_and_total(
                 read_timeout,
+                total_deadline,
                 reader.read(&mut buffer[..to_read]),
                 format!("reading chunk data from {peer}"),
             )
@@ -151,19 +209,23 @@ where
                 bail!("unexpected EOF while reading chunk data from {peer}");
             }
             remaining -= read;
-            write_all_with_timeout(
-                writer,
-                &buffer[..read],
-                write_timeout,
-                format!("forwarding chunk data {write_target}"),
+            with_total_deadline(
+                total_deadline,
+                write_all_with_timeout(
+                    writer,
+                    &buffer[..read],
+                    write_timeout,
+                    format!("forwarding chunk data {write_target}"),
+                ),
             )
             .await?;
             total_bytes = total_bytes.saturating_add(read as u64);
         }
 
         let mut crlf = [0u8; 2];
-        timeout_with_context(
+        with_idle_and_total(
             read_timeout,
+            total_deadline,
             reader.read_exact(&mut crlf),
             format!("reading chunk terminator from {peer}"),
         )
@@ -171,11 +233,14 @@ where
         if &crlf != b"\r\n" {
             bail!("invalid chunk terminator when reading from {peer}");
         }
-        write_all_with_timeout(
-            writer,
-            &crlf,
-            write_timeout,
-            format!("forwarding chunk terminator {write_target}"),
+        with_total_deadline(
+            total_deadline,
+            write_all_with_timeout(
+                writer,
+                &crlf,
+                write_timeout,
+                format!("forwarding chunk terminator {write_target}"),
+            ),
         )
         .await?;
         total_bytes = total_bytes.saturating_add(2);
@@ -187,8 +252,9 @@ where
 pub async fn stream_chunked_body<S, U>(
     reader: &mut BufReader<S>,
     upstream: &mut U,
-    client_timeout: Duration,
-    upstream_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
+    total_deadline: Option<Instant>,
     peer: SocketAddr,
     max_request_body_size: usize,
 ) -> Result<u64>
@@ -200,8 +266,9 @@ where
     relay_chunked_body_generic(
         reader,
         upstream,
-        client_timeout,
-        upstream_timeout,
+        read_timeout,
+        write_timeout,
+        total_deadline,
         peer,
         "to upstream",
         Some(&mut tracker),
@@ -213,8 +280,8 @@ pub async fn relay_fixed_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
     mut remaining: u64,
-    upstream_timeout: Duration,
-    client_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
     peer: SocketAddr,
 ) -> Result<u64>
 where
@@ -226,7 +293,7 @@ where
     while remaining > 0 {
         let to_read = remaining.min(buffer.len() as u64) as usize;
         let read = timeout_with_context(
-            upstream_timeout,
+            read_timeout,
             upstream.read(&mut buffer[..to_read]),
             format!("reading upstream response body from {peer}"),
         )
@@ -238,7 +305,7 @@ where
         write_all_with_timeout(
             client,
             &buffer[..read],
-            client_timeout,
+            write_timeout,
             "writing response body to client",
         )
         .await?;
@@ -250,8 +317,8 @@ where
 pub async fn relay_chunked_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
-    upstream_timeout: Duration,
-    client_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
     peer: SocketAddr,
 ) -> Result<u64>
 where
@@ -261,8 +328,9 @@ where
     relay_chunked_body_generic(
         upstream,
         client,
-        upstream_timeout,
-        client_timeout,
+        read_timeout,
+        write_timeout,
+        None,
         peer,
         "to client",
         None,
@@ -273,8 +341,8 @@ where
 pub async fn relay_until_close<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
-    upstream_timeout: Duration,
-    client_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
     peer: SocketAddr,
 ) -> Result<u64>
 where
@@ -285,7 +353,7 @@ where
     let mut buffer = [0u8; 8192];
     loop {
         let read = timeout_with_context(
-            upstream_timeout,
+            read_timeout,
             upstream.read(&mut buffer),
             format!("reading response body from upstream {peer}"),
         )
@@ -296,7 +364,7 @@ where
         write_all_with_timeout(
             client,
             &buffer[..read],
-            client_timeout,
+            write_timeout,
             "writing response body to client",
         )
         .await?;

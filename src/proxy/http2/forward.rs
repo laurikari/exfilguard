@@ -1,4 +1,9 @@
-use std::{collections::HashSet, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -8,6 +13,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use tokio::time::timeout;
 
 use crate::{
+    proxy::forward_error::RequestTimeout,
     proxy::forward_limits::{BodySizeTracker, HeaderBudget},
     util::timeout_with_context,
 };
@@ -18,6 +24,25 @@ use super::{
 };
 
 const HEADER_PADDING: usize = 4;
+
+async fn with_total_deadline<F, T>(total_deadline: Option<Instant>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    if let Some(deadline) = total_deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RequestTimeout.into());
+        }
+        let remaining = deadline - now;
+        match timeout(remaining, future).await {
+            Ok(result) => result,
+            Err(_) => Err(RequestTimeout.into()),
+        }
+    } else {
+        future.await
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ForwardOutcome {
@@ -52,11 +77,15 @@ pub(super) async fn forward_request_to_upstream(
     meta: SanitizedRequest,
     body: &mut RecvStream,
     respond: &mut SendResponse<Bytes>,
-    client_timeout: Duration,
-    upstream_timeout: Duration,
+    request_body_timeout: Duration,
+    response_header_timeout: Duration,
+    response_body_timeout: Duration,
+    request_start: Instant,
+    request_total_timeout: Option<Duration>,
     max_request_body_size: usize,
     max_response_header_bytes: usize,
 ) -> Result<ForwardOutcome> {
+    let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
     let mut sender = checkout.sender;
     let upstream_peer = checkout.peer;
     let reused_existing = checkout.reused_existing;
@@ -90,9 +119,12 @@ pub(super) async fn forward_request_to_upstream(
     let mut body_tracker = BodySizeTracker::new(max_request_body_size);
 
     if !end_of_stream {
-        while let Some(frame) = timeout(client_timeout, body.data())
-            .await
-            .map_err(|_| anyhow!("timed out reading HTTP/2 request body from client"))?
+        while let Some(frame) = with_total_deadline(request_deadline, async {
+            timeout(request_body_timeout, body.data())
+                .await
+                .map_err(|_| anyhow!("timed out reading HTTP/2 request body from client"))
+        })
+        .await?
         {
             let chunk = frame.context("failed to read data frame from HTTP/2 client")?;
             if chunk.is_empty() {
@@ -104,10 +136,13 @@ pub(super) async fn forward_request_to_upstream(
                 .context("failed to forward HTTP/2 request body upstream")?;
         }
 
-        match timeout_with_context(
-            client_timeout,
-            body.trailers(),
-            "reading HTTP/2 request trailers from client",
+        match with_total_deadline(
+            request_deadline,
+            timeout_with_context(
+                request_body_timeout,
+                body.trailers(),
+                "reading HTTP/2 request trailers from client",
+            ),
         )
         .await?
         {
@@ -124,10 +159,13 @@ pub(super) async fn forward_request_to_upstream(
         }
     }
 
-    let response = timeout_with_context(
-        upstream_timeout,
-        response_fut,
-        "receiving HTTP/2 response from upstream",
+    let response = with_total_deadline(
+        request_deadline,
+        timeout_with_context(
+            response_header_timeout,
+            response_fut,
+            "receiving HTTP/2 response from upstream",
+        ),
     )
     .await?;
     let client_body_bytes = body_tracker.total();
@@ -189,7 +227,7 @@ pub(super) async fn forward_request_to_upstream(
     let mut upstream_body_bytes = 0u64;
     let mut response_body = response.into_body();
     if !end_stream {
-        while let Some(frame) = timeout(upstream_timeout, response_body.data())
+        while let Some(frame) = timeout(response_body_timeout, response_body.data())
             .await
             .map_err(|_| anyhow!("timed out reading HTTP/2 response body from upstream"))?
         {
@@ -206,7 +244,7 @@ pub(super) async fn forward_request_to_upstream(
         }
 
         match timeout_with_context(
-            upstream_timeout,
+            response_body_timeout,
             response_body.trailers(),
             "reading HTTP/2 response trailers from upstream",
         )

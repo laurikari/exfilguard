@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -21,6 +22,10 @@ pub struct SpliceStats {
     pub upstream_addr: SocketAddr,
 }
 
+#[derive(Debug, Error)]
+#[error("CONNECT tunnel max lifetime exceeded")]
+pub struct ConnectTunnelTimeout;
+
 pub async fn handle_splice(
     client_stream: &mut TcpStream,
     target: &ConnectTarget,
@@ -31,28 +36,31 @@ pub async fn handle_splice(
     let connect_timeout = app.settings.upstream_connect_timeout();
     let (mut upstream_stream, upstream_addr) =
         upstream::connect_to_addrs(resolved.addresses(), connect_timeout).await?;
-    let client_timeout = app.settings.client_timeout();
-    let upstream_timeout = app.settings.upstream_timeout();
+    let tunnel_idle_timeout = app.settings.connect_tunnel_idle_timeout();
+    let tunnel_max_lifetime = app.settings.connect_tunnel_max_lifetime();
 
-    let handshake_bytes = send_connect_established(client_stream, client_timeout).await?;
+    let handshake_bytes = send_connect_established(client_stream, tunnel_idle_timeout).await?;
 
-    let (client_stream_bytes, upstream_stream_bytes) = relay_with_idle_timeouts(
-        client_stream,
-        &mut upstream_stream,
-        client_timeout,
-        upstream_timeout,
-    )
-    .await
-    .context("CONNECT splice relay failed")?;
+    let relay = relay_with_idle_timeouts(client_stream, &mut upstream_stream, tunnel_idle_timeout);
+    let relay_result = if let Some(limit) = tunnel_max_lifetime {
+        match tokio::time::timeout(limit, relay).await {
+            Ok(result) => result,
+            Err(_) => return Err(ConnectTunnelTimeout.into()),
+        }
+    } else {
+        relay.await
+    };
+    let (client_stream_bytes, upstream_stream_bytes) =
+        relay_result.context("CONNECT splice relay failed")?;
 
     timeout_with_context(
-        client_timeout,
+        tunnel_idle_timeout,
         client_stream.shutdown(),
         "closing client stream after CONNECT",
     )
     .await?;
     timeout_with_context(
-        upstream_timeout,
+        tunnel_idle_timeout,
         upstream_stream.shutdown(),
         "closing upstream stream after CONNECT",
     )
@@ -67,25 +75,24 @@ pub async fn handle_splice(
 
 pub async fn send_connect_established(
     stream: &mut TcpStream,
-    client_timeout: Duration,
+    write_timeout: Duration,
 ) -> Result<u64> {
     let established = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: exfilguard\r\n\r\n";
     write_all_with_timeout(
         stream,
         established,
-        client_timeout,
+        write_timeout,
         "writing CONNECT response",
     )
     .await?;
-    timeout_with_context(client_timeout, stream.flush(), "flushing CONNECT response").await?;
+    timeout_with_context(write_timeout, stream.flush(), "flushing CONNECT response").await?;
     Ok(established.len() as u64)
 }
 
 async fn relay_with_idle_timeouts(
     client_stream: &mut TcpStream,
     upstream_stream: &mut TcpStream,
-    client_timeout: Duration,
-    upstream_timeout: Duration,
+    idle_timeout: Duration,
 ) -> Result<(u64, u64)> {
     let (mut client_reader, mut client_writer) = io::split(client_stream);
     let (mut upstream_reader, mut upstream_writer) = io::split(upstream_stream);
@@ -93,16 +100,16 @@ async fn relay_with_idle_timeouts(
     let client_to_upstream = transfer_half(
         &mut client_reader,
         &mut upstream_writer,
-        client_timeout,
-        upstream_timeout,
+        idle_timeout,
+        idle_timeout,
         "CONNECT client",
         "upstream server",
     );
     let upstream_to_client = transfer_half(
         &mut upstream_reader,
         &mut client_writer,
-        client_timeout,
-        client_timeout,
+        idle_timeout,
+        idle_timeout,
         "upstream server",
         "CONNECT client",
     );
@@ -169,7 +176,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test(start_paused = true)]
-    async fn client_timeout_applies_to_upstream_read() -> Result<()> {
+    async fn idle_timeout_applies_to_upstream_read() -> Result<()> {
         let client_listener = TcpListener::bind("127.0.0.1:0").await?;
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
 
@@ -185,17 +192,10 @@ mod tests {
         let (mut client_stream, _) = client_accept.await??;
         let (mut upstream_stream, _) = upstream_accept.await??;
 
-        let client_timeout = Duration::from_secs(1);
-        let upstream_timeout = Duration::from_secs(10);
+        let idle_timeout = Duration::from_secs(1);
 
         let handle = tokio::spawn(async move {
-            relay_with_idle_timeouts(
-                &mut client_stream,
-                &mut upstream_stream,
-                client_timeout,
-                upstream_timeout,
-            )
-            .await
+            relay_with_idle_timeouts(&mut client_stream, &mut upstream_stream, idle_timeout).await
         });
 
         tokio::task::yield_now().await;

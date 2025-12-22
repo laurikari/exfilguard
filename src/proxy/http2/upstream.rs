@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use h2::client;
-use tokio::{net::TcpStream, task::JoinHandle};
+use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use tracing::debug;
 
@@ -132,7 +132,7 @@ impl Http2Upstream {
             &request.host,
             port,
             self.binding.as_ref(),
-            connect_timeout,
+            self.app.settings.dns_resolve_timeout(),
             allow_private_upstream,
             "policy allow_private_upstream permitted private upstream address",
         )
@@ -142,10 +142,13 @@ impl Http2Upstream {
         let connector = TlsConnector::from(self.app.tls.client_http2.clone());
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| anyhow!("invalid upstream host for TLS '{}'", request.host))?;
-        let tls_stream = connector
-            .connect(server_name, tcp_stream)
-            .await
-            .context("failed to establish TLS with upstream for HTTP/2")?;
+        let tls_stream = timeout(
+            self.app.settings.tls_handshake_timeout(),
+            connector.connect(server_name, tcp_stream),
+        )
+        .await
+        .map_err(|_| anyhow!("TLS handshake with upstream timed out"))?
+        .context("failed to establish TLS with upstream for HTTP/2")?;
         let protocol = tls_stream
             .get_ref()
             .1

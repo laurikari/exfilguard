@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, warn};
 
@@ -13,6 +14,7 @@ use crate::io_util::{BestEffortWriter, TeeWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::cache::{CacheSkipReason, CacheStorePlan, CacheWritePlan, plan_cache_write};
 use crate::proxy::connect::ResolvedTarget;
+use crate::proxy::forward_error::RequestTimeout;
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
@@ -28,8 +30,9 @@ use crate::proxy::cache::{build_cache_request_context, header_lines_to_map};
 
 pub struct ForwardTimeouts {
     pub connect: Duration,
-    pub upstream: Duration,
-    pub client: Duration,
+    pub request_io: Duration,
+    pub response_header: Duration,
+    pub response_io: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +130,8 @@ pub async fn forward_to_upstream<S>(
     body_plan: BodyPlan,
     connect_binding: Option<&ResolvedTarget>,
     timeouts: &ForwardTimeouts,
+    request_start: Instant,
+    request_total_timeout: Option<Duration>,
     expect_continue: bool,
     decision: &AllowDecision,
     peer: SocketAddr,
@@ -172,6 +177,8 @@ where
         headers,
         body_plan,
         timeouts,
+        request_start,
+        request_total_timeout,
         expect_continue,
         peer,
         max_request_body_size,
@@ -185,8 +192,8 @@ where
     match outcome {
         Ok((stats, reuse_upstream, client_close)) => {
             if reuse_upstream {
-                pool.put(key, connection, timeouts.upstream);
-            } else if let Err(err) = connection.shutdown(timeouts.upstream).await {
+                pool.put(key, connection, timeouts.response_io);
+            } else if let Err(err) = connection.shutdown(timeouts.response_io).await {
                 debug!(
                     host = %connection.host,
                     port = connection.port,
@@ -203,7 +210,7 @@ where
             })
         }
         Err(err) => {
-            if let Err(shutdown_err) = connection.shutdown(timeouts.upstream).await {
+            if let Err(shutdown_err) = connection.shutdown(timeouts.response_io).await {
                 debug!(
                     host = %connection.host,
                     port = connection.port,
@@ -225,6 +232,8 @@ pub async fn forward_with_connection<S>(
     headers: &HeaderAccumulator,
     body_plan: BodyPlan,
     timeouts: &ForwardTimeouts,
+    request_start: Instant,
+    request_total_timeout: Option<Duration>,
     expect_continue: bool,
     peer: SocketAddr,
     max_request_body_size: usize,
@@ -236,12 +245,13 @@ pub async fn forward_with_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
     let request_bytes =
         build_upstream_request(request, headers, request_close, &body_plan, expect_continue);
     write_all_with_timeout(
         &mut connection.stream,
         &request_bytes,
-        timeouts.upstream,
+        timeouts.request_io,
         "sending request headers to upstream",
     )
     .await?;
@@ -250,7 +260,7 @@ where
         client_reader.get_mut(),
         expect_continue,
         body_plan,
-        timeouts.client,
+        timeouts.request_io,
     )
     .await?;
 
@@ -262,8 +272,9 @@ where
                 client_reader,
                 &mut connection.stream,
                 length,
-                timeouts.client,
-                timeouts.upstream,
+                timeouts.request_io,
+                timeouts.request_io,
+                request_deadline,
             )
             .await?;
         }
@@ -271,8 +282,9 @@ where
             client_body_bytes = stream_chunked_body(
                 client_reader,
                 &mut connection.stream,
-                timeouts.client,
-                timeouts.upstream,
+                timeouts.request_io,
+                timeouts.request_io,
+                request_deadline,
                 peer,
                 max_request_body_size,
             )
@@ -281,21 +293,33 @@ where
     }
 
     timeout_with_context(
-        timeouts.upstream,
+        timeouts.request_io,
         connection.stream.flush(),
         "flushing upstream stream",
     )
     .await?;
 
     let mut upstream_reader = BufReader::new(&mut connection.stream);
-    let (head, informational_bytes) = read_final_response_head(
+    let head_fut = read_final_response_head(
         &mut upstream_reader,
         client_reader.get_mut(),
         timeouts,
         connection.peer,
         max_response_header_bytes,
-    )
-    .await?;
+    );
+    let (head, informational_bytes) = if let Some(deadline) = request_deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RequestTimeout.into());
+        }
+        let remaining = deadline - now;
+        match timeout(remaining, head_fut).await {
+            Ok(result) => result?,
+            Err(_) => return Err(RequestTimeout.into()),
+        }
+    } else {
+        head_fut.await?
+    };
     let response_body_plan = determine_response_body_plan(&request.method, head.status, &head);
 
     let mut client_close = request_close || head.connection_close;
@@ -388,7 +412,7 @@ where
         write_all_with_timeout(
             client_stream,
             &encoded_head,
-            timeouts.client,
+            timeouts.response_io,
             "writing response head to client",
         )
         .await?;
@@ -407,8 +431,8 @@ where
                         &mut upstream_reader,
                         &mut tee,
                         response_body_plan,
-                        timeouts.upstream,
-                        timeouts.client,
+                        timeouts.response_io,
+                        timeouts.response_io,
                         connection.peer,
                     )
                     .await
@@ -459,8 +483,8 @@ where
                 &mut upstream_reader,
                 client_stream,
                 response_body_plan,
-                timeouts.upstream,
-                timeouts.client,
+                timeouts.response_io,
+                timeouts.response_io,
                 connection.peer,
             )
             .await?
@@ -470,7 +494,7 @@ where
     }
     // Access client_stream again to flush
     timeout_with_context(
-        timeouts.client,
+        timeouts.response_io,
         client_reader.get_mut().flush(),
         "flushing client stream",
     )
@@ -501,8 +525,8 @@ async fn relay_body_generic<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
     plan: ResponseBodyPlan,
-    upstream_timeout: Duration,
-    client_timeout: Duration,
+    upstream_io_timeout: Duration,
+    client_io_timeout: Duration,
     peer: SocketAddr,
 ) -> Result<u64>
 where
@@ -516,17 +540,31 @@ where
                 upstream,
                 client,
                 length,
-                upstream_timeout,
-                client_timeout,
+                upstream_io_timeout,
+                client_io_timeout,
                 peer,
             )
             .await
         }
         ResponseBodyPlan::Chunked => {
-            relay_chunked_body(upstream, client, upstream_timeout, client_timeout, peer).await
+            relay_chunked_body(
+                upstream,
+                client,
+                upstream_io_timeout,
+                client_io_timeout,
+                peer,
+            )
+            .await
         }
         ResponseBodyPlan::UntilClose => {
-            relay_until_close(upstream, client, upstream_timeout, client_timeout, peer).await
+            relay_until_close(
+                upstream,
+                client,
+                upstream_io_timeout,
+                client_io_timeout,
+                peer,
+            )
+            .await
         }
     }
 }
@@ -544,9 +582,13 @@ where
 {
     let mut bytes_to_client = 0u64;
     loop {
-        let mut head =
-            read_response_head(upstream, timeouts.upstream, peer, max_response_header_bytes)
-                .await?;
+        let mut head = read_response_head(
+            upstream,
+            timeouts.response_header,
+            peer,
+            max_response_header_bytes,
+        )
+        .await?;
         if head.status == StatusCode::SWITCHING_PROTOCOLS {
             anyhow::bail!("upstream attempted protocol upgrade (101 Switching Protocols)");
         }
@@ -564,12 +606,12 @@ where
             write_all_with_timeout(
                 client,
                 &encoded,
-                timeouts.client,
+                timeouts.response_io,
                 "writing informational response to client",
             )
             .await?;
             timeout_with_context(
-                timeouts.client,
+                timeouts.response_io,
                 client.flush(),
                 "flushing informational response to client",
             )
@@ -744,8 +786,9 @@ mod tests {
         let mut client_writer = client_writer;
         let timeouts = ForwardTimeouts {
             connect: Duration::from_secs(1),
-            upstream: Duration::from_secs(1),
-            client: Duration::from_secs(1),
+            request_io: Duration::from_secs(1),
+            response_header: Duration::from_secs(1),
+            response_io: Duration::from_secs(1),
         };
         let (head, bytes) = super::read_final_response_head(
             &mut upstream_reader,
@@ -786,8 +829,9 @@ mod tests {
         let mut upstream_reader = BufReader::new(upstream_reader);
         let timeouts = ForwardTimeouts {
             connect: Duration::from_secs(1),
-            upstream: Duration::from_secs(1),
-            client: Duration::from_secs(1),
+            request_io: Duration::from_secs(1),
+            response_header: Duration::from_secs(1),
+            response_io: Duration::from_secs(1),
         };
         let result = super::read_final_response_head(
             &mut upstream_reader,
@@ -819,8 +863,9 @@ mod tests {
         let mut upstream_reader = BufReader::new(upstream_reader);
         let timeouts = ForwardTimeouts {
             connect: Duration::from_secs(1),
-            upstream: Duration::from_secs(1),
-            client: Duration::from_secs(1),
+            request_io: Duration::from_secs(1),
+            response_header: Duration::from_secs(1),
+            response_io: Duration::from_secs(1),
         };
         let result = super::read_final_response_head(
             &mut upstream_reader,

@@ -75,7 +75,10 @@ where
         start,
         fallback_scheme,
     } = ctx;
-    let client_timeout = app.settings.client_timeout();
+    let request_body_timeout = app.settings.request_body_idle_timeout();
+    let response_header_timeout = app.settings.response_header_timeout();
+    let response_body_timeout = app.settings.response_body_idle_timeout();
+    let request_total_timeout = app.settings.request_total_timeout();
     let content_length = match headers.content_length() {
         Ok(value) => value,
         Err(err) => {
@@ -86,7 +89,7 @@ where
                 StatusCode::BAD_REQUEST,
                 None,
                 b"invalid Content-Length header\r\n",
-                client_timeout,
+                response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
                 AccessLogBuilder::new(peer)
@@ -110,7 +113,7 @@ where
                 StatusCode::EXPECTATION_FAILED,
                 None,
                 b"expectation failed\r\n",
-                client_timeout,
+                response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
                 AccessLogBuilder::new(peer)
@@ -140,7 +143,7 @@ where
             StatusCode::PAYLOAD_TOO_LARGE,
             None,
             b"request body exceeds configured limit\r\n",
-            client_timeout,
+            response_body_timeout,
             total_request_bytes,
             start.elapsed(),
             AccessLogBuilder::new(peer)
@@ -172,7 +175,7 @@ where
                 StatusCode::BAD_REQUEST,
                 None,
                 b"invalid request target\r\n",
-                client_timeout,
+                response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
                 AccessLogBuilder::new(peer)
@@ -197,11 +200,14 @@ where
         body_plan,
         log_tracker,
         peer,
-        client_timeout,
+        request_body_timeout,
+        response_header_timeout,
+        response_body_timeout,
+        request_start: start,
+        request_total_timeout,
         parsed: &parsed,
         expect_continue,
     };
-
     request_pipeline::process_request(
         peer,
         &parsed,
@@ -225,7 +231,11 @@ where
     body_plan: BodyPlan,
     log_tracker: AllowLogTracker,
     peer: SocketAddr,
-    client_timeout: Duration,
+    request_body_timeout: Duration,
+    response_header_timeout: Duration,
+    response_body_timeout: Duration,
+    request_start: Instant,
+    request_total_timeout: Option<Duration>,
     parsed: &'a ParsedRequest,
     expect_continue: bool,
 }
@@ -270,7 +280,7 @@ where
                     write_all_with_timeout(
                         client_stream,
                         &encoded_head,
-                        self.client_timeout,
+                        self.response_body_timeout,
                         "writing cached response head",
                     )
                     .await?;
@@ -281,14 +291,14 @@ where
                         copied = copy_with_write_timeout(
                             &mut file,
                             client_stream,
-                            self.client_timeout,
+                            self.response_body_timeout,
                             "writing cached response body",
                         )
                         .await?;
                     }
 
                     if should_close {
-                        shutdown_stream(client_stream, self.client_timeout).await?;
+                        shutdown_stream(client_stream, self.response_body_timeout).await?;
                     }
 
                     // Log Cache Hit
@@ -383,9 +393,12 @@ where
             self.connect_binding,
             &ForwardTimeouts {
                 connect: self.app.settings.upstream_connect_timeout(),
-                upstream: self.app.settings.upstream_timeout(),
-                client: self.client_timeout,
+                request_io: self.request_body_timeout,
+                response_header: self.response_header_timeout,
+                response_io: self.response_body_timeout,
             },
+            self.request_start,
+            self.request_total_timeout,
             self.expect_continue,
             decision,
             self.peer,
@@ -411,7 +424,7 @@ where
         success: ForwardResult,
     ) -> Result<ClientDisposition> {
         if success.client_close {
-            shutdown_stream(self.reader.get_mut(), self.client_timeout).await?;
+            shutdown_stream(self.reader.get_mut(), self.response_body_timeout).await?;
             Ok(ClientDisposition::Close)
         } else {
             Ok(ClientDisposition::Continue)
@@ -441,7 +454,7 @@ where
             spec.status,
             None,
             spec.body_http1,
-            self.client_timeout,
+            self.response_body_timeout,
             self.log_tracker.current_bytes(),
             self.log_tracker.elapsed(),
             policy_response::forward_error_log_builder(log.access_log_builder(), &decision, &spec),
@@ -462,7 +475,7 @@ where
             response.spec.status,
             response.spec.reason,
             response.spec.body_http1,
-            self.client_timeout,
+            self.response_body_timeout,
             self.log_tracker.base_bytes(),
             self.log_tracker.elapsed(),
             response.log_builder,
@@ -482,7 +495,7 @@ where
             response.spec.status,
             response.spec.reason,
             response.spec.body_http1,
-            self.client_timeout,
+            self.response_body_timeout,
             self.log_tracker.base_bytes(),
             self.log_tracker.elapsed(),
             response.log_builder,
@@ -622,9 +635,17 @@ name = "allow"
             log: LogFormat::Text,
             leaf_ttl: 3600,
             log_queries: false,
-            client_timeout: 1,
+            dns_resolve_timeout: 1,
             upstream_connect_timeout: 1,
-            upstream_timeout: 1,
+            tls_handshake_timeout: 1,
+            request_header_timeout: 1,
+            request_body_idle_timeout: 1,
+            response_header_timeout: 1,
+            response_body_idle_timeout: 1,
+            request_total_timeout: 0,
+            client_keepalive_idle_timeout: 1,
+            connect_tunnel_idle_timeout: 1,
+            connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 4,
             max_request_header_size: 4096,
             max_response_header_size: 4096,

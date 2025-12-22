@@ -45,7 +45,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         request_bytes,
         start,
     } = ctx;
-    let client_timeout = app.settings.client_timeout();
+    let response_timeout = app.settings.response_body_idle_timeout();
     let mut stream = Some(stream);
     let parsed_target = match parse_connect_target(target, host_header) {
         Ok(parsed) => parsed,
@@ -55,7 +55,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
                 stream.as_mut().expect("stream present"),
                 peer,
                 target,
-                client_timeout,
+                response_timeout,
                 request_bytes as u64,
                 start,
             )
@@ -70,7 +70,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         parsed_target,
         request_bytes as u64,
         start,
-        client_timeout,
+        response_timeout,
     );
 
     let parsed_request = ParsedRequest {
@@ -139,7 +139,7 @@ async fn respond_invalid_connect_target(
     stream: &mut TcpStream,
     peer: SocketAddr,
     target: &str,
-    client_timeout: std::time::Duration,
+    response_timeout: std::time::Duration,
     bytes_in: u64,
     start: Instant,
 ) -> Result<()> {
@@ -148,7 +148,7 @@ async fn respond_invalid_connect_target(
         StatusCode::BAD_REQUEST,
         None,
         b"invalid CONNECT target\r\n",
-        client_timeout,
+        response_timeout,
         bytes_in,
         start.elapsed(),
         AccessLogBuilder::for_connect(peer, target.to_string(), target.to_string())

@@ -17,16 +17,48 @@ fn default_log_queries() -> bool {
     false
 }
 
-fn default_client_timeout() -> u64 {
-    30
+fn default_dns_resolve_timeout() -> u64 {
+    2
 }
 
 fn default_upstream_connect_timeout() -> u64 {
     5
 }
 
-fn default_upstream_timeout() -> u64 {
+fn default_tls_handshake_timeout() -> u64 {
+    10
+}
+
+fn default_request_header_timeout() -> u64 {
+    10
+}
+
+fn default_request_body_idle_timeout() -> u64 {
+    30
+}
+
+fn default_response_header_timeout() -> u64 {
+    30
+}
+
+fn default_response_body_idle_timeout() -> u64 {
     60
+}
+
+fn default_request_total_timeout() -> u64 {
+    0
+}
+
+fn default_client_keepalive_idle_timeout() -> u64 {
+    30
+}
+
+fn default_connect_tunnel_idle_timeout() -> u64 {
+    60
+}
+
+fn default_connect_tunnel_max_lifetime() -> u64 {
+    0
 }
 
 fn default_upstream_pool_capacity() -> usize {
@@ -67,12 +99,28 @@ pub struct Settings {
     pub leaf_ttl: u64,
     #[serde(default = "default_log_queries")]
     pub log_queries: bool,
-    #[serde(default = "default_client_timeout")]
-    pub client_timeout: u64,
+    #[serde(default = "default_dns_resolve_timeout")]
+    pub dns_resolve_timeout: u64,
     #[serde(default = "default_upstream_connect_timeout")]
     pub upstream_connect_timeout: u64,
-    #[serde(default = "default_upstream_timeout")]
-    pub upstream_timeout: u64,
+    #[serde(default = "default_tls_handshake_timeout")]
+    pub tls_handshake_timeout: u64,
+    #[serde(default = "default_request_header_timeout")]
+    pub request_header_timeout: u64,
+    #[serde(default = "default_request_body_idle_timeout")]
+    pub request_body_idle_timeout: u64,
+    #[serde(default = "default_response_header_timeout")]
+    pub response_header_timeout: u64,
+    #[serde(default = "default_response_body_idle_timeout")]
+    pub response_body_idle_timeout: u64,
+    #[serde(default = "default_request_total_timeout")]
+    pub request_total_timeout: u64,
+    #[serde(default = "default_client_keepalive_idle_timeout")]
+    pub client_keepalive_idle_timeout: u64,
+    #[serde(default = "default_connect_tunnel_idle_timeout")]
+    pub connect_tunnel_idle_timeout: u64,
+    #[serde(default = "default_connect_tunnel_max_lifetime")]
+    pub connect_tunnel_max_lifetime: u64,
     #[serde(default = "default_upstream_pool_capacity")]
     pub upstream_pool_capacity: usize,
     #[serde(default = "default_max_request_header_size")]
@@ -145,16 +193,56 @@ impl Settings {
         Duration::from_secs(self.leaf_ttl)
     }
 
-    pub fn client_timeout(&self) -> Duration {
-        Duration::from_secs(self.client_timeout)
+    pub fn dns_resolve_timeout(&self) -> Duration {
+        Duration::from_secs(self.dns_resolve_timeout)
     }
 
     pub fn upstream_connect_timeout(&self) -> Duration {
         Duration::from_secs(self.upstream_connect_timeout)
     }
 
-    pub fn upstream_timeout(&self) -> Duration {
-        Duration::from_secs(self.upstream_timeout)
+    pub fn tls_handshake_timeout(&self) -> Duration {
+        Duration::from_secs(self.tls_handshake_timeout)
+    }
+
+    pub fn request_header_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_header_timeout)
+    }
+
+    pub fn request_body_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_body_idle_timeout)
+    }
+
+    pub fn response_header_timeout(&self) -> Duration {
+        Duration::from_secs(self.response_header_timeout)
+    }
+
+    pub fn response_body_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.response_body_idle_timeout)
+    }
+
+    pub fn request_total_timeout(&self) -> Option<Duration> {
+        if self.request_total_timeout == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.request_total_timeout))
+        }
+    }
+
+    pub fn client_keepalive_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.client_keepalive_idle_timeout)
+    }
+
+    pub fn connect_tunnel_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_tunnel_idle_timeout)
+    }
+
+    pub fn connect_tunnel_max_lifetime(&self) -> Option<Duration> {
+        if self.connect_tunnel_max_lifetime == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.connect_tunnel_max_lifetime))
+        }
     }
 
     pub fn cache_sweeper_interval(&self) -> Duration {
@@ -259,9 +347,9 @@ impl Settings {
             self.max_request_body_size
         );
         ensure!(
-            self.client_timeout > 0,
-            "client_timeout must be greater than 0 seconds (got {})",
-            self.client_timeout
+            self.dns_resolve_timeout > 0,
+            "dns_resolve_timeout must be greater than 0 seconds (got {})",
+            self.dns_resolve_timeout
         );
         ensure!(
             self.upstream_connect_timeout > 0,
@@ -269,9 +357,39 @@ impl Settings {
             self.upstream_connect_timeout
         );
         ensure!(
-            self.upstream_timeout > 0,
-            "upstream_timeout must be greater than 0 seconds (got {})",
-            self.upstream_timeout
+            self.tls_handshake_timeout > 0,
+            "tls_handshake_timeout must be greater than 0 seconds (got {})",
+            self.tls_handshake_timeout
+        );
+        ensure!(
+            self.request_header_timeout > 0,
+            "request_header_timeout must be greater than 0 seconds (got {})",
+            self.request_header_timeout
+        );
+        ensure!(
+            self.request_body_idle_timeout > 0,
+            "request_body_idle_timeout must be greater than 0 seconds (got {})",
+            self.request_body_idle_timeout
+        );
+        ensure!(
+            self.response_header_timeout > 0,
+            "response_header_timeout must be greater than 0 seconds (got {})",
+            self.response_header_timeout
+        );
+        ensure!(
+            self.response_body_idle_timeout > 0,
+            "response_body_idle_timeout must be greater than 0 seconds (got {})",
+            self.response_body_idle_timeout
+        );
+        ensure!(
+            self.client_keepalive_idle_timeout > 0,
+            "client_keepalive_idle_timeout must be greater than 0 seconds (got {})",
+            self.client_keepalive_idle_timeout
+        );
+        ensure!(
+            self.connect_tunnel_idle_timeout > 0,
+            "connect_tunnel_idle_timeout must be greater than 0 seconds (got {})",
+            self.connect_tunnel_idle_timeout
         );
         ensure!(
             self.leaf_ttl > 0,
@@ -365,9 +483,17 @@ mod tests {
             log: LogFormat::Text,
             leaf_ttl: 3600,
             log_queries: false,
-            client_timeout: 30,
+            dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,
-            upstream_timeout: 60,
+            tls_handshake_timeout: 10,
+            request_header_timeout: 10,
+            request_body_idle_timeout: 30,
+            response_header_timeout: 30,
+            response_body_idle_timeout: 60,
+            request_total_timeout: 0,
+            client_keepalive_idle_timeout: 30,
+            connect_tunnel_idle_timeout: 60,
+            connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
@@ -399,9 +525,17 @@ mod tests {
             log: LogFormat::Text,
             leaf_ttl: 3600,
             log_queries: false,
-            client_timeout: 30,
+            dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,
-            upstream_timeout: 60,
+            tls_handshake_timeout: 10,
+            request_header_timeout: 10,
+            request_body_idle_timeout: 30,
+            response_header_timeout: 30,
+            response_body_idle_timeout: 60,
+            request_total_timeout: 0,
+            client_keepalive_idle_timeout: 30,
+            connect_tunnel_idle_timeout: 60,
+            connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
@@ -437,9 +571,17 @@ mod tests {
             log: LogFormat::Text,
             leaf_ttl: 3600,
             log_queries: false,
-            client_timeout: 30,
+            dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,
-            upstream_timeout: 60,
+            tls_handshake_timeout: 10,
+            request_header_timeout: 10,
+            request_body_idle_timeout: 30,
+            response_header_timeout: 30,
+            response_body_idle_timeout: 60,
+            request_total_timeout: 0,
+            client_keepalive_idle_timeout: 30,
+            connect_tunnel_idle_timeout: 60,
+            connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
