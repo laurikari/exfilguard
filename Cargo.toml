@@ -46,6 +46,7 @@ fuzzing = []
 
 [dev-dependencies]
 assert_matches = "1.5"
+nix = { version = "0.28", features = ["signal"] }
 tokio = { version = "1.48", features = ["rt", "macros", "test-util"] }
 tempfile = "3.23"
 
