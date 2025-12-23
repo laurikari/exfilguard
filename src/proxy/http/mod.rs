@@ -203,5 +203,25 @@ mod tests {
         assert!(!request_text.contains("Expect:"));
         Ok(())
     }
+
+    #[test]
+    fn build_upstream_request_omits_keep_alive_headers() -> anyhow::Result<()> {
+        let method = Method::GET;
+        let target = "http://example.com/data";
+        let parsed = parse_http1_request(method, target, None, Scheme::Http)?;
+        let mut headers = Http1HeaderAccumulator::new(2048);
+        headers.push_line("Connection: keep-alive\r\n")?;
+        headers.push_line("Keep-Alive: timeout=5\r\n")?;
+        headers.push_line("Accept: */*\r\n")?;
+        headers.push_line("\r\n")?;
+
+        let request_bytes =
+            build_upstream_request(&parsed, &headers, false, &BodyPlan::Empty, false);
+        let request_text = String::from_utf8(request_bytes)?;
+        assert!(!request_text.contains("Connection:"));
+        assert!(!request_text.contains("Keep-Alive:"));
+        assert!(request_text.contains("Accept: */*"));
+        Ok(())
+    }
 }
 pub mod cache_control;

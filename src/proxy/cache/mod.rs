@@ -34,7 +34,7 @@ use maintenance::{prepare_versioned_cache_dir, spawn_cache_dir_cleanup, spawn_ca
 use reader::CacheReader;
 pub(crate) use request::{CacheRequestContext, build_cache_request_context};
 use store::CacheStore;
-pub(super) use writer::CacheWriter;
+pub(crate) use writer::CacheWriter;
 
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
@@ -112,7 +112,7 @@ impl HttpCache {
             .await
     }
 
-    pub(super) async fn open_stream(
+    pub(crate) async fn open_stream(
         &self,
         method: &Method,
         uri: &Uri,
