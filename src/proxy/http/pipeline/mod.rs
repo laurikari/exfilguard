@@ -240,4 +240,42 @@ name = "allow"
         assert!(body.contains("expectation failed"));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn oversized_content_length_returns_413() -> Result<()> {
+        let temp = TempDir::new()?;
+        let app = build_test_app(&temp)?;
+        let (mut client_side, server_side) = tokio::io::duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut reader = BufReader::new(server_side);
+        let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
+        let oversized = app.settings.max_request_body_size + 1;
+
+        let mut headers = Http1HeaderAccumulator::new(1024);
+        headers.push_line("Host: example.com\r\n")?;
+        headers.push_line(&format!("Content-Length: {oversized}\r\n"))?;
+        headers.push_line("\r\n")?;
+        let header_bytes = headers.total_bytes();
+        let ctx = RequestContext {
+            method: Method::POST,
+            target: "/".to_string(),
+            headers,
+            request_line_bytes: 18,
+            header_bytes,
+            start: Instant::now(),
+            fallback_scheme: Scheme::Http,
+        };
+
+        let result =
+            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None).await?;
+        assert!(matches!(result, ClientDisposition::Close));
+
+        drop(reader);
+        let mut buf = Vec::new();
+        client_side.read_to_end(&mut buf).await?;
+        let body = String::from_utf8_lossy(&buf);
+        assert!(body.starts_with("HTTP/1.1 413"));
+        assert!(body.contains("request body exceeds configured limit"));
+        Ok(())
+    }
 }

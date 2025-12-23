@@ -265,6 +265,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_content_length_value() {
+        let mut sanitizer = RequestHeaderSanitizer::new(256);
+        let err = sanitizer
+            .record("Content-Length", "nope", 24)
+            .expect_err("expected invalid Content-Length to error");
+        assert!(
+            err.to_string().contains("invalid Content-Length value"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_content_length() {
+        let mut sanitizer = RequestHeaderSanitizer::new(256);
+        assert!(matches!(
+            sanitizer.record("Content-Length", "10", 24),
+            Ok(HeaderAction::Skip)
+        ));
+        let err = sanitizer
+            .record("Content-Length", "10", 24)
+            .expect_err("expected duplicate Content-Length to error");
+        assert!(
+            err.to_string()
+                .contains("multiple Content-Length headers are not supported"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn rejects_exceeding_max_bytes() {
         let mut sanitizer = RequestHeaderSanitizer::new(16);
         let err = sanitizer
