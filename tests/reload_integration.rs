@@ -66,37 +66,25 @@ async fn reload_on_sighup_updates_policy() -> Result<()> {
     let upstream_port = upstream_listener.local_addr()?.port();
     let upstream_task = tokio::spawn(run_upstream(upstream_listener));
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["reload-policy"]
-fallback = true
-"#;
+    let (clients, policies_deny) = TestConfigBuilder::new()
+        .default_client(&["reload-policy"])
+        .policy(PolicySpec::new("reload-policy").rule(
+            RuleSpec::deny(&["GET"], format!("http://127.0.0.1:{upstream_port}/**")).status(403),
+        ))
+        .render();
 
-    let policies_deny = format!(
-        r#"[[policy]]
-name = "reload-policy"
-  [[policy.rule]]
-  action = "DENY"
-  status = 403
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-"#,
-    );
-
-    let policies_allow = format!(
-        r#"[[policy]]
-name = "reload-policy"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-"#,
-    );
+    let policies_allow = TestConfigBuilder::new()
+        .policy(
+            PolicySpec::new("reload-policy").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render()
+        .1;
 
     let dirs = TestDirs::new()?;
-    write_clients_and_policies(&dirs, clients, &policies_deny)?;
+    write_clients_and_policies(&dirs, &clients, &policies_deny)?;
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, find_free_port()?));
     let settings = load_settings(&dirs, addr)?;

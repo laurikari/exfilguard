@@ -42,25 +42,17 @@ async fn test_max_request_body_size_enforced() -> Result<()> {
         }
     });
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-upload"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-upload"])
+        .policy(
+            PolicySpec::new("allow-upload").rule(
+                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r###"[[policy]]
-name = "allow-upload"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-"###
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(|settings| settings.max_request_body_size = 1024)
         .spawn()
         .await?;
@@ -126,25 +118,17 @@ async fn request_total_timeout_triggers_during_body() -> Result<()> {
         }
     });
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-upload"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-upload"])
+        .policy(
+            PolicySpec::new("allow-upload").rule(
+                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r###"[[policy]]
-name = "allow-upload"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-"###
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(|settings| {
             settings.request_total_timeout = 1;
             settings.request_body_idle_timeout = 10;
@@ -242,25 +226,17 @@ async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
         }
     });
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow"])
+        .policy(
+            PolicySpec::new("allow").rule(
+                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r###"[[policy]]
-name = "allow"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-"###
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -304,22 +280,12 @@ name = "allow"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_client_idle_timeout() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["dummy"]
-fallback = true
-"#;
-    let policies = r#"
-[[policy]]
-name = "dummy"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "http://dummy/**"
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["dummy"])
+        .policy(PolicySpec::new("dummy").rule(RuleSpec::allow_any("http://dummy/**")))
+        .render();
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(|settings| settings.client_keepalive_idle_timeout = 1)
         .spawn()
         .await?;

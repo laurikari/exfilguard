@@ -97,29 +97,21 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
 
     let upstream_task = tokio::spawn(upstream.run());
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["cache-test"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "cache-test"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-  [policy.rule.cache]
-"#,
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true)
+                    .cache_enabled(),
+            ),
+        )
+        .render();
 
     let mut dirs = TestDirs::new()?;
     dirs.enable_cache_dir()?;
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -172,29 +164,21 @@ async fn test_cache_hit_avoids_upstream() -> Result<()> {
 
     let upstream_task = tokio::spawn(upstream.run());
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["cache-test"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "cache-test"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-  [policy.rule.cache]
-"#,
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true)
+                    .cache_enabled(),
+            ),
+        )
+        .render();
 
     let mut dirs = TestDirs::new()?;
     dirs.enable_cache_dir()?;
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -250,29 +234,21 @@ async fn test_cache_hit_keeps_connection_open() -> Result<()> {
 
     let upstream_task = tokio::spawn(upstream.run());
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["cache-test"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "cache-test"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-  [policy.rule.cache]
-"#,
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true)
+                    .cache_enabled(),
+            ),
+        )
+        .render();
 
     let mut dirs = TestDirs::new()?;
     dirs.enable_cache_dir()?;
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -337,29 +313,21 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
 
     let upstream_task = tokio::spawn(upstream.run());
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["cache-test"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "cache-test"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-  [policy.rule.cache]
-"#,
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true)
+                    .cache_enabled(),
+            ),
+        )
+        .render();
 
     let mut dirs = TestDirs::new()?;
     dirs.enable_cache_dir()?;
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 

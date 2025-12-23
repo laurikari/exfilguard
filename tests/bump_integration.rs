@@ -35,31 +35,23 @@ use support::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_default_deny_returns_403() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-listed"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-listed"])
+        .policy(
+            PolicySpec::new("allow-listed")
+                .rule(RuleSpec::allow(&["GET"], "http://allowed.test/**")),
+        )
+        .render();
 
-    let policies = r#"[[policy]]
-name = "allow-listed"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://allowed.test/**"
-"#;
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
-    let mut stream = TcpStream::connect(harness.addr).await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
     let request = b"GET http://denied.test/resource HTTP/1.1\r\nHost: denied.test\r\nUser-Agent: exfilguard-test\r\nConnection: close\r\n\r\n";
-    stream.write_all(request).await?;
-    stream.flush().await?;
+    client.send(request).await?;
 
-    let response = read_http_response(&mut stream).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 403"),
         "unexpected response: {response}"
@@ -69,7 +61,7 @@ name = "allow-listed"
         "default deny body missing: {response}"
     );
 
-    stream.shutdown().await.ok();
+    client.shutdown().await;
     harness.shutdown().await;
 
     Ok(())
@@ -78,31 +70,23 @@ name = "allow-listed"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_private_ip_blocked_by_default() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-loopback"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-loopback"])
+        .policy(
+            PolicySpec::new("allow-loopback")
+                .rule(RuleSpec::allow(&["GET"], "http://127.0.0.1/**")),
+        )
+        .render();
 
-    let policies = r#"[[policy]]
-name = "allow-loopback"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1/**"
-"#;
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
-    let mut stream = TcpStream::connect(harness.addr).await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
     let request = b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    stream.write_all(request).await?;
-    stream.flush().await?;
+    client.send(request).await?;
 
-    let response = read_http_response(&mut stream).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 403"),
         "unexpected response: {response}"
@@ -112,7 +96,7 @@ name = "allow-loopback"
         "expected policy block body, got: {response}"
     );
 
-    stream.shutdown().await.ok();
+    client.shutdown().await;
     harness.shutdown().await;
 
     Ok(())
@@ -120,45 +104,31 @@ name = "allow-loopback"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_upstream_failure_returns_502() -> Result<()> {
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_port = upstream_listener.local_addr()?.port();
-    let upstream_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = upstream_listener.accept().await {
-            let _ = stream.shutdown().await;
-        }
-    });
+    let upstream = TestUpstream::close().await?;
+    let upstream_port = upstream.port();
 
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-local"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(
+            PolicySpec::new("allow-local").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-local"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-"#,
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
-    let mut stream = TcpStream::connect(harness.addr).await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
     let request = format!(
         "GET http://127.0.0.1:{upstream_port}/oops HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nUser-Agent: exfilguard-test\r\nConnection: close\r\n\r\n"
     );
-    stream.write_all(request.as_bytes()).await?;
-    stream.flush().await?;
+    client.send(request.as_bytes()).await?;
 
-    let response = read_http_response(&mut stream).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 502"),
         "unexpected response: {response}"
@@ -168,57 +138,34 @@ name = "allow-local"
         "missing upstream failure body: {response}"
     );
 
-    stream.shutdown().await.ok();
+    client.shutdown().await;
     harness.shutdown().await;
-    upstream_task.abort();
-    let _ = upstream_task.await;
+    drop(upstream);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_splice_stays_open_past_timeout() -> Result<()> {
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_port = upstream_listener.local_addr()?.port();
-    let upstream_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = upstream_listener.accept().await {
-            let mut buf = [0u8; 1024];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stream.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        }
-    });
+    let upstream = TestUpstream::echo().await?;
+    let upstream_port = upstream.port();
 
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["connect-splice"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["connect-splice"])
+        .policy(
+            PolicySpec::new("connect-splice").rule(
+                RuleSpec::allow(
+                    &["CONNECT"],
+                    format!("https://127.0.0.1:{upstream_port}/**"),
+                )
+                .inspect_payload(false)
+                .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r#"[[policy]]
-name = "connect-splice"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["CONNECT"]
-  inspect_payload = false
-  allow_private_upstream = true
-  url_pattern = "https://127.0.0.1:{upstream_port}/**"
-"#,
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(|settings| {
             settings.upstream_connect_timeout = 1;
             settings.response_body_idle_timeout = 1;
@@ -251,55 +198,32 @@ name = "connect-splice"
 
     stream.shutdown().await.ok();
     harness.shutdown().await;
-    upstream_task.abort();
-    let _ = upstream_task.await;
+    drop(upstream);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_splice_max_lifetime_closes_without_http_response() -> Result<()> {
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_port = upstream_listener.local_addr()?.port();
-    let upstream_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = upstream_listener.accept().await {
-            let mut buf = [0u8; 1024];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stream.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        }
-    });
+    let upstream = TestUpstream::echo().await?;
+    let upstream_port = upstream.port();
 
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["connect-splice"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["connect-splice"])
+        .policy(
+            PolicySpec::new("connect-splice").rule(
+                RuleSpec::allow(
+                    &["CONNECT"],
+                    format!("https://127.0.0.1:{upstream_port}/**"),
+                )
+                .inspect_payload(false)
+                .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r#"[[policy]]
-name = "connect-splice"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["CONNECT"]
-  inspect_payload = false
-  allow_private_upstream = true
-  url_pattern = "https://127.0.0.1:{upstream_port}/**"
-"#,
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(|settings| {
             settings.connect_tunnel_idle_timeout = 60;
             settings.connect_tunnel_max_lifetime = 1;
@@ -332,58 +256,38 @@ name = "connect-splice"
 
     stream.shutdown().await.ok();
     harness.shutdown().await;
-    upstream_task.abort();
-    let _ = upstream_task.await;
+    drop(upstream);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_private_ip_allowed_with_flag() -> Result<()> {
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_port = upstream_listener.local_addr()?.port();
-    let upstream_task = tokio::spawn(async move {
-        let (mut socket, _) = upstream_listener.accept().await?;
-        read_until_double_crlf(&mut socket).await?;
-        socket
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
-            .await
-            .context("failed to write upstream response")?;
-        socket.shutdown().await.ok();
-        Ok::<(), anyhow::Error>(())
-    });
+    let upstream = TestUpstream::http_ok("hello").await?;
+    let upstream_port = upstream.port();
 
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-loopback"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-loopback"])
+        .policy(
+            PolicySpec::new("allow-loopback").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-loopback"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["GET"]
-  url_pattern = "http://127.0.0.1:{upstream_port}/**"
-  allow_private_upstream = true
-"#
-    );
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
-    let mut stream = TcpStream::connect(harness.addr).await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
     let request = format!(
         "GET http://127.0.0.1:{upstream_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
     );
-    stream.write_all(request.as_bytes()).await?;
-    stream.flush().await?;
+    client.send(request.as_bytes()).await?;
 
-    let response = read_http_response(&mut stream).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "unexpected response: {response}"
@@ -393,10 +297,9 @@ name = "allow-loopback"
         "expected upstream body to be relayed: {response}"
     );
 
-    stream.shutdown().await.ok();
+    client.shutdown().await;
     harness.shutdown().await;
-
-    upstream_task.await??;
+    drop(upstream);
 
     Ok(())
 }
@@ -404,38 +307,30 @@ name = "allow-loopback"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_explicit_deny_returns_configured_status() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["egress"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["egress"])
+        .policy(
+            PolicySpec::new("egress")
+                .rule(
+                    RuleSpec::deny(&["ANY"], "http://blocked.test/**")
+                        .status(470)
+                        .reason("Policy Blocked")
+                        .body("Blocked by policy\n"),
+                )
+                .rule(RuleSpec::allow_any("http://allowed.test/**")),
+        )
+        .render();
 
-    let policies = r#"[[policy]]
-name = "egress"
-  [[policy.rule]]
-  action = "DENY"
-  status = 470
-  reason = "Policy Blocked"
-  body = "Blocked by policy\n"
-  url_pattern = "http://blocked.test/**"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "http://allowed.test/**"
-"#;
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
-    let mut stream = TcpStream::connect(harness.addr).await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
     let request =
         b"GET http://blocked.test/ HTTP/1.1\r\nHost: blocked.test\r\nConnection: close\r\n\r\n";
-    stream.write_all(request).await?;
-    stream.flush().await?;
+    client.send(request).await?;
 
-    let response = read_http_response(&mut stream).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 470 Policy Blocked"),
         "unexpected response: {response}"
@@ -445,7 +340,7 @@ name = "egress"
         "missing configured body: {response}"
     );
 
-    stream.shutdown().await.ok();
+    client.shutdown().await;
     harness.shutdown().await;
 
     Ok(())
@@ -454,22 +349,14 @@ name = "egress"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_default_deny_returns_403() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-listed"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-listed"])
+        .policy(
+            PolicySpec::new("allow-listed").rule(RuleSpec::allow_any("https://allowed.test/**")),
+        )
+        .render();
 
-    let policies = r#"[[policy]]
-name = "allow-listed"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "https://allowed.test/**"
-"#;
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -498,27 +385,18 @@ name = "allow-listed"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["connect"]
-fallback = true
-"#;
-
     let target_port = find_free_port()?;
-    let policies_doc = format!(
-        r#"[[policy]]
-name = "connect"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["CONNECT"]
-  url_pattern = "https://localhost:{port}/**"
-  inspect_payload = false
-"#,
-        port = target_port
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["connect"])
+        .policy(
+            PolicySpec::new("connect").rule(
+                RuleSpec::allow(&["CONNECT"], format!("https://localhost:{target_port}/**"))
+                    .inspect_payload(false),
+            ),
+        )
+        .render();
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies_doc.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -551,22 +429,16 @@ async fn connect_splice_relays_payload() -> Result<()> {
     const UPSTREAM_PAYLOAD: &[u8] = b"upstream->client";
 
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-splice"]
-fallback = true
-"#;
-
-    let policies = r#"[[policy]]
-name = "allow-splice"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["CONNECT"]
-  url_pattern = "https://localhost/**"
-  inspect_payload = false
-  allow_private_upstream = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-splice"])
+        .policy(
+            PolicySpec::new("allow-splice").rule(
+                RuleSpec::allow(&["CONNECT"], "https://localhost/**")
+                    .inspect_payload(false)
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_addr = upstream_listener.local_addr()?;
     let upstream_task = tokio::spawn(async move {
@@ -591,7 +463,7 @@ name = "allow-splice"
         Ok::<(), anyhow::Error>(())
     });
 
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -631,22 +503,12 @@ name = "allow-splice"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_blocks_private_ip_targets() -> Result<()> {
     let dirs = TestDirs::new()?;
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-listed"]
-fallback = true
-"#;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-listed"])
+        .policy(PolicySpec::new("allow-listed").rule(RuleSpec::allow_any("https://example.com/**")))
+        .render();
 
-    let policies = r#"[[policy]]
-name = "allow-listed"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "https://example.com/**"
-"#;
-
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
 
@@ -680,24 +542,12 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-http"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-http"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "http://{host}/**"
-  allow_private_upstream = true
-"#,
-        host = upstream_host
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-http"])
+        .policy(PolicySpec::new("allow-http").rule(
+            RuleSpec::allow_any(format!("http://{upstream_host}/**")).allow_private_upstream(true),
+        ))
+        .render();
 
     let accept_count = Arc::new(AtomicUsize::new(0));
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -727,7 +577,7 @@ name = "allow-http"
     });
 
     let cert_cache_path = cert_cache_dir.clone();
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(move |settings| {
             settings.cert_cache_dir = Some(cert_cache_path.clone());
         })
@@ -796,24 +646,12 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-bump"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-bump"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "https://{host}/**"
-  allow_private_upstream = true
-"#,
-        host = upstream_host
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-bump"])
+        .policy(PolicySpec::new("allow-bump").rule(
+            RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
+        ))
+        .render();
 
     let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
     let upstream_config = build_upstream_tls_config(&ca, upstream_host)?;
@@ -853,7 +691,7 @@ name = "allow-bump"
     let (added_proxy, _) = proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
     assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
     let cert_cache_path = cert_cache_dir.clone();
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_proxy_root_store(proxy_root_store)
         .with_settings(move |settings| {
             settings.cert_cache_dir = Some(cert_cache_path.clone());
@@ -947,24 +785,15 @@ async fn connect_bump_relays_https_response() -> Result<()> {
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-searchkit"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-searchkit"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "https://{host}/privacy-policy/"
-  allow_private_upstream = true
-"#,
-        host = upstream_host
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-searchkit"])
+        .policy(
+            PolicySpec::new("allow-searchkit").rule(
+                RuleSpec::allow_any(format!("https://{upstream_host}/privacy-policy/"))
+                    .allow_private_upstream(true),
+            ),
+        )
+        .render();
 
     let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
     let upstream_config = build_upstream_tls_config(&ca, upstream_host)?;
@@ -1003,7 +832,7 @@ name = "allow-searchkit"
     let (added_proxy, _) = proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
     assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
     let cert_cache_path = cert_cache_dir.clone();
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_proxy_root_store(proxy_root_store)
         .with_settings(move |settings| {
             settings.cert_cache_dir = Some(cert_cache_path.clone());
@@ -1096,24 +925,12 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-http1-only"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-http1-only"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "https://{host}/**"
-  allow_private_upstream = true
-"#,
-        host = upstream_host
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-http1-only"])
+        .policy(PolicySpec::new("allow-http1-only").rule(
+            RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
+        ))
+        .render();
 
     let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
     let upstream_config = build_upstream_tls_config(&ca, upstream_host)?;
@@ -1153,7 +970,7 @@ name = "allow-http1-only"
     let (added_proxy, _) = proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
     assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
     let cert_cache_path = cert_cache_dir.clone();
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_proxy_root_store(proxy_root_store)
         .with_settings(move |settings| {
             settings.cert_cache_dir = Some(cert_cache_path.clone());
@@ -1231,24 +1048,12 @@ async fn connect_bump_supports_http2() -> Result<()> {
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["allow-h2"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "allow-h2"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["ANY"]
-  url_pattern = "https://{host}/**"
-  allow_private_upstream = true
-"#,
-        host = upstream_host
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-h2"])
+        .policy(PolicySpec::new("allow-h2").rule(
+            RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
+        ))
+        .render();
 
     let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
     let upstream_config = build_upstream_h2_tls_config(&ca, upstream_host)?;
@@ -1288,7 +1093,7 @@ name = "allow-h2"
     let (added_proxy, _) = proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
     assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
     let cert_cache_path = cert_cache_dir.clone();
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_proxy_root_store(proxy_root_store)
         .with_settings(move |settings| {
             settings.cert_cache_dir = Some(cert_cache_path.clone());
@@ -1423,31 +1228,21 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
 
-    let clients = r#"[[client]]
-name = "default"
-cidr = "0.0.0.0/0"
-policies = ["h2-policy"]
-fallback = true
-"#;
-
-    let policies = format!(
-        r#"[[policy]]
-name = "h2-policy"
-  [[policy.rule]]
-  action = "ALLOW"
-  methods = ["CONNECT"]
-  url_pattern = "https://{host}/**"
-  allow_private_upstream = true
-
-  [[policy.rule]]
-  action = "DENY"
-  methods = ["GET"]
-  url_pattern = "https://{host}/blocked/**"
-  status = 451
-  body = "blocked by policy"
-"#,
-        host = upstream_host
-    );
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["h2-policy"])
+        .policy(
+            PolicySpec::new("h2-policy")
+                .rule(
+                    RuleSpec::allow(&["CONNECT"], format!("https://{upstream_host}/**"))
+                        .allow_private_upstream(true),
+                )
+                .rule(
+                    RuleSpec::deny(&["GET"], format!("https://{upstream_host}/blocked/**"))
+                        .status(451)
+                        .body("blocked by policy"),
+                ),
+        )
+        .render();
 
     let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
     let upstream_config = build_upstream_h2_tls_config(&ca, upstream_host)?;
@@ -1481,7 +1276,7 @@ name = "h2-policy"
     let (added_proxy, _) = proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
     assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
     let cert_cache_path = cert_cache_dir.clone();
-    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies.as_str())
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_proxy_root_store(proxy_root_store)
         .with_settings(move |settings| {
             settings.cert_cache_dir = Some(cert_cache_path.clone());
