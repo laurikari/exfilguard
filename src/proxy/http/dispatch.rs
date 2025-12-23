@@ -12,7 +12,7 @@ use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
 use crate::proxy::request::scheme_name;
 
-use super::codec::{RequestHead, read_request_head};
+use super::codec::{Http1RequestHead, read_http1_request_head};
 use super::pipeline::{
     ClientDisposition, RequestContext, handle_non_connect, respond_with_access_log,
 };
@@ -61,7 +61,7 @@ where
 
     loop {
         let start = Instant::now();
-        let request_head = match read_request_head(
+        let request_head = match read_http1_request_head(
             &mut reader,
             peer,
             keepalive_timeout,
@@ -98,7 +98,7 @@ where
                 break;
             }
         };
-        let RequestHead {
+        let Http1RequestHead {
             method,
             target,
             headers,

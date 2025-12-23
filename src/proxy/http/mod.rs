@@ -7,7 +7,7 @@ mod server;
 pub mod upstream;
 
 pub use body::BodyTooLarge;
-pub(crate) use codec::{HeaderAccumulator, HeaderLine, ResponseHead};
+pub(crate) use codec::{Http1HeaderAccumulator, Http1ResponseHead};
 pub use pipeline::{respond_with_access_log, send_response, shutdown_stream};
 pub use server::{handle_decrypted_https, handle_http};
 
@@ -31,7 +31,7 @@ pub mod fuzzing {
         S: AsyncRead + Unpin,
     {
         if let Some(head) =
-            super::codec::read_request_head(reader, peer, timeout, timeout, max_header_bytes)
+            super::codec::read_http1_request_head(reader, peer, timeout, timeout, max_header_bytes)
                 .await?
         {
             let host = head.headers.host();
@@ -56,7 +56,8 @@ pub mod fuzzing {
     where
         S: AsyncRead + Unpin,
     {
-        let _ = super::codec::read_response_head(reader, timeout, peer, max_header_bytes).await?;
+        let _ =
+            super::codec::read_http1_response_head(reader, timeout, peer, max_header_bytes).await?;
         Ok(())
     }
 }
@@ -64,13 +65,13 @@ pub mod fuzzing {
 #[cfg(test)]
 mod tests {
     use crate::proxy::request::parse_http1_request;
-    use http::{Method, StatusCode, Version};
+    use http::Method;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use tokio::io::BufReader;
 
     use super::body::{BodyPlan, BodyTooLarge, stream_chunked_body};
-    use super::codec::{HeaderAccumulator, parse_status_line, read_request_head};
+    use super::codec::{Http1HeaderAccumulator, read_http1_request_head};
     use super::forward::build_upstream_request;
     use crate::config::Scheme;
 
@@ -114,7 +115,7 @@ mod tests {
         drop(writer);
 
         let mut reader = BufReader::new(client_stream);
-        let head = read_request_head(
+        let head = read_http1_request_head(
             &mut reader,
             "127.0.0.1:12345".parse().unwrap(),
             Duration::from_secs(1),
@@ -141,7 +142,7 @@ mod tests {
         drop(writer);
 
         let mut reader = BufReader::new(client_stream);
-        let result = read_request_head(
+        let result = read_http1_request_head(
             &mut reader,
             "127.0.0.1:12345".parse().unwrap(),
             Duration::from_secs(1),
@@ -178,7 +179,7 @@ mod tests {
         let method = Method::GET;
         let target = "http://[fd00:1234::1]:8080/data";
         let parsed = parse_http1_request(method, target, None, Scheme::Http)?;
-        let headers = HeaderAccumulator::new(2048);
+        let headers = Http1HeaderAccumulator::new(2048);
         let request_bytes =
             build_upstream_request(&parsed, &headers, false, &BodyPlan::Empty, false);
         let request_text = String::from_utf8(request_bytes)?;
@@ -192,7 +193,7 @@ mod tests {
         let method = Method::POST;
         let target = "http://example.com/upload";
         let parsed = parse_http1_request(method, target, None, Scheme::Http)?;
-        let mut headers = HeaderAccumulator::new(2048);
+        let mut headers = Http1HeaderAccumulator::new(2048);
         headers.push_line("Expect: 100-continue\r\n")?;
         headers.push_line("\r\n")?;
 
@@ -201,53 +202,6 @@ mod tests {
         let request_text = String::from_utf8(request_bytes)?;
         assert!(!request_text.contains("Expect:"));
         Ok(())
-    }
-
-    #[test]
-    fn parse_status_line_accepts_valid_line() -> anyhow::Result<()> {
-        let (version, status, reason) = parse_status_line("HTTP/1.1 404 Not Found")?;
-        assert_eq!(version, Version::HTTP_11);
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(reason, "Not Found");
-        Ok(())
-    }
-
-    #[test]
-    fn parse_status_line_rejects_invalid_version() {
-        let err = parse_status_line("BAD 200 OK").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported upstream HTTP version"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn parse_status_line_rejects_http10() {
-        let err = parse_status_line("HTTP/1.0 200 OK").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported upstream HTTP version"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn parse_status_line_rejects_missing_code() {
-        let err = parse_status_line("HTTP/1.1").unwrap_err();
-        assert!(
-            err.to_string().contains("missing status code"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn parse_status_line_rejects_non_numeric_code() {
-        let err = parse_status_line("HTTP/1.1 twohundred OK").unwrap_err();
-        assert!(
-            err.to_string().contains("invalid upstream status code"),
-            "unexpected error: {err:?}"
-        );
     }
 }
 pub mod cache_control;

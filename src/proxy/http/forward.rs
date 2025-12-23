@@ -24,9 +24,11 @@ use super::body::{
     BodyPlan, relay_chunked_body, relay_fixed_body, relay_until_close, stream_chunked_body,
     stream_fixed_body,
 };
-use super::codec::{ConnectionDirective, HeaderAccumulator, ResponseHead, read_response_head};
+use super::codec::{
+    ConnectionOverride, Http1HeaderAccumulator, Http1ResponseHead, read_http1_response_head,
+};
 use super::upstream::{UpstreamConnection, UpstreamKey, UpstreamPool};
-use crate::proxy::cache::{build_cache_request_context, header_lines_to_map};
+use crate::proxy::cache::build_cache_request_context;
 
 pub struct ForwardTimeouts {
     pub connect: Duration,
@@ -126,7 +128,7 @@ pub async fn forward_to_upstream<S>(
     client_reader: &mut BufReader<S>,
     pool: &mut UpstreamPool,
     request: &ParsedRequest,
-    headers: &HeaderAccumulator,
+    headers: &Http1HeaderAccumulator,
     body_plan: BodyPlan,
     connect_binding: Option<&ResolvedTarget>,
     timeouts: &ForwardTimeouts,
@@ -229,7 +231,7 @@ pub async fn forward_with_connection<S>(
     client_reader: &mut BufReader<S>,
     connection: &mut UpstreamConnection,
     request: &ParsedRequest,
-    headers: &HeaderAccumulator,
+    headers: &Http1HeaderAccumulator,
     body_plan: BodyPlan,
     timeouts: &ForwardTimeouts,
     request_start: Instant,
@@ -347,7 +349,7 @@ where
             }
         };
 
-        let resp_headers_map = header_lines_to_map(head.headers.iter());
+        let resp_headers_map = head.header_map();
         let plan = plan_cache_write(
             method_obj,
             cache_request,
@@ -401,7 +403,7 @@ where
     }
 
     let override_connection = if client_close {
-        Some(ConnectionDirective::Close)
+        Some(ConnectionOverride::Close)
     } else {
         None
     };
@@ -575,14 +577,14 @@ async fn read_final_response_head<S, C>(
     timeouts: &ForwardTimeouts,
     peer: SocketAddr,
     max_response_header_bytes: usize,
-) -> Result<(ResponseHead, u64)>
+) -> Result<(Http1ResponseHead, u64)>
 where
     S: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
     let mut bytes_to_client = 0u64;
     loop {
-        let mut head = read_response_head(
+        let mut head = read_http1_response_head(
             upstream,
             timeouts.response_header,
             peer,
@@ -651,7 +653,7 @@ where
 pub fn determine_response_body_plan(
     method: &Method,
     status: StatusCode,
-    head: &ResponseHead,
+    head: &Http1ResponseHead,
 ) -> ResponseBodyPlan {
     if method == Method::HEAD {
         return ResponseBodyPlan::Empty;
@@ -679,7 +681,7 @@ pub fn determine_response_body_plan(
 
 pub fn build_upstream_request(
     request: &ParsedRequest,
-    headers: &HeaderAccumulator,
+    headers: &Http1HeaderAccumulator,
     close: bool,
     body_plan: &BodyPlan,
     expect_continue: bool,
@@ -728,7 +730,7 @@ pub fn build_upstream_request(
 #[cfg(test)]
 mod tests {
     use super::{ForwardTimeouts, ResponseBodyPlan, determine_response_body_plan};
-    use crate::proxy::http::codec::ResponseHead;
+    use crate::proxy::http::codec::Http1ResponseHead;
     use http::StatusCode;
     use std::time::Duration;
 
@@ -754,7 +756,7 @@ mod tests {
 
     #[test]
     fn transfer_encoding_without_chunked_forces_until_close() {
-        let head = ResponseHead {
+        let head = Http1ResponseHead {
             status_line: "HTTP/1.1 200 OK".to_string(),
             status: StatusCode::OK,
             headers: Vec::new(),

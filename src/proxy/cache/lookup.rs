@@ -1,14 +1,14 @@
 use anyhow::Result;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 
-use crate::proxy::http::{HeaderAccumulator, ResponseHead};
+use crate::proxy::http::{Http1HeaderAccumulator, Http1ResponseHead};
 use crate::proxy::request::ParsedRequest;
 
 use super::{CachedResponse, HttpCache, build_cache_request_context};
 
 pub(crate) struct CacheHit {
     pub cached: CachedResponse,
-    pub head: ResponseHead,
+    pub head: Http1ResponseHead,
 }
 
 pub(crate) enum CacheLookupOutcome {
@@ -45,7 +45,7 @@ impl CacheHit {
             Some(cached.content_length)
         };
 
-        let head = ResponseHead {
+        let head = Http1ResponseHead {
             status_line,
             status: cached.status,
             headers: Vec::new(),
@@ -63,7 +63,7 @@ impl HttpCache {
     pub(crate) async fn lookup_for_request(
         &self,
         request: &ParsedRequest,
-        headers: &HeaderAccumulator,
+        headers: &Http1HeaderAccumulator,
     ) -> Result<CacheLookupOutcome> {
         if headers.has_sensitive_cache_headers() {
             return Ok(CacheLookupOutcome::Bypass);

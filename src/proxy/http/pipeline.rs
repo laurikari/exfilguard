@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::body::BodyPlan;
-use super::codec::{ConnectionDirective, HeaderAccumulator, encode_cached_response};
+use super::codec::{ConnectionOverride, Http1HeaderAccumulator, encode_cached_http1_response};
 use super::forward::{
     ForwardResult, ForwardTimeouts, determine_response_body_plan, forward_to_upstream,
 };
@@ -41,7 +41,7 @@ pub enum ClientDisposition {
 pub struct RequestContext {
     pub method: Method,
     pub target: String,
-    pub headers: HeaderAccumulator,
+    pub headers: Http1HeaderAccumulator,
     pub request_line_bytes: usize,
     pub header_bytes: usize,
     pub start: Instant,
@@ -227,7 +227,7 @@ where
     upstream_pool: &'a mut UpstreamPool,
     app: &'a AppContext,
     connect_binding: Option<&'a ResolvedTarget>,
-    headers: HeaderAccumulator,
+    headers: Http1HeaderAccumulator,
     body_plan: BodyPlan,
     log_tracker: AllowLogTracker,
     peer: SocketAddr,
@@ -266,11 +266,11 @@ where
                     let should_close = self.headers.wants_connection_close()
                         || matches!(body_plan, super::forward::ResponseBodyPlan::UntilClose);
                     let override_connection = if should_close {
-                        Some(ConnectionDirective::Close)
+                        Some(ConnectionOverride::Close)
                     } else {
                         None
                     };
-                    let encoded_head = encode_cached_response(
+                    let encoded_head = encode_cached_http1_response(
                         &head.status_line,
                         &cached.headers,
                         body_plan,
@@ -714,7 +714,7 @@ name = "allow"
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let mut reader = BufReader::new(server_side);
         let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
-        let mut headers = HeaderAccumulator::new(1024);
+        let mut headers = Http1HeaderAccumulator::new(1024);
         headers.push_line("User-Agent: test\r\n")?;
         headers.push_line("\r\n")?;
         let header_bytes = headers.total_bytes();
@@ -751,7 +751,7 @@ name = "allow"
         let mut reader = BufReader::new(server_side);
         let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
 
-        let mut headers = HeaderAccumulator::new(1024);
+        let mut headers = Http1HeaderAccumulator::new(1024);
         headers.push_line("Host: example.com\r\n")?;
         headers.push_line("Expect: custom\r\n")?;
         headers.push_line("Content-Length: 10\r\n")?;

@@ -32,7 +32,7 @@ pub(crate) use lookup::CacheLookupOutcome;
 use maintenance::cache_version_dir;
 use maintenance::{prepare_versioned_cache_dir, spawn_cache_dir_cleanup, spawn_cache_sweeper};
 use reader::CacheReader;
-pub(crate) use request::{CacheRequestContext, build_cache_request_context, header_lines_to_map};
+pub(crate) use request::{CacheRequestContext, build_cache_request_context};
 use store::CacheStore;
 pub(super) use writer::CacheWriter;
 
