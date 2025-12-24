@@ -11,7 +11,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
-use exfilguard::cli::{Cli, LogFormat};
+use exfilguard::cli::Cli;
 use exfilguard::settings::Settings;
 use support::*;
 
@@ -60,7 +60,7 @@ fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_on_sighup_updates_policy() -> Result<()> {
-    let _ = exfilguard::logging::init_logger(LogFormat::Text);
+    let log_capture = LogCapture::new("info").await;
 
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_port = upstream_listener.local_addr()?.port();
@@ -116,6 +116,11 @@ async fn reload_on_sighup_updates_policy() -> Result<()> {
         }
         sleep(StdDuration::from_millis(50)).await;
     }
+    let logs = log_capture.text();
+    assert!(
+        logs.contains("configuration reloaded"),
+        "expected reload log entry, got: {logs}"
+    );
 
     run_task.abort();
     let _ = run_task.await;

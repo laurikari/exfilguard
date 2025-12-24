@@ -34,6 +34,7 @@ use support::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_default_deny_returns_403() -> Result<()> {
+    let log_capture = LogCapture::new("info").await;
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-listed"])
@@ -59,6 +60,11 @@ async fn http_default_deny_returns_403() -> Result<()> {
     assert!(
         response.contains("request blocked by policy"),
         "default deny body missing: {response}"
+    );
+    let logs = log_capture.text();
+    assert!(
+        logs.contains("no matching policy decision; default deny"),
+        "expected default deny log entry, got: {logs}"
     );
 
     client.shutdown().await;
@@ -502,6 +508,7 @@ async fn connect_splice_relays_payload() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_blocks_private_ip_targets() -> Result<()> {
+    let log_capture = LogCapture::new("info").await;
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-listed"])
@@ -526,6 +533,11 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
     assert!(
         response.contains("CONNECT to private networks is not allowed"),
         "missing private network warning body: {response}"
+    );
+    let logs = log_capture.text();
+    assert!(
+        logs.contains("CONNECT target is private network; blocking"),
+        "expected private CONNECT block log entry, got: {logs}"
     );
 
     stream.shutdown().await.ok();

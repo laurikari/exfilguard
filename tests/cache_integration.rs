@@ -156,8 +156,6 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_hit_avoids_upstream() -> Result<()> {
-    let _ = exfilguard::logging::init_logger(exfilguard::cli::LogFormat::Text);
-
     let upstream = MockUpstream::new("Cache-Control: public, max-age=60").await?;
     let upstream_port = upstream.port();
     let request_counter = upstream.requests.clone();
@@ -226,8 +224,6 @@ async fn test_cache_hit_avoids_upstream() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_hit_keeps_connection_open() -> Result<()> {
-    let _ = exfilguard::logging::init_logger(exfilguard::cli::LogFormat::Text);
-
     let upstream = MockUpstream::new("Cache-Control: public, max-age=60").await?;
     let upstream_port = upstream.port();
     let request_counter = upstream.requests.clone();
@@ -301,7 +297,7 @@ async fn test_cache_hit_keeps_connection_open() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
-    let _ = exfilguard::logging::init_logger(exfilguard::cli::LogFormat::Text);
+    let log_capture = LogCapture::new("info").await;
 
     let upstream = MockUpstream::new_with_delay(
         "Cache-Control: public, max-age=60",
@@ -411,6 +407,12 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         request_counter.load(Ordering::SeqCst),
         2,
         "Cache write failure should not create a usable entry"
+    );
+    let logs = log_capture.text();
+    assert!(
+        logs.contains("failed to finalize cache entry")
+            || logs.contains("failed to open cache write stream"),
+        "expected cache write failure to be logged, got: {logs}"
     );
 
     #[cfg(unix)]
