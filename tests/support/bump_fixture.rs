@@ -6,7 +6,7 @@ use std::sync::{
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use h2::server as h2_server;
+use h2::{client as h2_client, server as h2_server};
 use http::{HeaderValue, StatusCode};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
@@ -20,7 +20,7 @@ use exfilguard::tls::ca::CertificateAuthority;
 use super::{
     PolicySpec, ProxyHarness, ProxyHarnessBuilder, RuleSpec, TestConfigBuilder, build_client_tls,
     build_client_tls_h2, build_upstream_h2_tls_config, build_upstream_tls_config,
-    read_until_double_crlf,
+    read_http_response, read_http_response_with_length, read_until_double_crlf,
 };
 
 #[derive(Clone, Copy)]
@@ -72,6 +72,89 @@ impl<'a> BumpedTlsOptions<'a> {
     pub fn upstream_mode(mut self, mode: UpstreamMode) -> Self {
         self.upstream_mode = mode;
         self
+    }
+}
+
+pub struct BumpedHttp1Client<'a> {
+    stream: &'a mut tokio_rustls::client::TlsStream<TcpStream>,
+}
+
+impl<'a> BumpedHttp1Client<'a> {
+    pub async fn send(&mut self, request: impl AsRef<[u8]>) -> Result<()> {
+        self.stream.write_all(request.as_ref()).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    pub async fn read_response(&mut self) -> Result<String> {
+        read_http_response(self.stream).await
+    }
+
+    pub async fn read_response_with_length(&mut self) -> Result<String> {
+        read_http_response_with_length(self.stream).await
+    }
+
+    pub fn stream(&self) -> &tokio_rustls::client::TlsStream<TcpStream> {
+        self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut tokio_rustls::client::TlsStream<TcpStream> {
+        self.stream
+    }
+}
+
+pub struct BumpedH2Client {
+    send_request: h2::client::SendRequest<Bytes>,
+    connection: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BumpedH2Client {
+    pub async fn request(
+        &mut self,
+        request: http::Request<()>,
+    ) -> Result<http::Response<h2::RecvStream>> {
+        let (response_fut, _) = self
+            .send_request
+            .send_request(request, true)
+            .context("failed to send HTTP/2 request")?;
+        let response = response_fut
+            .await
+            .context("failed to receive HTTP/2 response")?;
+        Ok(response)
+    }
+
+    pub async fn request_text(
+        &mut self,
+        request: http::Request<()>,
+    ) -> Result<(StatusCode, String)> {
+        let response = self.request(request).await?;
+        let status = response.status();
+        let body = Self::read_body(response.into_body()).await?;
+        Ok((status, body))
+    }
+
+    pub async fn read_body(mut body: h2::RecvStream) -> Result<String> {
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.data().await {
+            let chunk = frame.context("failed to read HTTP/2 response chunk")?;
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(handle) = self.connection.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for BumpedH2Client {
+    fn drop(&mut self) {
+        if let Some(handle) = self.connection.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -209,10 +292,32 @@ impl BumpedTlsFixture {
             .expect("tls stream should be available")
     }
 
+    pub fn http1_client(&mut self) -> BumpedHttp1Client<'_> {
+        BumpedHttp1Client {
+            stream: self.tls_stream_mut(),
+        }
+    }
+
     pub fn take_tls_stream(&mut self) -> tokio_rustls::client::TlsStream<TcpStream> {
         self.tls_stream
             .take()
             .expect("tls stream should be available")
+    }
+
+    pub async fn h2_client(&mut self) -> Result<BumpedH2Client> {
+        let tls_stream = self.take_tls_stream();
+        let (send_request, connection) = h2_client::handshake(tls_stream)
+            .await
+            .context("failed to negotiate HTTP/2 with proxy")?;
+        let task = tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "downstream HTTP/2 connection ended");
+            }
+        });
+        Ok(BumpedH2Client {
+            send_request,
+            connection: Some(task),
+        })
     }
 
     pub fn upstream_addr(&self) -> SocketAddr {

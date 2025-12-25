@@ -11,7 +11,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use h2::client as h2_client;
 use http::{HeaderValue, Method, StatusCode, Uri};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -653,16 +652,15 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
     )
     .await?;
     let upstream_addr = fixture.upstream_addr();
-    let tls_stream = fixture.tls_stream_mut();
+    let mut client = fixture.http1_client();
 
     let request_one = format!(
         "GET /first HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nConnection: keep-alive\r\n\r\n",
         host = upstream_host,
         port = upstream_addr.port()
     );
-    tls_stream.write_all(request_one.as_bytes()).await?;
-    tls_stream.flush().await?;
-    let response_one = read_http_response(tls_stream).await?;
+    client.send(request_one.as_bytes()).await?;
+    let response_one = client.read_response_with_length().await?;
     assert!(
         response_one.starts_with("HTTP/1.1 200"),
         "unexpected first bumped response: {response_one}"
@@ -677,9 +675,8 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
         host = upstream_host,
         port = upstream_addr.port()
     );
-    tls_stream.write_all(request_two.as_bytes()).await?;
-    tls_stream.flush().await?;
-    let response_two = read_http_response(tls_stream).await?;
+    client.send(request_two.as_bytes()).await?;
+    let response_two = client.read_response_with_length().await?;
     assert!(
         response_two.starts_with("HTTP/1.1 200"),
         "unexpected second bumped response: {response_two}"
@@ -689,7 +686,7 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
         "second bumped response body missing path: {response_two}"
     );
 
-    tls_stream.shutdown().await.ok();
+    client.stream_mut().shutdown().await.ok();
 
     let accepts = fixture.accept_count();
     assert!(
@@ -716,20 +713,19 @@ async fn connect_bump_relays_https_response() -> Result<()> {
     )
     .await?;
     let upstream_addr = fixture.upstream_addr();
-    let tls_stream = fixture.tls_stream_mut();
+    let mut client = fixture.http1_client();
 
     let request = format!(
         "GET /privacy-policy/ HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nConnection: close\r\n\r\n",
         host = upstream_host,
         port = upstream_addr.port()
     );
-    tls_stream.write_all(request.as_bytes()).await?;
-    tls_stream.flush().await?;
+    client.send(request.as_bytes()).await?;
 
     let mut response_bytes = Vec::new();
     loop {
         let mut chunk = [0u8; 1024];
-        match tls_stream.read(&mut chunk).await {
+        match client.stream_mut().read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
                 response_bytes.extend_from_slice(&chunk[..n]);
@@ -760,7 +756,7 @@ async fn connect_bump_relays_https_response() -> Result<()> {
         "location header missing: {response_text}"
     );
 
-    tls_stream.shutdown().await.ok();
+    client.stream_mut().shutdown().await.ok();
     fixture.shutdown().await;
 
     Ok(())
@@ -776,16 +772,15 @@ async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
     let mut fixture =
         BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
     let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.http1_client();
     let request = format!(
         "GET http://{host}:{port}/absolute HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
         host = upstream_host,
         port = upstream_addr.port()
     );
-    let tls_stream = fixture.tls_stream_mut();
-    tls_stream.write_all(request.as_bytes()).await?;
-    tls_stream.flush().await?;
+    client.send(request.as_bytes()).await?;
 
-    let response = read_http_response(tls_stream).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 400"),
         "unexpected bumped response: {response}"
@@ -795,7 +790,7 @@ async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
         "expected target rejection body, got: {response}"
     );
 
-    tls_stream.shutdown().await.ok();
+    client.stream_mut().shutdown().await.ok();
     fixture.shutdown().await;
 
     Ok(())
@@ -815,9 +810,9 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
     )
     .await?;
     let upstream_addr = fixture.upstream_addr();
-    let tls_stream = fixture.tls_stream_mut();
+    let mut client = fixture.http1_client();
 
-    let negotiated = tls_stream.get_ref().1.alpn_protocol();
+    let negotiated = client.stream().get_ref().1.alpn_protocol();
     assert_eq!(
         negotiated,
         Some(&b"http/1.1"[..]),
@@ -829,9 +824,8 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
         host = upstream_host,
         port = upstream_addr.port()
     );
-    tls_stream.write_all(request.as_bytes()).await?;
-    tls_stream.flush().await?;
-    let response = read_http_response(tls_stream).await?;
+    client.send(request.as_bytes()).await?;
+    let response = client.read_response().await?;
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "unexpected fallback response: {response}"
@@ -841,7 +835,7 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
         "fallback response body missing path: {response}"
     );
 
-    tls_stream.shutdown().await.ok();
+    client.stream_mut().shutdown().await.ok();
     fixture.shutdown().await;
 
     Ok(())
@@ -861,16 +855,7 @@ async fn connect_bump_supports_http2() -> Result<()> {
     )
     .await?;
     let upstream_addr = fixture.upstream_addr();
-    let tls_stream = fixture.take_tls_stream();
-
-    let (mut client, connection) = h2_client::handshake(tls_stream)
-        .await
-        .context("failed to negotiate HTTP/2 with proxy")?;
-    let h2_task = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::warn!(error = %err, "downstream HTTP/2 connection ended");
-        }
-    });
+    let mut client = fixture.h2_client().await?;
 
     let authority = format!("{}:{}", upstream_host, upstream_addr.port());
 
@@ -889,20 +874,8 @@ async fn connect_bump_supports_http2() -> Result<()> {
         );
     let first_request = first_builder.body(())?;
 
-    let (first_response_fut, _first_stream) = client
-        .send_request(first_request, true)
-        .context("failed to send first HTTP/2 request")?;
-    let first_response = first_response_fut
-        .await
-        .context("failed to receive first HTTP/2 response")?;
-    assert_eq!(first_response.status(), StatusCode::OK);
-    let mut first_body = first_response.into_body();
-    let mut first_bytes = Vec::new();
-    while let Some(frame) = first_body.data().await {
-        let chunk = frame.context("failed to read first HTTP/2 response chunk")?;
-        first_bytes.extend_from_slice(&chunk);
-    }
-    let first_text = String::from_utf8(first_bytes)?;
+    let (first_status, first_text) = client.request_text(first_request).await?;
+    assert_eq!(first_status, StatusCode::OK);
     assert_eq!(first_text, "/h2/first");
 
     let second_uri = Uri::builder()
@@ -920,25 +893,11 @@ async fn connect_bump_supports_http2() -> Result<()> {
         );
     let second_request = second_builder.body(())?;
 
-    let (second_response_fut, _second_stream) = client
-        .send_request(second_request, true)
-        .context("failed to send second HTTP/2 request")?;
-    let second_response = second_response_fut
-        .await
-        .context("failed to receive second HTTP/2 response")?;
-    assert_eq!(second_response.status(), StatusCode::OK);
-    let mut second_body = second_response.into_body();
-    let mut second_bytes = Vec::new();
-    while let Some(frame) = second_body.data().await {
-        let chunk = frame.context("failed to read second HTTP/2 response chunk")?;
-        second_bytes.extend_from_slice(&chunk);
-    }
-    let second_text = String::from_utf8(second_bytes)?;
+    let (second_status, second_text) = client.request_text(second_request).await?;
+    assert_eq!(second_status, StatusCode::OK);
     assert_eq!(second_text, "/h2/second");
 
-    drop(client);
-    h2_task.abort();
-    let _ = h2_task.await;
+    client.shutdown().await;
 
     assert_eq!(
         fixture.accept_count(),
@@ -972,16 +931,7 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
     )
     .await?;
     let upstream_addr = fixture.upstream_addr();
-    let tls_stream = fixture.take_tls_stream();
-
-    let (mut client, connection) = h2_client::handshake(tls_stream)
-        .await
-        .context("failed to negotiate HTTP/2 with proxy")?;
-    let h2_task = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::warn!(error = %err, "downstream HTTP/2 connection ended");
-        }
-    });
+    let mut client = fixture.h2_client().await?;
 
     let authority = format!("{}:{}", upstream_host, upstream_addr.port());
 
@@ -994,20 +944,9 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
         .method(Method::GET)
         .uri(deny_uri)
         .body(())?;
-    let (deny_response_fut, _) = client
-        .send_request(deny_request, true)
-        .context("failed to send denied HTTP/2 request")?;
-    let deny_response = deny_response_fut
-        .await
-        .context("failed to receive denied HTTP/2 response")?;
-    assert_eq!(deny_response.status(), StatusCode::from_u16(451)?);
-    let mut deny_body = deny_response.into_body();
-    let mut deny_bytes = Vec::new();
-    while let Some(frame) = deny_body.data().await {
-        let chunk = frame.context("failed to read denied HTTP/2 response chunk")?;
-        deny_bytes.extend_from_slice(&chunk);
-    }
-    assert_eq!(String::from_utf8(deny_bytes)?, "blocked by policy");
+    let (deny_status, deny_body) = client.request_text(deny_request).await?;
+    assert_eq!(deny_status, StatusCode::from_u16(451)?);
+    assert_eq!(deny_body, "blocked by policy");
 
     let default_uri = Uri::builder()
         .scheme("https")
@@ -1018,27 +957,11 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
         .method(Method::GET)
         .uri(default_uri)
         .body(())?;
-    let (default_response_fut, _) = client
-        .send_request(default_request, true)
-        .context("failed to send default-deny HTTP/2 request")?;
-    let default_response = default_response_fut
-        .await
-        .context("failed to receive default-deny HTTP/2 response")?;
-    assert_eq!(default_response.status(), StatusCode::FORBIDDEN);
-    let mut default_body = default_response.into_body();
-    let mut default_bytes = Vec::new();
-    while let Some(frame) = default_body.data().await {
-        let chunk = frame.context("failed to read default-deny HTTP/2 response chunk")?;
-        default_bytes.extend_from_slice(&chunk);
-    }
-    assert_eq!(
-        String::from_utf8(default_bytes)?,
-        "request blocked by policy"
-    );
+    let (default_status, default_body) = client.request_text(default_request).await?;
+    assert_eq!(default_status, StatusCode::FORBIDDEN);
+    assert_eq!(default_body, "request blocked by policy");
 
-    drop(client);
-    h2_task.abort();
-    let _ = h2_task.await;
+    client.shutdown().await;
 
     fixture.shutdown().await;
 
