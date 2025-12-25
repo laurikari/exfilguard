@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::proxy::request::parse_host_header;
 
@@ -28,13 +28,19 @@ pub fn parse_connect_target(target: &str, host_header: Option<&str>) -> Result<C
 
 fn parse_host_port(value: &str) -> Result<ConnectTarget> {
     let (host, port) = parse_host_header(value)?;
-    let port = port.unwrap_or(443);
+    let Some(port) = port else {
+        bail!("CONNECT target must include an explicit port");
+    };
     Ok(ConnectTarget { host, port })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn error_chain_contains(err: &anyhow::Error, needle: &str) -> bool {
+        err.chain().any(|cause| cause.to_string().contains(needle))
+    }
 
     #[test]
     fn parses_direct_target() {
@@ -55,6 +61,24 @@ mod tests {
         let err = parse_connect_target("", None).unwrap_err();
         assert!(
             err.to_string().contains("missing Host header fallback"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_target_without_port() {
+        let err = parse_connect_target("example.com", None).unwrap_err();
+        assert!(
+            error_chain_contains(&err, "explicit port"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_host_fallback_without_port() {
+        let err = parse_connect_target("", Some("example.com")).unwrap_err();
+        assert!(
+            error_chain_contains(&err, "explicit port"),
             "unexpected error: {err:?}"
         );
     }
