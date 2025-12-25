@@ -10,7 +10,7 @@ use crate::proxy::{
     connect::ResolvedTarget,
     forward_limits::AllowLogTracker,
     policy_eval::PolicyLogConfig,
-    request::{parse_http1_request, scheme_name},
+    request::{parse_http1_request, parse_http1_request_origin_form, scheme_name},
     request_pipeline,
 };
 
@@ -132,8 +132,11 @@ where
             _ => BodyPlan::Empty,
         }
     };
-    let parsed = match parse_http1_request(method.clone(), &target, headers.host(), fallback_scheme)
-    {
+    let parsed = match if connect_binding.is_some() {
+        parse_http1_request_origin_form(method.clone(), &target, headers.host(), fallback_scheme)
+    } else {
+        parse_http1_request(method.clone(), &target, headers.host(), fallback_scheme)
+    } {
         Ok(parsed) => parsed,
         Err(err) => {
             warn!(peer = %peer, error = ?err, "failed to parse HTTP request target");

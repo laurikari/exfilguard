@@ -16,6 +16,12 @@ pub struct ParsedRequest {
     pub path: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Http1TargetMode {
+    Proxy,
+    OriginOnly,
+}
+
 /// Parse an HTTP/1.1 request target into a normalized [`ParsedRequest`].
 pub fn parse_http1_request(
     method: Method,
@@ -23,12 +29,51 @@ pub fn parse_http1_request(
     host_header: Option<&str>,
     fallback_scheme: Scheme,
 ) -> Result<ParsedRequest> {
+    parse_http1_request_with_mode(
+        method,
+        target,
+        host_header,
+        fallback_scheme,
+        Http1TargetMode::Proxy,
+    )
+}
+
+/// Parse an HTTP/1.1 request target that must be origin-form (no absolute-form).
+pub(crate) fn parse_http1_request_origin_form(
+    method: Method,
+    target: &str,
+    host_header: Option<&str>,
+    fallback_scheme: Scheme,
+) -> Result<ParsedRequest> {
+    parse_http1_request_with_mode(
+        method,
+        target,
+        host_header,
+        fallback_scheme,
+        Http1TargetMode::OriginOnly,
+    )
+}
+
+fn parse_http1_request_with_mode(
+    method: Method,
+    target: &str,
+    host_header: Option<&str>,
+    fallback_scheme: Scheme,
+    mode: Http1TargetMode,
+) -> Result<ParsedRequest> {
     let uri: Uri = target
         .parse()
         .with_context(|| format!("invalid request target '{target}'"))?;
 
     if uri.scheme().is_some() {
-        return parse_uri_request(method, &uri, fallback_scheme);
+        match mode {
+            Http1TargetMode::Proxy => return parse_uri_request(method, &uri, fallback_scheme),
+            Http1TargetMode::OriginOnly => {
+                bail!(
+                    "absolute-form request targets are not allowed over bumped HTTPS connections"
+                );
+            }
+        }
     }
 
     if target == "*" {
@@ -206,6 +251,21 @@ mod tests {
             parse_http1_request(Method::GET, "/resource", Some("example.com"), Scheme::Https)?;
         assert_eq!(parsed.port, Some(443));
         Ok(())
+    }
+
+    #[test]
+    fn parse_http1_request_origin_form_rejects_absolute_form() {
+        let err = parse_http1_request_origin_form(
+            Method::GET,
+            "http://example.com/resource",
+            Some("example.com"),
+            Scheme::Https,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("absolute-form"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
