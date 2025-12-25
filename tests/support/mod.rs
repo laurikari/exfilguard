@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+mod bump_fixture;
 mod config;
 mod dirs;
 mod harness;
@@ -12,6 +13,7 @@ mod proxy_client;
 mod tls;
 mod upstream;
 
+pub use bump_fixture::*;
 pub use config::*;
 pub use dirs::*;
 pub use harness::*;
