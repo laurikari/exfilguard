@@ -8,9 +8,11 @@ Control and monitor outbound HTTP/HTTPS traffic from your organization. Enforce 
 
 ## What is ExfilGuard?
 
-ExfilGuard is a Rust-based egress proxy that acts as a gatekeeper for all outbound traffic. It solves the critical security problem of **data exfiltration prevention** by ensuring that internal services and applications can only send data to explicitly approved external endpoints.
+ExfilGuard is a Rust-based explicit egress proxy that acts as a gatekeeper for all outbound traffic. It solves the critical security problem of **data exfiltration prevention** by ensuring that internal services and applications can only send data to explicitly approved external endpoints.
 
 Organizations face risks from malicious insiders, compromised services attempting to exfiltrate sensitive data, accidental data leakage through misconfigured integrations, and compliance violations when data leaves uncontrolled. ExfilGuard addresses all of these by enforcing fine-grained, per-client policies at the application layer.
+
+ExfilGuard targets Unix-like systems only; Windows is not supported.
 
 ---
 
@@ -20,13 +22,19 @@ Organizations face risks from malicious insiders, compromised services attemptin
 :   Map clients by exact IP address or CIDR ranges. Each client references ordered policies; the first matching rule wins.
 
 **Fine-Grained URL Matching**
-:   Policies specify allowed destinations using glob patterns for hostnames and regex patterns for paths.
+:   Policies specify allowed destinations using wildcard patterns for hostnames and paths.
 
 **TLS Inspection**
 :   Terminates TLS and mints leaf certificates on-the-fly for full request/response inspection including headers and body.
 
 **Pass-Through Mode**
 :   Tunnel CONNECT streams without decryption for services that use certificate pinning or refuse MITM.
+
+**Optional Response Caching**
+:   Shared HTTP response cache that follows standard cache headers; opt-in per rule via a `cache` block (requires cache storage configured globally).
+
+**Private Upstream Guardrails**
+:   Blocks upstream connections to private IPs by default to reduce SSRF risk; opt-in per rule with `allow_private_upstream = true`.
 
 **Hot-Reload Configuration**
 :   Supports SIGHUP signal to reload configuration without restarting the process. Zero downtime policy updates.

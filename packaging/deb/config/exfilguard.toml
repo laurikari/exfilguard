@@ -17,8 +17,8 @@ log = "json"
 # Uncomment to enable verbose request logging
 # log_queries = true
 
-# Response cache (disabled unless cache_dir is set)
-# cache_dir = "/var/lib/exfilguard/http-cache"
+# Response cache storage (rules opt-in)
+cache_dir = "/var/lib/exfilguard/cache"
 cache_max_entry_size = 10485760
 cache_max_entries = 10000
 cache_total_capacity = 1073741824

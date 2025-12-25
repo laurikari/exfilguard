@@ -156,11 +156,11 @@ Exports counters and histograms for per-client/policy decisions and latency, cac
 
 ## Cache Settings
 
-Response caching is disabled by default. Set `cache_dir` to enable.
+Response caching is opt-in per rule. The cache settings here configure the shared cache storage.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `cache_dir` | Path | None | Directory for response caching (enables caching when set) |
+| `cache_dir` | Path | None | Directory for response cache storage |
 | `cache_max_entry_size` | u64 | 10485760 (10 MiB) | Maximum size of individual cache entries |
 | `cache_max_entries` | usize | 10000 | Maximum number of cached responses (LRU) |
 | `cache_total_capacity` | u64 | 1073741824 (1 GiB) | Total cache capacity |
@@ -179,7 +179,7 @@ is acceptable for your deployment.
 
 #### Supported Headers
 
-- **Cache-Control**: `max-age`, `s-maxage`, `private`, `no-store`, `public`
+- **Cache-Control**: `max-age`, `s-maxage`, `public`, `private`, `no-cache`, `no-store`
 - **Expires**: HTTP date for cache expiration
 - **Vary**: Cache keys include request headers specified by Vary
 
@@ -198,7 +198,7 @@ Cache lifetime is determined in this order:
 - **Status codes**: 200, 203, 204, 205, 206, 301, 302
 - **Bypass**: Requests with `Authorization` or `Cookie` headers are never served from cache
   and are not stored
-- **Not cached**: Responses with `no-store` or `private` directives
+- **Not cached**: Responses with `no-store`, `no-cache`, or `private` directives, or any `Set-Cookie` header
 
 #### Request Cache Directives
 
@@ -213,7 +213,7 @@ Uses LRU (Least Recently Used) eviction when capacity is reached. Expired entrie
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`cache_dir/v1`). When the layout
+Cache entries live under a versioned subdirectory (`v1` under the cache root). When the layout
 version changes, old version directories are deleted asynchronously. A background
 sweeper runs every `cache_sweeper_interval` seconds and inspects up to
 `cache_sweeper_batch_size` entries, removing expired entries and pruning empty shard
@@ -236,8 +236,8 @@ EXFILGUARD__LISTEN="0.0.0.0:3128"
 EXFILGUARD__LOG="text"
 
 # Override timeouts
-EXFILGUARD__CLIENT_TIMEOUT=60
-EXFILGUARD__UPSTREAM_TIMEOUT=120
+EXFILGUARD__CLIENT_KEEPALIVE_IDLE_TIMEOUT=60
+EXFILGUARD__UPSTREAM_CONNECT_TIMEOUT=120
 ```
 
 ---

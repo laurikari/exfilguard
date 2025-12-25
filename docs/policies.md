@@ -205,13 +205,13 @@ The `inspect_payload` option controls whether ExfilGuard inspects request/respon
 - Full HTTP inspection including headers and body
 - TLS is terminated and re-encrypted (MITM)
 - Required for non-CONNECT methods
-- Enables response filtering and logging
+- Enables full request/response inspection for logging, metrics, and caching (when configured)
 
 ### inspect_payload = false (tunnel mode)
 
 - Traffic is tunneled without inspection
 - Only valid with `methods = ["CONNECT"]`
-- Only valid with URL pattern ending in `/**`
+- Only valid with URL pattern path `/**` (e.g., `https://secure.partner.com/**`)
 - Useful for certificate-pinned services that refuse MITM
 
 !!! warning
@@ -221,7 +221,7 @@ The `inspect_payload` option controls whether ExfilGuard inspects request/respon
 
 ## Response Caching
 
-Rules can enable caching for matched responses. Requires `cache_dir` in global config.
+Rules can enable caching for matched responses when the cache subsystem is configured globally.
 
 ```toml
 [[policy.rule]]
@@ -240,11 +240,11 @@ url_pattern = "https://cdn.example.com/**"
 
 The cache respects standard HTTP caching headers from upstream:
 
-- **Cache-Control**: `s-maxage`, `max-age`, `private`, `no-store`
+- **Cache-Control**: `s-maxage`, `max-age`, `public`, `private`, `no-cache`, `no-store`
 - **Expires**: HTTP date for expiration
 - **Vary**: Responses vary by specified request headers
 
-`force_cache_duration` is a **fallback only** - it does not override upstream headers. It only applies when the upstream server sends no cache directives.
+`force_cache_duration` is a **fallback only** - it does not override upstream freshness. It applies when the upstream response omits `s-maxage`, `max-age`, and `Expires` (including cases where only `public` is set).
 
 !!! note
     Only `GET` and `HEAD` responses with status 200, 203, 204, 205, 206, 301, or 302 are cached. See [Cache Settings](configuration.md#cache-settings) for full details.
