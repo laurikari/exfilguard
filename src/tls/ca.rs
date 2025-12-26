@@ -1,9 +1,9 @@
 use std::convert::TryInto;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Cursor, Write};
 // ExfilGuard only targets Unix-like hosts, so we rely on the Unix-specific
 // OpenOptions extension traits to enforce filesystem permissions.
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -42,7 +42,10 @@ impl CertificateAuthority {
     /// exists yet. When generating, the material is written to disk before being returned.
     pub fn load_or_generate<P: AsRef<Path>>(ca_dir: P) -> Result<Self> {
         let ca_dir = ca_dir.as_ref();
-        fs::create_dir_all(ca_dir)
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(ca_dir)
             .with_context(|| format!("failed to create CA directory {}", ca_dir.display()))?;
 
         let paths = CaPaths::new(ca_dir);

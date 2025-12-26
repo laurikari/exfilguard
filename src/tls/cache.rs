@@ -1,9 +1,9 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 // Windows support is out of scope; use the Unix-specific OpenOptions extension
 // to manage on-disk key permissions.
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,9 +40,13 @@ impl CertificateCache {
         let capacity = NonZeroUsize::new(capacity)
             .ok_or_else(|| anyhow!("certificate cache capacity must be greater than zero"))?;
         if let Some(dir) = disk_dir.as_ref() {
-            fs::create_dir_all(dir).with_context(|| {
-                format!("failed to create certificate cache dir {}", dir.display())
-            })?;
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| {
+                    format!("failed to create certificate cache dir {}", dir.display())
+                })?;
         }
         let cache = LruCache::new(capacity);
         Ok(Self {
@@ -225,12 +229,16 @@ struct DiskPaths {
 }
 
 fn persist_to_disk(paths: &DiskPaths, host: &str, minted: &MintedLeaf) -> Result<()> {
-    fs::create_dir_all(&paths.shard_dir).with_context(|| {
-        format!(
-            "failed to create certificate cache shard directory {}",
-            paths.shard_dir.display()
-        )
-    })?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&paths.shard_dir)
+        .with_context(|| {
+            format!(
+                "failed to create certificate cache shard directory {}",
+                paths.shard_dir.display()
+            )
+        })?;
     let temp_dir = create_temp_entry_dir(&paths.entry_dir)?;
     let write_result = write_chain_file(&temp_dir.join("chain"), &minted.chain_der)
         .and_then(|_| write_private_key(&temp_dir.join("key"), minted.private_key_der.as_slice()))
@@ -264,7 +272,9 @@ fn create_temp_entry_dir(entry_dir: &Path) -> Result<PathBuf> {
         .and_then(|value| value.to_str())
         .unwrap_or("entry");
     let temp_dir = parent.join(format!("{name}.tmp-{}", Uuid::new_v4()));
-    fs::create_dir(&temp_dir)
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&temp_dir)
         .with_context(|| format!("failed to create temp cache entry {}", temp_dir.display()))?;
     Ok(temp_dir)
 }
