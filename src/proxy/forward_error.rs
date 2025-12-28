@@ -43,6 +43,7 @@ pub enum ForwardErrorKind<'a> {
     BodyTooLarge(&'a BodyTooLarge),
     PrivateAddress(&'a PrivateAddressError),
     MisdirectedRequest(&'a MisdirectedRequest),
+    UpstreamClosed,
     Other,
 }
 
@@ -55,6 +56,8 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
         ForwardErrorKind::PrivateAddress(private)
     } else if let Some(misdirected) = err.downcast_ref::<MisdirectedRequest>() {
         ForwardErrorKind::MisdirectedRequest(misdirected)
+    } else if err.downcast_ref::<UpstreamClosed>().is_some() {
+        ForwardErrorKind::UpstreamClosed
     } else {
         ForwardErrorKind::Other
     }
@@ -82,6 +85,12 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &s
             requested_port = misdirected.requested_port,
             "HTTP/2 request did not match existing upstream connection"
         ),
+        ForwardErrorKind::UpstreamClosed => warn!(
+            peer = %peer,
+            host,
+            error = %err,
+            "upstream closed connection before response headers"
+        ),
         ForwardErrorKind::Other => warn!(
             peer = %peer,
             host,
@@ -91,3 +100,7 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &s
         ForwardErrorKind::BodyTooLarge(_) => {}
     }
 }
+
+#[derive(Debug, Error)]
+#[error("upstream closed connection before sending response headers")]
+pub struct UpstreamClosed;

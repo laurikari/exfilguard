@@ -290,7 +290,7 @@ where
     )
     .await?;
     if bytes == 0 {
-        bail!("upstream closed connection before sending status line");
+        return Err(crate::proxy::forward_error::UpstreamClosed.into());
     }
     budget.record(bytes)?;
     let trimmed = status_line.trim_end_matches(['\r', '\n']);
@@ -315,7 +315,7 @@ where
         )
         .await?;
         if read == 0 {
-            bail!("upstream closed connection during headers");
+            return Err(crate::proxy::forward_error::UpstreamClosed.into());
         }
         budget.record(read)?;
         let trimmed_line = header_line.trim_end_matches(['\r', '\n']);

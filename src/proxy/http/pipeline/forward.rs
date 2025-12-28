@@ -82,6 +82,7 @@ pub(super) async fn respond_forward_error<S>(
     spec: ForwardErrorSpec,
     log: RequestLogContext<'_>,
     decision: AllowDecision,
+    error_detail: &str,
 ) -> Result<ClientDisposition>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -99,7 +100,12 @@ where
         handler.response_body_timeout,
         handler.log_tracker.current_bytes(),
         handler.log_tracker.elapsed(),
-        policy_response::forward_error_log_builder(log.access_log_builder(), &decision, &spec),
+        policy_response::forward_error_log_builder(
+            log.access_log_builder(),
+            &decision,
+            &spec,
+            error_detail,
+        ),
     )
     .await?;
     Ok(ClientDisposition::Close)

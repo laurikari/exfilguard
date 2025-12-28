@@ -99,6 +99,7 @@ async fn http_private_ip_blocked_by_default() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_upstream_failure_returns_502() -> Result<()> {
+    let log_capture = LogCapture::new("info").await;
     let upstream = TestUpstream::close().await?;
     let upstream_port = upstream.port();
 
@@ -129,13 +130,21 @@ async fn http_upstream_failure_returns_502() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("upstream request failed"),
+        response.contains("upstream closed connection")
+            || response.contains("upstream request failed"),
         "missing upstream failure body: {response}"
     );
 
     client.shutdown().await;
     harness.shutdown().await;
     drop(upstream);
+
+    let logs = log_capture.text();
+    assert!(
+        logs.contains("error_reason=\"upstream_closed\"")
+            || logs.contains("error_reason=\"upstream_failed\""),
+        "expected upstream failure access log entry, got: {logs}"
+    );
 
     Ok(())
 }

@@ -81,7 +81,8 @@ where
                 handle_forward_success(self, success).await
             }
             policy_response::ForwardOutcome::Responded(ctx) => {
-                respond_forward_error(self, ctx.spec, ctx.log, ctx.decision).await
+                respond_forward_error(self, ctx.spec, ctx.log, ctx.decision, &ctx.error_detail)
+                    .await
             }
         }
     }

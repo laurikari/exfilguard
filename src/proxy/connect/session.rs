@@ -271,8 +271,14 @@ impl ConnectSession {
             ForwardOutcome::Completed(()) => Ok(()),
             ForwardOutcome::Responded(ctx) => {
                 if let Some(mut stream) = stream_for_error {
-                    self.respond_forward_error(&mut stream, ctx.spec, ctx.log, ctx.decision)
-                        .await?;
+                    self.respond_forward_error(
+                        &mut stream,
+                        ctx.spec,
+                        ctx.log,
+                        ctx.decision,
+                        &ctx.error_detail,
+                    )
+                    .await?;
                 }
                 Ok(())
             }
@@ -299,7 +305,7 @@ impl ConnectSession {
         {
             ForwardOutcome::Completed(()) => Ok(()),
             ForwardOutcome::Responded(ctx) => {
-                self.log_forward_error(ctx.spec, ctx.log, ctx.decision)
+                self.log_forward_error(ctx.spec, ctx.log, ctx.decision, &ctx.error_detail)
                     .await
             }
         }
@@ -311,6 +317,7 @@ impl ConnectSession {
         spec: ForwardErrorSpec,
         log: RequestLogContext<'_>,
         allow: AllowDecision,
+        error_detail: &str,
     ) -> Result<()> {
         if spec.extra_client_bytes > 0 {
             self.bytes_in = self.bytes_in.saturating_add(spec.extra_client_bytes);
@@ -323,7 +330,12 @@ impl ConnectSession {
             self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),
-            policy_response::forward_error_log_builder(log.access_log_builder(), &allow, &spec),
+            policy_response::forward_error_log_builder(
+                log.access_log_builder(),
+                &allow,
+                &spec,
+                error_detail,
+            ),
         )
         .await
     }
@@ -333,15 +345,21 @@ impl ConnectSession {
         spec: ForwardErrorSpec,
         log: RequestLogContext<'_>,
         allow: AllowDecision,
+        error_detail: &str,
     ) -> Result<()> {
         if spec.extra_client_bytes > 0 {
             self.bytes_in = self.bytes_in.saturating_add(spec.extra_client_bytes);
         }
-        policy_response::forward_error_log_builder(log.access_log_builder(), &allow, &spec)
-            .status(spec.status)
-            .bytes(self.bytes_in, 0)
-            .elapsed(self.start.elapsed())
-            .log();
+        policy_response::forward_error_log_builder(
+            log.access_log_builder(),
+            &allow,
+            &spec,
+            error_detail,
+        )
+        .status(spec.status)
+        .bytes(self.bytes_in, 0)
+        .elapsed(self.start.elapsed())
+        .log();
         Ok(())
     }
 

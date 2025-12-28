@@ -56,6 +56,8 @@ pub struct AccessLogEvent {
     pub elapsed_ms: u128,
     pub upstream_addr: Option<String>,
     pub upstream_reused: Option<bool>,
+    pub error_reason: Option<String>,
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug)]
@@ -86,6 +88,8 @@ impl AccessLogBuilder {
                 elapsed_ms: 0,
                 upstream_addr: None,
                 upstream_reused: None,
+                error_reason: None,
+                error_detail: None,
             },
         }
     }
@@ -181,6 +185,16 @@ impl AccessLogBuilder {
         self
     }
 
+    pub fn error_reason(mut self, reason: impl Into<String>) -> Self {
+        self.event.error_reason = Some(reason.into());
+        self
+    }
+
+    pub fn error_detail(mut self, detail: impl Into<String>) -> Self {
+        self.event.error_detail = Some(detail.into());
+        self
+    }
+
     pub fn build(self) -> AccessLogEvent {
         self.event
     }
@@ -219,6 +233,8 @@ pub fn log_access(event: AccessLogEvent) {
         elapsed_ms,
         upstream_addr,
         upstream_reused,
+        error_reason,
+        error_detail,
     } = event;
 
     let now = OffsetDateTime::now_utc();
@@ -232,6 +248,8 @@ pub fn log_access(event: AccessLogEvent) {
     );
     let policy_field = policy.as_deref().unwrap_or_default();
     let rule_field = rule.as_deref().unwrap_or_default();
+    let error_reason_field = error_reason.as_deref().unwrap_or_default();
+    let error_detail_field = error_detail.as_deref().unwrap_or_default();
 
     tracing::info!(
         target = "access_log",
@@ -253,7 +271,9 @@ pub fn log_access(event: AccessLogEvent) {
         elapsed_ms,
         client_port,
         upstream_addr = upstream_addr.unwrap_or_default(),
-        upstream_reused = upstream_reused.unwrap_or(false)
+        upstream_reused = upstream_reused.unwrap_or(false),
+        error_reason = error_reason_field,
+        error_detail = error_detail_field
     );
 
     crate::metrics::record_request(

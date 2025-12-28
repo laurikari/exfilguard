@@ -23,6 +23,9 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
             }
         };
         debug!(peer = %peer_addr, "accepted connection");
+        if let Err(err) = stream.set_nodelay(true) {
+            debug!(peer = %peer_addr, error = %err, "failed to set TCP_NODELAY on downstream stream");
+        }
         let connection_app = app.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, peer_addr, connection_app).await {

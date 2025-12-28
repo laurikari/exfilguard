@@ -16,6 +16,7 @@ pub struct ForwardErrorSpec {
     pub body_http2: &'static str,
     pub decision: &'static str,
     pub extra_client_bytes: u64,
+    pub log_reason: &'static str,
 }
 
 pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
@@ -26,6 +27,7 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             body_http2: "request timed out",
             decision: "ERROR",
             extra_client_bytes: 0,
+            log_reason: "request_timeout",
         },
         ForwardErrorKind::BodyTooLarge(body) => ForwardErrorSpec {
             status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -33,6 +35,7 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             body_http2: "request body exceeds configured limit",
             decision: "DENY",
             extra_client_bytes: body.bytes_read,
+            log_reason: "body_too_large",
         },
         ForwardErrorKind::PrivateAddress(_) => ForwardErrorSpec {
             status: StatusCode::FORBIDDEN,
@@ -40,6 +43,7 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             body_http2: "request blocked by policy",
             decision: "DENY",
             extra_client_bytes: 0,
+            log_reason: "private_address",
         },
         ForwardErrorKind::MisdirectedRequest(_) => ForwardErrorSpec {
             status: StatusCode::MISDIRECTED_REQUEST,
@@ -47,6 +51,15 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             body_http2: "misdirected request",
             decision: "ERROR",
             extra_client_bytes: 0,
+            log_reason: "misdirected_request",
+        },
+        ForwardErrorKind::UpstreamClosed => ForwardErrorSpec {
+            status: StatusCode::BAD_GATEWAY,
+            body_http1: b"upstream closed connection\r\n",
+            body_http2: "upstream closed connection",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "upstream_closed",
         },
         ForwardErrorKind::Other => ForwardErrorSpec {
             status: StatusCode::BAD_GATEWAY,
@@ -54,6 +67,7 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             body_http2: "upstream request failed",
             decision: "ERROR",
             extra_client_bytes: 0,
+            log_reason: "upstream_failed",
         },
     }
 }
@@ -62,12 +76,15 @@ pub fn forward_error_log_builder(
     builder: AccessLogBuilder,
     allow: &AllowDecision,
     spec: &ForwardErrorSpec,
+    error_detail: &str,
 ) -> AccessLogBuilder {
     builder
         .client(allow.client.as_ref())
         .decision(spec.decision)
         .policy(allow.policy.as_ref())
         .rule(allow.rule.as_ref())
+        .error_reason(spec.log_reason)
+        .error_detail(error_detail)
         .inspect_payload(allow.inspect_payload)
 }
 
@@ -82,6 +99,7 @@ pub struct ForwardErrorContext<'a> {
     pub spec: ForwardErrorSpec,
     pub log: RequestLogContext<'a>,
     pub decision: AllowDecision,
+    pub error_detail: String,
 }
 
 /// Shared helper for responding to forwarding failures after a policy ALLOW decision.
@@ -101,6 +119,7 @@ pub async fn handle_forward_result<'a, T>(
                 ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
                 ForwardErrorKind::PrivateAddress(_) => "private_address",
                 ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
+                ForwardErrorKind::UpstreamClosed => "upstream_closed",
                 ForwardErrorKind::Other => "other",
             };
             crate::metrics::record_upstream_error(kind_label);
@@ -110,6 +129,7 @@ pub async fn handle_forward_result<'a, T>(
                 spec,
                 log,
                 decision: decision.clone(),
+                error_detail: err.to_string(),
             }))
         }
     }

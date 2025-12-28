@@ -254,13 +254,19 @@ impl DownstreamRequestCtx {
         spec: ForwardErrorSpec,
         log: RequestLogContext<'_>,
         decision: AllowDecision,
+        error_detail: &str,
     ) -> Result<()> {
         send_error_response(&mut self.respond, spec.status, spec.body_http2).await?;
         self.log_tracker.add_client_bytes(spec.extra_client_bytes);
-        policy_response::forward_error_log_builder(log.access_log_builder(), &decision, &spec)
-            .bytes(self.log_tracker.current_bytes(), 0)
-            .elapsed(self.log_tracker.elapsed())
-            .log();
+        policy_response::forward_error_log_builder(
+            log.access_log_builder(),
+            &decision,
+            &spec,
+            error_detail,
+        )
+        .bytes(self.log_tracker.current_bytes(), 0)
+        .elapsed(self.log_tracker.elapsed())
+        .log();
         Ok(())
     }
 }
@@ -322,8 +328,11 @@ impl Http2RequestHandler {
         spec: ForwardErrorSpec,
         log: RequestLogContext<'_>,
         decision: AllowDecision,
+        error_detail: &str,
     ) -> Result<()> {
-        self.ctx.respond_forward_error(spec, log, decision).await
+        self.ctx
+            .respond_forward_error(spec, log, decision, error_detail)
+            .await
     }
 }
 
@@ -349,7 +358,7 @@ impl RequestHandler for Http2RequestHandler {
                 self.handle_forward_success(success).await
             }
             policy_response::ForwardOutcome::Responded(ctx) => {
-                self.respond_forward_error(ctx.spec, ctx.log, ctx.decision)
+                self.respond_forward_error(ctx.spec, ctx.log, ctx.decision, &ctx.error_detail)
                     .await
             }
         }
