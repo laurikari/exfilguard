@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -119,6 +120,7 @@ impl CacheWriteState {
         response_body_plan: ResponseBodyPlan,
         timeouts: &ForwardTimeouts,
         upstream_peer: SocketAddr,
+        total_deadline: Option<Instant>,
         peer: SocketAddr,
         request: &ParsedRequest,
     ) -> Result<(u64, CacheStoreResult)>
@@ -134,6 +136,7 @@ impl CacheWriteState {
                     response_body_plan,
                     timeouts,
                     upstream_peer,
+                    total_deadline,
                 )
                 .await?;
                 Ok((bytes, CacheStoreResult::Bypassed))
@@ -145,6 +148,7 @@ impl CacheWriteState {
                     response_body_plan,
                     timeouts,
                     upstream_peer,
+                    total_deadline,
                 )
                 .await?;
                 Ok((bytes, CacheStoreResult::Skipped))
@@ -164,6 +168,7 @@ impl CacheWriteState {
                         response_body_plan,
                         timeouts,
                         upstream_peer,
+                        total_deadline,
                     )
                     .await?
                 };

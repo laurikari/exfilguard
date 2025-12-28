@@ -283,6 +283,7 @@ pub async fn relay_fixed_body<S, C>(
     read_timeout: Duration,
     write_timeout: Duration,
     peer: SocketAddr,
+    total_deadline: Option<Instant>,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -292,21 +293,27 @@ where
     let mut buffer = [0u8; 8192];
     while remaining > 0 {
         let to_read = remaining.min(buffer.len() as u64) as usize;
-        let read = timeout_with_context(
-            read_timeout,
-            upstream.read(&mut buffer[..to_read]),
-            format!("reading upstream response body from {peer}"),
+        let read = with_total_deadline(
+            total_deadline,
+            timeout_with_context(
+                read_timeout,
+                upstream.read(&mut buffer[..to_read]),
+                format!("reading upstream response body from {peer}"),
+            ),
         )
         .await?;
         if read == 0 {
             bail!("upstream closed connection early while sending response body");
         }
         remaining -= read as u64;
-        write_all_with_timeout(
-            client,
-            &buffer[..read],
-            write_timeout,
-            "writing response body to client",
+        with_total_deadline(
+            total_deadline,
+            write_all_with_timeout(
+                client,
+                &buffer[..read],
+                write_timeout,
+                "writing response body to client",
+            ),
         )
         .await?;
         transferred = transferred.saturating_add(read as u64);
@@ -320,6 +327,7 @@ pub async fn relay_chunked_body<S, C>(
     read_timeout: Duration,
     write_timeout: Duration,
     peer: SocketAddr,
+    total_deadline: Option<Instant>,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -330,7 +338,7 @@ where
         client,
         read_timeout,
         write_timeout,
-        None,
+        total_deadline,
         peer,
         "to client",
         None,
@@ -344,6 +352,7 @@ pub async fn relay_until_close<S, C>(
     read_timeout: Duration,
     write_timeout: Duration,
     peer: SocketAddr,
+    total_deadline: Option<Instant>,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -352,20 +361,26 @@ where
     let mut total = 0u64;
     let mut buffer = [0u8; 8192];
     loop {
-        let read = timeout_with_context(
-            read_timeout,
-            upstream.read(&mut buffer),
-            format!("reading response body from upstream {peer}"),
+        let read = with_total_deadline(
+            total_deadline,
+            timeout_with_context(
+                read_timeout,
+                upstream.read(&mut buffer),
+                format!("reading response body from upstream {peer}"),
+            ),
         )
         .await?;
         if read == 0 {
             break;
         }
-        write_all_with_timeout(
-            client,
-            &buffer[..read],
-            write_timeout,
-            "writing response body to client",
+        with_total_deadline(
+            total_deadline,
+            write_all_with_timeout(
+                client,
+                &buffer[..read],
+                write_timeout,
+                "writing response body to client",
+            ),
         )
         .await?;
         total = total.saturating_add(read as u64);

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use http::{Method, StatusCode};
@@ -118,6 +119,7 @@ pub(super) async fn relay_body<S, C>(
     body_plan: ResponseBodyPlan,
     timeouts: &ForwardTimeouts,
     upstream_peer: SocketAddr,
+    total_deadline: Option<Instant>,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -133,6 +135,7 @@ where
                 timeouts.response_io,
                 timeouts.response_io,
                 upstream_peer,
+                total_deadline,
             )
             .await
         }
@@ -143,6 +146,7 @@ where
                 timeouts.response_io,
                 timeouts.response_io,
                 upstream_peer,
+                total_deadline,
             )
             .await
         }
@@ -153,6 +157,7 @@ where
                 timeouts.response_io,
                 timeouts.response_io,
                 upstream_peer,
+                total_deadline,
             )
             .await
         }
@@ -162,11 +167,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{ResponseBodyPlan, determine_response_body_plan, read_final_response_head};
+    use crate::proxy::forward_error::RequestTimeout;
     use crate::proxy::http::codec::Http1ResponseHead;
     use crate::proxy::http::forward::ForwardTimeouts;
     use http::{Method, StatusCode};
     use std::net::SocketAddr;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
 
     fn head_with_status(status: StatusCode) -> Http1ResponseHead {
@@ -220,6 +226,47 @@ mod tests {
         assert_eq!(
             determine_response_body_plan(&Method::GET, head.status, &head),
             ResponseBodyPlan::Chunked
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_body_respects_total_deadline() {
+        let (_upstream_writer, upstream_stream) = duplex(1024);
+        let (client_stream, _client_reader) = duplex(1024);
+        let mut upstream_reader = BufReader::new(upstream_stream);
+        let mut client = client_stream;
+
+        let timeouts = ForwardTimeouts {
+            connect: Duration::from_secs(5),
+            request_io: Duration::from_secs(5),
+            response_header: Duration::from_secs(5),
+            response_io: Duration::from_secs(5),
+        };
+        let total_deadline = Some(Instant::now() + Duration::from_millis(50));
+        let upstream_peer: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            super::relay_body(
+                &mut upstream_reader,
+                &mut client,
+                ResponseBodyPlan::Fixed(4),
+                &timeouts,
+                upstream_peer,
+                total_deadline,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        let err = handle
+            .await
+            .expect("task panicked")
+            .expect_err("expected total deadline to trigger timeout");
+        assert!(
+            err.downcast_ref::<RequestTimeout>().is_some(),
+            "unexpected error: {err}"
         );
     }
 
