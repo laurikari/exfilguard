@@ -85,8 +85,9 @@ policies.
 ExfilGuard’s outbound TLS client configuration **requires** a populated
 platform trust store. The process aborts startup when no native anchors are
 present rather than silently continuing without any trust material. This is
-intentional; if you’re operating in a stripped-down environment, install system
-certificates instead of providing a custom trust store.
+intentional; if you’re operating in a stripped-down environment (e.g., minimal
+containers), install the standard CA bundle (`ca-certificates` or equivalent) so
+outbound TLS verification remains intact.
 
 ## Repository Map
 
@@ -286,7 +287,9 @@ override the config or set `EXFILGUARD__*` environment variables.
 
 Set `metrics_listen = "127.0.0.1:9090"` in your config to expose Prometheus
 metrics at `/metrics`. Provide `metrics_tls_cert` and `metrics_tls_key` to serve
-the endpoint over HTTPS.
+the endpoint over HTTPS. The listener is intended for internal use only—keep it
+firewalled to your Prometheus (or front it with an authenticating reverse
+proxy) because the metrics include internal hosts and policy decisions.
 
 ## Learn more
 
