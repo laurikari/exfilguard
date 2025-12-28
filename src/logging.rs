@@ -246,10 +246,16 @@ pub fn log_access(event: AccessLogEvent) {
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}Z",
         month = month_number
     );
-    let policy_field = policy.as_deref().unwrap_or_default();
-    let rule_field = rule.as_deref().unwrap_or_default();
-    let error_reason_field = error_reason.as_deref().unwrap_or_default();
-    let error_detail_field = error_detail.as_deref().unwrap_or_default();
+
+    let cache_lookup_field = cache_lookup.as_deref();
+    let cache_store_field = cache_store.as_deref();
+    let client_field = client.as_deref();
+    let policy_field = policy.as_deref();
+    let rule_field = rule.as_deref();
+    let upstream_addr_field = upstream_addr.as_deref();
+    let upstream_reused_field = upstream_reused;
+    let error_reason_field = error_reason.as_deref();
+    let error_detail_field = error_detail.as_deref();
 
     tracing::info!(
         target = "access_log",
@@ -259,8 +265,9 @@ pub fn log_access(event: AccessLogEvent) {
         scheme,
         host,
         path,
-        cache_lookup = cache_lookup.unwrap_or_default(),
-        cache_store = cache_store.unwrap_or_default(),
+        cache_lookup = cache_lookup_field,
+        cache_store = cache_store_field,
+        client = client_field,
         status,
         decision,
         policy = policy_field,
@@ -270,8 +277,8 @@ pub fn log_access(event: AccessLogEvent) {
         bytes_out,
         elapsed_ms,
         client_port,
-        upstream_addr = upstream_addr.unwrap_or_default(),
-        upstream_reused = upstream_reused.unwrap_or(false),
+        upstream_addr = upstream_addr_field,
+        upstream_reused = upstream_reused_field,
         error_reason = error_reason_field,
         error_detail = error_detail_field
     );
