@@ -1,0 +1,51 @@
+services:
+  exfilguard:
+    build:
+      context: ..
+      dockerfile: perf/Dockerfile.exfilguard
+    image: exfilguard-perf
+    cpus: "1.0"
+    command: ["--config", "/etc/exfilguard/exfilguard.toml"]
+    volumes:
+      - ./config/clients.d:/etc/exfilguard/clients.d:ro
+      - ./config/policies.d:/etc/exfilguard/policies.d:ro
+    expose:
+      - "3128"
+    environment:
+      RUST_LOG: info
+
+  upstream:
+    image: nginxdemos/hello:plain-text
+    expose:
+      - "80"
+
+  client:
+    image: grafana/k6:latest
+    depends_on:
+      - exfilguard
+      - upstream
+    entrypoint: ["k6"]
+    command: ["run", "--out", "json=/results/k6.json", "/scripts/http-load.js"]
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./results:/results
+    environment:
+      HTTP_PROXY: http://exfilguard:3128
+      HTTPS_PROXY: http://exfilguard:3128
+      NO_PROXY: exfilguard,localhost,127.0.0.1,raw.githubusercontent.com,github.com
+      TARGET: http://upstream/
+      RATE: ${RATE:-500}
+      DURATION: ${DURATION:-15s}
+      VUS: ${VUS:-100}
+      MAX_VUS: ${MAX_VUS:-200}
+      RAMP: ${RAMP:-1}
+      RAMP_START_RATE: ${RAMP_START_RATE:-500}
+      RAMP_STEP: ${RAMP_STEP:-250}
+      RAMP_STAGES: ${RAMP_STAGES:-4}
+      RAMP_STAGE_DURATION: ${RAMP_STAGE_DURATION:-30s}
+      K6_SUMMARY_EXPORT: /results/summary.json
+      K6_NO_USAGE_REPORT: true
+      K6_WEB_DASHBOARD: true
+      K6_WEB_DASHBOARD_PORT: "-1"
+      K6_WEB_DASHBOARD_EXPORT: /results/dashboard.html
+      K6_WEB_DASHBOARD_PERIOD: ${K6_WEB_DASHBOARD_PERIOD:-2s}

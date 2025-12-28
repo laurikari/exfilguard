@@ -1,0 +1,7 @@
+target/**
+!target/debian/**
+.git
+perf/results
+perf/.env
+**/*.swp
+**/*.tmp

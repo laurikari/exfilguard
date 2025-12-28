@@ -1,0 +1,13 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY target/debian/exfilguard_*.deb /tmp/exfilguard.deb
+
+RUN apt-get update \
+    && apt-get install -y /tmp/exfilguard.deb \
+    && rm -f /tmp/exfilguard.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+USER exfilguard
+ENTRYPOINT ["/usr/sbin/exfilguard"]
