@@ -273,6 +273,7 @@ fn latency_buckets() -> Vec<f64> {
 
 const METRICS_MAX_REQUEST_BYTES: usize = 8192;
 const METRICS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const METRICS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn status_class(status: u16) -> &'static str {
     match status {
@@ -454,7 +455,9 @@ async fn handle_connection(
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
     if let Some(acceptor) = tls_acceptor {
-        let tls = acceptor.accept(stream).await?;
+        let tls = timeout(METRICS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+            .await
+            .map_err(|_| anyhow!("timed out during TLS handshake"))??;
         handle_stream(tls, path).await
     } else {
         handle_stream(stream, path).await
@@ -657,6 +660,8 @@ fn remaining_deadline(deadline: Instant, context: &str) -> Result<Duration> {
 mod tests {
     use super::*;
     use http::StatusCode;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
 
     #[test]
     fn record_basic_metrics() {
@@ -732,5 +737,39 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tls_handshake_times_out_when_client_is_idle() -> anyhow::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let cert_der = cert.cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)?;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            super::handle_connection(stream, "/metrics", Some(acceptor)).await
+        });
+
+        let _client = TcpStream::connect(addr).await?;
+        tokio::task::yield_now().await;
+        tokio::time::advance(super::METRICS_HANDSHAKE_TIMEOUT + Duration::from_millis(50)).await;
+
+        let err = server
+            .await
+            .expect("server task panicked")
+            .expect_err("handshake should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        Ok(())
     }
 }
