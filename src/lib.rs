@@ -27,7 +27,7 @@ const DEFAULT_CERT_CACHE_CAPACITY: usize = 512;
 
 pub async fn run(settings: Settings) -> Result<()> {
     let settings = Arc::new(settings);
-    if let Some(addr) = settings.metrics_listen {
+    let metrics = settings.metrics_listen.map(|addr| {
         let path = "/metrics".to_string();
         let tls = match (&settings.metrics_tls_cert, &settings.metrics_tls_key) {
             (Some(cert), Some(key)) => Some(crate::metrics::MetricsTlsConfig {
@@ -36,13 +36,8 @@ pub async fn run(settings: Settings) -> Result<()> {
             }),
             _ => None,
         };
-        tokio::spawn(async move {
-            tracing::info!(address = %addr, tls = tls.is_some(), "metrics endpoint starting");
-            if let Err(err) = crate::metrics::serve(addr, path, tls).await {
-                tracing::error!(error = %err, "metrics endpoint failed");
-            }
-        });
-    }
+        (addr, path, tls)
+    });
     let ca = Arc::new(CertificateAuthority::load_or_generate(&settings.ca_dir)?);
     let cert_cache_dir = settings.cert_cache_dir.clone();
     let cert_cache = Arc::new(CertificateCache::new(
@@ -78,7 +73,16 @@ pub async fn run(settings: Settings) -> Result<()> {
     };
 
     let app = proxy::AppContext::new(settings, policy_store, tls_context, cache);
-    proxy::run(app).await
+
+    if let Some((addr, path, tls)) = metrics {
+        tracing::info!(address = %addr, tls = tls.is_some(), "metrics endpoint starting");
+        tokio::select! {
+            res = crate::metrics::serve(addr, path, tls) => res,
+            res = proxy::run(app) => res,
+        }
+    } else {
+        proxy::run(app).await
+    }
 }
 
 fn build_policy_snapshot(settings: &Settings) -> Result<PolicySnapshot> {
