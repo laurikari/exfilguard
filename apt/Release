@@ -1,0 +1,14 @@
+Origin: ExfilGuard
+Label: ExfilGuard
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: ExfilGuard APT repository
+Date: Mon, 29 Dec 2025 16:37:16 +0000
+MD5Sum:
+ e63df2f57cf830a8af3073564d554938 1246 Packages
+ e5033539ee84da7b34af34dcae0fdf98 549 Packages.gz
+SHA256:
+ b62a5cab74f900f61721abd41d24c53e97c7955d65c14e88a4c248bb3e8a8dfc 1246 Packages
+ c2fd38802fb28ad0c1df9b7c99ffbc9e404e76a3b7be69345e55ad4d3e226ac0 549 Packages.gz
