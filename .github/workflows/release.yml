@@ -21,7 +21,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     env:
       PUBLISH_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || inputs.publish_release == 'true' }}
     steps:
@@ -42,14 +50,25 @@ jobs:
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deb-package
+          name: deb-package-${{ matrix.arch }}
           path: target/debian/*.deb
 
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || inputs.publish_release == 'true'
+    steps:
+      - name: Download .deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-package-*
+          path: deb-package
+          merge-multiple: true
+
       - name: Create GitHub Release
-        if: env.PUBLISH_RELEASE == 'true'
         uses: softprops/action-gh-release@v1
         with:
-          files: target/debian/*.deb
+          files: deb-package/*.deb
           generate_release_notes: true
 
   publish-apt:
@@ -86,8 +105,9 @@ jobs:
       - name: Download .deb artifact
         uses: actions/download-artifact@v4
         with:
-          name: deb-package
+          pattern: deb-package-*
           path: deb-package
+          merge-multiple: true
 
       - name: Prepare GitHub Pages content
         run: |
@@ -108,7 +128,7 @@ jobs:
           Label: ExfilGuard
           Suite: stable
           Codename: stable
-          Architectures: amd64
+          Architectures: amd64 arm64
           Components: main
           Description: ExfilGuard APT repository
           Date: $(date -Ru)
