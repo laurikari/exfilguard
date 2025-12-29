@@ -130,10 +130,14 @@ pub(super) async fn forward_request_to_upstream(
             if chunk.is_empty() {
                 continue;
             }
-            body_tracker.record(chunk.len())?;
+            let chunk_len = chunk.len();
+            body_tracker.record(chunk_len)?;
             send_stream
                 .send_data(chunk, false)
                 .context("failed to forward HTTP/2 request body upstream")?;
+            body.flow_control()
+                .release_capacity(chunk_len)
+                .context("failed to release HTTP/2 request body flow-control capacity")?;
         }
 
         match with_total_deadline(
@@ -235,12 +239,17 @@ pub(super) async fn forward_request_to_upstream(
             if chunk.is_empty() {
                 continue;
             }
+            let chunk_len = chunk.len();
             upstream_body_bytes = upstream_body_bytes
-                .checked_add(chunk.len() as u64)
+                .checked_add(chunk_len as u64)
                 .ok_or_else(|| anyhow!("response body size overflow"))?;
             send_body
                 .send_data(chunk, false)
                 .context("failed to forward HTTP/2 response body to client")?;
+            response_body
+                .flow_control()
+                .release_capacity(chunk_len)
+                .context("failed to release HTTP/2 response body flow-control capacity")?;
         }
 
         match timeout_with_context(
