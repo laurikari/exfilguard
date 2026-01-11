@@ -16,9 +16,10 @@ reloaded without restarting the process.
    cargo run -- --config examples/quickstart/exfilguard.toml
    ```
 
-   This config trusts only `127.0.0.1`, intercepts `CONNECT` requests to
-   `https://www.searchkit.com/`, and only allows paths that start with `/faq/`.
-   All generated material lives under `/tmp/exfilguard/quickstart`.
+   This config trusts only `127.0.0.1`, allows bumped HTTPS requests to
+   `https://www.searchkit.com/faq/**`, and denies everything else. The implicit
+   CONNECT tunnel is only opened for that host/port. All generated material
+   lives under `/tmp/exfilguard/quickstart`.
 
 2. Send a test request through the proxy:
 
@@ -161,7 +162,8 @@ others.
 Each policy rule declares whether ExfilGuard bumps TLS:
 
 - `inspect_payload = true` (default) terminates TLS so the proxy can enforce
-  scheme, host, path, and method checks—and log bodies if needed.
+  scheme, host, path, and method checks—and log bodies if needed. HTTPS rules
+  implicitly authorize CONNECT bumping for the same host/port.
 - `inspect_payload = false` only enforces scheme/host/port. These rules must use
   `methods = ["CONNECT"]` and a `url_pattern` ending in `/**`, making it clear
   that the intent is to tunnel the host untouched. Use this for pinned TLS or
@@ -182,7 +184,7 @@ name = "pinned-payments-egress"
   [[policy.rule]]
   action = "ALLOW"
   methods = ["CONNECT"]
-  url_pattern = "https://secure.partner.com/payments/**"
+  url_pattern = "https://secure.partner.com/**"
   inspect_payload = false
   allow_private_upstream = true
 ```

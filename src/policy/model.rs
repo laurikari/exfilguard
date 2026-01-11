@@ -178,12 +178,23 @@ impl MethodMask {
 
     pub fn allows(&self, method: &Method) -> bool {
         if self.allow_any {
-            return true;
+            return method != Method::CONNECT;
         }
         if let Some(bit) = method_bit(method) {
             return (self.mask & bit) != 0;
         }
         self.extras.iter().any(|m| m == method)
+    }
+
+    pub fn is_connect_only(&self) -> bool {
+        if self.allow_any {
+            return false;
+        }
+        self.mask == (1 << 8) && self.extras.is_empty()
+    }
+
+    pub fn is_any(&self) -> bool {
+        self.allow_any
     }
 }
 

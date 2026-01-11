@@ -131,10 +131,38 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
         }
 
         let mut compiled_rules = Vec::with_capacity(rules.len());
+        let mut seen_non_connect_rule = false;
         let policy_name = Arc::<str>::from(name.as_str());
         for (idx, rule) in rules.into_iter().enumerate() {
             let action = parse_action(&name, &rule)?;
             let methods = parse_methods(&rule)?;
+            let has_connect = methods_include_connect(&methods);
+            let is_connect_only = methods_connect_only(&methods);
+            if has_connect && !is_connect_only {
+                bail!(
+                    "policy '{}' rule {}: CONNECT method must not be combined with other methods",
+                    name,
+                    idx
+                );
+            }
+            if is_connect_only {
+                if seen_non_connect_rule {
+                    bail!(
+                        "policy '{}' rule {}: CONNECT rules must appear before non-CONNECT rules",
+                        name,
+                        idx
+                    );
+                }
+                if matches!(action, RuleAction::Allow) && rule.inspect_payload {
+                    bail!(
+                        "policy '{}' rule {}: CONNECT ALLOW rules must set inspect_payload=false",
+                        name,
+                        idx
+                    );
+                }
+            } else {
+                seen_non_connect_rule = true;
+            }
             let url_pattern = match &rule.url_pattern {
                 Some(pattern) => Some(parse_url_pattern(pattern).with_context(|| {
                     format!("policy '{}' has invalid url_pattern '{}'", name, pattern)
@@ -327,6 +355,20 @@ fn parse_methods(rule: &RawRule) -> Result<MethodMatch> {
             }
             Ok(MethodMatch::List(parsed))
         }
+    }
+}
+
+fn methods_include_connect(methods: &MethodMatch) -> bool {
+    match methods {
+        MethodMatch::Any => false,
+        MethodMatch::List(list) => list.contains(&Method::CONNECT),
+    }
+}
+
+fn methods_connect_only(methods: &MethodMatch) -> bool {
+    match methods {
+        MethodMatch::Any => false,
+        MethodMatch::List(list) => list.len() == 1 && list[0] == Method::CONNECT,
     }
 }
 
@@ -865,6 +907,90 @@ name = "pass"
         assert!(
             err.to_string()
                 .contains("inspect_payload=false requires url_pattern ending with '/**'")
+        );
+    }
+
+    #[test]
+    fn reject_connect_rule_after_non_connect_rule() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+fallback = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET"]
+  url_pattern = "https://example.com/**"
+
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT"]
+  url_pattern = "https://example.com/**"
+  inspect_payload = false
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CONNECT rules must appear before non-CONNECT rules")
+        );
+    }
+
+    #[test]
+    fn reject_connect_allow_with_inspect_payload_true() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+fallback = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT"]
+  url_pattern = "https://example.com/**"
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CONNECT ALLOW rules must set inspect_payload=false")
+        );
+    }
+
+    #[test]
+    fn reject_connect_combined_with_other_methods() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+fallback = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT", "GET"]
+  url_pattern = "https://example.com/**"
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CONNECT method must not be combined with other methods")
         );
     }
 

@@ -86,23 +86,86 @@ pub struct EvaluationResult {
 }
 
 fn evaluate_policy(policy: &super::model::CompiledPolicy, request: &Request) -> Option<Decision> {
+    if request.method == Method::CONNECT {
+        return evaluate_connect_policy(policy, request);
+    }
+
     for rule in policy.rules.iter() {
         if !rule.methods.allows(request.method) {
             continue;
         }
-        if let Some(url) = &rule.url {
-            let ignore_path = request.method == Method::CONNECT;
-            if !url.matches(
+        if let Some(url) = &rule.url
+            && !url.matches(
                 request.scheme,
                 request.host,
                 request.port,
                 request.path,
-                ignore_path,
-            ) {
-                continue;
-            }
+                false,
+            )
+        {
+            continue;
         }
         return Some(make_decision(policy, rule));
+    }
+    None
+}
+
+fn evaluate_connect_policy(
+    policy: &super::model::CompiledPolicy,
+    request: &Request,
+) -> Option<Decision> {
+    for rule in policy.rules.iter() {
+        if !rule.methods.is_connect_only() {
+            continue;
+        }
+        if let Some(url) = &rule.url
+            && !url.matches(
+                request.scheme,
+                request.host,
+                request.port,
+                request.path,
+                true,
+            )
+        {
+            continue;
+        }
+        return Some(make_decision(policy, rule));
+    }
+
+    if request.scheme != Scheme::Https {
+        return None;
+    }
+
+    for rule in policy.rules.iter() {
+        if rule.methods.is_connect_only() {
+            continue;
+        }
+        let url_matches = match &rule.url {
+            Some(url) => {
+                if url.scheme != Scheme::Https {
+                    false
+                } else {
+                    url.matches(
+                        request.scheme,
+                        request.host,
+                        request.port,
+                        request.path,
+                        true,
+                    )
+                }
+            }
+            None => true,
+        };
+        if !url_matches {
+            continue;
+        }
+        match rule.action {
+            RuleAction::Allow if rule.inspect_payload => return Some(make_decision(policy, rule)),
+            RuleAction::Deny { .. } if rule.methods.is_any() => {
+                return Some(make_decision(policy, rule));
+            }
+            _ => {}
+        }
     }
     None
 }
@@ -309,7 +372,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/privacy-policy/")),
                         original: Arc::<str>::from("https://example.com/privacy-policy/"),
                     }),
-                    inspect_payload: false,
+                    inspect_payload: true,
                     allow_private_upstream: false,
                     cache: None,
                 }]
@@ -342,6 +405,65 @@ mod tests {
         match decision {
             Decision::Allow { .. } => {}
             other => panic!("expected allow decision, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn connect_denied_by_any_rule_with_custom_status() {
+        let policy = Policy {
+            name: Arc::<str>::from("deny-connect"),
+            rules: Arc::from(
+                vec![Rule {
+                    id: Arc::<str>::from("deny-connect#0"),
+                    action: RuleAction::Deny {
+                        status: StatusCode::from_u16(499).unwrap(),
+                        reason: None,
+                        body: Some(Arc::<str>::from("blocked connect")),
+                    },
+                    methods: MethodMatch::Any,
+                    url_pattern: Some(UrlPattern {
+                        scheme: Scheme::Https,
+                        host: Arc::<str>::from("example.com"),
+                        port: None,
+                        path: Some(Arc::<str>::from("/**")),
+                        original: Arc::<str>::from("https://example.com/**"),
+                    }),
+                    inspect_payload: true,
+                    allow_private_upstream: false,
+                    cache: None,
+                }]
+                .into_boxed_slice(),
+            ),
+        };
+        let config = ValidatedConfig::new(Config {
+            clients: vec![Client {
+                name: Arc::<str>::from("default"),
+                selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+                policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                fallback: true,
+            }],
+            policies: vec![policy],
+        })
+        .expect("validate config");
+        let compiled = Arc::new(compile_config(&config).expect("compile config"));
+        let matcher = PolicyMatcher::new(compiled.clone());
+        let client = &compiled.clients[0];
+        let request = Request {
+            method: &Method::CONNECT,
+            scheme: Scheme::Https,
+            host: "example.com",
+            port: Some(443),
+            path: "/",
+        };
+        let decision = matcher
+            .evaluate(client.policies.as_ref(), &request)
+            .expect("decision");
+        match decision {
+            Decision::Deny { status, body, .. } => {
+                assert_eq!(status, StatusCode::from_u16(499).unwrap());
+                assert_eq!(body.unwrap().as_ref(), "blocked connect");
+            }
+            other => panic!("expected deny decision, got {:?}", other),
         }
     }
 

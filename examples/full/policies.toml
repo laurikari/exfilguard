@@ -26,6 +26,6 @@ name = "pinned-payments-egress"
   [[policy.rule]]
   action = "ALLOW"
   methods = ["CONNECT"]
-  url_pattern = "https://secure.partner.com/payments/**"
+  url_pattern = "https://secure.partner.com/**"
   inspect_payload = false
   allow_private_upstream = true

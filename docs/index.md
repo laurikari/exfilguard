@@ -106,6 +106,7 @@ sudo systemctl enable --now exfilguard
 
 ```toml
 # Allow analytics service to reach trusted endpoint
+# HTTPS rules implicitly allow the CONNECT bump for the same host/port.
 [[policy.rule]]
 action = "ALLOW"
 methods = ["GET", "POST"]

@@ -925,13 +925,13 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
     let policy_name = "h2-policy";
     let policy = PolicySpec::new(policy_name)
         .rule(
-            RuleSpec::allow(&["CONNECT"], format!("https://{upstream_host}/**"))
-                .allow_private_upstream(true),
-        )
-        .rule(
             RuleSpec::deny(&["GET"], format!("https://{upstream_host}/blocked/**"))
                 .status(451)
                 .body("blocked by policy"),
+        )
+        .rule(
+            RuleSpec::allow(&["GET"], format!("https://{upstream_host}/allowed/**"))
+                .allow_private_upstream(true),
         );
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)

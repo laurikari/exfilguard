@@ -84,7 +84,7 @@ Rules are evaluated in order. The first matching rule determines the action.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `action` | String | Required | `"ALLOW"` or `"DENY"` |
-| `methods` | Array | `["ANY"]` | HTTP methods to match |
+| `methods` | Array | `["ANY"]` | HTTP methods to match (non-CONNECT by default) |
 | `url_pattern` | String | None | URL pattern to match (see syntax below) |
 | `inspect_payload` | Boolean | true | Whether to inspect request/response bodies |
 | `allow_private_upstream` | Boolean | false | Allow upstream requests to private IPs (ALLOW only) |
@@ -115,7 +115,7 @@ Rules are evaluated in order. The first matching rule determines the action.
 
 Valid method values:
 
-- `"ANY"` - Matches all methods (default)
+- `"ANY"` - Matches all non-CONNECT methods (default)
 - `"GET"`, `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`
 - `"HEAD"`, `"OPTIONS"`, `"TRACE"`, `"CONNECT"`
 
@@ -132,6 +132,12 @@ methods = ["ANY"]
 
 !!! note
     Cannot mix `"ANY"` with explicit methods in the same array.
+    `"CONNECT"` must be the only method in its rule.
+
+CONNECT requests are evaluated against explicit CONNECT rules first. If no
+explicit CONNECT rule matches, HTTPS rules can implicitly allow a bumped tunnel,
+and DENY rules with `methods = ["ANY"]` can supply custom CONNECT denial
+responses.
 
 ---
 
@@ -205,6 +211,7 @@ The `inspect_payload` option controls whether ExfilGuard inspects request/respon
 - Full HTTP inspection including headers and body
 - TLS is terminated and re-encrypted (MITM)
 - Required for non-CONNECT methods
+- HTTPS rules implicitly authorize CONNECT bumping for the same host/port
 - Enables full request/response inspection for logging, metrics, and caching (when configured)
 
 ### inspect_payload = false (tunnel mode)
@@ -212,6 +219,7 @@ The `inspect_payload` option controls whether ExfilGuard inspects request/respon
 - Traffic is tunneled without inspection
 - Only valid with `methods = ["CONNECT"]`
 - Only valid with URL pattern path `/**` (e.g., `https://secure.partner.com/**`)
+- CONNECT tunnel rules must appear before non-CONNECT rules inside each policy
 - Useful for certificate-pinned services that refuse MITM
 
 !!! warning
