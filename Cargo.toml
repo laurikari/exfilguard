@@ -31,7 +31,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-ipnet = "2.11"
+ipnet = { version = "2.11", features = ["serde"] }
 time = { version = "0.3", features = ["std"] }
 zeroize = "1.7"
 blake3 = "1.5"

@@ -1,10 +1,12 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
 use config::{Config, ConfigError, Environment, File};
+use ipnet::IpNet;
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 
 use crate::cli::{Cli, LogFormat};
 use crate::config as runtime_config;
@@ -81,9 +83,71 @@ fn default_log_format() -> LogFormat {
     LogFormat::Json
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocolMode {
+    #[default]
+    Off,
+    Optional,
+    Required,
+}
+
+fn deserialize_proxy_protocol_mode<'de, D>(deserializer: D) -> Result<ProxyProtocolMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ModeVisitor;
+
+    impl<'de> Visitor<'de> for ModeVisitor {
+        type Value = ProxyProtocolMode;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("off, optional, required, or a boolean")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(if value {
+                ProxyProtocolMode::Required
+            } else {
+                ProxyProtocolMode::Off
+            })
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            match value.to_ascii_lowercase().as_str() {
+                "off" => Ok(ProxyProtocolMode::Off),
+                "optional" => Ok(ProxyProtocolMode::Optional),
+                "required" => Ok(ProxyProtocolMode::Required),
+                _ => Err(de::Error::custom(format!(
+                    "unsupported proxy_protocol value '{value}'"
+                ))),
+            }
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_any(ModeVisitor)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
     pub listen: SocketAddr,
+    #[serde(default, deserialize_with = "deserialize_proxy_protocol_mode")]
+    pub proxy_protocol: ProxyProtocolMode,
+    #[serde(default)]
+    pub proxy_protocol_allowed_cidrs: Option<Vec<IpNet>>,
     pub ca_dir: PathBuf,
     pub clients: PathBuf,
     pub policies: PathBuf,
@@ -245,6 +309,13 @@ impl Settings {
         }
     }
 
+    pub fn proxy_protocol_allows_peer(&self, peer: IpAddr) -> bool {
+        match &self.proxy_protocol_allowed_cidrs {
+            None => true,
+            Some(cidrs) => cidrs.iter().any(|cidr| cidr.contains(&peer)),
+        }
+    }
+
     pub fn cache_sweeper_interval(&self) -> Duration {
         Duration::from_secs(self.cache_sweeper_interval)
     }
@@ -326,6 +397,15 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.proxy_protocol != ProxyProtocolMode::Off {
+            ensure!(
+                matches!(
+                    self.proxy_protocol_allowed_cidrs.as_ref(),
+                    Some(cidrs) if !cidrs.is_empty()
+                ),
+                "proxy_protocol_allowed_cidrs must be set when proxy_protocol is enabled"
+            );
+        }
         ensure!(
             self.upstream_pool_capacity > 0,
             "upstream_pool_capacity must be at least 1 (got {})",
@@ -467,13 +547,15 @@ fn default_cache_sweeper_batch_size() -> usize {
 #[cfg(test)]
 mod tests {
     use crate::cli::LogFormat;
-    use crate::settings::Settings;
+    use crate::settings::{ProxyProtocolMode, Settings};
     use std::path::PathBuf;
 
     #[test]
     fn test_settings_validation_cache_enabled() {
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            proxy_protocol: ProxyProtocolMode::Off,
+            proxy_protocol_allowed_cidrs: None,
             ca_dir: PathBuf::from("ca"),
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
@@ -516,6 +598,8 @@ mod tests {
     fn test_settings_validation_cache_invalid_sizes() {
         let mut settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            proxy_protocol: ProxyProtocolMode::Off,
+            proxy_protocol_allowed_cidrs: None,
             ca_dir: PathBuf::from("ca"),
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
@@ -562,6 +646,8 @@ mod tests {
     fn test_settings_validation_cache_disabled_sizes_ignored() {
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            proxy_protocol: ProxyProtocolMode::Off,
+            proxy_protocol_allowed_cidrs: None,
             ca_dir: PathBuf::from("ca"),
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
@@ -599,5 +685,48 @@ mod tests {
         };
         // Should be OK because cache_dir is None
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn test_settings_validation_proxy_protocol_requires_allowlist() {
+        let settings = Settings {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            proxy_protocol: ProxyProtocolMode::Required,
+            proxy_protocol_allowed_cidrs: None,
+            ca_dir: PathBuf::from("ca"),
+            clients: PathBuf::from("clients.toml"),
+            policies: PathBuf::from("policies.toml"),
+            clients_dir: None,
+            policies_dir: None,
+            cert_cache_dir: None,
+            log: LogFormat::Text,
+            leaf_ttl: 3600,
+            log_queries: false,
+            dns_resolve_timeout: 2,
+            upstream_connect_timeout: 5,
+            tls_handshake_timeout: 10,
+            request_header_timeout: 10,
+            request_body_idle_timeout: 30,
+            response_header_timeout: 30,
+            response_body_idle_timeout: 60,
+            request_total_timeout: 0,
+            client_keepalive_idle_timeout: 30,
+            connect_tunnel_idle_timeout: 60,
+            connect_tunnel_max_lifetime: 0,
+            upstream_pool_capacity: 32,
+            max_request_header_size: 1024,
+            max_response_header_size: 1024,
+            max_request_body_size: 1024,
+            cache_dir: None,
+            cache_max_entry_size: 0,
+            cache_max_entries: 0,
+            cache_total_capacity: 0,
+            cache_sweeper_interval: 0,
+            cache_sweeper_batch_size: 0,
+            metrics_listen: None,
+            metrics_tls_cert: None,
+            metrics_tls_key: None,
+        };
+        assert!(settings.validate().is_err());
     }
 }

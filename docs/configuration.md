@@ -11,6 +11,8 @@ Required settings to run ExfilGuard.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `listen` | String | Yes | Listen address and port (e.g., `"127.0.0.1:3128"`) |
+| `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
+| `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
 | `ca_dir` | Path | Yes | Directory containing CA certificate and private key for TLS interception |
 | `clients` | Path | Yes | Path to clients configuration file |
 | `policies` | Path | Yes | Path to policies configuration file |
@@ -19,6 +21,14 @@ Required settings to run ExfilGuard.
 
 !!! note
     Relative paths are resolved from the directory containing the main config file.
+
+!!! note
+    When `proxy_protocol` is `"optional"` or `"required"`, ExfilGuard auto-detects PROXY
+    protocol v1 or v2 headers. If the peer IP is not in `proxy_protocol_allowed_cidrs`,
+    ExfilGuard ignores any PROXY headers and treats the connection as a plain client.
+
+!!! note
+    `proxy_protocol_allowed_cidrs` must be set when PROXY protocol is enabled.
 
 ---
 

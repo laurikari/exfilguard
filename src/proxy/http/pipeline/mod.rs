@@ -45,7 +45,7 @@ mod tests {
         config::Scheme,
         policy::{self, matcher::PolicySnapshot},
         proxy::{self, PolicyStore, http::upstream::UpstreamPool},
-        settings::Settings,
+        settings::{ProxyProtocolMode, Settings},
         tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
     };
     use anyhow::Result;
@@ -87,6 +87,8 @@ name = "allow"
 
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            proxy_protocol: ProxyProtocolMode::Off,
+            proxy_protocol_allowed_cidrs: None,
             ca_dir: ca_dir.clone(),
             clients: clients_path.clone(),
             clients_dir: None,

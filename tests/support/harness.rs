@@ -12,7 +12,7 @@ use exfilguard::{
     config,
     policy::{self, matcher::PolicySnapshot},
     proxy::{self, AppContext, PolicyStore},
-    settings::Settings,
+    settings::{ProxyProtocolMode, Settings},
     tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
 };
 
@@ -27,6 +27,8 @@ const CERT_CACHE_CAPACITY: usize = 512;
 fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
     Settings {
         listen,
+        proxy_protocol: ProxyProtocolMode::Off,
+        proxy_protocol_allowed_cidrs: None,
         ca_dir: dirs.ca_dir.clone(),
         clients: dirs.clients_path.clone(),
         clients_dir: None,
