@@ -48,7 +48,7 @@ ExfilGuard uses a two-tier CA hierarchy. The `ca_dir` must contain:
 ```
 ca_dir/
 ├── root.crt           # Root CA certificate
-├── root.key           # Root CA private key
+├── root.key           # Root CA private key (optional when using external CA)
 ├── intermediate.crt   # Intermediate CA certificate (signed by root)
 └── intermediate.key   # Intermediate CA private key
 ```
@@ -56,6 +56,7 @@ ca_dir/
 - **Leaf certificates** are signed by the intermediate CA
 - **Certificate chain** sent to clients: Leaf → Intermediate → Root
 - Clients only need to trust the root CA
+- If using an externally signed intermediate, `root.key` may be omitted
 
 If `ca_dir` is empty, ExfilGuard generates all four files automatically on first startup.
 

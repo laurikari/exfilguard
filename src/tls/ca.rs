@@ -34,7 +34,6 @@ pub struct CertificateAuthority {
     root_cert: Arc<Vec<u8>>,
     intermediate_cert: Arc<Vec<u8>>,
     intermediate_key: Arc<KeyPair>,
-    intermediate_params: Arc<CertificateParams>,
 }
 
 impl CertificateAuthority {
@@ -49,24 +48,26 @@ impl CertificateAuthority {
             .with_context(|| format!("failed to create CA directory {}", ca_dir.display()))?;
 
         let paths = CaPaths::new(ca_dir);
-        let existing = [
-            paths.root_cert.exists(),
-            paths.root_key.exists(),
-            paths.intermediate_cert.exists(),
-            paths.intermediate_key.exists(),
-        ];
-        let present = existing.iter().filter(|present| **present).count();
+        let has_root_cert = paths.root_cert.exists();
+        let has_root_key = paths.root_key.exists();
+        let has_intermediate_cert = paths.intermediate_cert.exists();
+        let has_intermediate_key = paths.intermediate_key.exists();
 
-        match present {
-            0 => Self::generate(&paths),
-            4 => Self::load_existing(&paths),
+        match (
+            has_root_cert,
+            has_root_key,
+            has_intermediate_cert,
+            has_intermediate_key,
+        ) {
+            (false, false, false, false) => Self::generate(&paths),
+            (true, _, true, true) => Self::load_existing(&paths),
             _ => bail!(
-                "incomplete CA material detected in {}; expected {}, {}, {}, {}",
+                "incomplete CA material detected in {}; expected {}, {}, {} (and optionally {})",
                 ca_dir.display(),
                 ROOT_CERT_FILE,
-                ROOT_KEY_FILE,
                 INTERMEDIATE_CERT_FILE,
-                INTERMEDIATE_KEY_FILE
+                INTERMEDIATE_KEY_FILE,
+                ROOT_KEY_FILE
             ),
         }
     }
@@ -105,23 +106,12 @@ impl CertificateAuthority {
             directory = %paths.dir.display(),
             "generated new certificate authority material"
         );
-        Self::from_material(
-            root_der,
-            intermediate_der,
-            intermediate_params,
-            intermediate_key,
-        )
+        Self::from_material(root_der, intermediate_der, intermediate_key)
     }
 
     fn load_existing(paths: &CaPaths) -> Result<Self> {
         let root_der = read_certificate_der(&paths.root_cert)?;
-        // Validate that the root key exists; we intentionally do not load it into memory.
-        if !paths.root_key.exists() {
-            bail!("expected root key at {}", paths.root_key.display());
-        }
-
         let intermediate_der = read_certificate_der(&paths.intermediate_cert)?;
-        let intermediate_params = build_intermediate_params();
         let intermediate_key_pem = Zeroizing::new(
             fs::read_to_string(&paths.intermediate_key).with_context(|| {
                 format!(
@@ -137,18 +127,12 @@ impl CertificateAuthority {
             directory = %paths.dir.display(),
             "loaded existing certificate authority material"
         );
-        Self::from_material(
-            root_der,
-            intermediate_der,
-            intermediate_params,
-            intermediate_key,
-        )
+        Self::from_material(root_der, intermediate_der, intermediate_key)
     }
 
     fn from_material(
         root_der: Vec<u8>,
         intermediate_der: Vec<u8>,
-        intermediate_params: CertificateParams,
         intermediate_key: KeyPair,
     ) -> Result<Self> {
         ensure_key_matches_cert(&intermediate_der, &intermediate_key)?;
@@ -156,7 +140,6 @@ impl CertificateAuthority {
             root_cert: Arc::new(root_der),
             intermediate_cert: Arc::new(intermediate_der),
             intermediate_key: Arc::new(intermediate_key),
-            intermediate_params: Arc::new(intermediate_params),
         })
     }
 
@@ -194,8 +177,9 @@ impl CertificateAuthority {
         let (leaf_params, expires_at) = build_leaf_params(names, ttl)?;
         let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate leaf key: {err}"))?;
-        let issuer =
-            rcgen::Issuer::from_params(self.intermediate_params.as_ref(), &*self.intermediate_key);
+        let intermediate_cert = CertificateDer::from(self.intermediate_cert.as_ref().clone());
+        let issuer = rcgen::Issuer::from_ca_cert_der(&intermediate_cert, &*self.intermediate_key)
+            .map_err(|err| anyhow!("failed to parse intermediate certificate: {err}"))?;
         let leaf_cert = sign_certificate(&leaf_params, &leaf_key, &issuer)?;
 
         let private_key_der = Zeroizing::new(leaf_key.serialize_der());
@@ -409,6 +393,7 @@ mod tests {
     use std::net::IpAddr;
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
+    use x509_parser::parse_x509_certificate;
 
     #[test]
     fn generates_new_material_when_missing() -> Result<()> {
@@ -450,6 +435,52 @@ mod tests {
     }
 
     #[test]
+    fn leaf_issuer_matches_loaded_intermediate_subject() -> Result<()> {
+        let dir = TempDir::new()?;
+        let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
+        let root_params = build_root_params();
+        let root_cert = root_params
+            .self_signed(&root_key)
+            .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
+
+        let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
+        let mut intermediate_params = build_intermediate_params();
+        intermediate_params.distinguished_name = distinguished_name("Corp Intermediate CA");
+        let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+        let intermediate_cert =
+            sign_certificate(&intermediate_params, &intermediate_key, &root_issuer)?;
+
+        write_pem_file(&dir.path().join(ROOT_CERT_FILE), &root_cert.pem(), false)?;
+        write_pem_file(
+            &dir.path().join(INTERMEDIATE_CERT_FILE),
+            &intermediate_cert.pem(),
+            false,
+        )?;
+        write_pem_file(
+            &dir.path().join(INTERMEDIATE_KEY_FILE),
+            &intermediate_key.serialize_pem(),
+            true,
+        )?;
+
+        let ca = CertificateAuthority::load_or_generate(dir.path())?;
+        let minted = ca.mint_leaf(&["leaf.example"], StdDuration::from_secs(3600))?;
+        let leaf_der = &minted.chain_der[0];
+        let (_, leaf_cert) = parse_x509_certificate(leaf_der)
+            .map_err(|err| anyhow!("failed to parse leaf certificate: {err}"))?;
+        let intermediate_der = ca.intermediate_certificate_der();
+        let (_, intermediate_cert) = parse_x509_certificate(intermediate_der.as_ref())
+            .map_err(|err| anyhow!("failed to parse intermediate certificate: {err}"))?;
+
+        assert_eq!(
+            leaf_cert.tbs_certificate.issuer,
+            intermediate_cert.tbs_certificate.subject
+        );
+        Ok(())
+    }
+
+    #[test]
     fn errors_on_partial_material() -> Result<()> {
         let dir = TempDir::new()?;
         let root_path = dir.path().join(ROOT_CERT_FILE);
@@ -461,6 +492,40 @@ mod tests {
                 "{err:?}"
             ),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn loads_with_missing_root_key() -> Result<()> {
+        let dir = TempDir::new()?;
+        let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
+        let root_params = build_root_params();
+        let root_cert = root_params
+            .self_signed(&root_key)
+            .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
+
+        let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
+        let intermediate_params = build_intermediate_params();
+        let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+        let intermediate_cert =
+            sign_certificate(&intermediate_params, &intermediate_key, &root_issuer)?;
+
+        write_pem_file(&dir.path().join(ROOT_CERT_FILE), &root_cert.pem(), false)?;
+        write_pem_file(
+            &dir.path().join(INTERMEDIATE_CERT_FILE),
+            &intermediate_cert.pem(),
+            false,
+        )?;
+        write_pem_file(
+            &dir.path().join(INTERMEDIATE_KEY_FILE),
+            &intermediate_key.serialize_pem(),
+            true,
+        )?;
+
+        let ca = CertificateAuthority::load_or_generate(dir.path())?;
+        assert!(!ca.intermediate_certificate_der().as_ref().is_empty());
         Ok(())
     }
 
