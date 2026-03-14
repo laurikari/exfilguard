@@ -104,23 +104,20 @@ fn build_tls_client_configs(_settings: &Settings) -> Result<TlsClientConfigs> {
     let mut root_store = RootCertStore::empty();
     let mut anchors_loaded = 0usize;
 
-    match native_certs::load_native_certs() {
-        Ok(certs) => {
-            let (added, ignored) = root_store.add_parsable_certificates(certs);
-            if ignored > 0 {
-                warn!(ignored, "ignored {ignored} invalid system trust anchors");
-            }
-            if added == 0 {
-                warn!(
-                    "no trust anchors loaded from system locations; outbound TLS verification may fail"
-                );
-            }
-            anchors_loaded += added;
-        }
-        Err(err) => {
-            warn!(error = %err, "failed to load system trust anchors");
+    let native = native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        for err in &native.errors {
+            warn!(error = %err, "failed to load some system trust anchors");
         }
     }
+    let (added, ignored) = root_store.add_parsable_certificates(native.certs);
+    if ignored > 0 {
+        warn!(ignored, "ignored {ignored} invalid system trust anchors");
+    }
+    if added == 0 {
+        warn!("no trust anchors loaded from system locations; outbound TLS verification may fail");
+    }
+    anchors_loaded += added;
 
     ensure!(
         anchors_loaded > 0,

@@ -9,8 +9,10 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     Registry, TextEncoder,
 };
-use rustls::{ServerConfig, pki_types::PrivateKeyDer};
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -546,11 +548,10 @@ fn build_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     response
 }
 
-fn load_certs(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+fn load_certs(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>> {
     let data = std::fs::read(path)
         .with_context(|| format!("failed to read certs from {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(&data[..]);
-    let certs = certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(&data)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("failed to parse certs: {e}"))?;
     Ok(certs)
@@ -559,19 +560,8 @@ fn load_certs(path: &std::path::Path) -> Result<Vec<rustls::pki_types::Certifica
 fn load_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
     let data = std::fs::read(path)
         .with_context(|| format!("failed to read key from {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(&data[..]);
-    if let Some(key) = pkcs8_private_keys(&mut reader).next() {
-        let key = key.map_err(|e| anyhow!("failed to parse pkcs8 key: {e}"))?;
-        return Ok(PrivateKeyDer::Pkcs8(key));
-    }
-
-    let mut reader = std::io::BufReader::new(&data[..]);
-    if let Some(key) = rsa_private_keys(&mut reader).next() {
-        let key = key.map_err(|e| anyhow!("failed to parse rsa key: {e}"))?;
-        return Ok(PrivateKeyDer::from(key));
-    }
-
-    Err(anyhow!("no valid private key found in {}", path.display()))
+    PrivateKeyDer::from_pem_slice(&data)
+        .map_err(|e| anyhow!("failed to parse private key from {}: {e}", path.display()))
 }
 
 fn build_tls_acceptor(
@@ -660,6 +650,8 @@ fn remaining_deadline(deadline: Instant, context: &str) -> Result<Duration> {
 mod tests {
     use super::*;
     use http::StatusCode;
+    use std::fs;
+    use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsAcceptor;
 
@@ -770,6 +762,19 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn build_tls_acceptor_loads_generated_pem_material() -> anyhow::Result<()> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let dir = TempDir::new()?;
+        let cert_path = dir.path().join("metrics.crt");
+        let key_path = dir.path().join("metrics.key");
+        fs::write(&cert_path, cert.cert.pem())?;
+        fs::write(&key_path, cert.signing_key.serialize_pem())?;
+
+        let _acceptor = super::build_tls_acceptor(&cert_path, &key_path)?;
         Ok(())
     }
 }

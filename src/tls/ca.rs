@@ -1,6 +1,6 @@
 use std::convert::TryInto;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{Cursor, Write};
+use std::io::Write;
 // ExfilGuard only targets Unix-like hosts, so we rely on the Unix-specific
 // OpenOptions extension traits to enforce filesystem permissions.
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -15,7 +15,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SerialNumber,
 };
 use rustls::crypto::ring;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::sign::CertifiedKey;
 use time::{Duration, OffsetDateTime};
 use tracing::info;
@@ -273,15 +273,22 @@ fn write_pem_file(path: &Path, contents: &str, private: bool) -> Result<()> {
 fn read_certificate_der(path: &Path) -> Result<Vec<u8>> {
     let bytes =
         fs::read(path).with_context(|| format!("failed to read certificate {}", path.display()))?;
-    let mut cursor = Cursor::new(bytes);
-    let mut certs = rustls_pemfile::certs(&mut cursor);
+    let mut certs = CertificateDer::pem_slice_iter(&bytes);
     match certs.next() {
         Some(Ok(cert)) => {
-            if certs.next().is_some() {
-                bail!(
-                    "multiple certificates found in {}; expected a single PEM section",
-                    path.display()
-                );
+            match certs.next() {
+                Some(Ok(_)) => {
+                    bail!(
+                        "multiple certificates found in {}; expected a single PEM section",
+                        path.display()
+                    );
+                }
+                Some(Err(err)) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to parse certificate at {}", path.display())
+                    });
+                }
+                None => {}
             }
             Ok(cert.as_ref().to_vec())
         }
