@@ -11,6 +11,7 @@ use crate::logging::AccessLogBuilder;
 pub struct ParsedRequest {
     pub method: Method,
     pub scheme: Scheme,
+    pub authority: String,
     pub host: String,
     pub port: Option<u16>,
     pub path: String,
@@ -86,6 +87,7 @@ fn parse_http1_request_with_mode(
 
     let host_header = host_header
         .ok_or_else(|| anyhow!("request missing Host header required for origin-form request"))?;
+    let authority = host_header.trim().to_string();
     let (host, port) = parse_host_header(host_header)?;
     let port = port.or(Some(fallback_scheme.default_port()));
     let path = if target.is_empty() {
@@ -97,6 +99,7 @@ fn parse_http1_request_with_mode(
     Ok(ParsedRequest {
         method,
         scheme: fallback_scheme,
+        authority,
         host,
         port,
         path,
@@ -127,6 +130,7 @@ pub fn parse_uri_request(
     Ok(ParsedRequest {
         method,
         scheme,
+        authority: authority.to_string(),
         host,
         port,
         path,
@@ -199,17 +203,8 @@ impl ParsedRequest {
             .path(path)
     }
 
-    pub fn authority_host(&self) -> String {
-        let mut host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        if let Some(port) = self.port.filter(|port| *port != self.scheme.default_port()) {
-            host.push(':');
-            host.push_str(&port.to_string());
-        }
-        host
+    pub fn authority_host(&self) -> &str {
+        &self.authority
     }
 
     /// Return the request path without query parameters for policy evaluation.
@@ -250,6 +245,20 @@ mod tests {
         let parsed =
             parse_http1_request(Method::GET, "/resource", Some("example.com"), Scheme::Https)?;
         assert_eq!(parsed.port, Some(443));
+        assert_eq!(parsed.authority_host(), "example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http1_request_preserves_explicit_default_port_in_authority() -> Result<()> {
+        let parsed = parse_http1_request(
+            Method::GET,
+            "/resource",
+            Some("example.com:443"),
+            Scheme::Https,
+        )?;
+        assert_eq!(parsed.port, Some(443));
+        assert_eq!(parsed.authority_host(), "example.com:443");
         Ok(())
     }
 
@@ -275,6 +284,15 @@ mod tests {
         assert_eq!(parsed.host, "2001:db8::10");
         assert_eq!(parsed.port, Some(443));
         assert_eq!(parsed.authority_host(), "[2001:db8::10]");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_uri_request_preserves_explicit_default_port_in_authority() -> Result<()> {
+        let uri: Uri = "https://example.com:443/upload".parse()?;
+        let parsed = parse_uri_request(Method::GET, &uri, Scheme::Https)?;
+        assert_eq!(parsed.port, Some(443));
+        assert_eq!(parsed.authority_host(), "example.com:443");
         Ok(())
     }
 

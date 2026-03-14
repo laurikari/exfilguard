@@ -43,6 +43,7 @@ pub enum UpstreamMode {
     Http1Keepalive,
     Http1Redirect,
     Http2,
+    Http2Inspect,
 }
 
 pub struct BumpedTlsOptions<'a> {
@@ -133,6 +134,29 @@ impl BumpedH2Client {
         Ok((status, body))
     }
 
+    pub async fn request_text_with_body(
+        &mut self,
+        request: http::Request<()>,
+        body: Bytes,
+    ) -> Result<(StatusCode, String)> {
+        let end_stream = body.is_empty();
+        let (response_fut, mut send_stream) = self
+            .send_request
+            .send_request(request, end_stream)
+            .context("failed to send HTTP/2 request")?;
+        if !end_stream {
+            send_stream
+                .send_data(body, true)
+                .context("failed to send HTTP/2 request body")?;
+        }
+        let response = response_fut
+            .await
+            .context("failed to receive HTTP/2 response")?;
+        let status = response.status();
+        let body = Self::read_body(response.into_body()).await?;
+        Ok((status, body))
+    }
+
     pub async fn read_body(mut body: h2::RecvStream) -> Result<String> {
         let mut bytes = Vec::new();
         while let Some(frame) = body.data().await {
@@ -204,7 +228,9 @@ impl BumpedTlsFixture {
             UpstreamMode::Http1Keepalive | UpstreamMode::Http1Redirect => {
                 build_upstream_tls_config(&ca, upstream_host)?
             }
-            UpstreamMode::Http2 => build_upstream_h2_tls_config(&ca, upstream_host)?,
+            UpstreamMode::Http2 | UpstreamMode::Http2Inspect => {
+                build_upstream_h2_tls_config(&ca, upstream_host)?
+            }
         };
 
         let accept_count = Arc::new(AtomicUsize::new(0));
@@ -238,6 +264,9 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http2 => {
                                         serve_tls_h2(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2Inspect => {
+                                        serve_tls_h2_inspect(stream, acceptor, peer).await
                                     }
                                 };
                                 if let Err(err) = result {
@@ -405,6 +434,55 @@ async fn serve_tls_h2(stream: TcpStream, acceptor: TlsAcceptor, _peer: SocketAdd
             .context("failed to send HTTP/2 response headers")?;
         if !path.is_empty() {
             send.send_data(Bytes::copy_from_slice(path.as_bytes()), true)
+                .context("failed to send HTTP/2 response body")?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve_tls_h2_inspect(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    while let Some(result) = connection.accept().await {
+        let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
+        let content_length = request
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<missing>")
+            .to_string();
+        let mut request_body = request.into_body();
+        let mut body = Vec::new();
+        while let Some(frame) = request_body.data().await {
+            let chunk = frame.context("failed to read HTTP/2 request body")?;
+            body.extend_from_slice(&chunk);
+        }
+
+        let response_body = format!(
+            "content-length={content_length}\nbody-len={}\nbody={}",
+            body.len(),
+            String::from_utf8_lossy(&body)
+        );
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+        let mut send = respond
+            .send_response(response, response_body.is_empty())
+            .context("failed to send HTTP/2 response headers")?;
+        if !response_body.is_empty() {
+            send.send_data(Bytes::from(response_body), true)
                 .context("failed to send HTTP/2 response body")?;
         }
     }

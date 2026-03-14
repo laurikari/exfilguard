@@ -76,6 +76,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
     let parsed_request = ParsedRequest {
         method: Method::CONNECT,
         scheme: Scheme::Https,
+        authority: session.original_target().to_string(),
         host: session.parsed().host.clone(),
         port: Some(session.parsed().port),
         path: session.original_target().to_string(),

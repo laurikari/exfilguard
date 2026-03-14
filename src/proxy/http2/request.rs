@@ -15,6 +15,7 @@ use crate::{
 #[derive(Clone)]
 pub(super) struct SanitizedRequest {
     pub parsed: ParsedRequest,
+    pub content_length: Option<usize>,
     pub forward_headers: Vec<(HeaderName, HeaderValue)>,
     pub header_bytes: usize,
     pub request_line_bytes: u64,
@@ -99,6 +100,7 @@ fn sanitize_request_parts(
 
     Ok(SanitizedRequest {
         parsed,
+        content_length: sanitizer.content_length(),
         forward_headers,
         header_bytes: sanitizer.total_bytes(),
         request_line_bytes,
@@ -132,15 +134,17 @@ pub(super) fn build_upstream_uri(request: &ParsedRequest) -> Result<Uri> {
     });
 
     let authority = request.authority_host();
-    builder = builder.authority(authority.as_str());
+    builder = builder.authority(authority);
     builder = builder.path_and_query(request.path.as_str());
     builder.build().context("failed to build upstream URI")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::reject_expect_header;
-    use http::{HeaderMap, HeaderValue};
+    use super::{reject_expect_header, sanitize_request_parts};
+    use crate::{config::Scheme, proxy::request::parse_uri_request};
+    use anyhow::Result;
+    use http::{HeaderMap, HeaderValue, Method, Uri};
 
     #[test]
     fn reject_expect_header_allows_absent() {
@@ -160,5 +164,35 @@ mod tests {
             err.to_string().contains("Expect header"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn sanitize_request_preserves_content_length() -> Result<()> {
+        let uri: Uri = "https://example.com/upload".parse()?;
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("11"));
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("exfilguard-test"),
+        );
+
+        let sanitized = sanitize_request_parts(&Method::PUT, &uri, &headers, 1024)?;
+
+        assert_eq!(sanitized.content_length, Some(11));
+        assert_eq!(sanitized.forward_headers.len(), 1);
+        assert_eq!(sanitized.forward_headers[0].0, http::header::USER_AGENT);
+        Ok(())
+    }
+
+    #[test]
+    fn build_upstream_uri_preserves_explicit_default_port() -> Result<()> {
+        let uri: Uri = "https://example.com:443/upload".parse()?;
+        let parsed = parse_uri_request(Method::PUT, &uri, Scheme::Https)?;
+        let upstream = super::build_upstream_uri(&parsed)?;
+        assert_eq!(
+            upstream.authority().map(|authority| authority.as_str()),
+            Some("example.com:443")
+        );
+        Ok(())
     }
 }

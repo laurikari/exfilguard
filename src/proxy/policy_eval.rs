@@ -362,6 +362,7 @@ mod tests {
         let parsed = ParsedRequest {
             method: Method::GET,
             scheme: Scheme::Https,
+            authority: "example.com".to_string(),
             host: "example.com".to_string(),
             port: None,
             path: "/api/v1/items?token=abc".to_string(),

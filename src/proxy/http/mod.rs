@@ -189,6 +189,23 @@ mod tests {
     }
 
     #[test]
+    fn build_upstream_request_preserves_explicit_default_port_in_host_header() -> anyhow::Result<()>
+    {
+        let parsed = parse_http1_request(
+            Method::PUT,
+            "/upload",
+            Some("example.com:443"),
+            Scheme::Https,
+        )?;
+        let headers = Http1HeaderAccumulator::new(2048);
+        let request_bytes =
+            build_upstream_request(&parsed, &headers, false, &BodyPlan::Fixed(3), false);
+        let request_text = String::from_utf8(request_bytes)?;
+        assert!(request_text.contains("Host: example.com:443\r\n"));
+        Ok(())
+    }
+
+    #[test]
     fn build_upstream_request_strips_expect_continue() -> anyhow::Result<()> {
         let method = Method::POST;
         let target = "http://example.com/upload";

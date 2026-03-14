@@ -243,6 +243,7 @@ mod tests {
         ParsedRequest {
             method: Method::GET,
             scheme: Scheme::Https,
+            authority: "example.com".to_string(),
             host: "example.com".to_string(),
             port: None,
             path: "/resource".to_string(),

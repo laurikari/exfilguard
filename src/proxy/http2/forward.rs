@@ -102,9 +102,14 @@ pub(super) async fn forward_request_to_upstream(
         for (name, value) in &meta.forward_headers {
             headers.append(name.clone(), value.clone());
         }
+        if let Some(content_length) = meta.content_length {
+            let value = HeaderValue::from_str(&content_length.to_string())
+                .context("invalid content-length header value")?;
+            headers.insert(http::header::CONTENT_LENGTH, value);
+        }
         headers.insert(
             http::header::HOST,
-            HeaderValue::from_str(&authority_host).context("invalid host header value")?,
+            HeaderValue::from_str(authority_host).context("invalid host header value")?,
         );
     }
     let request = builder

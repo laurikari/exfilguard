@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode, Uri};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -914,6 +915,64 @@ async fn connect_bump_supports_http2() -> Result<()> {
         "expected upstream HTTP/2 connection reuse"
     );
 
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_preserves_content_length_for_body_requests() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-put";
+    let policy = PolicySpec::new(policy_name).rule(
+        RuleSpec::allow(&["PUT"], format!("https://{upstream_host}/upload/**"))
+            .allow_private_upstream(true),
+    );
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2Inspect),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let body = Bytes::from_static(b"hello world");
+    let content_length = body.len();
+    let uri = Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query("/upload/object")
+        .build()?;
+    let mut builder = http::Request::builder().method(Method::PUT).uri(uri);
+    let headers = builder.headers_mut().expect("headers before body");
+    headers.insert(
+        http::header::USER_AGENT,
+        HeaderValue::from_static("exfilguard-test"),
+    );
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())?,
+    );
+    let request = builder.body(())?;
+
+    let (status, response_body) = client.request_text_with_body(request, body.clone()).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response_body.contains(&format!("content-length={content_length}")),
+        "expected upstream content-length echo, got: {response_body}"
+    );
+    assert!(
+        response_body.contains(&format!("body-len={content_length}")),
+        "expected upstream body length echo, got: {response_body}"
+    );
+    assert!(
+        response_body.contains("body=hello world"),
+        "expected upstream body echo, got: {response_body}"
+    );
+
+    client.shutdown().await;
     fixture.shutdown().await;
 
     Ok(())

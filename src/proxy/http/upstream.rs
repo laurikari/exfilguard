@@ -180,6 +180,7 @@ mod tests {
         let request = ParsedRequest {
             method: http::Method::GET,
             scheme: Scheme::Https,
+            authority: "example.com".to_string(),
             host: "example.com".to_string(),
             port: Some(443),
             path: "/".to_string(),
