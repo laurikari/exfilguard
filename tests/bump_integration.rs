@@ -1308,6 +1308,56 @@ async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-total-timeout-body";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2HeadersThenStallBody)
+            .with_settings(|settings| {
+                settings.request_total_timeout = 1;
+                settings.response_body_idle_timeout = 10;
+            }),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/slow-body")
+                .build()?,
+        )
+        .body(())?;
+
+    let result = timeout(StdDuration::from_secs(2), client.request_text(request)).await;
+    match result {
+        Ok(Err(_)) => {}
+        Ok(Ok((status, body))) => {
+            panic!("expected HTTP/2 body relay to fail on total timeout, got {status} {body:?}");
+        }
+        Err(_) => panic!("HTTP/2 response body relay ignored request_total_timeout"),
+    }
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_preserves_content_length_for_body_requests() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-put";

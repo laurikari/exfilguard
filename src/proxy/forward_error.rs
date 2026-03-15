@@ -68,7 +68,7 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &s
         ForwardErrorKind::RequestTimeout => warn!(
             peer = %peer,
             host,
-            "request timed out before response headers"
+            "request timed out while forwarding"
         ),
         ForwardErrorKind::PrivateAddress(private_err) => warn!(
             peer = %peer,
