@@ -45,13 +45,19 @@ async fn run_upstream(listener: TcpListener) -> Result<()> {
     }
 }
 
-fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
+fn write_main_config(dirs: &TestDirs, addr: SocketAddr) -> Result<()> {
     let config_path = dirs.config_dir.join("exfilguard.toml");
     let config = format!(
         "listen = \"{addr}\"\n\nca_dir = \"{}\"\nclients = \"clients.toml\"\npolicies = \"policies.toml\"\nlog = \"text\"\n",
         dirs.ca_dir.display()
     );
     std::fs::write(&config_path, config)?;
+    Ok(())
+}
+
+fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
+    write_main_config(dirs, addr)?;
+    let config_path = dirs.config_dir.join("exfilguard.toml");
     let cli = Cli {
         config: Some(config_path),
     };
@@ -61,7 +67,7 @@ fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reload_on_sighup_updates_policy() -> Result<()> {
+async fn reload_on_sighup_updates_runtime_policy() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
 
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -118,8 +124,79 @@ async fn reload_on_sighup_updates_policy() -> Result<()> {
     }
     let logs = log_capture.text();
     assert!(
-        logs.contains("configuration reloaded"),
+        logs.contains("runtime policy reloaded"),
         "expected reload log entry, got: {logs}"
+    );
+
+    run_task.abort();
+    let _ = run_task.await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_on_sighup_does_not_rebind_listener() -> Result<()> {
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(run_upstream(upstream_listener));
+
+    let (clients, policies_deny) = TestConfigBuilder::new()
+        .default_client(&["reload-policy"])
+        .policy(PolicySpec::new("reload-policy").rule(
+            RuleSpec::deny(&["GET"], format!("http://127.0.0.1:{upstream_port}/**")).status(403),
+        ))
+        .render();
+
+    let policies_allow = TestConfigBuilder::new()
+        .policy(PolicySpec::new("reload-policy").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render()
+        .1;
+
+    let dirs = TestDirs::new()?;
+    write_clients_and_policies(&dirs, &clients, &policies_deny)?;
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, find_free_port()?));
+    let new_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, find_free_port()?));
+    let settings = load_settings(&dirs, addr)?;
+
+    let run_task = tokio::spawn(async move {
+        if let Err(err) = exfilguard::run(settings).await {
+            tracing::error!(error = ?err, "proxy run failed");
+        }
+    });
+
+    wait_for_listener(addr).await?;
+
+    let status = send_proxy_request(addr, upstream_port).await?;
+    assert_eq!(status, 403, "expected initial deny before reload");
+
+    write_main_config(&dirs, new_addr)?;
+    std::fs::write(&dirs.policies_path, policies_allow)?;
+    send_sighup()?;
+
+    let deadline = Instant::now() + StdDuration::from_secs(3);
+    loop {
+        let status = send_proxy_request(addr, upstream_port).await?;
+        if status == 200 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "expected allow after reload on original listener; last status was {status}"
+            ));
+        }
+        sleep(StdDuration::from_millis(50)).await;
+    }
+
+    let new_listener = TcpStream::connect(new_addr).await;
+    assert!(
+        new_listener.is_err(),
+        "listener should not rebind on SIGHUP to startup-only address {new_addr}"
     );
 
     run_task.abort();

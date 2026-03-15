@@ -5,8 +5,8 @@ HTTP and HTTPS traffic. It accepts explicit proxy connections, evaluates each
 request against the client's policy, logs the decision, and either forwards or
 denies the request. When a rule enables inspection, ExfilGuard terminates TLS
 and mints leaf certificates on the fly using its built-in CA; otherwise it can
-tunnel the CONNECT stream without touching the payload. Configuration can be
-reloaded without restarting the process.
+tunnel the CONNECT stream without touching the payload. Client/policy data can
+be reloaded without restarting the process.
 
 ## Quickstart
 
@@ -65,7 +65,7 @@ requests, supporting both HTTP/1.1 and H2 multiplexing.
 ### Full example lab
 
 Use the richer sample layout when you need multiple clients, a mix of inspection
-settings, or hot reload demonstrations:
+settings, or runtime policy reload demonstrations:
 
 ```shell
 cp examples/full/exfilguard.toml exfilguard.toml
@@ -74,6 +74,11 @@ cargo run -- --config exfilguard.toml
 
 Edit the copied files—or point `--config` at the originals—to try different
 policies.
+
+`SIGHUP` reloads only the client/policy data from the already configured
+`clients`, `clients_dir`, `policies`, and `policies_dir` paths. Changes to
+`exfilguard.toml` itself, including listener, metrics, cache, TLS, logging, and
+timeout settings, require restarting the process.
 
 ## Platform Support
 
