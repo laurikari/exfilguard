@@ -180,7 +180,15 @@ url_pattern = "https://example.com:8443/api/**"
 | `/users/*/profile` | `/users/123/profile`, `/users/abc/profile` |
 
 !!! note
-    Query strings are ignored when evaluating path patterns.
+    Policy path matching uses a canonical path view. Query strings are ignored,
+    literal `.` and `..` segments are normalized, and ambiguous path syntax is
+    rejected instead of being rewritten. ExfilGuard preserves the raw request
+    target for upstream forwarding, so signed requests keep their original path
+    bytes.
+
+!!! note
+    Requests are rejected if the path contains invalid escapes, backslashes,
+    encoded path separators, or encoded dot-segments such as `%2e%2e`.
 
 ### Complete Examples
 

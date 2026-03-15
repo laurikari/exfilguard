@@ -169,7 +169,28 @@ async fn process_downstream_request(
         return Ok(());
     }
 
-    let ctx = DownstreamRequestCtx::new(request, respond, peer, &app)?;
+    let start = Instant::now();
+    let snapshot = app.policies.snapshot();
+    let max_request_header_size = app.settings.max_request_header_size;
+    let (meta, body) = match sanitize_request(request, max_request_header_size) {
+        Ok(result) => result,
+        Err(err) => {
+            warn!(
+                peer = %peer,
+                error = %err,
+                "failed to sanitize HTTP/2 request"
+            );
+            let mut respond = respond;
+            send_error_response(
+                &mut respond,
+                http::StatusCode::BAD_REQUEST,
+                "invalid request",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let ctx = DownstreamRequestCtx::new(meta, body, respond, peer, snapshot, start, &app);
     ctx.handle(upstream).await
 }
 
@@ -192,19 +213,17 @@ struct DownstreamRequestCtx {
 
 impl DownstreamRequestCtx {
     fn new(
-        request: http::Request<h2::RecvStream>,
+        meta: SanitizedRequest,
+        body: h2::RecvStream,
         respond: SendResponse<Bytes>,
         peer: SocketAddr,
+        snapshot: PolicySnapshot,
+        start: Instant,
         app: &AppContext,
-    ) -> Result<Self> {
-        let start = Instant::now();
-        let snapshot = app.policies.snapshot();
-        let max_request_header_size = app.settings.max_request_header_size;
-        let (meta, body) = sanitize_request(request, max_request_header_size)
-            .context("failed to sanitize HTTP/2 request")?;
+    ) -> Self {
         let log_queries = app.settings.log_queries;
         let request_base = meta.request_line_bytes + meta.header_bytes as u64;
-        Ok(Self {
+        Self {
             peer,
             meta,
             body,
@@ -219,7 +238,7 @@ impl DownstreamRequestCtx {
             max_response_header_bytes: app.settings.max_response_header_size,
             log_queries,
             log_tracker: AllowLogTracker::new(request_base, start),
-        })
+        }
     }
 
     async fn handle(self, upstream: Arc<Mutex<Http2Upstream>>) -> Result<()> {

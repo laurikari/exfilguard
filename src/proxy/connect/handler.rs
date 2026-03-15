@@ -80,6 +80,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         host: session.parsed().host.clone(),
         port: Some(session.parsed().port),
         path: session.original_target().to_string(),
+        policy_path: session.original_target().to_string(),
     };
 
     let mut handler = ConnectRequestHandler {

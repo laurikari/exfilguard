@@ -246,6 +246,7 @@ mod tests {
             host: "example.com".to_string(),
             port: None,
             path: "/resource".to_string(),
+            policy_path: "/resource".to_string(),
         }
     }
 

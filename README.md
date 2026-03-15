@@ -104,10 +104,23 @@ outbound TLS verification remains intact.
 1. The listener accepts TCP connections on the configured address.
 2. Protocol front-ends parse HTTP/1.1 requests or CONNECT tunnels (HTTP/2 support
    lives in `proxy::http2`).
-3. The request pipeline normalizes the request and evaluates the relevant
-   client's policies in order until one matches.
+3. The request pipeline derives a canonical policy view and evaluates the
+   relevant client's policies in order until one matches.
 4. Allowed requests are proxied upstream with pooled TCP/TLS clients; denied
    requests receive a 403 and a structured log entry.
+
+### Forwarding vs. Policy Matching
+
+ExfilGuard keeps the raw request target for upstream forwarding, logging, cache
+keys, and signature-sensitive traffic. Policy evaluation uses a separate
+canonical path view so rule matching does not depend on origin-specific path
+normalization.
+
+- Query strings are ignored for path matching.
+- Literal `.` and `..` path segments are normalized before policy evaluation.
+- Ambiguous path syntax is rejected with `400 Bad Request` instead of being
+  silently rewritten. This includes invalid escapes, backslashes, encoded path
+  separators, and encoded dot-segments such as `%2e%2e`.
 
 ## Security
 

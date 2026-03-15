@@ -134,7 +134,7 @@ pub fn evaluate_request<'a>(
         scheme: parsed.scheme,
         host: &parsed.host,
         port: parsed.port,
-        path: parsed.path_without_query(),
+        path: parsed.policy_path(),
     };
 
     match snapshot.evaluate_request(peer.ip(), &policy_request) {
@@ -362,6 +362,27 @@ mod tests {
             host: "example.com".to_string(),
             port: None,
             path: "/api/v1/items?token=abc".to_string(),
+            policy_path: "/api/v1/items".to_string(),
+        };
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
+        match outcome {
+            PolicyOutcome::Allow(_) => {}
+            _ => panic!("expected allow decision"),
+        }
+    }
+
+    #[test]
+    fn policy_eval_uses_canonical_policy_path() {
+        let snapshot = build_snapshot();
+        let parsed = ParsedRequest {
+            method: Method::GET,
+            scheme: Scheme::Https,
+            authority: "example.com".to_string(),
+            host: "example.com".to_string(),
+            port: None,
+            path: "/other/../api/v1/items?token=abc".to_string(),
+            policy_path: "/api/v1/items".to_string(),
         };
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
