@@ -170,6 +170,7 @@ mod tests {
             host: "example.com".to_string(),
             port: Some(443),
             path: "/".to_string(),
+            policy_path: "/".to_string(),
         };
 
         let first = UpstreamKey::from_request(&request);
