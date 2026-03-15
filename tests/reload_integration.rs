@@ -206,3 +206,69 @@ async fn reload_on_sighup_does_not_rebind_listener() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_on_sighup_updates_clients() -> Result<()> {
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(run_upstream(upstream_listener));
+
+    let (clients_deny, policies) = TestConfigBuilder::new()
+        .client_ip("loopback", "127.0.0.1", &["deny-policy"], false)
+        .default_client(&["allow-policy"])
+        .policy(PolicySpec::new("deny-policy").rule(
+            RuleSpec::deny(&["GET"], format!("http://127.0.0.1:{upstream_port}/**")).status(403),
+        ))
+        .policy(PolicySpec::new("allow-policy").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+
+    let clients_allow = TestConfigBuilder::new()
+        .client_ip("loopback", "127.0.0.1", &["allow-policy"], false)
+        .default_client(&["allow-policy"])
+        .render()
+        .0;
+
+    let dirs = TestDirs::new()?;
+    write_clients_and_policies(&dirs, &clients_deny, &policies)?;
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, find_free_port()?));
+    let settings = load_settings(&dirs, addr)?;
+
+    let run_task = tokio::spawn(async move {
+        if let Err(err) = exfilguard::run(settings).await {
+            tracing::error!(error = ?err, "proxy run failed");
+        }
+    });
+
+    wait_for_listener(addr).await?;
+
+    let status = send_proxy_request(addr, upstream_port).await?;
+    assert_eq!(status, 403, "expected initial deny before client reload");
+
+    std::fs::write(&dirs.clients_path, clients_allow)?;
+    send_sighup()?;
+
+    let deadline = Instant::now() + StdDuration::from_secs(3);
+    loop {
+        let status = send_proxy_request(addr, upstream_port).await?;
+        if status == 200 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "expected allow after client reload; last status was {status}"
+            ));
+        }
+        sleep(StdDuration::from_millis(50)).await;
+    }
+
+    run_task.abort();
+    let _ = run_task.await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+
+    Ok(())
+}
