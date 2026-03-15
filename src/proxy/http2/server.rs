@@ -6,9 +6,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures::future::poll_fn;
 use h2::server::{self, SendResponse};
 use http;
-use tokio::{net::TcpStream, sync::Mutex, task::JoinSet};
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex, watch},
+    task::JoinSet,
+};
 use tokio_rustls::server::TlsStream;
 use tracing::warn;
 
@@ -18,6 +23,7 @@ use crate::{
         AppContext,
         allow_log::{AllowLogStats, log_allow_success},
         connect::ResolvedTarget,
+        forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
         forward_limits::AllowLogTracker,
         policy_eval::{self, AllowDecision, PolicyLogConfig, RequestLogContext},
         policy_response::{self, ForwardErrorSpec},
@@ -49,6 +55,7 @@ struct Http2BumpService {
     app: AppContext,
     connection: server::Connection<TlsStream<TcpStream>, Bytes>,
     upstream: Arc<Mutex<Http2Upstream>>,
+    upstream_closed: watch::Receiver<bool>,
 }
 
 impl Http2BumpService {
@@ -63,41 +70,72 @@ impl Http2BumpService {
             .await
             .context("failed to handshake HTTP/2 with downstream client")?;
         let upstream = Http2Upstream::new(app.clone(), connect_binding, primed_upstream);
+        let upstream_closed = upstream.closed_receiver();
         Ok(Self {
             peer,
             app,
             connection,
             upstream: Arc::new(Mutex::new(upstream)),
+            upstream_closed,
         })
     }
 
     async fn run(&mut self) -> Result<()> {
         let mut tasks = JoinSet::new();
-        while let Some(result) = self.connection.accept().await {
-            match result {
-                Ok((request, respond)) => {
-                    let peer = self.peer;
-                    let app = self.app.clone();
-                    let upstream = self.upstream.clone();
-                    tasks.spawn(async move {
-                        if let Err(err) =
-                            process_downstream_request(request, respond, peer, app, upstream).await
-                        {
+        loop {
+            tokio::select! {
+                biased;
+                result = self.upstream_closed.changed() => {
+                    match result {
+                        Ok(()) if *self.upstream_closed.borrow() => {
                             warn!(
-                                peer = %peer,
-                                error = %err,
-                                "HTTP/2 downstream request handling failed"
+                                peer = %self.peer,
+                                "closing downstream HTTP/2 session after upstream connection closed"
                             );
+                            self.connection.graceful_shutdown();
+                            if let Err(err) = poll_fn(|cx| self.connection.poll_closed(cx)).await {
+                                warn!(
+                                    peer = %self.peer,
+                                    error = %err,
+                                    "failed to close downstream HTTP/2 connection after upstream shutdown"
+                                );
+                            }
+                            break;
                         }
-                    });
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        peer = %self.peer,
-                        error = %err,
-                        "failed to accept HTTP/2 request from downstream"
-                    );
-                    break;
+                result = self.connection.accept() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    match result {
+                        Ok((request, respond)) => {
+                            let peer = self.peer;
+                            let app = self.app.clone();
+                            let upstream = self.upstream.clone();
+                            tasks.spawn(async move {
+                                if let Err(err) =
+                                    process_downstream_request(request, respond, peer, app, upstream).await
+                                {
+                                    warn!(
+                                        peer = %peer,
+                                        error = %err,
+                                        "HTTP/2 downstream request handling failed"
+                                    );
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            warn!(
+                                peer = %self.peer,
+                                error = %err,
+                                "failed to accept HTTP/2 request from downstream"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -277,6 +315,15 @@ struct Http2RequestHandler {
 }
 
 impl Http2RequestHandler {
+    fn should_disconnect_on_forward_error(err: &anyhow::Error) -> bool {
+        !matches!(
+            classify_forward_error(err),
+            ForwardErrorKind::BodyTooLarge(_)
+                | ForwardErrorKind::PrivateAddress(_)
+                | ForwardErrorKind::MisdirectedRequest(_)
+        )
+    }
+
     async fn forward_request(
         &mut self,
         _decision: &AllowDecision,
@@ -332,6 +379,42 @@ impl Http2RequestHandler {
             .respond_forward_error(spec, log, decision, error_detail)
             .await
     }
+
+    async fn disconnect_downstream_for_transport_error(
+        &mut self,
+        decision: &AllowDecision,
+        log: RequestLogContext<'_>,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        let kind = classify_forward_error(&err);
+        let kind_label = match kind {
+            ForwardErrorKind::RequestTimeout => "request_timeout",
+            ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
+            ForwardErrorKind::PrivateAddress(_) => "private_address",
+            ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
+            ForwardErrorKind::UpstreamClosed => "upstream_closed",
+            ForwardErrorKind::Other => "other",
+        };
+        crate::metrics::record_upstream_error(kind_label);
+        log_forward_error(&kind, self.ctx.peer, &self.ctx.meta.parsed.host, &err);
+
+        {
+            let mut upstream = self.upstream.lock().await;
+            upstream.terminate_session().await;
+        }
+
+        let spec = policy_response::forward_error_spec(&kind);
+        policy_response::forward_error_log_builder(
+            log.access_log_builder(),
+            decision,
+            &spec,
+            &err.to_string(),
+        )
+        .bytes(self.ctx.log_tracker.current_bytes(), 0)
+        .elapsed(self.ctx.log_tracker.elapsed())
+        .log();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -341,23 +424,41 @@ impl RequestHandler for Http2RequestHandler {
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
         let policy_eval::AllowOutcome { decision, log } = outcome;
         let forward_result = self.forward_request(&decision).await;
-        let handled = policy_response::handle_forward_result(
-            &decision,
-            log.clone(),
-            forward_result,
-            self.ctx.peer,
-            &self.ctx.meta.parsed.host,
-        )
-        .await?;
-        match handled {
-            policy_response::ForwardOutcome::Completed(success) => {
+        match forward_result {
+            Ok(success) => {
                 let stats = self.build_allow_log_stats(&success);
                 log_allow_success(log, &decision, stats, None, None);
                 self.handle_forward_success(success).await
             }
-            policy_response::ForwardOutcome::Responded(ctx) => {
-                self.respond_forward_error(ctx.spec, ctx.log, ctx.decision, &ctx.error_detail)
+            Err(err) if Self::should_disconnect_on_forward_error(&err) => {
+                self.disconnect_downstream_for_transport_error(&decision, log, err)
                     .await
+            }
+            Err(err) => {
+                let handled = policy_response::handle_forward_result(
+                    &decision,
+                    log.clone(),
+                    Err(err),
+                    self.ctx.peer,
+                    &self.ctx.meta.parsed.host,
+                )
+                .await?;
+                match handled {
+                    policy_response::ForwardOutcome::Completed(success) => {
+                        let stats = self.build_allow_log_stats(&success);
+                        log_allow_success(log, &decision, stats, None, None);
+                        self.handle_forward_success(success).await
+                    }
+                    policy_response::ForwardOutcome::Responded(ctx) => {
+                        self.respond_forward_error(
+                            ctx.spec,
+                            ctx.log,
+                            ctx.decision,
+                            &ctx.error_detail,
+                        )
+                        .await
+                    }
+                }
             }
         }
     }

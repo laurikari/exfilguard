@@ -1,11 +1,15 @@
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use futures::future::poll_fn;
 use h2::{client as h2_client, server as h2_server};
 use http::{HeaderValue, StatusCode};
 use rustls::RootCertStore;
@@ -13,8 +17,10 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
+use exfilguard::settings::Settings;
 use exfilguard::tls::ca::CertificateAuthority;
 
 use super::{
@@ -43,6 +49,9 @@ pub enum UpstreamMode {
     Http1Keepalive,
     Http1Redirect,
     Http2,
+    Http2CloseBeforeResponse,
+    Http2NoResponse,
+    Http2SingleUse,
     Http2Inspect,
 }
 
@@ -52,6 +61,7 @@ pub struct BumpedTlsOptions<'a> {
     policy: PolicySpec,
     client_protocols: ClientProtocols,
     upstream_mode: UpstreamMode,
+    settings_override: Option<Box<dyn FnOnce(&mut Settings) + Send>>,
 }
 
 impl<'a> BumpedTlsOptions<'a> {
@@ -62,6 +72,7 @@ impl<'a> BumpedTlsOptions<'a> {
             policy,
             client_protocols: ClientProtocols::Http1,
             upstream_mode: UpstreamMode::Http1Keepalive,
+            settings_override: None,
         }
     }
 
@@ -72,6 +83,14 @@ impl<'a> BumpedTlsOptions<'a> {
 
     pub fn upstream_mode(mut self, mode: UpstreamMode) -> Self {
         self.upstream_mode = mode;
+        self
+    }
+
+    pub fn with_settings<F>(mut self, func: F) -> Self
+    where
+        F: FnOnce(&mut Settings) + Send + 'static,
+    {
+        self.settings_override = Some(Box::new(func));
         self
     }
 }
@@ -166,6 +185,18 @@ impl BumpedH2Client {
         Ok(String::from_utf8(bytes)?)
     }
 
+    pub async fn wait_closed(&mut self, timeout_dur: Duration) -> Result<()> {
+        let handle = self
+            .connection
+            .take()
+            .ok_or_else(|| anyhow!("HTTP/2 connection task not available"))?;
+        timeout(timeout_dur, handle)
+            .await
+            .map_err(|_| anyhow!("timed out waiting for downstream HTTP/2 connection to close"))?
+            .context("downstream HTTP/2 connection task failed")?;
+        Ok(())
+    }
+
     pub async fn shutdown(mut self) {
         if let Some(handle) = self.connection.take() {
             handle.abort();
@@ -199,6 +230,7 @@ impl BumpedTlsFixture {
             policy,
             client_protocols,
             upstream_mode,
+            settings_override,
         } = options;
         let dirs = super::TestDirs::new()?;
         let workspace = dirs.config_dir.parent().expect("temp workspace directory");
@@ -216,10 +248,14 @@ impl BumpedTlsFixture {
             proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
         assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
         let cert_cache_path = cert_cache_dir.clone();
+        let mut settings_override = settings_override;
         let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
             .with_proxy_root_store(proxy_root_store)
             .with_settings(move |settings| {
                 settings.cert_cache_dir = Some(cert_cache_path.clone());
+                if let Some(override_fn) = settings_override.take() {
+                    override_fn(settings);
+                }
             })
             .spawn()
             .await?;
@@ -228,9 +264,11 @@ impl BumpedTlsFixture {
             UpstreamMode::Http1Keepalive | UpstreamMode::Http1Redirect => {
                 build_upstream_tls_config(&ca, upstream_host)?
             }
-            UpstreamMode::Http2 | UpstreamMode::Http2Inspect => {
-                build_upstream_h2_tls_config(&ca, upstream_host)?
-            }
+            UpstreamMode::Http2
+            | UpstreamMode::Http2CloseBeforeResponse
+            | UpstreamMode::Http2NoResponse
+            | UpstreamMode::Http2SingleUse
+            | UpstreamMode::Http2Inspect => build_upstream_h2_tls_config(&ca, upstream_host)?,
         };
 
         let accept_count = Arc::new(AtomicUsize::new(0));
@@ -264,6 +302,15 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http2 => {
                                         serve_tls_h2(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2CloseBeforeResponse => {
+                                        serve_tls_h2_close_before_response(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2NoResponse => {
+                                        serve_tls_h2_no_response(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2SingleUse => {
+                                        serve_tls_h2_single_use(stream, acceptor, peer).await
                                     }
                                     UpstreamMode::Http2Inspect => {
                                         serve_tls_h2_inspect(stream, acceptor, peer).await
@@ -437,6 +484,85 @@ async fn serve_tls_h2(stream: TcpStream, acceptor: TlsAcceptor, _peer: SocketAdd
                 .context("failed to send HTTP/2 response body")?;
         }
     }
+
+    Ok(())
+}
+
+async fn serve_tls_h2_close_before_response(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    let Some(result) = connection.accept().await else {
+        return Ok(());
+    };
+    let (_request, _respond) = result.context("failed to accept HTTP/2 request")?;
+    Ok(())
+}
+
+async fn serve_tls_h2_no_response(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    let Some(result) = connection.accept().await else {
+        return Ok(());
+    };
+    let (_request, _respond) = result.context("failed to accept HTTP/2 request")?;
+    sleep(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+async fn serve_tls_h2_single_use(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    let Some(result) = connection.accept().await else {
+        return Ok(());
+    };
+    let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
+    let path = request.uri().path().to_string();
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+    let mut send = respond
+        .send_response(response, path.is_empty())
+        .context("failed to send HTTP/2 response headers")?;
+    if !path.is_empty() {
+        send.send_data(Bytes::copy_from_slice(path.as_bytes()), true)
+            .context("failed to send HTTP/2 response body")?;
+    }
+
+    connection.graceful_shutdown();
+    poll_fn(|cx| connection.poll_closed(cx))
+        .await
+        .context("failed to close single-use HTTP/2 upstream connection")?;
 
     Ok(())
 }

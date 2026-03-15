@@ -3,15 +3,18 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use h2::client;
-use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
+use tokio::{net::TcpStream, sync::watch, task::JoinHandle, time::timeout};
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use tracing::debug;
 
 use crate::{
     config::Scheme,
     proxy::{
-        AppContext, connect::ResolvedTarget, forward_error::MisdirectedRequest,
-        request::ParsedRequest, upstream,
+        AppContext,
+        connect::ResolvedTarget,
+        forward_error::{MisdirectedRequest, UpstreamClosed},
+        request::ParsedRequest,
+        upstream,
     },
 };
 use rustls::pki_types::ServerName;
@@ -28,6 +31,8 @@ pub(super) struct Http2Upstream {
     binding: Option<ResolvedTarget>,
     handle: Option<UpstreamHandle>,
     primed: Option<PrimedHttp2Upstream>,
+    closed_tx: watch::Sender<bool>,
+    closed_rx: watch::Receiver<bool>,
 }
 
 pub(super) struct UpstreamHandle {
@@ -52,18 +57,31 @@ impl Http2Upstream {
         binding: Option<ResolvedTarget>,
         primed: Option<PrimedHttp2Upstream>,
     ) -> Self {
+        let (closed_tx, closed_rx) = watch::channel(false);
         Self {
             app,
             binding,
             handle: None,
             primed,
+            closed_tx,
+            closed_rx,
         }
+    }
+
+    pub(super) fn closed_receiver(&self) -> watch::Receiver<bool> {
+        self.closed_rx.clone()
     }
 
     pub(super) async fn checkout_sender(
         &mut self,
         request: &ParsedRequest,
     ) -> Result<UpstreamCheckout> {
+        self.reap_finished_handle().await;
+
+        if *self.closed_rx.borrow() {
+            return Err(UpstreamClosed.into());
+        }
+
         if let Some(handle) = self.handle.as_ref() {
             ensure_request_matches(handle, request)?;
         }
@@ -107,6 +125,7 @@ impl Http2Upstream {
                 primed.host,
                 primed.port,
                 request.scheme,
+                self.closed_tx.clone(),
             )
             .await;
         }
@@ -144,12 +163,39 @@ impl Http2Upstream {
             );
         }
 
-        make_handle_from_stream(tls_stream, peer, request.host.clone(), port, request.scheme).await
+        make_handle_from_stream(
+            tls_stream,
+            peer,
+            request.host.clone(),
+            port,
+            request.scheme,
+            self.closed_tx.clone(),
+        )
+        .await
     }
 
     pub(super) async fn shutdown(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.connection_task.abort();
+            let _ = handle.connection_task.await;
+        }
+    }
+
+    pub(super) async fn terminate_session(&mut self) {
+        let _ = self.closed_tx.send(true);
+        if let Some(handle) = self.handle.take() {
+            handle.connection_task.abort();
+            let _ = handle.connection_task.await;
+        }
+    }
+
+    async fn reap_finished_handle(&mut self) {
+        let finished = self
+            .handle
+            .as_ref()
+            .map(|handle| handle.connection_task.is_finished())
+            .unwrap_or(false);
+        if finished && let Some(handle) = self.handle.take() {
             let _ = handle.connection_task.await;
         }
     }
@@ -161,6 +207,7 @@ async fn make_handle_from_stream(
     host: String,
     port: u16,
     scheme: Scheme,
+    closed_tx: watch::Sender<bool>,
 ) -> Result<UpstreamHandle> {
     let (sender, connection) = client::handshake(tls_stream)
         .await
@@ -170,6 +217,7 @@ async fn make_handle_from_stream(
         if let Err(err) = connection.await {
             debug!(error = %err, "HTTP/2 upstream connection terminated with error");
         }
+        let _ = closed_tx.send(true);
     });
 
     Ok(UpstreamHandle {

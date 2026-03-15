@@ -972,6 +972,145 @@ async fn connect_bump_supports_http2() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_closes_downstream_after_upstream_close() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-reconnect";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2SingleUse),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+
+    let first_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/first")
+                .build()?,
+        )
+        .body(())?;
+    let (first_status, first_text) = client.request_text(first_request).await?;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_text, "/h2/first");
+
+    client.wait_closed(StdDuration::from_secs(1)).await?;
+
+    client.shutdown().await;
+
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "expected downstream HTTP/2 session to close after upstream close"
+    );
+
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_disconnects_when_upstream_closes_before_response() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-close-before-response";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2CloseBeforeResponse),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/broken")
+                .build()?,
+        )
+        .body(())?;
+
+    let _ = client
+        .request_text(request)
+        .await
+        .expect_err("expected downstream disconnect after upstream closed before response");
+    client.wait_closed(StdDuration::from_secs(1)).await?;
+    client.shutdown().await;
+
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-timeout";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2NoResponse)
+            .with_settings(|settings| {
+                settings.response_header_timeout = 1;
+            }),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/timeout")
+                .build()?,
+        )
+        .body(())?;
+
+    let _ = client
+        .request_text(request)
+        .await
+        .expect_err("expected downstream disconnect after upstream response timeout");
+    client.wait_closed(StdDuration::from_secs(2)).await?;
+    client.shutdown().await;
+
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_preserves_content_length_for_body_requests() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-put";
