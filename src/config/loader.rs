@@ -153,13 +153,6 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
                         idx
                     );
                 }
-                if matches!(action, RuleAction::Allow) && rule.inspect_payload {
-                    bail!(
-                        "policy '{}' rule {}: CONNECT ALLOW rules must set inspect_payload=false",
-                        name,
-                        idx
-                    );
-                }
             } else {
                 seen_non_connect_rule = true;
             }
@@ -183,29 +176,14 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
                     idx
                 );
             }
-            if rule.allow_private_upstream && !matches!(action, RuleAction::Allow) {
-                bail!(
-                    "policy '{}' rule {}: allow_private_upstream may only be used with ALLOW action",
-                    name,
-                    idx
-                );
-            }
-
             let id = Arc::<str>::from(format!("{}#{}", policy_name, idx));
-            validate_inspection_constraints(
-                &name,
-                idx,
-                rule.inspect_payload,
-                &methods,
-                &url_pattern,
-            )?;
+            validate_rule_constraints(&name, idx, rule.inspect_payload, &methods, &url_pattern)?;
             compiled_rules.push(Rule {
                 id,
                 action,
                 methods,
                 url_pattern,
                 inspect_payload: rule.inspect_payload,
-                allow_private_upstream: rule.allow_private_upstream,
                 cache: rule.cache.map(|c| CacheConfig {
                     force_cache_duration: c.force_cache_duration,
                 }),
@@ -513,12 +491,14 @@ fn validate_path_pattern(path: &str) -> Result<()> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClientsDoc {
     #[serde(default, rename = "client")]
     clients: Vec<RawClient>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawClient {
     name: String,
     #[serde(default)]
@@ -532,12 +512,14 @@ struct RawClient {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PoliciesDoc {
     #[serde(default, rename = "policy")]
     policies: Vec<RawPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
     name: String,
     #[serde(default, rename = "rule")]
@@ -545,12 +527,14 @@ struct RawPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCacheConfig {
     #[serde(default)]
     force_cache_duration: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRule {
     #[serde(default)]
     url_pattern: Option<String>,
@@ -569,8 +553,6 @@ struct RawRule {
     #[serde(default)]
     splice: Option<bool>,
     #[serde(default)]
-    allow_private_upstream: bool,
-    #[serde(default)]
     cache: Option<RawCacheConfig>,
 }
 
@@ -578,13 +560,18 @@ fn default_inspect_payload() -> bool {
     true
 }
 
-fn validate_inspection_constraints(
+fn validate_rule_constraints(
     policy: &str,
     idx: usize,
     inspect_payload: bool,
     methods: &MethodMatch,
     url_pattern: &Option<UrlPattern>,
 ) -> Result<()> {
+    let connect_only = methods_connect_only(methods);
+    if connect_only {
+        validate_connect_pattern(policy, idx, url_pattern)?;
+    }
+
     if inspect_payload {
         return Ok(());
     }
@@ -606,18 +593,34 @@ fn validate_inspection_constraints(
         }
     }
 
+    validate_connect_pattern(policy, idx, url_pattern)?;
+
+    Ok(())
+}
+
+fn validate_connect_pattern(
+    policy: &str,
+    idx: usize,
+    url_pattern: &Option<UrlPattern>,
+) -> Result<()> {
     let pattern = url_pattern.as_ref().ok_or_else(|| {
         anyhow!(
-            "policy '{}' rule {}: inspect_payload=false requires url_pattern ending with '/**'",
+            "policy '{}' rule {}: CONNECT rules require https:// url_pattern ending with '/**'",
             policy,
             idx
         )
     })?;
-
+    if pattern.scheme != Scheme::Https {
+        bail!(
+            "policy '{}' rule {}: CONNECT rules must use https:// url_pattern",
+            policy,
+            idx
+        );
+    }
     match pattern.path.as_ref().map(|path| path.as_ref()) {
         Some("/**") => Ok(()),
         _ => bail!(
-            "policy '{}' rule {}: inspect_payload=false requires url_pattern ending with '/**'",
+            "policy '{}' rule {}: CONNECT rules require https:// url_pattern ending with '/**'",
             policy,
             idx
         ),
@@ -884,7 +887,7 @@ name = "pass"
     }
 
     #[test]
-    fn reject_inspect_payload_false_without_wildcard_path() {
+    fn reject_connect_rule_without_wildcard_path() {
         let clients = write_temp(
             r#"[[client]]
 name = "default"
@@ -906,7 +909,7 @@ name = "pass"
         let err = load_config(clients.path(), policies.path()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("inspect_payload=false requires url_pattern ending with '/**'")
+                .contains("CONNECT rules require https:// url_pattern ending with '/**'")
         );
     }
 
@@ -943,7 +946,7 @@ name = "allow"
     }
 
     #[test]
-    fn reject_connect_allow_with_inspect_payload_true() {
+    fn allow_connect_bump_rule() {
         let clients = write_temp(
             r#"[[client]]
 name = "default"
@@ -961,11 +964,34 @@ name = "allow"
   url_pattern = "https://example.com/**"
 "#,
         );
-        let err = load_config(clients.path(), policies.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("CONNECT ALLOW rules must set inspect_payload=false")
+        let config = load_config(clients.path(), policies.path()).expect("config should load");
+        assert_eq!(config.policies.len(), 1);
+        assert_eq!(config.policies[0].rules.len(), 1);
+    }
+
+    #[test]
+    fn reject_unknown_rule_field() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+fallback = true
+"#,
         );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET"]
+  url_pattern = "http://example.com/**"
+  mystery = true
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("unknown field `mystery`"));
     }
 
     #[test]

@@ -62,6 +62,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         metrics_listen: None,
         metrics_tls_cert: None,
         metrics_tls_key: None,
+        allow_test_upstreams: true,
     }
 }
 

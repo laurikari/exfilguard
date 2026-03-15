@@ -82,7 +82,7 @@ pub async fn forward_to_upstream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let key = UpstreamKey::from_request(request, decision.allow_private_upstream);
+    let key = UpstreamKey::from_request(request);
     let request_close = headers.wants_connection_close();
     let (mut connection, reused_existing) = match pool.take(&key) {
         Some(conn) => {
@@ -97,14 +97,8 @@ where
         }
         None => {
             crate::metrics::record_pool_miss();
-            let conn = UpstreamConnection::connect(
-                request,
-                app,
-                timeouts.connect,
-                connect_binding,
-                decision.allow_private_upstream,
-            )
-            .await?;
+            let conn = UpstreamConnection::connect(request, app, timeouts.connect, connect_binding)
+                .await?;
             crate::metrics::record_pool_reuse(false);
             (conn, false)
         }

@@ -102,13 +102,6 @@ impl TestConfigBuilder {
                 if let Some(inspect_payload) = rule.inspect_payload {
                     let _ = writeln!(policies_doc, "  inspect_payload = {}", inspect_payload);
                 }
-                if let Some(allow_private_upstream) = rule.allow_private_upstream {
-                    let _ = writeln!(
-                        policies_doc,
-                        "  allow_private_upstream = {}",
-                        allow_private_upstream
-                    );
-                }
                 if let Some(cache) = &rule.cache {
                     let _ = writeln!(policies_doc, "  [policy.rule.cache]");
                     if let Some(duration) = cache.force_cache_duration {
@@ -188,7 +181,6 @@ pub struct RuleSpec {
     methods: Option<Vec<String>>,
     url_pattern: Option<String>,
     inspect_payload: Option<bool>,
-    allow_private_upstream: Option<bool>,
     status: Option<u16>,
     reason: Option<String>,
     body: Option<String>,
@@ -208,7 +200,6 @@ impl RuleSpec {
             methods: Some(methods.iter().map(|method| (*method).to_string()).collect()),
             url_pattern: Some(url_pattern.into()),
             inspect_payload: None,
-            allow_private_upstream: None,
             status: None,
             reason: None,
             body: None,
@@ -226,7 +217,6 @@ impl RuleSpec {
             methods: Some(methods.iter().map(|method| (*method).to_string()).collect()),
             url_pattern: Some(url_pattern.into()),
             inspect_payload: None,
-            allow_private_upstream: None,
             status: None,
             reason: None,
             body: None,
@@ -236,11 +226,6 @@ impl RuleSpec {
 
     pub fn inspect_payload(mut self, inspect_payload: bool) -> Self {
         self.inspect_payload = Some(inspect_payload);
-        self
-    }
-
-    pub fn allow_private_upstream(mut self, allow_private_upstream: bool) -> Self {
-        self.allow_private_upstream = Some(allow_private_upstream);
         self
     }
 

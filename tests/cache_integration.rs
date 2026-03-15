@@ -102,7 +102,6 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
         .policy(
             PolicySpec::new("cache-test").rule(
                 RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true)
                     .cache_enabled(),
             ),
         )
@@ -167,7 +166,6 @@ async fn test_cache_hit_avoids_upstream() -> Result<()> {
         .policy(
             PolicySpec::new("cache-test").rule(
                 RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true)
                     .cache_enabled(),
             ),
         )
@@ -235,7 +233,6 @@ async fn test_cache_hit_keeps_connection_open() -> Result<()> {
         .policy(
             PolicySpec::new("cache-test").rule(
                 RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true)
                     .cache_enabled(),
             ),
         )
@@ -314,7 +311,6 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         .policy(
             PolicySpec::new("cache-test").rule(
                 RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true)
                     .cache_enabled(),
             ),
         )

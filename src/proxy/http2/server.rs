@@ -279,14 +279,12 @@ struct Http2RequestHandler {
 impl Http2RequestHandler {
     async fn forward_request(
         &mut self,
-        decision: &AllowDecision,
+        _decision: &AllowDecision,
     ) -> Result<super::forward::ForwardOutcome> {
         let forward_meta = self.ctx.meta.clone();
         let checkout = {
             let mut upstream = self.upstream.lock().await;
-            upstream
-                .checkout_sender(decision.allow_private_upstream, &forward_meta.parsed)
-                .await?
+            upstream.checkout_sender(&forward_meta.parsed).await?
         };
         forward_request_to_upstream(
             checkout,

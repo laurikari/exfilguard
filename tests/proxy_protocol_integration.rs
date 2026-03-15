@@ -15,10 +15,9 @@ async fn proxy_protocol_allows_forwarded_client() -> Result<()> {
         .client_ip("lb", "203.0.113.10", &["allow-proxy"], false)
         .client_cidr("fallback", "0.0.0.0/0", &["deny-all"], true)
         .policy(
-            PolicySpec::new("allow-proxy").rule(
-                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
+            PolicySpec::new("allow-proxy").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
         )
         .policy(PolicySpec::new("deny-all").rule(
             RuleSpec::deny(&["ANY"], format!("http://127.0.0.1:{upstream_port}/**")).status(403),
@@ -59,10 +58,9 @@ async fn proxy_protocol_allowlist_skips_untrusted_peer() -> Result<()> {
     let (clients, policies) = TestConfigBuilder::new()
         .client_ip("local", "127.0.0.1", &["allow-local"], true)
         .policy(
-            PolicySpec::new("allow-local").rule(
-                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
+            PolicySpec::new("allow-local").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
         )
         .render();
 

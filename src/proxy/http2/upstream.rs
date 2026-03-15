@@ -7,7 +7,6 @@ use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use tracing::debug;
 
-use crate::util;
 use crate::{
     config::Scheme,
     proxy::{
@@ -38,7 +37,6 @@ pub(super) struct UpstreamHandle {
     pub port: u16,
     pub scheme: Scheme,
     pub reused: bool,
-    pub is_private_peer: bool,
     connection_task: JoinHandle<()>,
 }
 
@@ -49,10 +47,6 @@ pub(super) struct UpstreamCheckout {
 }
 
 impl Http2Upstream {
-    fn reuse_forbidden(handle: &UpstreamHandle, allow_private_upstream: bool) -> bool {
-        handle.is_private_peer && !allow_private_upstream
-    }
-
     pub(super) fn new(
         app: AppContext,
         binding: Option<ResolvedTarget>,
@@ -68,20 +62,14 @@ impl Http2Upstream {
 
     pub(super) async fn checkout_sender(
         &mut self,
-        allow_private_upstream: bool,
         request: &ParsedRequest,
     ) -> Result<UpstreamCheckout> {
         if let Some(handle) = self.handle.as_ref() {
             ensure_request_matches(handle, request)?;
-            if Self::reuse_forbidden(handle, allow_private_upstream) {
-                self.shutdown().await;
-            }
         }
 
         if self.handle.is_none() {
-            let handle = self
-                .establish_connection(allow_private_upstream, request)
-                .await?;
+            let handle = self.establish_connection(request).await?;
             self.handle = Some(handle);
         }
         let handle = self.handle.as_mut().expect("upstream handle available");
@@ -94,11 +82,7 @@ impl Http2Upstream {
         })
     }
 
-    async fn establish_connection(
-        &mut self,
-        allow_private_upstream: bool,
-        request: &ParsedRequest,
-    ) -> Result<UpstreamHandle> {
+    async fn establish_connection(&mut self, request: &ParsedRequest) -> Result<UpstreamHandle> {
         let port = request.port.unwrap_or(request.scheme.default_port());
         if request.scheme != Scheme::Https {
             bail!("HTTP/2 upstream requires HTTPS scheme");
@@ -133,8 +117,7 @@ impl Http2Upstream {
             port,
             self.binding.as_ref(),
             self.app.settings.dns_resolve_timeout(),
-            allow_private_upstream,
-            "policy allow_private_upstream permitted private upstream address",
+            self.app.settings.allow_test_upstreams,
         )
         .await?;
         let (tcp_stream, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;
@@ -197,7 +180,6 @@ async fn make_handle_from_stream(
         port,
         scheme,
         reused: false,
-        is_private_peer: util::is_private_ip(peer.ip()),
     })
 }
 
@@ -213,41 +195,4 @@ fn ensure_request_matches(handle: &UpstreamHandle, request: &ParsedRequest) -> R
         .into());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::duplex;
-
-    #[tokio::test]
-    async fn reuse_forbidden_detects_private_peer() -> Result<()> {
-        let (_client_io, server_io) = duplex(1024);
-        let (sender, connection) = client::handshake(server_io).await?;
-        let connection_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        let handle = UpstreamHandle {
-            sender,
-            peer: "10.0.0.5:443".parse().unwrap(),
-            host: "example.com".to_string(),
-            port: 443,
-            scheme: Scheme::Https,
-            reused: false,
-            is_private_peer: true,
-            connection_task,
-        };
-
-        assert!(
-            Http2Upstream::reuse_forbidden(&handle, false),
-            "private peer must not be reused when allow_private_upstream is false"
-        );
-        assert!(
-            !Http2Upstream::reuse_forbidden(&handle, true),
-            "private peer may be reused when allow_private_upstream is true"
-        );
-        handle.connection_task.abort();
-        Ok(())
-    }
 }

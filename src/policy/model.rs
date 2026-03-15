@@ -134,7 +134,6 @@ pub struct CompiledRule {
     pub methods: MethodMask,
     pub url: Option<UrlMatcher>,
     pub inspect_payload: bool,
-    pub allow_private_upstream: bool,
     pub cache: Option<CompiledCacheConfig>,
 }
 

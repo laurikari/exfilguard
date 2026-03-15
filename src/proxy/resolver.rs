@@ -5,7 +5,6 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use thiserror::Error;
 use tokio::net::lookup_host;
-use tracing::{info, warn};
 
 use crate::util::{is_private_ip, timeout_with_context};
 
@@ -31,7 +30,6 @@ impl PrivateAddressError {
 pub struct FilteredAddresses {
     pub allowed: Vec<SocketAddr>,
     pub filtered_private: usize,
-    pub allowed_private: usize,
 }
 
 /// Builder-style configuration for DNS resolution that enforces policy constraints.
@@ -41,7 +39,6 @@ pub struct ResolveRequest<'a> {
     timeout: Duration,
     allow_private: bool,
     context: &'static str,
-    allow_private_message: Option<&'static str>,
 }
 
 impl<'a> ResolveRequest<'a> {
@@ -52,7 +49,6 @@ impl<'a> ResolveRequest<'a> {
             timeout,
             allow_private: false,
             context: "host",
-            allow_private_message: None,
         }
     }
 
@@ -66,11 +62,6 @@ impl<'a> ResolveRequest<'a> {
         self
     }
 
-    pub fn allow_private_message(mut self, message: &'static str) -> Self {
-        self.allow_private_message = Some(message);
-        self
-    }
-
     pub async fn resolve_filtered(self) -> Result<FilteredAddresses> {
         let Self {
             host,
@@ -78,14 +69,8 @@ impl<'a> ResolveRequest<'a> {
             timeout,
             allow_private,
             context,
-            allow_private_message,
         } = self;
-        let filtered =
-            resolve_host_with_policy_inner(host, port, timeout, allow_private, context).await?;
-        if let Some(message) = allow_private_message {
-            log_resolution_outcome(host, &filtered, allow_private, message);
-        }
-        Ok(filtered)
+        resolve_host_with_policy_inner(host, port, timeout, allow_private, context).await
     }
 
     pub async fn resolve(self) -> Result<Vec<SocketAddr>> {
@@ -115,12 +100,10 @@ pub async fn resolve_host(host: &str, port: u16, timeout_dur: Duration) -> Resul
 pub fn filter_addresses(addrs: Vec<SocketAddr>, allow_private: bool) -> FilteredAddresses {
     let mut allowed = Vec::new();
     let mut filtered_private = 0usize;
-    let mut allowed_private = 0usize;
 
     for addr in addrs {
         if is_private_ip(addr.ip()) {
             if allow_private {
-                allowed_private += 1;
                 allowed.push(addr);
             } else {
                 filtered_private += 1;
@@ -133,7 +116,6 @@ pub fn filter_addresses(addrs: Vec<SocketAddr>, allow_private: bool) -> Filtered
     FilteredAddresses {
         allowed,
         filtered_private,
-        allowed_private,
     }
 }
 
@@ -146,11 +128,9 @@ async fn resolve_host_with_policy_inner(
 ) -> Result<FilteredAddresses> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addrs = ensure_literal_ip(ip, port, allow_private, context, host)?;
-        let allowed_private = if is_private_ip(ip) { addrs.len() } else { 0 };
         return Ok(FilteredAddresses {
             allowed: addrs,
             filtered_private: 0,
-            allowed_private,
         });
     }
 
@@ -158,28 +138,6 @@ async fn resolve_host_with_policy_inner(
     let filtered = filter_addresses(resolved, allow_private);
     bail_if_empty(&filtered, host, port, context)?;
     Ok(filtered)
-}
-
-pub fn log_resolution_outcome(
-    host: &str,
-    filtered: &FilteredAddresses,
-    allow_private: bool,
-    allow_private_message: &str,
-) {
-    if filtered.filtered_private > 0 {
-        warn!(
-            host,
-            filtered = filtered.filtered_private,
-            "filtered private addresses from DNS response"
-        );
-    }
-    if allow_private && filtered.allowed_private > 0 {
-        info!(
-            host,
-            allowed_private = filtered.allowed_private,
-            "{allow_private_message}"
-        );
-    }
 }
 
 pub fn ensure_literal_ip(

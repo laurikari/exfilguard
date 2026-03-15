@@ -4,7 +4,6 @@ name = "allow-ipv6-specific"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "https://[2001:db8::10]/allowed"
-  allow_private_upstream = false
 
 [[policy]]
 name = "deny-loopback"

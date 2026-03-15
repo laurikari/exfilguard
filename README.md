@@ -146,7 +146,7 @@ others.
 - Review timeout and size limits for your setup (see `docs/configuration.md`).
 - Set `max_request_body_size`, `max_request_header_size`, and
   `max_response_header_size` to reasonable values.
-- Leave `allow_private_upstream = false` unless you need to reach private IPs.
+- Private upstreams are always blocked, including loopback and RFC1918/RFC4193 space.
 - Treat logs and metrics as sensitive—they contain internal hostnames and can
   reveal unusual traffic patterns.
 
@@ -163,7 +163,8 @@ Each policy rule declares whether ExfilGuard bumps TLS:
 
 - `inspect_payload = true` (default) terminates TLS so the proxy can enforce
   scheme, host, path, and method checks—and log bodies if needed. HTTPS rules
-  implicitly authorize CONNECT bumping for the same host/port.
+  implicitly authorize CONNECT bumping for the same host/port. Private upstream
+  addresses are still blocked.
 - `inspect_payload = false` only enforces scheme/host/port. These rules must use
   `methods = ["CONNECT"]` and a `url_pattern` ending in `/**`, making it clear
   that the intent is to tunnel the host untouched. Use this for pinned TLS or
@@ -186,7 +187,6 @@ name = "pinned-payments-egress"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/**"
   inspect_payload = false
-  allow_private_upstream = true
 ```
 
 The loader aborts if the inspection settings are inconsistent (for example:

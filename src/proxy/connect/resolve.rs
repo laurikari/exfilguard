@@ -48,7 +48,6 @@ pub async fn resolve_connect_target(
         resolver::ResolveRequest::new(target.host.as_str(), target.port, resolve_timeout)
             .allow_private(allow_private)
             .context("host")
-            .allow_private_message("CONNECT allowed to private address due to configuration")
             .resolve()
             .await?;
 

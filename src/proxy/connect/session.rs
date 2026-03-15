@@ -85,7 +85,7 @@ impl ConnectSession {
         let resolved = match resolve_connect_target(
             &self.parsed,
             resolve_timeout,
-            allow.allow_private_upstream,
+            app.settings.allow_test_upstreams,
         )
         .await
         {

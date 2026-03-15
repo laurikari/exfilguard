@@ -45,10 +45,9 @@ async fn test_max_request_body_size_enforced() -> Result<()> {
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-upload"])
         .policy(
-            PolicySpec::new("allow-upload").rule(
-                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
+            PolicySpec::new("allow-upload").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
         )
         .render();
 
@@ -121,10 +120,9 @@ async fn request_total_timeout_triggers_during_body() -> Result<()> {
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-upload"])
         .policy(
-            PolicySpec::new("allow-upload").rule(
-                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
+            PolicySpec::new("allow-upload").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
         )
         .render();
 
@@ -228,12 +226,9 @@ async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
 
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow"])
-        .policy(
-            PolicySpec::new("allow").rule(
-                RuleSpec::allow_any(format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
-        )
+        .policy(PolicySpec::new("allow").rule(RuleSpec::allow_any(format!(
+            "http://127.0.0.1:{upstream_port}/**"
+        ))))
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)

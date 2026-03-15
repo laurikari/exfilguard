@@ -211,6 +211,8 @@ pub struct Settings {
     pub metrics_tls_cert: Option<PathBuf>,
     #[serde(default)]
     pub metrics_tls_key: Option<PathBuf>,
+    #[serde(skip)]
+    pub allow_test_upstreams: bool,
 }
 
 impl Settings {
@@ -590,6 +592,7 @@ mod tests {
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
+            allow_test_upstreams: false,
         };
         assert!(settings.validate().is_ok());
     }
@@ -634,6 +637,7 @@ mod tests {
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
+            allow_test_upstreams: false,
         };
         assert!(settings.validate().is_err());
 
@@ -682,6 +686,7 @@ mod tests {
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
+            allow_test_upstreams: false,
         };
         // Should be OK because cache_dir is None
         assert!(settings.validate().is_ok());
@@ -726,6 +731,7 @@ mod tests {
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
+            allow_test_upstreams: false,
         };
         assert!(settings.validate().is_err());
     }

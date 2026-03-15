@@ -52,7 +52,6 @@ pub async fn resolve_or_use_binding(
     binding: Option<&ResolvedTarget>,
     resolve_timeout: Duration,
     allow_private: bool,
-    allow_private_message: &'static str,
 ) -> Result<Vec<SocketAddr>> {
     if let Some(binding) = binding {
         if host != binding.host() || port != binding.port() {
@@ -64,15 +63,12 @@ pub async fn resolve_or_use_binding(
                 binding.port()
             );
         }
-        let filtered = resolver::filter_addresses(binding.addresses().to_vec(), allow_private);
-        resolver::bail_if_empty(&filtered, host, port, "upstream")?;
-        return Ok(filtered.allowed);
+        return Ok(binding.addresses().to_vec());
     }
 
     let filtered = resolver::ResolveRequest::new(host, port, resolve_timeout)
         .allow_private(allow_private)
         .context("upstream")
-        .allow_private_message(allow_private_message)
         .resolve_filtered()
         .await?;
     Ok(filtered.allowed)
@@ -86,66 +82,29 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn binding_private_only_rejected_when_disallowed() {
+    async fn binding_reuses_validated_private_target() -> Result<()> {
         let binding = ResolvedTarget::from_addresses(
             "internal.test".to_string(),
             443,
             vec!["10.0.0.5:443".parse().unwrap()],
         );
-        let err = resolve_or_use_binding(
+        let addrs = resolve_or_use_binding(
             "internal.test",
             443,
             Some(&binding),
             Duration::from_secs(1),
             false,
-            "unused",
         )
-        .await
-        .expect_err("private binding should be rejected when allow_private=false");
+        .await?;
+        assert_eq!(addrs, vec!["10.0.0.5:443".parse().unwrap()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_resolution_rejects_private_targets_when_disallowed() {
+        let err = resolve_or_use_binding("10.0.0.5", 443, None, Duration::from_secs(1), false)
+            .await
+            .expect_err("private upstream should be rejected");
         assert!(err.downcast_ref::<PrivateAddressError>().is_some());
-    }
-
-    #[tokio::test]
-    async fn binding_filters_private_when_disallowed() -> Result<()> {
-        let private_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
-        let public_addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let binding = ResolvedTarget::from_addresses(
-            "example.com".to_string(),
-            443,
-            vec![private_addr, public_addr],
-        );
-        let addrs = resolve_or_use_binding(
-            "example.com",
-            443,
-            Some(&binding),
-            Duration::from_secs(1),
-            false,
-            "unused",
-        )
-        .await?;
-        assert_eq!(addrs, vec![public_addr]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn binding_allows_private_when_enabled() -> Result<()> {
-        let private_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
-        let public_addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let binding = ResolvedTarget::from_addresses(
-            "example.com".to_string(),
-            443,
-            vec![private_addr, public_addr],
-        );
-        let addrs = resolve_or_use_binding(
-            "example.com",
-            443,
-            Some(&binding),
-            Duration::from_secs(1),
-            true,
-            "unused",
-        )
-        .await?;
-        assert_eq!(addrs, vec![private_addr, public_addr]);
-        Ok(())
     }
 }

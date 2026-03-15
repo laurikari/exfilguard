@@ -195,14 +195,12 @@ fn into_decision(result: EvaluationResult) -> PolicyOutcomeInternal {
             policy,
             rule,
             inspect_payload,
-            allow_private_upstream,
             cache,
         } => PolicyOutcomeInternal::Allow(AllowDecision {
             client,
             policy,
             rule,
             inspect_payload,
-            allow_private_upstream,
             cache,
         }),
         Decision::Deny {
@@ -291,7 +289,6 @@ pub struct AllowDecision {
     pub policy: Arc<str>,
     pub rule: Arc<str>,
     pub inspect_payload: bool,
-    pub allow_private_upstream: bool,
     pub cache: Option<CompiledCacheConfig>,
 }
 
@@ -335,7 +332,6 @@ mod tests {
                         original: Arc::<str>::from("https://example.com/api/**"),
                     }),
                     inspect_payload: true,
-                    allow_private_upstream: false,
                     cache: None,
                 }]
                 .into_boxed_slice(),

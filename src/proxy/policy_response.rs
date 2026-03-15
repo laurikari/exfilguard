@@ -223,7 +223,6 @@ mod tests {
             policy: Arc::<str>::from("policy"),
             rule: Arc::<str>::from("rule"),
             inspect_payload: true,
-            allow_private_upstream: false,
             cache: None,
         }
     }

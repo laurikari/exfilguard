@@ -107,7 +107,6 @@ fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {
             methods,
             url,
             inspect_payload: rule.inspect_payload,
-            allow_private_upstream: rule.allow_private_upstream,
             cache,
         });
     }
@@ -246,7 +245,6 @@ mod tests {
                 original: Arc::<str>::from("https://*.example.com/api/**"),
             }),
             inspect_payload: true,
-            allow_private_upstream: false,
             cache: None,
         };
         Policy {
@@ -271,7 +269,6 @@ mod tests {
             methods: MethodMatch::Any,
             url_pattern: None,
             inspect_payload: true,
-            allow_private_upstream: false,
             cache: None,
         };
         let policy = Policy {
@@ -309,7 +306,6 @@ mod tests {
                         methods: MethodMatch::Any,
                         url_pattern: None,
                         inspect_payload: true,
-                        allow_private_upstream: false,
                         cache: None,
                     }]
                     .into_boxed_slice(),

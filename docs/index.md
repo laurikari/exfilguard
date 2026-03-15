@@ -34,7 +34,7 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 :   Shared HTTP response cache that follows standard cache headers; opt-in per rule via a `cache` block (requires cache storage configured globally).
 
 **Private Upstream Guardrails**
-:   Blocks upstream connections to private IPs by default to reduce SSRF risk; opt-in per rule with `allow_private_upstream = true`.
+:   Blocks upstream connections to private IPs to reduce SSRF risk.
 
 **Hot-Reload Configuration**
 :   Supports SIGHUP signal to reload configuration without restarting the process. Zero downtime policy updates.

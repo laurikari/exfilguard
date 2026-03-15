@@ -55,7 +55,9 @@ fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
     let cli = Cli {
         config: Some(config_path),
     };
-    Settings::load(&cli)
+    let mut settings = Settings::load(&cli)?;
+    settings.allow_test_upstreams = true;
+    Ok(settings)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -74,12 +76,10 @@ async fn reload_on_sighup_updates_policy() -> Result<()> {
         .render();
 
     let policies_allow = TestConfigBuilder::new()
-        .policy(
-            PolicySpec::new("reload-policy").rule(
-                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
-        )
+        .policy(PolicySpec::new("reload-policy").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
         .render()
         .1;
 

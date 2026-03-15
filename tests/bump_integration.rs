@@ -75,6 +75,7 @@ async fn http_private_ip_blocked_by_default() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.allow_test_upstreams = false)
         .spawn()
         .await?;
 
@@ -107,12 +108,10 @@ async fn http_upstream_failure_returns_502() -> Result<()> {
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-local"])
-        .policy(
-            PolicySpec::new("allow-local").rule(
-                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
-        )
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
@@ -164,8 +163,7 @@ async fn connect_splice_stays_open_past_timeout() -> Result<()> {
                     &["CONNECT"],
                     format!("https://127.0.0.1:{upstream_port}/**"),
                 )
-                .inspect_payload(false)
-                .allow_private_upstream(true),
+                .inspect_payload(false),
             ),
         )
         .render();
@@ -222,8 +220,7 @@ async fn connect_splice_max_lifetime_closes_without_http_response() -> Result<()
                     &["CONNECT"],
                     format!("https://127.0.0.1:{upstream_port}/**"),
                 )
-                .inspect_payload(false)
-                .allow_private_upstream(true),
+                .inspect_payload(false),
             ),
         )
         .render();
@@ -267,19 +264,17 @@ async fn connect_splice_max_lifetime_closes_without_http_response() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn http_private_ip_allowed_with_flag() -> Result<()> {
+async fn http_loopback_upstream_relays_response() -> Result<()> {
     let upstream = TestUpstream::http_ok("hello").await?;
     let upstream_port = upstream.port();
 
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-loopback"])
-        .policy(
-            PolicySpec::new("allow-loopback").rule(
-                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
-                    .allow_private_upstream(true),
-            ),
-        )
+        .policy(PolicySpec::new("allow-loopback").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
@@ -402,6 +397,47 @@ async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.allow_test_upstreams = false)
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "CONNECT localhost:{target_port} HTTP/1.1\r\nHost: localhost:{target_port}\r\nUser-Agent: exfilguard-test\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("CONNECT to private networks is not allowed"),
+        "expected private network denial message, got: {response}"
+    );
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bumped_private_resolution_is_blocked() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let target_port = find_free_port()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["bump"])
+        .policy(PolicySpec::new("bump").rule(RuleSpec::allow(
+            &["GET"],
+            format!("https://localhost:{target_port}/**"),
+        )))
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.allow_test_upstreams = false)
         .spawn()
         .await?;
 
@@ -437,11 +473,8 @@ async fn connect_splice_relays_payload() -> Result<()> {
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-splice"])
         .policy(
-            PolicySpec::new("allow-splice").rule(
-                RuleSpec::allow(&["CONNECT"], "https://localhost/**")
-                    .inspect_payload(false)
-                    .allow_private_upstream(true),
-            ),
+            PolicySpec::new("allow-splice")
+                .rule(RuleSpec::allow(&["CONNECT"], "https://localhost/**").inspect_payload(false)),
         )
         .render();
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -515,6 +548,7 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.allow_test_upstreams = false)
         .spawn()
         .await?;
 
@@ -555,9 +589,10 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
 
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-http"])
-        .policy(PolicySpec::new("allow-http").rule(
-            RuleSpec::allow_any(format!("http://{upstream_host}/**")).allow_private_upstream(true),
-        ))
+        .policy(
+            PolicySpec::new("allow-http")
+                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**"))),
+        )
         .render();
 
     let accept_count = Arc::new(AtomicUsize::new(0));
@@ -653,9 +688,12 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
 async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
-    let policy = PolicySpec::new(policy_name).rule(
-        RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
-    );
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .upstream_mode(UpstreamMode::Http1Keepalive),
@@ -713,10 +751,14 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
 async fn connect_bump_relays_https_response() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-searchkit";
-    let policy = PolicySpec::new(policy_name).rule(
-        RuleSpec::allow_any(format!("https://{upstream_host}/privacy-policy/"))
-            .allow_private_upstream(true),
-    );
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!(
+            "https://{upstream_host}/privacy-policy/"
+        )));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .upstream_mode(UpstreamMode::Http1Redirect),
@@ -776,9 +818,12 @@ async fn connect_bump_relays_https_response() -> Result<()> {
 async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
-    let policy = PolicySpec::new(policy_name).rule(
-        RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
-    );
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture =
         BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
     let upstream_addr = fixture.upstream_addr();
@@ -810,9 +855,12 @@ async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
 async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-http1-only";
-    let policy = PolicySpec::new(policy_name).rule(
-        RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
-    );
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .client_protocols(ClientProtocols::Http2)
@@ -855,9 +903,12 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
 async fn connect_bump_supports_http2() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2";
-    let policy = PolicySpec::new(policy_name).rule(
-        RuleSpec::allow_any(format!("https://{upstream_host}/**")).allow_private_upstream(true),
-    );
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .client_protocols(ClientProtocols::Http2)
@@ -924,10 +975,15 @@ async fn connect_bump_supports_http2() -> Result<()> {
 async fn connect_bump_http2_preserves_content_length_for_body_requests() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-put";
-    let policy = PolicySpec::new(policy_name).rule(
-        RuleSpec::allow(&["PUT"], format!("https://{upstream_host}/upload/**"))
-            .allow_private_upstream(true),
-    );
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
+        .rule(RuleSpec::allow(
+            &["PUT"],
+            format!("https://{upstream_host}/upload/**"),
+        ));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .client_protocols(ClientProtocols::Http2)
@@ -983,15 +1039,19 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "h2-policy";
     let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(
+            &["CONNECT"],
+            format!("https://{upstream_host}/**"),
+        ))
         .rule(
             RuleSpec::deny(&["GET"], format!("https://{upstream_host}/blocked/**"))
                 .status(451)
                 .body("blocked by policy"),
         )
-        .rule(
-            RuleSpec::allow(&["GET"], format!("https://{upstream_host}/allowed/**"))
-                .allow_private_upstream(true),
-        );
+        .rule(RuleSpec::allow(
+            &["GET"],
+            format!("https://{upstream_host}/allowed/**"),
+        ));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .client_protocols(ClientProtocols::Http2)
@@ -1055,6 +1115,7 @@ async fn http_ipv6_loopback_denied() -> Result<()> {
             settings.listen = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
             settings.cert_cache_dir = Some(cert_cache_path.clone());
             settings.log_queries = true;
+            settings.allow_test_upstreams = false;
         })
         .spawn()
         .await?;

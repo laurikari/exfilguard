@@ -87,7 +87,6 @@ Rules are evaluated in order. The first matching rule determines the action.
 | `methods` | Array | `["ANY"]` | HTTP methods to match (non-CONNECT by default) |
 | `url_pattern` | String | None | URL pattern to match (see syntax below) |
 | `inspect_payload` | Boolean | true | Whether to inspect request/response bodies |
-| `allow_private_upstream` | Boolean | false | Allow upstream requests to private IPs (ALLOW only) |
 | `cache` | Table | None | Cache configuration (see below) |
 | `status` | u16 | Required for DENY | HTTP status code for denial response |
 | `reason` | String | None | HTTP reason phrase (DENY only) |
@@ -100,14 +99,12 @@ Rules are evaluated in order. The first matching rule determines the action.
 - Permit the request to proceed upstream
 - Must not set `status`, `reason`, or `body`
 - Can use `inspect_payload = false` for tunnel mode
-- Can set `allow_private_upstream = true`
 
 #### DENY Rules
 
 - Block the request with specified response
 - Must set `status` (HTTP status code)
 - Optional: `reason` and `body`
-- Cannot use `allow_private_upstream`
 
 ---
 
@@ -137,7 +134,8 @@ methods = ["ANY"]
 CONNECT requests are evaluated against explicit CONNECT rules first. If no
 explicit CONNECT rule matches, HTTPS rules can implicitly allow a bumped tunnel,
 and DENY rules with `methods = ["ANY"]` can supply custom CONNECT denial
-responses.
+responses. Private upstream addresses are never permitted, whether the request
+is plain HTTP, tunneled CONNECT, or bumped HTTPS.
 
 ---
 
@@ -212,6 +210,7 @@ The `inspect_payload` option controls whether ExfilGuard inspects request/respon
 - TLS is terminated and re-encrypted (MITM)
 - Required for non-CONNECT methods
 - HTTPS rules implicitly authorize CONNECT bumping for the same host/port
+- Private upstream resolution is still blocked
 - Enables full request/response inspection for logging, metrics, and caching (when configured)
 
 ### inspect_payload = false (tunnel mode)
@@ -299,7 +298,6 @@ name = "pinned-payments"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/**"
   inspect_payload = false
-  allow_private_upstream = true
 ```
 
 ### Cached Static Content
