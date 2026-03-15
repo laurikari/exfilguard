@@ -1,30 +1,68 @@
 use anyhow::{Result, anyhow, bail};
-use http::{HeaderMap, header::HeaderName};
+use http::{
+    HeaderMap,
+    header::{HeaderName, HeaderValue},
+};
 
 use crate::proxy::headers::{HeaderAction, RequestHeaderSanitizer};
 
 #[derive(Clone)]
 pub(crate) struct Http1HeaderLine {
-    pub name: String,
-    pub value: String,
-    lower_name: String,
+    name: HeaderName,
+    value: HeaderValue,
+    name_text: String,
+    value_text: String,
 }
 
 impl Http1HeaderLine {
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        let name_string = name.into();
-        let lower_name = name_string.to_ascii_lowercase();
-        let value_string = value.into();
-        Self {
-            name: name_string,
-            value: value_string,
-            lower_name,
-        }
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        let name_text = name.into();
+        let value_text = value.into();
+        let name = parse_header_name(&name_text)?;
+        let value = parse_header_value(name.as_str(), &value_text)?;
+        Ok(Self {
+            name,
+            value,
+            name_text,
+            value_text,
+        })
     }
 
     pub fn lower_name(&self) -> &str {
-        &self.lower_name
+        self.name.as_str()
     }
+
+    pub fn name_text(&self) -> &str {
+        &self.name_text
+    }
+
+    pub fn value_text(&self) -> &str {
+        &self.value_text
+    }
+
+    pub fn value_bytes(&self) -> &[u8] {
+        self.value.as_bytes()
+    }
+
+    pub fn header_name(&self) -> &HeaderName {
+        &self.name
+    }
+
+    pub fn header_value(&self) -> &HeaderValue {
+        &self.value
+    }
+}
+
+pub(crate) fn parse_header_name(name: &str) -> Result<HeaderName> {
+    if name.is_empty() {
+        bail!("header name must not be empty");
+    }
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| anyhow!("invalid header name '{name}'"))
+}
+
+pub(crate) fn parse_header_value(name: &str, value: &str) -> Result<HeaderValue> {
+    HeaderValue::from_bytes(value.as_bytes())
+        .map_err(|_| anyhow!("invalid header value for '{name}'"))
 }
 
 pub(crate) struct Http1HeaderAccumulator {
@@ -53,14 +91,11 @@ impl Http1HeaderAccumulator {
             .ok_or_else(|| anyhow!("header missing ':' separator"))?;
         let name = name.trim();
         let value = value.trim();
-        if name.is_empty() {
-            bail!("header name must not be empty");
-        }
-        HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| anyhow!("invalid header name '{name}'"))?;
+        parse_header_name(name)?;
+        parse_header_value(name, value)?;
         match self.sanitizer.record(name, value, line_len)? {
             HeaderAction::Forward => {
-                self.headers.push(Http1HeaderLine::new(name, value));
+                self.headers.push(Http1HeaderLine::new(name, value)?);
             }
             HeaderAction::Skip => {}
         }
@@ -108,8 +143,8 @@ impl Http1HeaderAccumulator {
             if seen {
                 bail!("multiple Expect headers are not supported");
             }
-            if !header.value.eq_ignore_ascii_case("100-continue") {
-                bail!("unsupported Expect header value '{}'", header.value);
+            if !header.value_text().eq_ignore_ascii_case("100-continue") {
+                bail!("unsupported Expect header value '{}'", header.value_text());
             }
             seen = true;
         }
@@ -135,11 +170,7 @@ where
 {
     let mut map = HeaderMap::new();
     for header in headers {
-        if let Ok(name) = http::header::HeaderName::from_bytes(header.name.as_bytes())
-            && let Ok(value) = http::header::HeaderValue::from_bytes(header.value.as_bytes())
-        {
-            map.append(name, value);
-        }
+        map.append(header.header_name().clone(), header.header_value().clone());
     }
     map
 }
@@ -160,7 +191,7 @@ mod tests {
         assert!(matches!(accumulator.push_line("\r\n"), Ok(false)));
         let names: Vec<_> = accumulator
             .forward_headers()
-            .map(|header| header.name.as_str())
+            .map(|header| header.name_text())
             .collect();
         assert!(
             names.contains(&"Bar"),
@@ -208,6 +239,18 @@ mod tests {
             .expect_err("invalid header name should error");
         assert!(
             err.to_string().contains("invalid header name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_header_value() {
+        let mut accumulator = Http1HeaderAccumulator::new(256);
+        let err = accumulator
+            .push_line("X-Test: ok\rX-Evil: 1\r\n")
+            .expect_err("invalid header value should error");
+        assert!(
+            err.to_string().contains("invalid header value"),
             "unexpected error: {err}"
         );
     }

@@ -31,9 +31,9 @@ pub(crate) fn build_upstream_request(
         if expect_continue && header.lower_name() == "expect" {
             continue;
         }
-        buffer.extend_from_slice(header.name.as_bytes());
+        buffer.extend_from_slice(header.name_text().as_bytes());
         buffer.extend_from_slice(b": ");
-        buffer.extend_from_slice(header.value.as_bytes());
+        buffer.extend_from_slice(header.value_bytes());
         buffer.extend_from_slice(b"\r\n");
     }
 

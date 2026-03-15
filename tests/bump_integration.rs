@@ -150,6 +150,85 @@ async fn http_upstream_failure_returns_502() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_invalid_header_value_returns_400() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-listed"])
+        .policy(
+            PolicySpec::new("allow-listed")
+                .rule(RuleSpec::allow(&["GET"], "http://allowed.test/**")),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = b"GET http://allowed.test/resource HTTP/1.1\r\nHost: allowed.test\r\nX-Test: ok\rX-Evil: 1\r\nConnection: close\r\n\r\n";
+    client.send(request).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("invalid request"),
+        "expected invalid request body, got: {response}"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_invalid_upstream_header_value_returns_502() -> Result<()> {
+    let upstream = TestUpstream::http_response(
+        b"HTTP/1.1 200 OK\r\nX-Test: ok\rX-Evil: 1\r\nConnection: close\r\n\r\n".to_vec(),
+    )
+    .await?;
+    let upstream_port = upstream.port();
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/oops HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(request.as_bytes()).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 502"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("upstream request failed"),
+        "expected upstream failure body, got: {response}"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    drop(upstream);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_splice_stays_open_past_timeout() -> Result<()> {
     let upstream = TestUpstream::echo().await?;
     let upstream_port = upstream.port();
