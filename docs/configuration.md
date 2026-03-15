@@ -1,6 +1,7 @@
 # Configuration Reference
 
-Global settings for ExfilGuard defined in `exfilguard.toml`.
+Global settings for ExfilGuard defined in `exfilguard.toml`. These settings are
+loaded at process startup.
 
 ---
 
@@ -29,6 +30,13 @@ Required settings to run ExfilGuard.
 
 !!! note
     `proxy_protocol_allowed_cidrs` must be set when PROXY protocol is enabled.
+
+!!! note
+    `exfilguard.toml` is startup-only. Sending `SIGHUP` reloads only the
+    client/policy data read from the already configured `clients`,
+    `clients_dir`, `policies`, and `policies_dir` paths. Changes to fields in
+    `exfilguard.toml` itself, including `listen`, metrics, cache, TLS,
+    logging, and timeout settings, require restart.
 
 ---
 

@@ -17,7 +17,8 @@ use crate::util::cidrs_overlap;
 
 /// Ensures that client selectors do not conflict (duplicate IPs or overlapping CIDRs except for the
 /// designated fallback). This validation is shared by both the configuration loader and
-/// the policy compiler so that hot reloads and programmatic configs get identical guarantees.
+/// the policy compiler so that runtime policy reloads and programmatic configs
+/// get identical guarantees.
 pub fn validate_clients(clients: &[Client]) -> Result<()> {
     struct CidrClaim<'a> {
         name: &'a str,

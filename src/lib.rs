@@ -50,9 +50,9 @@ pub async fn run(settings: Settings) -> Result<()> {
         settings.leaf_ttl(),
     )?);
     let TlsClientConfigs { http1, http2 } = build_tls_client_configs(&settings)?;
-    let snapshot = build_policy_snapshot(&settings)?;
+    let snapshot = build_runtime_policy_snapshot(&settings)?;
     let (policy_tx, policy_rx) = watch::channel(snapshot.clone());
-    spawn_reload_task(settings.clone(), policy_tx);
+    spawn_runtime_policy_reload_task(settings.clone(), policy_tx);
     let policy_store = proxy::PolicyStore::new(policy_rx);
     let tls_context = Arc::new(proxy::TlsContext::new(ca, tls_issuer, http1, http2));
 
@@ -85,7 +85,11 @@ pub async fn run(settings: Settings) -> Result<()> {
     }
 }
 
-fn build_policy_snapshot(settings: &Settings) -> Result<PolicySnapshot> {
+/// Reloadable runtime state derived from the configured client/policy files.
+///
+/// This intentionally excludes startup-owned settings such as listeners,
+/// metrics, cache, and TLS/material configuration.
+fn build_runtime_policy_snapshot(settings: &Settings) -> Result<PolicySnapshot> {
     let config = settings.load_runtime_config()?;
     let compiled = Arc::new(policy::compile::compile_config(&config)?);
     Ok(PolicySnapshot::new(compiled))
@@ -138,7 +142,10 @@ fn build_tls_client_configs(_settings: &Settings) -> Result<TlsClientConfigs> {
 }
 
 #[cfg(unix)]
-fn spawn_reload_task(settings: Arc<Settings>, policy_tx: watch::Sender<PolicySnapshot>) {
+fn spawn_runtime_policy_reload_task(
+    settings: Arc<Settings>,
+    policy_tx: watch::Sender<PolicySnapshot>,
+) {
     use tokio::signal::unix::{SignalKind, signal};
 
     tokio::spawn(async move {
@@ -151,19 +158,22 @@ fn spawn_reload_task(settings: Arc<Settings>, policy_tx: watch::Sender<PolicySna
         };
 
         while hup.recv().await.is_some() {
-            tracing::info!("received SIGHUP; reloading configuration");
-            match build_policy_snapshot(&settings) {
+            tracing::info!("received SIGHUP; reloading runtime policy");
+            match build_runtime_policy_snapshot(&settings) {
                 Ok(snapshot) => {
                     let client_count = snapshot.compiled.clients.len();
                     let policy_count = snapshot.compiled.policies.len();
                     if let Err(err) = policy_tx.send(snapshot) {
-                        tracing::error!(error = %err, "failed to publish reloaded configuration");
+                        tracing::error!(
+                            error = %err,
+                            "failed to publish reloaded runtime policy"
+                        );
                         break;
                     }
-                    tracing::info!(client_count, policy_count, "configuration reloaded");
+                    tracing::info!(client_count, policy_count, "runtime policy reloaded");
                 }
                 Err(err) => {
-                    tracing::error!(error = ?err, "configuration reload failed");
+                    tracing::error!(error = ?err, "runtime policy reload failed");
                 }
             }
         }
@@ -171,7 +181,10 @@ fn spawn_reload_task(settings: Arc<Settings>, policy_tx: watch::Sender<PolicySna
 }
 
 #[cfg(not(unix))]
-fn spawn_reload_task(_settings: Arc<Settings>, _policy_tx: watch::Sender<PolicySnapshot>) {
-    tracing::info!("SIGHUP reload is not supported on this platform");
+fn spawn_runtime_policy_reload_task(
+    _settings: Arc<Settings>,
+    _policy_tx: watch::Sender<PolicySnapshot>,
+) {
+    tracing::info!("SIGHUP runtime policy reload is not supported on this platform");
 }
 pub mod io_util;

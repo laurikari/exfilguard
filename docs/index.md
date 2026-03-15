@@ -36,8 +36,8 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 **Private Upstream Guardrails**
 :   Blocks upstream connections to private IPs to reduce SSRF risk.
 
-**Hot-Reload Configuration**
-:   Supports SIGHUP signal to reload configuration without restarting the process. Zero downtime policy updates.
+**Runtime Policy Reload**
+:   Supports SIGHUP signal to reload client/policy data from the configured files without restarting the process. Listener, metrics, cache, TLS, logging, and timeout settings still require restart.
 
 **Structured Logging**
 :   JSON or text format logging with decision tracking. Logs each request's allow/deny decision with structured metadata.
