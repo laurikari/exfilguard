@@ -236,9 +236,12 @@ pub(super) async fn forward_request_to_upstream(
     let mut upstream_body_bytes = 0u64;
     let mut response_body = response.into_body();
     if !end_stream {
-        while let Some(frame) = timeout(response_body_timeout, response_body.data())
-            .await
-            .map_err(|_| anyhow!("timed out reading HTTP/2 response body from upstream"))?
+        while let Some(frame) = with_total_deadline(request_deadline, async {
+            timeout(response_body_timeout, response_body.data())
+                .await
+                .map_err(|_| anyhow!("timed out reading HTTP/2 response body from upstream"))
+        })
+        .await?
         {
             let chunk = frame.context("failed to read HTTP/2 response data frame")?;
             if chunk.is_empty() {
@@ -257,10 +260,13 @@ pub(super) async fn forward_request_to_upstream(
                 .context("failed to release HTTP/2 response body flow-control capacity")?;
         }
 
-        match timeout_with_context(
-            response_body_timeout,
-            response_body.trailers(),
-            "reading HTTP/2 response trailers from upstream",
+        match with_total_deadline(
+            request_deadline,
+            timeout_with_context(
+                response_body_timeout,
+                response_body.trailers(),
+                "reading HTTP/2 response trailers from upstream",
+            ),
         )
         .await?
         {

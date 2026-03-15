@@ -50,6 +50,7 @@ pub enum UpstreamMode {
     Http1Redirect,
     Http2,
     Http2CloseBeforeResponse,
+    Http2HeadersThenStallBody,
     Http2NoResponse,
     Http2SingleUse,
     Http2Inspect,
@@ -266,6 +267,7 @@ impl BumpedTlsFixture {
             }
             UpstreamMode::Http2
             | UpstreamMode::Http2CloseBeforeResponse
+            | UpstreamMode::Http2HeadersThenStallBody
             | UpstreamMode::Http2NoResponse
             | UpstreamMode::Http2SingleUse
             | UpstreamMode::Http2Inspect => build_upstream_h2_tls_config(&ca, upstream_host)?,
@@ -305,6 +307,9 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http2CloseBeforeResponse => {
                                         serve_tls_h2_close_before_response(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2HeadersThenStallBody => {
+                                        serve_tls_h2_headers_then_stall_body(stream, acceptor, peer).await
                                     }
                                     UpstreamMode::Http2NoResponse => {
                                         serve_tls_h2_no_response(stream, acceptor, peer).await
@@ -505,6 +510,34 @@ async fn serve_tls_h2_close_before_response(
         return Ok(());
     };
     let (_request, _respond) = result.context("failed to accept HTTP/2 request")?;
+    Ok(())
+}
+
+async fn serve_tls_h2_headers_then_stall_body(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    let Some(result) = connection.accept().await else {
+        return Ok(());
+    };
+    let (_request, mut respond) = result.context("failed to accept HTTP/2 request")?;
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+    let _send = respond
+        .send_response(response, false)
+        .context("failed to send HTTP/2 response headers")?;
+    sleep(Duration::from_secs(5)).await;
     Ok(())
 }
 
