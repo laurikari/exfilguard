@@ -298,7 +298,7 @@ impl DownstreamRequestCtx {
         self.log_tracker.add_client_bytes(spec.extra_client_bytes);
         policy_response::forward_error_log_builder(
             log.access_log_builder(),
-            &decision,
+            decision,
             &spec,
             error_detail,
         )
