@@ -291,7 +291,7 @@ impl DownstreamRequestCtx {
         &mut self,
         spec: ForwardErrorSpec,
         log: RequestLogContext<'_>,
-        decision: AllowDecision,
+        decision: &AllowDecision,
         error_detail: &str,
     ) -> Result<()> {
         send_error_response(&mut self.respond, spec.status, spec.body_http2).await?;
@@ -315,19 +315,27 @@ struct Http2RequestHandler {
 }
 
 impl Http2RequestHandler {
-    fn should_disconnect_on_forward_error(err: &anyhow::Error) -> bool {
+    fn should_disconnect_on_forward_error(kind: &ForwardErrorKind<'_>) -> bool {
         !matches!(
-            classify_forward_error(err),
+            kind,
             ForwardErrorKind::BodyTooLarge(_)
                 | ForwardErrorKind::PrivateAddress(_)
                 | ForwardErrorKind::MisdirectedRequest(_)
         )
     }
 
-    async fn forward_request(
-        &mut self,
-        _decision: &AllowDecision,
-    ) -> Result<super::forward::ForwardOutcome> {
+    fn forward_error_kind_label(kind: &ForwardErrorKind<'_>) -> &'static str {
+        match kind {
+            ForwardErrorKind::RequestTimeout => "request_timeout",
+            ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
+            ForwardErrorKind::PrivateAddress(_) => "private_address",
+            ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
+            ForwardErrorKind::UpstreamClosed => "upstream_closed",
+            ForwardErrorKind::Other => "other",
+        }
+    }
+
+    async fn forward_request(&mut self) -> Result<super::forward::ForwardOutcome> {
         let forward_meta = self.ctx.meta.clone();
         let checkout = {
             let mut upstream = self.upstream.lock().await;
@@ -361,59 +369,38 @@ impl Http2RequestHandler {
         )
     }
 
-    async fn handle_forward_success(
-        &mut self,
-        _success: super::forward::ForwardOutcome,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn respond_forward_error(
-        &mut self,
-        spec: ForwardErrorSpec,
-        log: RequestLogContext<'_>,
-        decision: AllowDecision,
-        error_detail: &str,
-    ) -> Result<()> {
-        self.ctx
-            .respond_forward_error(spec, log, decision, error_detail)
-            .await
-    }
-
-    async fn disconnect_downstream_for_transport_error(
+    async fn handle_forward_error(
         &mut self,
         decision: &AllowDecision,
         log: RequestLogContext<'_>,
         err: anyhow::Error,
     ) -> Result<()> {
         let kind = classify_forward_error(&err);
-        let kind_label = match kind {
-            ForwardErrorKind::RequestTimeout => "request_timeout",
-            ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
-            ForwardErrorKind::PrivateAddress(_) => "private_address",
-            ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
-            ForwardErrorKind::UpstreamClosed => "upstream_closed",
-            ForwardErrorKind::Other => "other",
-        };
-        crate::metrics::record_upstream_error(kind_label);
+        let should_disconnect = Self::should_disconnect_on_forward_error(&kind);
+        let spec = policy_response::forward_error_spec(&kind);
+        let error_detail = err.to_string();
+
+        crate::metrics::record_upstream_error(Self::forward_error_kind_label(&kind));
         log_forward_error(&kind, self.ctx.peer, &self.ctx.meta.parsed.host, &err);
 
-        {
+        if should_disconnect {
             let mut upstream = self.upstream.lock().await;
             upstream.terminate_session().await;
+            policy_response::forward_error_log_builder(
+                log.access_log_builder(),
+                decision,
+                &spec,
+                &error_detail,
+            )
+            .bytes(self.ctx.log_tracker.current_bytes(), 0)
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+            Ok(())
+        } else {
+            self.ctx
+                .respond_forward_error(spec, log, decision, &error_detail)
+                .await
         }
-
-        let spec = policy_response::forward_error_spec(&kind);
-        policy_response::forward_error_log_builder(
-            log.access_log_builder(),
-            decision,
-            &spec,
-            &err.to_string(),
-        )
-        .bytes(self.ctx.log_tracker.current_bytes(), 0)
-        .elapsed(self.ctx.log_tracker.elapsed())
-        .log();
-        Ok(())
     }
 }
 
@@ -423,43 +410,13 @@ impl RequestHandler for Http2RequestHandler {
 
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
         let policy_eval::AllowOutcome { decision, log } = outcome;
-        let forward_result = self.forward_request(&decision).await;
-        match forward_result {
+        match self.forward_request().await {
             Ok(success) => {
                 let stats = self.build_allow_log_stats(&success);
                 log_allow_success(log, &decision, stats, None, None);
-                self.handle_forward_success(success).await
+                Ok(())
             }
-            Err(err) if Self::should_disconnect_on_forward_error(&err) => {
-                self.disconnect_downstream_for_transport_error(&decision, log, err)
-                    .await
-            }
-            Err(err) => {
-                let handled = policy_response::handle_forward_result(
-                    &decision,
-                    log.clone(),
-                    Err(err),
-                    self.ctx.peer,
-                    &self.ctx.meta.parsed.host,
-                )
-                .await?;
-                match handled {
-                    policy_response::ForwardOutcome::Completed(success) => {
-                        let stats = self.build_allow_log_stats(&success);
-                        log_allow_success(log, &decision, stats, None, None);
-                        self.handle_forward_success(success).await
-                    }
-                    policy_response::ForwardOutcome::Responded(ctx) => {
-                        self.respond_forward_error(
-                            ctx.spec,
-                            ctx.log,
-                            ctx.decision,
-                            &ctx.error_detail,
-                        )
-                        .await
-                    }
-                }
-            }
+            Err(err) => self.handle_forward_error(&decision, log, err).await,
         }
     }
 
