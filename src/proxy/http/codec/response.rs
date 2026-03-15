@@ -10,7 +10,7 @@ use tracing::warn;
 use crate::proxy::forward_limits::HeaderBudget;
 use crate::proxy::http::forward::ResponseBodyPlan;
 
-use super::headers::{Http1HeaderLine, header_lines_to_map};
+use super::headers::{Http1HeaderLine, header_lines_to_map, parse_header_name, parse_header_value};
 use super::line::read_line_with_timeout;
 
 #[derive(Clone, Copy)]
@@ -49,7 +49,7 @@ impl Http1ResponseHead {
         let mut connection_tokens = HashSet::new();
         for header in &self.headers {
             if header.lower_name() == "connection" {
-                for token in header.value.split(',') {
+                for token in header.value_text().split(',') {
                     let token = token.trim();
                     if token.is_empty() {
                         continue;
@@ -65,11 +65,11 @@ impl Http1ResponseHead {
         for header in &self.headers {
             let name_lower = header.lower_name();
             if name_lower == "transfer-encoding" {
-                transfer_encodings.push(header.value.clone());
+                transfer_encodings.push(header.value_text().to_string());
                 continue;
             }
             if name_lower == "trailer" {
-                trailers.push(header.value.clone());
+                trailers.push(header.value_text().to_string());
                 continue;
             }
             if name_lower == "content-length" {
@@ -86,9 +86,9 @@ impl Http1ResponseHead {
                 continue;
             }
 
-            buffer.extend_from_slice(header.name.as_bytes());
+            buffer.extend_from_slice(header.name_text().as_bytes());
             buffer.extend_from_slice(b": ");
-            buffer.extend_from_slice(header.value.as_bytes());
+            buffer.extend_from_slice(header.value_bytes());
             buffer.extend_from_slice(b"\r\n");
         }
 
@@ -327,6 +327,8 @@ where
             .ok_or_else(|| anyhow!("header missing ':' separator from upstream"))?;
         let name = name.trim();
         let value = value.trim();
+        parse_header_name(name)?;
+        parse_header_value(name, value)?;
         if name.eq_ignore_ascii_case("content-length") {
             if content_length_seen {
                 bail!("multiple Content-Length headers from upstream are not supported");
@@ -359,7 +361,7 @@ where
                 connection_close = false;
             }
         }
-        headers.push(Http1HeaderLine::new(name, value));
+        headers.push(Http1HeaderLine::new(name, value)?);
     }
 
     if transfer_encoding_present && content_length_seen {
@@ -428,13 +430,13 @@ mod tests {
             status_line: "HTTP/1.1 200 OK".to_string(),
             status: http::StatusCode::OK,
             headers: vec![
-                Http1HeaderLine::new("Connection", "Foo, Upgrade"),
-                Http1HeaderLine::new("Foo", "bar"),
-                Http1HeaderLine::new("Upgrade", "websocket"),
-                Http1HeaderLine::new("Transfer-Encoding", "chunked"),
-                Http1HeaderLine::new("Trailer", "X-Trailer"),
-                Http1HeaderLine::new("Content-Length", "123"),
-                Http1HeaderLine::new("X-Test", "1"),
+                Http1HeaderLine::new("Connection", "Foo, Upgrade").expect("valid header"),
+                Http1HeaderLine::new("Foo", "bar").expect("valid header"),
+                Http1HeaderLine::new("Upgrade", "websocket").expect("valid header"),
+                Http1HeaderLine::new("Transfer-Encoding", "chunked").expect("valid header"),
+                Http1HeaderLine::new("Trailer", "X-Trailer").expect("valid header"),
+                Http1HeaderLine::new("Content-Length", "123").expect("valid header"),
+                Http1HeaderLine::new("X-Test", "1").expect("valid header"),
             ],
             content_length: Some(123),
             chunked: true,
@@ -459,7 +461,9 @@ mod tests {
         let head = Http1ResponseHead {
             status_line: "HTTP/1.1 200 OK".to_string(),
             status: http::StatusCode::OK,
-            headers: vec![Http1HeaderLine::new("Transfer-Encoding", "chunked")],
+            headers: vec![
+                Http1HeaderLine::new("Transfer-Encoding", "chunked").expect("valid header"),
+            ],
             content_length: Some(5),
             chunked: false,
             transfer_encoding_present: true,
@@ -637,6 +641,26 @@ mod tests {
             );
         } else {
             panic!("Transfer-Encoding with Content-Length should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_head_rejects_invalid_header_value() {
+        let response = b"HTTP/1.1 200 OK\r\nX-Test: ok\rX-Evil: 1\r\n\r\n";
+        let mut reader = tokio::io::BufReader::new(&response[..]);
+        let result = read_http1_response_head(
+            &mut reader,
+            Duration::from_secs(1),
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("invalid header value should be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("invalid header value"),
+                "unexpected error: {err}"
+            ),
         }
     }
 }
