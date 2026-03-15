@@ -11,6 +11,7 @@ use prometheus::{
 };
 use rustls::{
     ServerConfig,
+    crypto::ring,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 use tokio::{
@@ -570,7 +571,10 @@ fn build_tls_acceptor(
 ) -> Result<tokio_rustls::TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let mut config = ServerConfig::builder()
+    let provider = ring::default_provider();
+    let builder = ServerConfig::builder_with_provider(provider.into());
+    let builder = builder.with_safe_default_protocol_versions()?;
+    let mut config = builder
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| anyhow!("failed to build server config: {e}"))?;
@@ -733,11 +737,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn tls_handshake_times_out_when_client_is_idle() -> anyhow::Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let cert_der = cert.cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
-        let config = ServerConfig::builder()
+        let provider = ring::default_provider();
+        let builder = ServerConfig::builder_with_provider(provider.into());
+        let builder = builder.with_safe_default_protocol_versions()?;
+        let config = builder
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
