@@ -335,6 +335,16 @@ impl Http2RequestHandler {
         }
     }
 
+    fn forward_error_decision(kind: &ForwardErrorKind<'_>) -> &'static str {
+        match kind {
+            ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
+            ForwardErrorKind::RequestTimeout
+            | ForwardErrorKind::MisdirectedRequest(_)
+            | ForwardErrorKind::UpstreamClosed
+            | ForwardErrorKind::Other => "ERROR",
+        }
+    }
+
     async fn forward_request(&mut self) -> Result<super::forward::ForwardOutcome> {
         let forward_meta = self.ctx.meta.clone();
         let checkout = {
@@ -377,30 +387,44 @@ impl Http2RequestHandler {
     ) -> Result<()> {
         let kind = classify_forward_error(&err);
         let should_disconnect = Self::should_disconnect_on_forward_error(&kind);
-        let spec = policy_response::forward_error_spec(&kind);
         let error_detail = err.to_string();
 
         crate::metrics::record_upstream_error(Self::forward_error_kind_label(&kind));
         log_forward_error(&kind, self.ctx.peer, &self.ctx.meta.parsed.host, &err);
 
         if should_disconnect {
-            let mut upstream = self.upstream.lock().await;
-            upstream.terminate_session().await;
-            policy_response::forward_error_log_builder(
-                log.access_log_builder(),
-                decision,
-                &spec,
-                &error_detail,
-            )
-            .bytes(self.ctx.log_tracker.current_bytes(), 0)
-            .elapsed(self.ctx.log_tracker.elapsed())
-            .log();
+            {
+                let mut upstream = self.upstream.lock().await;
+                upstream.terminate_session().await;
+            }
+            self.log_disconnect_forward_error(decision, log, &kind, &error_detail);
             Ok(())
         } else {
+            let spec = policy_response::forward_error_spec(&kind);
             self.ctx
                 .respond_forward_error(spec, log, decision, &error_detail)
                 .await
         }
+    }
+
+    fn log_disconnect_forward_error(
+        &mut self,
+        decision: &AllowDecision,
+        log: RequestLogContext<'_>,
+        kind: &ForwardErrorKind<'_>,
+        error_detail: &str,
+    ) {
+        log.access_log_builder()
+            .client(decision.client.as_ref())
+            .decision(Self::forward_error_decision(kind))
+            .policy(decision.policy.as_ref())
+            .rule(decision.rule.as_ref())
+            .error_reason(Self::forward_error_kind_label(kind))
+            .error_detail(error_detail)
+            .inspect_payload(decision.inspect_payload)
+            .bytes(self.ctx.log_tracker.current_bytes(), 0)
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
     }
 }
 
