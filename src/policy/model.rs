@@ -301,52 +301,42 @@ impl HostPattern {
     }
 
     fn matches_labels(&self, labels: &[&str]) -> bool {
-        let mut memo = vec![vec![None; labels.len() + 1]; self.labels.len() + 1];
-        self.matches_from(0, 0, labels, &mut memo)
-    }
+        let mut pattern_idx = 0usize;
+        let mut label_idx = 0usize;
+        let mut last_multi_pattern = None;
+        let mut next_multi_label = 0usize;
 
-    fn matches_from(
-        &self,
-        pattern_idx: usize,
-        label_idx: usize,
-        labels: &[&str],
-        memo: &mut Vec<Vec<Option<bool>>>,
-    ) -> bool {
-        if let Some(value) = memo[pattern_idx][label_idx] {
-            return value;
-        }
-
-        let result = if pattern_idx == self.labels.len() {
-            label_idx == labels.len()
-        } else {
-            match &self.labels[pattern_idx] {
-                HostLabel::Exact(expected) => {
-                    label_idx < labels.len()
-                        && labels[label_idx] == expected.as_ref()
-                        && self.matches_from(pattern_idx + 1, label_idx + 1, labels, memo)
+        while label_idx < labels.len() {
+            match self.labels.get(pattern_idx) {
+                Some(HostLabel::Exact(expected)) if labels[label_idx] == expected.as_ref() => {
+                    pattern_idx += 1;
+                    label_idx += 1;
                 }
-                HostLabel::Single => {
-                    label_idx < labels.len()
-                        && self.matches_from(pattern_idx + 1, label_idx + 1, labels, memo)
+                Some(HostLabel::Single) => {
+                    pattern_idx += 1;
+                    label_idx += 1;
                 }
-                HostLabel::Multi => {
-                    if label_idx >= labels.len() {
+                Some(HostLabel::Multi) => {
+                    last_multi_pattern = Some(pattern_idx);
+                    next_multi_label = label_idx + 1;
+                    pattern_idx += 1;
+                    label_idx += 1;
+                }
+                _ => {
+                    let Some(multi_pattern_idx) = last_multi_pattern else {
+                        return false;
+                    };
+                    if next_multi_label > labels.len() {
                         return false;
                     }
-                    let mut next = label_idx + 1;
-                    while next <= labels.len() {
-                        if self.matches_from(pattern_idx + 1, next, labels, memo) {
-                            return true;
-                        }
-                        next += 1;
-                    }
-                    false
+                    pattern_idx = multi_pattern_idx + 1;
+                    label_idx = next_multi_label;
+                    next_multi_label += 1;
                 }
             }
-        };
+        }
 
-        memo[pattern_idx][label_idx] = Some(result);
-        result
+        pattern_idx == self.labels.len()
     }
 }
 
@@ -415,5 +405,35 @@ mod tests {
         assert!(pattern.matches("api.foo.bar.example.com"));
         assert!(!pattern.matches("foo.api.example.com"));
         assert!(!pattern.matches("api.example.com"));
+    }
+
+    #[test]
+    fn host_pattern_multi_labels_backtrack_without_zero_length_matches() {
+        let pattern = HostPattern::new(vec![
+            HostLabel::Multi,
+            HostLabel::Exact(Arc::from("mid")),
+            HostLabel::Multi,
+            HostLabel::Exact(Arc::from("example")),
+            HostLabel::Exact(Arc::from("com")),
+        ]);
+
+        assert!(pattern.matches("foo.mid.bar.example.com"));
+        assert!(pattern.matches("foo.bar.mid.baz.example.com"));
+        assert!(!pattern.matches("mid.bar.example.com"));
+        assert!(!pattern.matches("foo.mid.example.com"));
+    }
+
+    #[test]
+    fn host_pattern_consecutive_multi_labels_require_one_each() {
+        let pattern = HostPattern::new(vec![
+            HostLabel::Multi,
+            HostLabel::Multi,
+            HostLabel::Exact(Arc::from("example")),
+            HostLabel::Exact(Arc::from("com")),
+        ]);
+
+        assert!(pattern.matches("foo.bar.example.com"));
+        assert!(pattern.matches("foo.bar.baz.example.com"));
+        assert!(!pattern.matches("foo.example.com"));
     }
 }
