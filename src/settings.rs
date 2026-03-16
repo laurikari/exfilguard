@@ -11,76 +11,100 @@ use serde::de::{self, Deserializer, Visitor};
 use crate::cli::{Cli, LogFormat};
 use crate::config as runtime_config;
 
-fn default_leaf_ttl() -> u64 {
-    86_400
-}
+struct SettingsDefaults;
 
-fn default_log_queries() -> bool {
-    false
-}
+impl SettingsDefaults {
+    const fn leaf_ttl() -> u64 {
+        86_400
+    }
 
-fn default_dns_resolve_timeout() -> u64 {
-    2
-}
+    const fn log_queries() -> bool {
+        false
+    }
 
-fn default_upstream_connect_timeout() -> u64 {
-    5
-}
+    const fn dns_resolve_timeout() -> u64 {
+        2
+    }
 
-fn default_tls_handshake_timeout() -> u64 {
-    10
-}
+    const fn upstream_connect_timeout() -> u64 {
+        5
+    }
 
-fn default_request_header_timeout() -> u64 {
-    10
-}
+    const fn tls_handshake_timeout() -> u64 {
+        10
+    }
 
-fn default_request_body_idle_timeout() -> u64 {
-    30
-}
+    const fn request_header_timeout() -> u64 {
+        10
+    }
 
-fn default_response_header_timeout() -> u64 {
-    30
-}
+    const fn request_body_idle_timeout() -> u64 {
+        30
+    }
 
-fn default_response_body_idle_timeout() -> u64 {
-    60
-}
+    const fn response_header_timeout() -> u64 {
+        30
+    }
 
-fn default_request_total_timeout() -> u64 {
-    0
-}
+    const fn response_body_idle_timeout() -> u64 {
+        60
+    }
 
-fn default_client_keepalive_idle_timeout() -> u64 {
-    30
-}
+    const fn request_total_timeout() -> u64 {
+        0
+    }
 
-fn default_connect_tunnel_idle_timeout() -> u64 {
-    60
-}
+    const fn client_keepalive_idle_timeout() -> u64 {
+        30
+    }
 
-fn default_connect_tunnel_max_lifetime() -> u64 {
-    0
-}
+    const fn connect_tunnel_idle_timeout() -> u64 {
+        60
+    }
 
-fn default_upstream_pool_capacity() -> usize {
-    32
-}
+    const fn connect_tunnel_max_lifetime() -> u64 {
+        0
+    }
 
-fn default_max_request_header_size() -> usize {
-    32 * 1024
-}
+    const fn upstream_pool_capacity() -> usize {
+        32
+    }
 
-fn default_max_response_header_size() -> usize {
-    32 * 1024
-}
+    const fn max_request_header_size() -> usize {
+        32 * 1024
+    }
 
-fn default_max_request_body_size() -> usize {
-    64 * 1024 * 1024
-}
+    const fn max_response_header_size() -> usize {
+        32 * 1024
+    }
 
-fn default_log_format() -> LogFormat {
-    LogFormat::Json
+    const fn max_request_body_size() -> usize {
+        64 * 1024 * 1024
+    }
+
+    const fn log_format() -> LogFormat {
+        LogFormat::Json
+    }
+
+    const fn cache_max_entry_size() -> u64 {
+        10 * 1024 * 1024
+    }
+
+    const fn cache_max_entries() -> usize {
+        10_000
+    }
+
+    const fn cache_total_capacity() -> u64 {
+        1024 * 1024 * 1024
+    }
+
+    const fn cache_sweeper_interval() -> u64 {
+        300
+    }
+
+    const fn cache_sweeper_batch_size() -> usize {
+        1000
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -157,53 +181,53 @@ pub struct Settings {
     pub policies_dir: Option<PathBuf>,
     #[serde(default)]
     pub cert_cache_dir: Option<PathBuf>,
-    #[serde(default = "default_log_format")]
+    #[serde(default = "SettingsDefaults::log_format")]
     pub log: LogFormat,
-    #[serde(default = "default_leaf_ttl")]
+    #[serde(default = "SettingsDefaults::leaf_ttl")]
     pub leaf_ttl: u64,
-    #[serde(default = "default_log_queries")]
+    #[serde(default = "SettingsDefaults::log_queries")]
     pub log_queries: bool,
-    #[serde(default = "default_dns_resolve_timeout")]
+    #[serde(default = "SettingsDefaults::dns_resolve_timeout")]
     pub dns_resolve_timeout: u64,
-    #[serde(default = "default_upstream_connect_timeout")]
+    #[serde(default = "SettingsDefaults::upstream_connect_timeout")]
     pub upstream_connect_timeout: u64,
-    #[serde(default = "default_tls_handshake_timeout")]
+    #[serde(default = "SettingsDefaults::tls_handshake_timeout")]
     pub tls_handshake_timeout: u64,
-    #[serde(default = "default_request_header_timeout")]
+    #[serde(default = "SettingsDefaults::request_header_timeout")]
     pub request_header_timeout: u64,
-    #[serde(default = "default_request_body_idle_timeout")]
+    #[serde(default = "SettingsDefaults::request_body_idle_timeout")]
     pub request_body_idle_timeout: u64,
-    #[serde(default = "default_response_header_timeout")]
+    #[serde(default = "SettingsDefaults::response_header_timeout")]
     pub response_header_timeout: u64,
-    #[serde(default = "default_response_body_idle_timeout")]
+    #[serde(default = "SettingsDefaults::response_body_idle_timeout")]
     pub response_body_idle_timeout: u64,
-    #[serde(default = "default_request_total_timeout")]
+    #[serde(default = "SettingsDefaults::request_total_timeout")]
     pub request_total_timeout: u64,
-    #[serde(default = "default_client_keepalive_idle_timeout")]
+    #[serde(default = "SettingsDefaults::client_keepalive_idle_timeout")]
     pub client_keepalive_idle_timeout: u64,
-    #[serde(default = "default_connect_tunnel_idle_timeout")]
+    #[serde(default = "SettingsDefaults::connect_tunnel_idle_timeout")]
     pub connect_tunnel_idle_timeout: u64,
-    #[serde(default = "default_connect_tunnel_max_lifetime")]
+    #[serde(default = "SettingsDefaults::connect_tunnel_max_lifetime")]
     pub connect_tunnel_max_lifetime: u64,
-    #[serde(default = "default_upstream_pool_capacity")]
+    #[serde(default = "SettingsDefaults::upstream_pool_capacity")]
     pub upstream_pool_capacity: usize,
-    #[serde(default = "default_max_request_header_size")]
+    #[serde(default = "SettingsDefaults::max_request_header_size")]
     pub max_request_header_size: usize,
-    #[serde(default = "default_max_response_header_size")]
+    #[serde(default = "SettingsDefaults::max_response_header_size")]
     pub max_response_header_size: usize,
-    #[serde(default = "default_max_request_body_size")]
+    #[serde(default = "SettingsDefaults::max_request_body_size")]
     pub max_request_body_size: usize,
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
-    #[serde(default = "default_cache_max_entry_size")]
+    #[serde(default = "SettingsDefaults::cache_max_entry_size")]
     pub cache_max_entry_size: u64,
-    #[serde(default = "default_cache_max_entries")]
+    #[serde(default = "SettingsDefaults::cache_max_entries")]
     pub cache_max_entries: usize,
-    #[serde(default = "default_cache_total_capacity")]
+    #[serde(default = "SettingsDefaults::cache_total_capacity")]
     pub cache_total_capacity: u64,
-    #[serde(default = "default_cache_sweeper_interval")]
+    #[serde(default = "SettingsDefaults::cache_sweeper_interval")]
     pub cache_sweeper_interval: u64,
-    #[serde(default = "default_cache_sweeper_batch_size")]
+    #[serde(default = "SettingsDefaults::cache_sweeper_batch_size")]
     pub cache_sweeper_batch_size: usize,
     #[serde(default)]
     pub metrics_listen: Option<SocketAddr>,
@@ -524,26 +548,6 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
-}
-
-fn default_cache_max_entry_size() -> u64 {
-    10 * 1024 * 1024 // 10 MiB
-}
-
-fn default_cache_max_entries() -> usize {
-    10_000
-}
-
-fn default_cache_total_capacity() -> u64 {
-    1024 * 1024 * 1024 // 1 GiB
-}
-
-fn default_cache_sweeper_interval() -> u64 {
-    300
-}
-
-fn default_cache_sweeper_batch_size() -> usize {
-    1000
 }
 
 #[cfg(test)]
