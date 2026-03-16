@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use http::StatusCode;
 use time::OffsetDateTime;
-use tracing::{Level, debug, error, info, trace, warn};
+use tracing::Level;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::cli::LogFormat;
@@ -15,14 +15,16 @@ const DEFAULT_FILTER: &str = "info";
 macro_rules! log_with_level {
     ($level:expr, $($tt:tt)*) => {
         match $level {
-            Level::ERROR => error!($($tt)*),
-            Level::WARN => warn!($($tt)*),
-            Level::INFO => info!($($tt)*),
-            Level::DEBUG => debug!($($tt)*),
-            Level::TRACE => trace!($($tt)*),
+            ::tracing::Level::ERROR => ::tracing::error!($($tt)*),
+            ::tracing::Level::WARN => ::tracing::warn!($($tt)*),
+            ::tracing::Level::INFO => ::tracing::info!($($tt)*),
+            ::tracing::Level::DEBUG => ::tracing::debug!($($tt)*),
+            ::tracing::Level::TRACE => ::tracing::trace!($($tt)*),
         }
     };
 }
+
+pub(crate) use log_with_level;
 
 pub fn init_logger(format: LogFormat) -> Result<()> {
     let filter =

@@ -1,22 +1,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use http::StatusCode;
-use tracing::{Level, debug, error, info, trace, warn};
-
-macro_rules! log_with_level {
-    ($level:expr, $($tt:tt)*) => {
-        match $level {
-            Level::ERROR => error!($($tt)*),
-            Level::WARN => warn!($($tt)*),
-            Level::INFO => info!($($tt)*),
-            Level::DEBUG => debug!($($tt)*),
-            Level::TRACE => trace!($($tt)*),
-        }
-    };
-}
+use tracing::Level;
 
 use crate::{
-    logging::AccessLogBuilder,
+    logging::{AccessLogBuilder, log_with_level},
     policy::{
         Decision,
         matcher::{EvaluationResult, PolicySnapshot, Request},
