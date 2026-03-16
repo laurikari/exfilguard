@@ -47,6 +47,19 @@ pub enum ForwardErrorKind<'a> {
     Other,
 }
 
+impl ForwardErrorKind<'_> {
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            Self::RequestTimeout => "request_timeout",
+            Self::BodyTooLarge(_) => "body_too_large",
+            Self::PrivateAddress(_) => "private_address",
+            Self::MisdirectedRequest(_) => "misdirected_request",
+            Self::UpstreamClosed => "upstream_closed",
+            Self::Other => "other",
+        }
+    }
+}
+
 pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
     if err.downcast_ref::<RequestTimeout>().is_some() {
         ForwardErrorKind::RequestTimeout
@@ -104,3 +117,43 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &s
 #[derive(Debug, Error)]
 #[error("upstream closed connection before sending response headers")]
 pub struct UpstreamClosed;
+
+#[cfg(test)]
+mod tests {
+    use super::{ForwardErrorKind, MisdirectedRequest};
+    use crate::{proxy::http::BodyTooLarge, proxy::resolver::PrivateAddressError};
+
+    #[test]
+    fn metric_labels_cover_all_forward_error_kinds() {
+        let body = BodyTooLarge { bytes_read: 42 };
+        let private = PrivateAddressError::new("example.com", 443, "connect target");
+        let misdirected = MisdirectedRequest::new(
+            "upstream.test".to_string(),
+            443,
+            "requested.test".to_string(),
+            8443,
+        );
+
+        assert_eq!(
+            ForwardErrorKind::RequestTimeout.as_metric_label(),
+            "request_timeout"
+        );
+        assert_eq!(
+            ForwardErrorKind::BodyTooLarge(&body).as_metric_label(),
+            "body_too_large"
+        );
+        assert_eq!(
+            ForwardErrorKind::PrivateAddress(&private).as_metric_label(),
+            "private_address"
+        );
+        assert_eq!(
+            ForwardErrorKind::MisdirectedRequest(&misdirected).as_metric_label(),
+            "misdirected_request"
+        );
+        assert_eq!(
+            ForwardErrorKind::UpstreamClosed.as_metric_label(),
+            "upstream_closed"
+        );
+        assert_eq!(ForwardErrorKind::Other.as_metric_label(), "other");
+    }
+}

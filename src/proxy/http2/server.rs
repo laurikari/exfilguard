@@ -365,17 +365,6 @@ impl Http2RequestHandler {
         )
     }
 
-    fn forward_error_kind_label(kind: &ForwardErrorKind<'_>) -> &'static str {
-        match kind {
-            ForwardErrorKind::RequestTimeout => "request_timeout",
-            ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
-            ForwardErrorKind::PrivateAddress(_) => "private_address",
-            ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
-            ForwardErrorKind::UpstreamClosed => "upstream_closed",
-            ForwardErrorKind::Other => "other",
-        }
-    }
-
     fn forward_error_decision(kind: &ForwardErrorKind<'_>) -> &'static str {
         match kind {
             ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
@@ -430,7 +419,7 @@ impl Http2RequestHandler {
         let should_disconnect = Self::should_disconnect_on_forward_error(&kind);
         let error_detail = err.to_string();
 
-        crate::metrics::record_upstream_error(Self::forward_error_kind_label(&kind));
+        crate::metrics::record_upstream_error(kind.as_metric_label());
         log_forward_error(&kind, self.ctx.peer, &self.ctx.meta.parsed.host, &err);
 
         if should_disconnect {
@@ -460,7 +449,7 @@ impl Http2RequestHandler {
             .decision(Self::forward_error_decision(kind))
             .policy(decision.policy.as_ref())
             .rule(decision.rule.as_ref())
-            .error_reason(Self::forward_error_kind_label(kind))
+            .error_reason(kind.as_metric_label())
             .error_detail(error_detail)
             .bytes(self.ctx.log_tracker.current_bytes(), 0)
             .elapsed(self.ctx.log_tracker.elapsed())

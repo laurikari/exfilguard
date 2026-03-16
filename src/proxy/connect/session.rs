@@ -104,8 +104,14 @@ impl ConnectSession {
             Ok(resolved) => resolved,
             Err(err) => {
                 let mut stream = stream;
-                self.respond_tunnel_resolution_error(&mut stream, &allow, err)
-                    .await?;
+                self.respond_resolution_error(&mut stream, err, |builder| {
+                    builder
+                        .client(allow.client.as_ref())
+                        .policy(allow.policy.as_ref())
+                        .rule(allow.rule.as_ref())
+                        .effective_mode("tunnel")
+                })
+                .await?;
                 return Ok(());
             }
         };
@@ -132,8 +138,13 @@ impl ConnectSession {
             Ok(resolved) => resolved,
             Err(err) => {
                 let mut stream = stream;
-                self.respond_preflight_resolution_error(&mut stream, client.as_ref(), err)
-                    .await?;
+                self.respond_resolution_error(&mut stream, err, |builder| {
+                    builder
+                        .client(client.as_ref())
+                        .effective_mode("bump")
+                        .transport("tls_bump_preflight")
+                })
+                .await?;
                 return Ok(());
             }
         };
@@ -332,24 +343,7 @@ impl ConnectSession {
             Ok(()) => Ok(()),
             Err(err) => {
                 let kind = classify_forward_error(&err);
-                crate::metrics::record_upstream_error(match kind {
-                    crate::proxy::forward_error::ForwardErrorKind::RequestTimeout => {
-                        "request_timeout"
-                    }
-                    crate::proxy::forward_error::ForwardErrorKind::BodyTooLarge(_) => {
-                        "body_too_large"
-                    }
-                    crate::proxy::forward_error::ForwardErrorKind::PrivateAddress(_) => {
-                        "private_address"
-                    }
-                    crate::proxy::forward_error::ForwardErrorKind::MisdirectedRequest(_) => {
-                        "misdirected_request"
-                    }
-                    crate::proxy::forward_error::ForwardErrorKind::UpstreamClosed => {
-                        "upstream_closed"
-                    }
-                    crate::proxy::forward_error::ForwardErrorKind::Other => "other",
-                });
+                crate::metrics::record_upstream_error(kind.as_metric_label());
                 log_forward_error(&kind, self.peer, &self.parsed.host, &err);
                 self.log_bump_preflight_error(
                     policy_response::forward_error_spec(&kind),
@@ -413,12 +407,15 @@ impl ConnectSession {
         Ok(())
     }
 
-    async fn respond_tunnel_resolution_error(
+    async fn respond_resolution_error<F>(
         &self,
         stream: &mut TcpStream,
-        allow: &AllowDecision,
         err: anyhow::Error,
-    ) -> Result<()> {
+        build: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(AccessLogBuilder) -> AccessLogBuilder,
+    {
         if err
             .downcast_ref::<crate::proxy::resolver::PrivateAddressError>()
             .is_some()
@@ -435,13 +432,7 @@ impl ConnectSession {
                 None,
                 b"CONNECT to private networks is not allowed\r\n",
                 "DENY",
-                |builder| {
-                    builder
-                        .client(allow.client.as_ref())
-                        .policy(allow.policy.as_ref())
-                        .rule(allow.rule.as_ref())
-                        .effective_mode("tunnel")
-                },
+                build,
             )
             .await
         } else {
@@ -458,68 +449,7 @@ impl ConnectSession {
                 None,
                 b"failed to resolve CONNECT target\r\n",
                 "ERROR",
-                |builder| {
-                    builder
-                        .client(allow.client.as_ref())
-                        .policy(allow.policy.as_ref())
-                        .rule(allow.rule.as_ref())
-                        .effective_mode("tunnel")
-                },
-            )
-            .await
-        }
-    }
-
-    async fn respond_preflight_resolution_error(
-        &self,
-        stream: &mut TcpStream,
-        client: &str,
-        err: anyhow::Error,
-    ) -> Result<()> {
-        if err
-            .downcast_ref::<crate::proxy::resolver::PrivateAddressError>()
-            .is_some()
-        {
-            warn!(
-                peer = %self.peer,
-                host = %self.parsed.host,
-                port = self.parsed.port,
-                "CONNECT target resolved to private network; blocking"
-            );
-            self.respond_with_builder(
-                stream,
-                StatusCode::FORBIDDEN,
-                None,
-                b"CONNECT to private networks is not allowed\r\n",
-                "DENY",
-                |builder| {
-                    builder
-                        .client(client)
-                        .effective_mode("bump")
-                        .transport("tls_bump_preflight")
-                },
-            )
-            .await
-        } else {
-            warn!(
-                peer = %self.peer,
-                host = %self.parsed.host,
-                port = self.parsed.port,
-                error = %err,
-                "failed to resolve CONNECT target"
-            );
-            self.respond_with_builder(
-                stream,
-                StatusCode::BAD_GATEWAY,
-                None,
-                b"failed to resolve CONNECT target\r\n",
-                "ERROR",
-                |builder| {
-                    builder
-                        .client(client)
-                        .effective_mode("bump")
-                        .transport("tls_bump_preflight")
-                },
+                build,
             )
             .await
         }

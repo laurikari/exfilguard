@@ -113,15 +113,7 @@ pub async fn handle_forward_result<'a, T>(
         Ok(value) => Ok(ForwardOutcome::Completed(value)),
         Err(err) => {
             let kind = classify_forward_error(&err);
-            let kind_label = match kind {
-                ForwardErrorKind::RequestTimeout => "request_timeout",
-                ForwardErrorKind::BodyTooLarge(_) => "body_too_large",
-                ForwardErrorKind::PrivateAddress(_) => "private_address",
-                ForwardErrorKind::MisdirectedRequest(_) => "misdirected_request",
-                ForwardErrorKind::UpstreamClosed => "upstream_closed",
-                ForwardErrorKind::Other => "other",
-            };
-            crate::metrics::record_upstream_error(kind_label);
+            crate::metrics::record_upstream_error(kind.as_metric_label());
             log_forward_error(&kind, peer, host, &err);
             let spec = forward_error_spec(&kind);
             Ok(ForwardOutcome::Responded(ForwardErrorContext {
