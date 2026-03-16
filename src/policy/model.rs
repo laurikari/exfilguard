@@ -189,13 +189,15 @@ impl MethodMask {
         if self.allow_any {
             return false;
         }
-        self.mask == (1 << 8) && self.extras.is_empty()
+        self.mask == CONNECT_BIT && self.extras.is_empty()
     }
 
     pub fn is_any(&self) -> bool {
         self.allow_any
     }
 }
+
+const CONNECT_BIT: u32 = 1 << 8;
 
 fn method_bit(method: &Method) -> Option<u32> {
     match method.as_str() {
@@ -207,7 +209,7 @@ fn method_bit(method: &Method) -> Option<u32> {
         "HEAD" => Some(1 << 5),
         "OPTIONS" => Some(1 << 6),
         "TRACE" => Some(1 << 7),
-        "CONNECT" => Some(1 << 8),
+        "CONNECT" => Some(CONNECT_BIT),
         _ => None,
     }
 }
