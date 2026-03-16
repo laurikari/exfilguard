@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -136,8 +135,8 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
         for (idx, rule) in rules.into_iter().enumerate() {
             let action = parse_action(&name, &rule)?;
             let methods = parse_methods(&rule)?;
-            let has_connect = methods_include_connect(&methods);
-            let is_connect_only = methods_connect_only(&methods);
+            let has_connect = super::methods_include_connect(&methods);
+            let is_connect_only = super::methods_connect_only(&methods);
             if has_connect && !is_connect_only {
                 bail!(
                     "policy '{}' rule {}: CONNECT method must not be combined with other methods",
@@ -164,7 +163,7 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
             };
             let https_mode = parse_https_mode(&name, idx, &rule)?;
             let id = Arc::<str>::from(format!("{}#{}", policy_name, idx));
-            validate_rule_constraints(&name, idx, https_mode, &methods, &url_pattern)?;
+            super::validate_rule_constraints(&name, idx, https_mode, &methods, &url_pattern)?;
             compiled_rules.push(Rule {
                 id,
                 action,
@@ -274,7 +273,7 @@ fn parse_action(policy: &str, rule: &RawRule) -> Result<RuleAction> {
             })?;
             let reason = match &rule.reason {
                 Some(reason) => {
-                    validate_reason(reason).with_context(|| {
+                    super::validate_reason(reason).with_context(|| {
                         format!(
                             "policy '{}' DENY rule has invalid reason phrase '{}'",
                             policy, reason
@@ -323,20 +322,6 @@ fn parse_methods(rule: &RawRule) -> Result<MethodMatch> {
     }
 }
 
-fn methods_include_connect(methods: &MethodMatch) -> bool {
-    match methods {
-        MethodMatch::Any => false,
-        MethodMatch::List(list) => list.contains(&Method::CONNECT),
-    }
-}
-
-fn methods_connect_only(methods: &MethodMatch) -> bool {
-    match methods {
-        MethodMatch::Any => false,
-        MethodMatch::List(list) => list.len() == 1 && list[0] == Method::CONNECT,
-    }
-}
-
 fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
     let (scheme_part, rest) = raw
         .split_once("://")
@@ -357,11 +342,11 @@ fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
         .ok_or_else(|| anyhow!("pattern missing host"))?;
 
     let (host, port) = parse_host_and_port(host_port)?;
-    validate_host_pattern(host)?;
+    super::validate_host_pattern(host)?;
 
     let path = host_and_path.next().map(|path| format!("/{}", path));
     if let Some(path_ref) = path.as_ref() {
-        validate_path_pattern(path_ref)?;
+        super::validate_path_pattern(path_ref)?;
     }
 
     Ok(UrlPattern {
@@ -408,73 +393,6 @@ fn parse_host_and_port(value: &str) -> Result<(&str, Option<u16>)> {
     }
 
     Ok((value, None))
-}
-
-fn validate_host_pattern(host: &str) -> Result<()> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if host.contains('*') {
-            bail!("IP literals must not contain '*'");
-        }
-        // Additional validation already handled by parse::<IpAddr>.
-        match ip {
-            IpAddr::V4(_) | IpAddr::V6(_) => return Ok(()),
-        }
-    }
-
-    if host.contains('/') {
-        bail!("host must not contain '/'");
-    }
-
-    if host.chars().any(|c| c.is_whitespace()) {
-        bail!("host must not contain whitespace");
-    }
-
-    for label in host.split('.') {
-        if label.is_empty() {
-            bail!("host contains empty label");
-        }
-        if label == "*" || label == "**" {
-            continue;
-        }
-        if label.contains('*') {
-            bail!("'*' may only appear as entire host label");
-        }
-        for ch in label.chars() {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
-                continue;
-            }
-            bail!("host label '{}' contains invalid character '{}'", label, ch);
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_path_pattern(path: &str) -> Result<()> {
-    if !path.starts_with('/') {
-        bail!("path pattern must start with '/'");
-    }
-    for segment in path.split('/').skip(1) {
-        if segment.is_empty() {
-            continue;
-        }
-        if segment == "*" || segment == "**" {
-            continue;
-        }
-        if segment.contains('{') || segment.contains('}') {
-            bail!("path segment '{}' must not contain '{{' or '}}'", segment);
-        }
-        if segment.contains("**") {
-            bail!("'**' may only appear as its own segment");
-        }
-        if !segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-._*".contains(c))
-        {
-            bail!("path segment '{}' contains invalid character", segment);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -552,77 +470,6 @@ fn parse_https_mode(policy: &str, idx: usize, rule: &RawRule) -> Result<HttpsMod
             other
         ),
     }
-}
-
-fn validate_rule_constraints(
-    policy: &str,
-    idx: usize,
-    https_mode: HttpsMode,
-    methods: &MethodMatch,
-    url_pattern: &Option<UrlPattern>,
-) -> Result<()> {
-    let connect_only = methods_connect_only(methods);
-    match https_mode {
-        HttpsMode::Inspect => {
-            if connect_only {
-                bail!(
-                    "policy '{}' rule {}: CONNECT rules must set https_mode = \"tunnel\"",
-                    policy,
-                    idx
-                );
-            }
-            Ok(())
-        }
-        HttpsMode::Tunnel => {
-            if !connect_only {
-                bail!(
-                    "policy '{}' rule {}: https_mode=\"tunnel\" rules must restrict methods to CONNECT",
-                    policy,
-                    idx
-                );
-            }
-            validate_connect_pattern(policy, idx, url_pattern)
-        }
-    }
-}
-
-fn validate_connect_pattern(
-    policy: &str,
-    idx: usize,
-    url_pattern: &Option<UrlPattern>,
-) -> Result<()> {
-    let pattern = url_pattern.as_ref().ok_or_else(|| {
-        anyhow!(
-            "policy '{}' rule {}: CONNECT rules require https:// url_pattern ending with '/**'",
-            policy,
-            idx
-        )
-    })?;
-    if pattern.scheme != Scheme::Https {
-        bail!(
-            "policy '{}' rule {}: CONNECT rules must use https:// url_pattern",
-            policy,
-            idx
-        );
-    }
-    match pattern.path.as_ref().map(|path| path.as_ref()) {
-        Some("/**") => Ok(()),
-        _ => bail!(
-            "policy '{}' rule {}: CONNECT rules require https:// url_pattern ending with '/**'",
-            policy,
-            idx
-        ),
-    }
-}
-
-fn validate_reason(reason: &str) -> Result<()> {
-    if reason.trim().is_empty() {
-        bail!("reason must not be empty");
-    }
-    if reason.chars().any(|c| c == '\r' || c == '\n') {
-        bail!("reason must not contain CR or LF characters");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
