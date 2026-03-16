@@ -224,20 +224,28 @@ pub struct UrlMatcher {
 }
 
 impl UrlMatcher {
-    /// Matches a request against the pattern.
-    ///
-    /// NOTE: For `CONNECT` requests, `ignore_path` should be true. In a CONNECT
-    /// tunnel, the proxy only knows the host/port; the path is hidden inside
-    /// the encrypted payload. The path is only validated after TLS bumping
-    /// occurs and the tunnel is "unwrapped."
-    pub fn matches(
+    /// Matches the full request tuple, including the canonical policy path.
+    pub fn matches_request(
         &self,
         scheme: Scheme,
         host: &str,
         port: Option<u16>,
         path: &str,
-        ignore_path: bool,
     ) -> bool {
+        if !self.matches_authority(scheme, host, port) {
+            return false;
+        }
+        if let Some(path_matcher) = &self.path {
+            return path_matcher.matches(path);
+        }
+        true
+    }
+
+    /// Matches only scheme, host, and port.
+    ///
+    /// This is used for CONNECT tunnel evaluation and HTTPS bump preflight,
+    /// where the proxy does not yet have an inner HTTP path.
+    pub fn matches_authority(&self, scheme: Scheme, host: &str, port: Option<u16>) -> bool {
         if self.scheme != scheme {
             return false;
         }
@@ -249,12 +257,6 @@ impl UrlMatcher {
             if Some(expected) != actual {
                 return false;
             }
-        }
-        if let Some(path_matcher) = &self.path {
-            if ignore_path {
-                return true;
-            }
-            return path_matcher.matches(path);
         }
         true
     }
@@ -364,7 +366,9 @@ impl PathMatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostLabel, HostPattern};
+    use super::{HostLabel, HostMatcher, HostPattern, PathMatcher, UrlMatcher};
+    use crate::config::Scheme;
+    use regex::Regex;
     use std::sync::Arc;
 
     #[test]
@@ -437,5 +441,39 @@ mod tests {
         assert!(pattern.matches("foo.bar.example.com"));
         assert!(pattern.matches("foo.bar.baz.example.com"));
         assert!(!pattern.matches("foo.example.com"));
+    }
+
+    #[test]
+    fn url_matcher_matches_request_requires_path_match() {
+        let matcher = UrlMatcher {
+            scheme: Scheme::Https,
+            host: HostMatcher::Exact("example.com".to_string()),
+            port: Some(443),
+            path: Some(PathMatcher::new(
+                Regex::new("^/api(?:/.*)?$").unwrap(),
+                Arc::from("/api/**"),
+            )),
+            original: Arc::from("https://example.com/api/**"),
+        };
+
+        assert!(matcher.matches_request(Scheme::Https, "example.com", None, "/api/v1"));
+        assert!(!matcher.matches_request(Scheme::Https, "example.com", None, "/admin"));
+    }
+
+    #[test]
+    fn url_matcher_matches_authority_ignores_path_component() {
+        let matcher = UrlMatcher {
+            scheme: Scheme::Https,
+            host: HostMatcher::Exact("example.com".to_string()),
+            port: Some(443),
+            path: Some(PathMatcher::new(
+                Regex::new("^/api(?:/.*)?$").unwrap(),
+                Arc::from("/api/**"),
+            )),
+            original: Arc::from("https://example.com/api/**"),
+        };
+
+        assert!(matcher.matches_authority(Scheme::Https, "example.com", None));
+        assert!(!matcher.matches_authority(Scheme::Https, "example.com", Some(8443)));
     }
 }

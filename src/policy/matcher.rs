@@ -137,13 +137,7 @@ fn evaluate_policy(policy: &super::model::CompiledPolicy, request: &Request) -> 
             continue;
         }
         if let Some(url) = &rule.url
-            && !url.matches(
-                request.scheme,
-                request.host,
-                request.port,
-                request.path,
-                false,
-            )
+            && !url.matches_request(request.scheme, request.host, request.port, request.path)
         {
             continue;
         }
@@ -161,13 +155,7 @@ fn evaluate_connect_policy(
             continue;
         }
         if let Some(url) = &rule.url
-            && !url.matches(
-                request.scheme,
-                request.host,
-                request.port,
-                request.path,
-                true,
-            )
+            && !url.matches_authority(request.scheme, request.host, request.port)
         {
             continue;
         }
@@ -192,13 +180,7 @@ fn evaluate_tls_bump_preflight_policy(
                 if url.scheme != Scheme::Https {
                     false
                 } else {
-                    url.matches(
-                        request.scheme,
-                        request.host,
-                        request.port,
-                        request.path,
-                        true,
-                    )
+                    url.matches_authority(request.scheme, request.host, request.port)
                 }
             }
             None => true,
