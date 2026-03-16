@@ -161,8 +161,8 @@ fn spawn_runtime_policy_reload_task(
             tracing::info!("received SIGHUP; reloading runtime policy");
             match build_runtime_policy_snapshot(&settings) {
                 Ok(snapshot) => {
-                    let client_count = snapshot.compiled.clients.len();
-                    let policy_count = snapshot.compiled.policies.len();
+                    let client_count = snapshot.client_count();
+                    let policy_count = snapshot.policy_count();
                     if let Err(err) = policy_tx.send(snapshot) {
                         tracing::error!(
                             error = %err,

@@ -51,14 +51,22 @@ impl PolicyMatcher {
 ///    `Rule` that matches the request's method and URL pattern determines the outcome.
 #[derive(Clone)]
 pub struct PolicySnapshot {
-    pub compiled: Arc<CompiledConfig>,
-    pub matcher: PolicyMatcher,
+    compiled: Arc<CompiledConfig>,
+    matcher: PolicyMatcher,
 }
 
 impl PolicySnapshot {
     pub fn new(compiled: Arc<CompiledConfig>) -> Self {
         let matcher = PolicyMatcher::new(compiled.clone());
         Self { compiled, matcher }
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.compiled.clients.len()
+    }
+
+    pub fn policy_count(&self) -> usize {
+        self.compiled.policies.len()
     }
 
     pub fn resolve_client(&self, addr: IpAddr) -> Option<&ClientEntry> {
@@ -308,6 +316,16 @@ mod tests {
             fallback: true,
         }];
         ValidatedConfig::new(Config { clients, policies }).expect("validate config")
+    }
+
+    #[test]
+    fn snapshot_exposes_client_and_policy_counts() {
+        let config = build_config(true);
+        let compiled = Arc::new(compile_config(&config).expect("compile config"));
+        let snapshot = PolicySnapshot::new(compiled);
+
+        assert_eq!(snapshot.client_count(), 1);
+        assert_eq!(snapshot.policy_count(), 2);
     }
 
     #[test]
