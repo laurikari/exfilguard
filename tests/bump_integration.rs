@@ -764,6 +764,111 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
+    let upstream_host = "localhost";
+    let dirs = TestDirs::new()?;
+    let workspace = dirs.config_dir.parent().expect("temp workspace directory");
+    let cert_cache_dir = workspace.join("cert_cache");
+    std::fs::create_dir_all(&cert_cache_dir)?;
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-http"])
+        .policy(
+            PolicySpec::new("allow-http")
+                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**"))),
+        )
+        .render();
+
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let accept_counter = accept_count.clone();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                accept = upstream_listener.accept() => {
+                    let (stream, peer) = match accept {
+                        Ok(pair) => pair,
+                        Err(err) => return Err(anyhow::anyhow!("upstream accept error: {err}")),
+                    };
+                    accept_counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        if let Err(err) = serve_http_stale_keepalive(stream, peer).await {
+                            tracing::warn!(error = %err, "stale keepalive upstream handler error");
+                        }
+                    });
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let cert_cache_path = cert_cache_dir.clone();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(move |settings| {
+            settings.cert_cache_dir = Some(cert_cache_path.clone());
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request_one = format!(
+        "GET http://{host}:{port}/first HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port()
+    );
+    stream.write_all(request_one.as_bytes()).await?;
+    stream.flush().await?;
+    let response_one = read_http_response(&mut stream).await?;
+    assert!(
+        response_one.starts_with("HTTP/1.1 200"),
+        "unexpected first response: {response_one}"
+    );
+    assert!(
+        response_one.contains("first"),
+        "first response body missing path: {response_one}"
+    );
+
+    let request_two = format!(
+        "GET http://{host}:{port}/second HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port()
+    );
+    stream.write_all(request_two.as_bytes()).await?;
+    stream.flush().await?;
+    let response_two = read_http_response(&mut stream).await?;
+    assert!(
+        response_two.starts_with("HTTP/1.1 200"),
+        "unexpected second response: {response_two}"
+    );
+    assert!(
+        response_two.contains("second"),
+        "second response body missing path: {response_two}"
+    );
+
+    stream.shutdown().await.ok();
+
+    assert_eq!(
+        accept_count.load(Ordering::SeqCst),
+        2,
+        "expected the proxy to reconnect after a stale keep-alive upstream socket"
+    );
+
+    let _ = shutdown_tx.send(());
+    upstream_task
+        .await
+        .expect("upstream task join failed")
+        .expect("upstream task error");
+
+    harness.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
@@ -1498,6 +1603,39 @@ async fn serve_http_keepalive(mut stream: TcpStream, _peer: SocketAddr) -> Resul
         .shutdown()
         .await
         .context("failed to shutdown HTTP upstream stream")?;
+    Ok(())
+}
+
+async fn serve_http_stale_keepalive(mut stream: TcpStream, _peer: SocketAddr) -> Result<()> {
+    let request_bytes = read_request(&mut stream).await?;
+    if request_bytes.is_empty() {
+        stream
+            .shutdown()
+            .await
+            .context("failed to shutdown empty stale keepalive stream")?;
+        return Ok(());
+    }
+
+    let request = String::from_utf8(request_bytes)?;
+    let path = request_path(&request);
+    let body = path.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("failed to write stale keepalive HTTP response")?;
+    stream
+        .flush()
+        .await
+        .context("failed to flush stale keepalive HTTP response")?;
+    stream
+        .shutdown()
+        .await
+        .context("failed to shutdown stale keepalive upstream stream")?;
     Ok(())
 }
 
