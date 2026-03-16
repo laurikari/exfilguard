@@ -28,4 +28,4 @@ name = "deny-all"
 #   action = "ALLOW"
 #   methods = ["CONNECT"]
 #   url_pattern = "https://cdn.example.com/**"
-#   inspect_payload = false  # Pass-through without TLS interception
+#   https_mode = "tunnel"  # Pass-through without TLS interception

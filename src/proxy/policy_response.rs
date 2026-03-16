@@ -85,7 +85,6 @@ pub fn forward_error_log_builder(
         .rule(allow.rule.as_ref())
         .error_reason(spec.log_reason)
         .error_detail(error_detail)
-        .inspect_payload(allow.inspect_payload)
 }
 
 /// Indicates whether forwarding completed successfully or the protocol already
@@ -222,7 +221,7 @@ mod tests {
             client: Arc::<str>::from("client"),
             policy: Arc::<str>::from("policy"),
             rule: Arc::<str>::from("rule"),
-            inspect_payload: true,
+            https_mode: crate::config::HttpsMode::Inspect,
             cache: None,
         }
     }
@@ -247,6 +246,7 @@ mod tests {
             port: None,
             path: "/resource".to_string(),
             policy_path: "/resource".to_string(),
+            flow: None,
         }
     }
 

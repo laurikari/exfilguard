@@ -106,7 +106,7 @@ fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {
             action: rule.action.clone(),
             methods,
             url,
-            inspect_payload: rule.inspect_payload,
+            https_mode: rule.https_mode,
             cache,
         });
     }
@@ -226,7 +226,7 @@ fn compile_path_pattern(pattern: &Arc<str>) -> Result<PathMatcher> {
 mod tests {
     use super::*;
     use crate::config::{
-        Client, ClientSelector, Config, MethodMatch, Policy, Rule, RuleAction, Scheme,
+        Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
         ValidatedConfig,
     };
     use http::{Method, StatusCode};
@@ -244,7 +244,7 @@ mod tests {
                 path: Some(Arc::<str>::from("/api/**")),
                 original: Arc::<str>::from("https://*.example.com/api/**"),
             }),
-            inspect_payload: true,
+            https_mode: HttpsMode::Inspect,
             cache: None,
         };
         Policy {
@@ -268,7 +268,7 @@ mod tests {
             },
             methods: MethodMatch::Any,
             url_pattern: None,
-            inspect_payload: true,
+            https_mode: HttpsMode::Inspect,
             cache: None,
         };
         let policy = Policy {
@@ -305,7 +305,7 @@ mod tests {
                         },
                         methods: MethodMatch::Any,
                         url_pattern: None,
-                        inspect_payload: true,
+                        https_mode: HttpsMode::Inspect,
                         cache: None,
                     }]
                     .into_boxed_slice(),

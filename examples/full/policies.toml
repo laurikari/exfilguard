@@ -27,4 +27,4 @@ name = "pinned-payments-egress"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/**"
-  inspect_payload = false
+  https_mode = "tunnel"

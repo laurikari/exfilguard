@@ -4,5 +4,4 @@ name = "allow-upstream"
   action = "ALLOW"
   methods = ["GET", "HEAD", "POST"]
   url_pattern = "http://upstream/**"
-  inspect_payload = true
   allow_private_upstream = true

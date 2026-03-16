@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use crate::config::Scheme;
 use crate::proxy::AppContext;
 use crate::proxy::connect::{self, ResolvedTarget};
+use crate::proxy::request::RequestFlowContext;
 
 use super::dispatch::{self, HttpLoopOptions, LoopOutcome};
 
@@ -19,11 +20,12 @@ pub async fn handle_decrypted_https<S>(
     peer: SocketAddr,
     app: AppContext,
     connect_binding: Option<ResolvedTarget>,
+    flow_context: Option<RequestFlowContext>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_bumped_connection(stream, peer, app, connect_binding).await
+    serve_bumped_connection(stream, peer, app, connect_binding, flow_context).await
 }
 
 async fn serve_plain_http(stream: TcpStream, peer: SocketAddr, app: AppContext) -> Result<()> {
@@ -35,6 +37,7 @@ async fn serve_plain_http(stream: TcpStream, peer: SocketAddr, app: AppContext) 
             allow_connect: true,
             fallback_scheme: Scheme::Http,
             connect_binding: None,
+            flow_context: None,
         },
     )
     .await?
@@ -62,6 +65,7 @@ async fn serve_bumped_connection<S>(
     peer: SocketAddr,
     app: AppContext,
     connect_binding: Option<ResolvedTarget>,
+    flow_context: Option<RequestFlowContext>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -74,6 +78,7 @@ where
             allow_connect: false,
             fallback_scheme: Scheme::Https,
             connect_binding,
+            flow_context,
         },
     )
     .await?

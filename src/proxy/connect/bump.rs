@@ -12,6 +12,7 @@ use crate::proxy::{
     AppContext,
     http::handle_decrypted_https,
     http2::{self, PrimedHttp2Upstream},
+    request::RequestFlowContext,
     upstream,
 };
 
@@ -27,6 +28,7 @@ pub async fn handle_bump(
     resolved: ResolvedTarget,
     app: &AppContext,
     peer: SocketAddr,
+    flow_context: RequestFlowContext,
 ) -> Result<BumpStats> {
     let mut stream = stream;
     let tunnel_idle_timeout = app.settings.connect_tunnel_idle_timeout();
@@ -81,10 +83,18 @@ pub async fn handle_bump(
                 app.clone(),
                 Some(resolved.clone()),
                 primed,
+                flow_context.clone(),
             )
             .await
         } else {
-            handle_decrypted_https(tls_stream, peer, app.clone(), Some(resolved)).await
+            handle_decrypted_https(
+                tls_stream,
+                peer,
+                app.clone(),
+                Some(resolved),
+                Some(flow_context.clone()),
+            )
+            .await
         }
     };
 

@@ -10,7 +10,9 @@ use crate::proxy::{
     connect::ResolvedTarget,
     forward_limits::AllowLogTracker,
     policy_eval::PolicyLogConfig,
-    request::{parse_http1_request, parse_http1_request_origin_form, scheme_name},
+    request::{
+        RequestFlowContext, parse_http1_request, parse_http1_request_origin_form, scheme_name,
+    },
     request_pipeline,
 };
 
@@ -28,6 +30,7 @@ pub async fn handle_non_connect<S>(
     upstream_pool: &mut UpstreamPool,
     ctx: RequestContext,
     connect_binding: Option<&ResolvedTarget>,
+    flow_context: Option<&RequestFlowContext>,
 ) -> Result<ClientDisposition>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -132,7 +135,7 @@ where
             _ => BodyPlan::Empty,
         }
     };
-    let parsed = match if connect_binding.is_some() {
+    let mut parsed = match if connect_binding.is_some() {
         parse_http1_request_origin_form(method.clone(), &target, headers.host(), fallback_scheme)
     } else {
         parse_http1_request(method.clone(), &target, headers.host(), fallback_scheme)
@@ -159,6 +162,9 @@ where
             return Ok(ClientDisposition::Close);
         }
     };
+    if let Some(flow_context) = flow_context {
+        parsed.set_flow_context(flow_context.clone());
+    }
     let snapshot = app.policies.snapshot();
     let log_tracker = AllowLogTracker::new(total_request_bytes, start);
     let mut handler = Http1RequestHandler {

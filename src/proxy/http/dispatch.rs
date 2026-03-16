@@ -10,7 +10,7 @@ use crate::logging::AccessLogBuilder;
 
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::request::scheme_name;
+use crate::proxy::request::{RequestFlowContext, scheme_name};
 
 use super::codec::{Http1RequestHead, read_http1_request_head};
 use super::pipeline::{
@@ -22,6 +22,7 @@ pub(super) struct HttpLoopOptions {
     pub allow_connect: bool,
     pub fallback_scheme: Scheme,
     pub connect_binding: Option<ResolvedTarget>,
+    pub flow_context: Option<RequestFlowContext>,
 }
 
 pub(super) enum LoopOutcome<S> {
@@ -50,6 +51,7 @@ where
         allow_connect,
         fallback_scheme,
         connect_binding,
+        flow_context,
     } = options;
     let keepalive_timeout = app.settings.client_keepalive_idle_timeout();
     let header_timeout = app.settings.request_header_timeout();
@@ -132,7 +134,17 @@ where
             fallback_scheme,
         };
 
-        match handle_non_connect(&mut reader, peer, app, &mut upstream_pool, ctx, binding).await? {
+        match handle_non_connect(
+            &mut reader,
+            peer,
+            app,
+            &mut upstream_pool,
+            ctx,
+            binding,
+            flow_context.as_ref(),
+        )
+        .await?
+        {
             ClientDisposition::Continue => continue,
             ClientDisposition::Close => break,
         }

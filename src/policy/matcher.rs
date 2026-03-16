@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use http::Method;
 
-use crate::config::{RuleAction, Scheme};
+use crate::config::{HttpsMode, RuleAction, Scheme};
 
 use super::Decision;
 use super::model::{ClientEntry, CompiledConfig};
@@ -28,6 +28,18 @@ impl PolicyMatcher {
             }
         }
         None
+    }
+
+    pub fn evaluate_tls_bump_preflight(&self, policy_indices: &[usize], request: &Request) -> bool {
+        for &policy_idx in policy_indices {
+            let Some(policy) = self.config.policies.get(policy_idx) else {
+                continue;
+            };
+            if evaluate_tls_bump_preflight_policy(policy.as_ref(), request) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -68,6 +80,23 @@ impl PolicySnapshot {
             decision,
         })
     }
+
+    pub fn evaluate_tls_bump_preflight(
+        &self,
+        addr: IpAddr,
+        request: &Request,
+    ) -> Option<TlsBumpPreflightResult> {
+        let client = self.resolve_client(addr)?;
+        if self
+            .matcher
+            .evaluate_tls_bump_preflight(client.policies.as_ref(), request)
+        {
+            return Some(TlsBumpPreflightResult {
+                client: client.name.clone(),
+            });
+        }
+        None
+    }
 }
 
 fn normalize_peer_ip(addr: IpAddr) -> IpAddr {
@@ -83,6 +112,11 @@ fn normalize_peer_ip(addr: IpAddr) -> IpAddr {
 pub struct EvaluationResult {
     pub client: Arc<str>,
     pub decision: Decision,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsBumpPreflightResult {
+    pub client: Arc<str>,
 }
 
 fn evaluate_policy(policy: &super::model::CompiledPolicy, request: &Request) -> Option<Decision> {
@@ -115,7 +149,7 @@ fn evaluate_connect_policy(
     request: &Request,
 ) -> Option<Decision> {
     for rule in policy.rules.iter() {
-        if !rule.methods.is_connect_only() {
+        if rule.https_mode != HttpsMode::Tunnel || !rule.methods.is_connect_only() {
             continue;
         }
         if let Some(url) = &rule.url
@@ -131,13 +165,18 @@ fn evaluate_connect_policy(
         }
         return Some(make_decision(policy, rule));
     }
+    None
+}
 
-    if request.scheme != Scheme::Https {
-        return None;
+fn evaluate_tls_bump_preflight_policy(
+    policy: &super::model::CompiledPolicy,
+    request: &Request,
+) -> bool {
+    if request.method != Method::CONNECT || request.scheme != Scheme::Https {
+        return false;
     }
-
     for rule in policy.rules.iter() {
-        if rule.methods.is_connect_only() {
+        if rule.https_mode != HttpsMode::Inspect || rule.methods.is_connect_only() {
             continue;
         }
         let url_matches = match &rule.url {
@@ -159,15 +198,9 @@ fn evaluate_connect_policy(
         if !url_matches {
             continue;
         }
-        match rule.action {
-            RuleAction::Allow if rule.inspect_payload => return Some(make_decision(policy, rule)),
-            RuleAction::Deny { .. } if rule.methods.is_any() => {
-                return Some(make_decision(policy, rule));
-            }
-            _ => {}
-        }
+        return true;
     }
-    None
+    false
 }
 
 fn make_decision(
@@ -178,7 +211,7 @@ fn make_decision(
         RuleAction::Allow => Decision::Allow {
             policy: policy.name.clone(),
             rule: rule.id.clone(),
-            inspect_payload: rule.inspect_payload,
+            https_mode: rule.https_mode,
             cache: rule.cache.clone(),
         },
         RuleAction::Deny {
@@ -208,8 +241,8 @@ pub struct Request<'a> {
 mod tests {
     use super::*;
     use crate::config::{
-        Client, ClientSelector, Config, MethodMatch, Policy, Rule, RuleAction, UrlPattern,
-        ValidatedConfig,
+        Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction,
+        UrlPattern, ValidatedConfig,
     };
     use crate::policy::compile::compile_config;
     use http::{Method, StatusCode};
@@ -232,7 +265,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/api/**")),
                         original: Arc::<str>::from("https://*.example.com/api/**"),
                     }),
-                    inspect_payload: false,
+                    https_mode: HttpsMode::Inspect,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -253,7 +286,7 @@ mod tests {
                     },
                     methods: MethodMatch::Any,
                     url_pattern: None,
-                    inspect_payload: false,
+                    https_mode: HttpsMode::Inspect,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -354,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_allows_when_rule_has_path() {
+    fn connect_preflight_allows_when_inspect_rule_has_path() {
         let policy = Policy {
             name: Arc::<str>::from("allow-site"),
             rules: Arc::from(
@@ -369,7 +402,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/privacy-policy/")),
                         original: Arc::<str>::from("https://example.com/privacy-policy/"),
                     }),
-                    inspect_payload: true,
+                    https_mode: HttpsMode::Inspect,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -395,17 +428,16 @@ mod tests {
             port: Some(443),
             path: "/",
         };
-        let decision = matcher
-            .evaluate(client.policies.as_ref(), &request)
-            .expect("decision");
-        match decision {
-            Decision::Allow { .. } => {}
-            other => panic!("expected allow decision, got {:?}", other),
-        }
+        assert!(
+            matcher
+                .evaluate(client.policies.as_ref(), &request)
+                .is_none()
+        );
+        assert!(matcher.evaluate_tls_bump_preflight(client.policies.as_ref(), &request));
     }
 
     #[test]
-    fn connect_denied_by_any_rule_with_custom_status() {
+    fn connect_denied_by_explicit_tunnel_rule_with_custom_status() {
         let policy = Policy {
             name: Arc::<str>::from("deny-connect"),
             rules: Arc::from(
@@ -416,7 +448,7 @@ mod tests {
                         reason: None,
                         body: Some(Arc::<str>::from("blocked connect")),
                     },
-                    methods: MethodMatch::Any,
+                    methods: MethodMatch::List(vec![Method::CONNECT]),
                     url_pattern: Some(UrlPattern {
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("example.com"),
@@ -424,7 +456,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/**")),
                         original: Arc::<str>::from("https://example.com/**"),
                     }),
-                    inspect_payload: true,
+                    https_mode: HttpsMode::Tunnel,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -590,7 +622,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/v1/**")),
                         original: Arc::<str>::from("https://api.example.com:443/v1/**"),
                     }),
-                    inspect_payload: false,
+                    https_mode: HttpsMode::Inspect,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -639,7 +671,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/")),
                         original: Arc::<str>::from("https://[2001:db8::10]:443/"),
                     }),
-                    inspect_payload: false,
+                    https_mode: HttpsMode::Inspect,
                     cache: None,
                 }]
                 .into_boxed_slice(),

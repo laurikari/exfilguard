@@ -8,7 +8,7 @@ use crate::{
         headers::{
             HeaderAction, HeaderDisposition, RequestHeaderSanitizer, classify_request_header,
         },
-        request::{ParsedRequest, parse_uri_request},
+        request::{ParsedRequest, RequestFlowContext, parse_uri_request},
     },
 };
 
@@ -24,12 +24,14 @@ pub(super) struct SanitizedRequest {
 pub(super) fn sanitize_request(
     request: http::Request<RecvStream>,
     max_header_bytes: usize,
+    flow_context: &RequestFlowContext,
 ) -> Result<(SanitizedRequest, RecvStream)> {
     let sanitized = sanitize_request_parts(
         request.method(),
         request.uri(),
         request.headers(),
         max_header_bytes,
+        flow_context,
     )?;
     let body = request.into_body();
 
@@ -41,6 +43,7 @@ fn sanitize_request_parts(
     uri: &Uri,
     headers: &HeaderMap,
     max_header_bytes: usize,
+    flow_context: &RequestFlowContext,
 ) -> Result<SanitizedRequest> {
     ensure!(
         max_header_bytes > 0,
@@ -49,7 +52,8 @@ fn sanitize_request_parts(
 
     reject_expect_header(headers)?;
 
-    let parsed = parse_uri_request(method.clone(), uri, Scheme::Https)?;
+    let mut parsed = parse_uri_request(method.clone(), uri, Scheme::Https)?;
+    parsed.set_flow_context(flow_context.clone());
 
     let mut forward_headers = Vec::new();
     let mut sanitizer = RequestHeaderSanitizer::new(max_header_bytes);
@@ -114,7 +118,12 @@ pub fn sanitize_request_for_fuzz(
     headers: &HeaderMap,
     max_header_bytes: usize,
 ) -> Result<()> {
-    let _ = sanitize_request_parts(method, uri, headers, max_header_bytes)?;
+    let flow_context = RequestFlowContext {
+        session_id: "fuzz".into(),
+        outer_method: "CONNECT".into(),
+        effective_mode: crate::proxy::request::EffectiveMode::Bump,
+    };
+    let _ = sanitize_request_parts(method, uri, headers, max_header_bytes, &flow_context)?;
     Ok(())
 }
 
@@ -142,7 +151,10 @@ pub(super) fn build_upstream_uri(request: &ParsedRequest) -> Result<Uri> {
 #[cfg(test)]
 mod tests {
     use super::{reject_expect_header, sanitize_request_parts};
-    use crate::{config::Scheme, proxy::request::parse_uri_request};
+    use crate::{
+        config::Scheme,
+        proxy::request::{EffectiveMode, RequestFlowContext, parse_uri_request},
+    };
     use anyhow::Result;
     use http::{HeaderMap, HeaderValue, Method, Uri};
 
@@ -175,8 +187,13 @@ mod tests {
             http::header::USER_AGENT,
             HeaderValue::from_static("exfilguard-test"),
         );
+        let flow_context = RequestFlowContext {
+            session_id: "test-session".into(),
+            outer_method: "CONNECT".into(),
+            effective_mode: EffectiveMode::Bump,
+        };
 
-        let sanitized = sanitize_request_parts(&Method::PUT, &uri, &headers, 1024)?;
+        let sanitized = sanitize_request_parts(&Method::PUT, &uri, &headers, 1024, &flow_context)?;
 
         assert_eq!(sanitized.content_length, Some(11));
         assert_eq!(sanitized.forward_headers.len(), 1);

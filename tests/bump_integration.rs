@@ -242,7 +242,7 @@ async fn connect_splice_stays_open_past_timeout() -> Result<()> {
                     &["CONNECT"],
                     format!("https://127.0.0.1:{upstream_port}/**"),
                 )
-                .inspect_payload(false),
+                .https_mode("tunnel"),
             ),
         )
         .render();
@@ -299,7 +299,7 @@ async fn connect_splice_max_lifetime_closes_without_http_response() -> Result<()
                     &["CONNECT"],
                     format!("https://127.0.0.1:{upstream_port}/**"),
                 )
-                .inspect_payload(false),
+                .https_mode("tunnel"),
             ),
         )
         .render();
@@ -470,7 +470,7 @@ async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
         .policy(
             PolicySpec::new("connect").rule(
                 RuleSpec::allow(&["CONNECT"], format!("https://localhost:{target_port}/**"))
-                    .inspect_payload(false),
+                    .https_mode("tunnel"),
             ),
         )
         .render();
@@ -553,7 +553,7 @@ async fn connect_splice_relays_payload() -> Result<()> {
         .default_client(&["allow-splice"])
         .policy(
             PolicySpec::new("allow-splice")
-                .rule(RuleSpec::allow(&["CONNECT"], "https://localhost/**").inspect_payload(false)),
+                .rule(RuleSpec::allow(&["CONNECT"], "https://localhost/**").https_mode("tunnel")),
         )
         .render();
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -768,10 +768,6 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -830,14 +826,9 @@ async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
 async fn connect_bump_relays_https_response() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-searchkit";
-    let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
-        .rule(RuleSpec::allow_any(format!(
-            "https://{upstream_host}/privacy-policy/"
-        )));
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow_any(format!(
+        "https://{upstream_host}/privacy-policy/"
+    )));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .upstream_mode(UpstreamMode::Http1Redirect),
@@ -898,10 +889,6 @@ async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture =
         BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
@@ -934,14 +921,9 @@ async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
 async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-canonical-path";
-    let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
-        .rule(RuleSpec::allow_any(format!(
-            "https://{upstream_host}/canonical/**"
-        )));
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow_any(format!(
+        "https://{upstream_host}/canonical/**"
+    )));
     let mut fixture =
         BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
     let upstream_addr = fixture.upstream_addr();
@@ -973,14 +955,9 @@ async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Re
 async fn connect_bump_blocks_dot_segment_policy_bypass() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-prefix-only";
-    let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
-        .rule(RuleSpec::allow_any(format!(
-            "https://{upstream_host}/alias/**"
-        )));
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow_any(format!(
+        "https://{upstream_host}/alias/**"
+    )));
     let mut fixture =
         BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
     let upstream_addr = fixture.upstream_addr();
@@ -1013,10 +990,6 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-http1-only";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1061,10 +1034,6 @@ async fn connect_bump_supports_http2() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1133,10 +1102,6 @@ async fn connect_bump_http2_invalid_request_path_returns_400() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-invalid";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1173,10 +1138,6 @@ async fn connect_bump_http2_closes_downstream_after_upstream_close() -> Result<(
     let upstream_host = "localhost";
     let policy_name = "allow-h2-reconnect";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1223,10 +1184,6 @@ async fn connect_bump_http2_disconnects_when_upstream_closes_before_response() -
     let upstream_host = "localhost";
     let policy_name = "allow-h2-close-before-response";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1266,10 +1223,6 @@ async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result
     let upstream_host = "localhost";
     let policy_name = "allow-h2-timeout";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1312,10 +1265,6 @@ async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<(
     let upstream_host = "localhost";
     let policy_name = "allow-h2-total-timeout-body";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
@@ -1361,15 +1310,10 @@ async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<(
 async fn connect_bump_http2_preserves_content_length_for_body_requests() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-put";
-    let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
-        .rule(RuleSpec::allow(
-            &["PUT"],
-            format!("https://{upstream_host}/upload/**"),
-        ));
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["PUT"],
+        format!("https://{upstream_host}/upload/**"),
+    ));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
             .client_protocols(ClientProtocols::Http2)
@@ -1425,10 +1369,6 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "h2-policy";
     let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow(
-            &["CONNECT"],
-            format!("https://{upstream_host}/**"),
-        ))
         .rule(
             RuleSpec::deny(&["GET"], format!("https://{upstream_host}/blocked/**"))
                 .status(451)

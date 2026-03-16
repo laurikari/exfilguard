@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use http::{Method, Uri};
@@ -22,6 +23,29 @@ pub struct ParsedRequest {
     pub path: String,
     /// Canonical path used only for policy evaluation.
     pub policy_path: String,
+    pub flow: Option<RequestFlowContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveMode {
+    Bump,
+    Tunnel,
+}
+
+impl EffectiveMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bump => "bump",
+            Self::Tunnel => "tunnel",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestFlowContext {
+    pub session_id: Arc<str>,
+    pub outer_method: Arc<str>,
+    pub effective_mode: EffectiveMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -192,6 +216,7 @@ impl ParsedRequest {
         path: impl Into<String>,
     ) -> AccessLogBuilder {
         AccessLogBuilder::new(peer)
+            .apply_flow_context(self.flow.as_ref(), self.method.as_str())
             .method(self.method.as_str())
             .scheme(scheme_name(self.scheme))
             .host(self.host.clone())
@@ -205,6 +230,14 @@ impl ParsedRequest {
     /// Return the canonical path used for policy evaluation.
     pub fn policy_path(&self) -> &str {
         &self.policy_path
+    }
+
+    pub fn set_flow_context(&mut self, flow: RequestFlowContext) {
+        self.flow = Some(flow);
+    }
+
+    pub fn flow_context(&self) -> Option<&RequestFlowContext> {
+        self.flow.as_ref()
     }
 
     /// Build an absolute URI for cache keying that includes scheme, host, port, and path/query.
@@ -247,6 +280,7 @@ fn build_parsed_request(
         port,
         path,
         policy_path,
+        flow: None,
     })
 }
 

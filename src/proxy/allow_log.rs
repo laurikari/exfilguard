@@ -27,7 +27,6 @@ pub fn log_allow_success(
         .client(allow.client.as_ref())
         .policy(allow.policy.as_ref())
         .rule(allow.rule.as_ref())
-        .inspect_payload(allow.inspect_payload)
         .bytes(stats.bytes_in, stats.bytes_out)
         .elapsed(stats.elapsed)
         .upstream_addr(stats.upstream_addr)

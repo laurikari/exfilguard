@@ -95,8 +95,7 @@ where
 
             let log_builder = log_builder
                 .policy(decision.policy.as_ref())
-                .rule(decision.rule.as_ref())
-                .inspect_payload(decision.inspect_payload);
+                .rule(decision.rule.as_ref());
 
             log_builder.log();
 

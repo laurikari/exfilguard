@@ -7,7 +7,7 @@ use http::Method;
 use ipnet::IpNet;
 use regex::Regex;
 
-use crate::config::{RuleAction, Scheme};
+use crate::config::{HttpsMode, RuleAction, Scheme};
 
 #[derive(Debug, Clone)]
 pub struct CompiledConfig {
@@ -133,7 +133,7 @@ pub struct CompiledRule {
     pub action: RuleAction,
     pub methods: MethodMask,
     pub url: Option<UrlMatcher>,
-    pub inspect_payload: bool,
+    pub https_mode: HttpsMode,
     pub cache: Option<CompiledCacheConfig>,
 }
 

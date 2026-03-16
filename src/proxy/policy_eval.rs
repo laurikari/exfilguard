@@ -47,25 +47,14 @@ impl PolicyLogConfig {
         }
     }
 
-    pub const fn http2_connect_bump() -> Self {
-        Self {
-            allow_level: Level::DEBUG,
-            deny_level: Level::DEBUG,
-            default_level: Level::WARN,
-            allow_message: "policy allow decision (HTTP/2 CONNECT bump)",
-            deny_message: "policy deny decision (HTTP/2 CONNECT bump)",
-            default_message: "no matching policy decision for HTTP/2 CONNECT bump; default deny",
-        }
-    }
-
-    pub const fn connect() -> Self {
+    pub const fn connect_tunnel() -> Self {
         Self {
             allow_level: Level::INFO,
             deny_level: Level::INFO,
-            default_level: Level::WARN,
-            allow_message: "policy allow decision (CONNECT)",
-            deny_message: "policy deny decision (CONNECT)",
-            default_message: "no matching policy decision for CONNECT; default deny",
+            default_level: Level::DEBUG,
+            allow_message: "policy allow decision (CONNECT tunnel)",
+            deny_message: "policy deny decision (CONNECT tunnel)",
+            default_message: "no matching CONNECT tunnel policy; checking TLS bump preflight",
         }
     }
 }
@@ -194,13 +183,13 @@ fn into_decision(result: EvaluationResult) -> PolicyOutcomeInternal {
         Decision::Allow {
             policy,
             rule,
-            inspect_payload,
+            https_mode,
             cache,
         } => PolicyOutcomeInternal::Allow(AllowDecision {
             client,
             policy,
             rule,
-            inspect_payload,
+            https_mode,
             cache,
         }),
         Decision::Deny {
@@ -228,17 +217,28 @@ fn log_policy_allow(
     logged_path: &str,
     decision: &AllowDecision,
 ) {
+    let flow = parsed.flow_context();
+    let session_id = flow.map(|flow| flow.session_id.as_ref());
+    let outer_method = flow.map(|flow| flow.outer_method.as_ref());
+    let inner_method = flow.map(|_| parsed.method.as_str());
+    let effective_mode = flow.map(|flow| flow.effective_mode.as_str()).or_else(|| {
+        (parsed.method == http::Method::CONNECT).then_some(decision.https_mode.as_str())
+    });
     log_with_level!(
         level,
         peer = %peer,
         client = %decision.client,
         policy = %decision.policy,
         rule = %decision.rule,
-        inspect_payload = decision.inspect_payload,
+        policy_basis = %decision.rule,
         method = %parsed.method,
         scheme = scheme_name(parsed.scheme),
         host = %parsed.host,
         path = %logged_path,
+        session_id = session_id,
+        outer_method = outer_method,
+        inner_method = inner_method,
+        effective_mode = effective_mode,
         "{message}"
     );
 }
@@ -251,17 +251,29 @@ fn log_policy_deny(
     logged_path: &str,
     decision: &DenyDecision,
 ) {
+    let flow = parsed.flow_context();
+    let session_id = flow.map(|flow| flow.session_id.as_ref());
+    let outer_method = flow.map(|flow| flow.outer_method.as_ref());
+    let inner_method = flow.map(|_| parsed.method.as_str());
+    let effective_mode = flow
+        .map(|flow| flow.effective_mode.as_str())
+        .or_else(|| (parsed.method == http::Method::CONNECT).then_some("tunnel"));
     log_with_level!(
         level,
         peer = %peer,
         client = %decision.client,
         policy = %decision.policy,
         rule = %decision.rule,
+        policy_basis = %decision.rule,
         status = decision.status.as_u16(),
         method = %parsed.method,
         scheme = scheme_name(parsed.scheme),
         host = %parsed.host,
         path = %logged_path,
+        session_id = session_id,
+        outer_method = outer_method,
+        inner_method = inner_method,
+        effective_mode = effective_mode,
         "{message}"
     );
 }
@@ -273,6 +285,11 @@ fn log_policy_default(
     parsed: &ParsedRequest,
     logged_path: &str,
 ) {
+    let flow = parsed.flow_context();
+    let session_id = flow.map(|flow| flow.session_id.as_ref());
+    let outer_method = flow.map(|flow| flow.outer_method.as_ref());
+    let inner_method = flow.map(|_| parsed.method.as_str());
+    let effective_mode = flow.map(|flow| flow.effective_mode.as_str());
     log_with_level!(
         level,
         peer = %peer,
@@ -280,6 +297,10 @@ fn log_policy_default(
         scheme = scheme_name(parsed.scheme),
         host = %parsed.host,
         path = %logged_path,
+        session_id = session_id,
+        outer_method = outer_method,
+        inner_method = inner_method,
+        effective_mode = effective_mode,
         "{message}"
     );
 }
@@ -288,7 +309,7 @@ pub struct AllowDecision {
     pub client: Arc<str>,
     pub policy: Arc<str>,
     pub rule: Arc<str>,
-    pub inspect_payload: bool,
+    pub https_mode: crate::config::HttpsMode,
     pub cache: Option<CompiledCacheConfig>,
 }
 
@@ -306,8 +327,8 @@ pub struct DenyDecision {
 mod tests {
     use super::*;
     use crate::config::{
-        Client, ClientSelector, Config, MethodMatch, Policy, Rule, RuleAction, Scheme, UrlPattern,
-        ValidatedConfig,
+        Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
+        UrlPattern, ValidatedConfig,
     };
     use crate::policy::compile::compile_config;
     use crate::policy::matcher::PolicySnapshot;
@@ -331,7 +352,7 @@ mod tests {
                         path: Some(Arc::<str>::from("/api/**")),
                         original: Arc::<str>::from("https://example.com/api/**"),
                     }),
-                    inspect_payload: true,
+                    https_mode: HttpsMode::Inspect,
                     cache: None,
                 }]
                 .into_boxed_slice(),
@@ -363,6 +384,7 @@ mod tests {
             port: None,
             path: "/api/v1/items?token=abc".to_string(),
             policy_path: "/api/v1/items".to_string(),
+            flow: None,
         };
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
@@ -383,6 +405,7 @@ mod tests {
             port: None,
             path: "/other/../api/v1/items?token=abc".to_string(),
             policy_path: "/api/v1/items".to_string(),
+            flow: None,
         };
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
