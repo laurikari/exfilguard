@@ -97,7 +97,7 @@ impl ConnectSession {
         let resolved = match resolve_connect_target(
             &self.parsed,
             resolve_timeout,
-            app.settings.allow_test_upstreams,
+            app.allow_private_test_upstreams(),
         )
         .await
         {
@@ -131,7 +131,7 @@ impl ConnectSession {
         let resolved = match resolve_connect_target(
             &self.parsed,
             resolve_timeout,
-            app.settings.allow_test_upstreams,
+            app.allow_private_test_upstreams(),
         )
         .await
         {

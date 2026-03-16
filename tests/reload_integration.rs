@@ -61,9 +61,7 @@ fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
     let cli = Cli {
         config: Some(config_path),
     };
-    let mut settings = Settings::load(&cli)?;
-    settings.allow_test_upstreams = true;
-    Ok(settings)
+    Settings::load(&cli)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -96,7 +94,7 @@ async fn reload_on_sighup_updates_runtime_policy() -> Result<()> {
     let settings = load_settings(&dirs, addr)?;
 
     let run_task = tokio::spawn(async move {
-        if let Err(err) = exfilguard::run(settings).await {
+        if let Err(err) = exfilguard::run_for_tests(settings).await {
             tracing::error!(error = ?err, "proxy run failed");
         }
     });
@@ -165,7 +163,7 @@ async fn reload_on_sighup_does_not_rebind_listener() -> Result<()> {
     let settings = load_settings(&dirs, addr)?;
 
     let run_task = tokio::spawn(async move {
-        if let Err(err) = exfilguard::run(settings).await {
+        if let Err(err) = exfilguard::run_for_tests(settings).await {
             tracing::error!(error = ?err, "proxy run failed");
         }
     });
@@ -238,7 +236,7 @@ async fn reload_on_sighup_updates_clients() -> Result<()> {
     let settings = load_settings(&dirs, addr)?;
 
     let run_task = tokio::spawn(async move {
-        if let Err(err) = exfilguard::run(settings).await {
+        if let Err(err) = exfilguard::run_for_tests(settings).await {
             tracing::error!(error = ?err, "proxy run failed");
         }
     });

@@ -16,7 +16,7 @@ use exfilguard::{
     tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
 };
 
-use rustls::{RootCertStore, client::ClientConfig};
+use rustls::RootCertStore;
 
 use super::dirs::{TestDirs, write_clients_and_policies};
 use super::net::{find_free_port, wait_for_listener};
@@ -62,26 +62,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         metrics_listen: None,
         metrics_tls_cert: None,
         metrics_tls_key: None,
-        allow_test_upstreams: true,
     }
-}
-
-fn build_app_context(
-    settings: Arc<Settings>,
-    policy_store: PolicyStore,
-    ca: Arc<CertificateAuthority>,
-    tls_issuer: Arc<TlsIssuer>,
-    client_http1: Arc<ClientConfig>,
-    client_http2: Arc<ClientConfig>,
-    cache: Option<Arc<proxy::cache::HttpCache>>,
-) -> AppContext {
-    let tls = Arc::new(proxy::TlsContext::new(
-        ca,
-        tls_issuer,
-        client_http1,
-        client_http2,
-    ));
-    AppContext::new(settings, policy_store, tls, cache)
 }
 
 pub struct ProxyHarness {
@@ -112,6 +93,7 @@ pub struct ProxyHarnessBuilder {
     proxy_root_store: RootCertStore,
     cache: Option<Arc<proxy::cache::HttpCache>>,
     settings_override: Option<Box<dyn FnOnce(&mut Settings) + Send>>,
+    allow_private_test_upstreams: bool,
 }
 
 impl ProxyHarnessBuilder {
@@ -127,6 +109,7 @@ impl ProxyHarnessBuilder {
             proxy_root_store: RootCertStore::empty(),
             cache: None,
             settings_override: None,
+            allow_private_test_upstreams: true,
         }
     }
 
@@ -150,6 +133,11 @@ impl ProxyHarnessBuilder {
         F: FnOnce(&mut Settings) + Send + 'static,
     {
         self.settings_override = Some(Box::new(func));
+        self
+    }
+
+    pub fn with_private_test_upstreams(mut self, allow: bool) -> Self {
+        self.allow_private_test_upstreams = allow;
         self
     }
 
@@ -202,15 +190,14 @@ impl ProxyHarnessBuilder {
             None
         };
 
-        let app = build_app_context(
-            settings.clone(),
-            policy_store,
+        let tls = Arc::new(proxy::TlsContext::new(
             ca.clone(),
             tls_issuer,
             proxy_client_config,
             proxy_client_h2_config,
-            cache.clone(),
-        );
+        ));
+        let app = AppContext::new(settings.clone(), policy_store, tls, cache.clone())
+            .with_private_test_upstreams(self.allow_private_test_upstreams);
 
         let handle = tokio::spawn(async move {
             if let Err(err) = proxy::run(app).await {

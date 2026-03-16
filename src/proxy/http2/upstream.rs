@@ -136,7 +136,7 @@ impl Http2Upstream {
             port,
             self.binding.as_ref(),
             self.app.settings.dns_resolve_timeout(),
-            self.app.settings.allow_test_upstreams,
+            self.app.allow_private_test_upstreams(),
         )
         .await?;
         let (tcp_stream, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;

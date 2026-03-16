@@ -122,7 +122,6 @@ name = "allow"
             metrics_listen: None,
             metrics_tls_cert: None,
             metrics_tls_key: None,
-            allow_test_upstreams: false,
         };
 
         let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);

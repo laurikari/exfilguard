@@ -46,6 +46,7 @@ pub struct AppContext {
     pub policies: PolicyStore,
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
+    allow_private_test_upstreams: bool,
 }
 
 impl AppContext {
@@ -60,7 +61,18 @@ impl AppContext {
             policies,
             tls,
             cache,
+            allow_private_test_upstreams: false,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_private_test_upstreams(mut self, allow: bool) -> Self {
+        self.allow_private_test_upstreams = allow;
+        self
+    }
+
+    pub(crate) fn allow_private_test_upstreams(&self) -> bool {
+        self.allow_private_test_upstreams
     }
 }
 

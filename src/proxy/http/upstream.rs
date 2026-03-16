@@ -118,7 +118,7 @@ impl UpstreamConnection {
             port,
             binding,
             app.settings.dns_resolve_timeout(),
-            app.settings.allow_test_upstreams,
+            app.allow_private_test_upstreams(),
         )
         .await?;
         let (upstream_tcp, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;

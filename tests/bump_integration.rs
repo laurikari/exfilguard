@@ -75,7 +75,7 @@ async fn http_private_ip_blocked_by_default() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(|settings| settings.allow_test_upstreams = false)
+        .with_private_test_upstreams(false)
         .spawn()
         .await?;
 
@@ -476,7 +476,7 @@ async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(|settings| settings.allow_test_upstreams = false)
+        .with_private_test_upstreams(false)
         .spawn()
         .await?;
 
@@ -516,7 +516,7 @@ async fn connect_bumped_private_resolution_is_blocked() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(|settings| settings.allow_test_upstreams = false)
+        .with_private_test_upstreams(false)
         .spawn()
         .await?;
 
@@ -627,7 +627,7 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
         .render();
 
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(|settings| settings.allow_test_upstreams = false)
+        .with_private_test_upstreams(false)
         .spawn()
         .await?;
 
@@ -1541,12 +1541,12 @@ async fn http_ipv6_loopback_denied() -> Result<()> {
 
     let cert_cache_path = cert_cache_dir.clone();
     let harness = ProxyHarnessBuilder::with_dirs(dirs, clients.as_str(), policies.as_str())
+        .with_private_test_upstreams(false)
         .with_settings(move |settings| {
             let port = settings.listen.port();
             settings.listen = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
             settings.cert_cache_dir = Some(cert_cache_path.clone());
             settings.log_queries = true;
-            settings.allow_test_upstreams = false;
         })
         .spawn()
         .await?;

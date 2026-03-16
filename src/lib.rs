@@ -26,6 +26,18 @@ use crate::{
 const DEFAULT_CERT_CACHE_CAPACITY: usize = 512;
 
 pub async fn run(settings: Settings) -> Result<()> {
+    run_with_test_upstreams(settings, false).await
+}
+
+#[doc(hidden)]
+pub async fn run_for_tests(settings: Settings) -> Result<()> {
+    run_with_test_upstreams(settings, true).await
+}
+
+async fn run_with_test_upstreams(
+    settings: Settings,
+    allow_private_test_upstreams: bool,
+) -> Result<()> {
     let settings = Arc::new(settings);
     let metrics = settings.metrics_listen.map(|addr| {
         let path = "/metrics".to_string();
@@ -72,7 +84,8 @@ pub async fn run(settings: Settings) -> Result<()> {
         None
     };
 
-    let app = proxy::AppContext::new(settings, policy_store, tls_context, cache);
+    let app = proxy::AppContext::new(settings, policy_store, tls_context, cache)
+        .with_private_test_upstreams(allow_private_test_upstreams);
 
     if let Some((addr, path, tls)) = metrics {
         tracing::info!(address = %addr, tls = tls.is_some(), "metrics endpoint starting");
