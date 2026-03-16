@@ -6,6 +6,7 @@ use http::{Method, Uri};
 
 use crate::config::Scheme;
 use crate::logging::AccessLogBuilder;
+use crate::policy::matcher::Request as PolicyRequest;
 
 /// Common representation of an HTTP request after parsing the start line / pseudo headers.
 ///
@@ -210,6 +211,16 @@ pub fn scheme_name(scheme: Scheme) -> &'static str {
 }
 
 impl ParsedRequest {
+    pub fn as_policy_request(&self) -> PolicyRequest<'_> {
+        PolicyRequest {
+            method: &self.method,
+            scheme: self.scheme,
+            host: &self.host,
+            port: self.port,
+            path: self.policy_path(),
+        }
+    }
+
     pub fn access_log_builder(
         &self,
         peer: SocketAddr,
@@ -574,6 +585,25 @@ mod tests {
         )?;
         assert_eq!(parsed.path, "/public/../admin/./panel?token=abc");
         assert_eq!(parsed.policy_path(), "/admin/panel");
+        Ok(())
+    }
+
+    #[test]
+    fn as_policy_request_uses_canonical_policy_path() -> Result<()> {
+        let parsed = parse_http1_request(
+            Method::GET,
+            "/public/../admin/./panel?token=abc",
+            Some("example.com"),
+            Scheme::Https,
+        )?;
+
+        let request = parsed.as_policy_request();
+
+        assert_eq!(*request.method, Method::GET);
+        assert_eq!(request.scheme, Scheme::Https);
+        assert_eq!(request.host, "example.com");
+        assert_eq!(request.port, Some(443));
+        assert_eq!(request.path, "/admin/panel");
         Ok(())
     }
 

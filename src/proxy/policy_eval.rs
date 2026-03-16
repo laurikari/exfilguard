@@ -7,7 +7,7 @@ use crate::{
     logging::{AccessLogBuilder, log_with_level},
     policy::{
         Decision,
-        matcher::{EvaluationResult, PolicySnapshot, Request},
+        matcher::{EvaluationResult, PolicySnapshot},
         model::CompiledCacheConfig,
     },
     proxy::request::{ParsedRequest, redacted_path, scheme_name},
@@ -106,13 +106,7 @@ pub fn evaluate_request<'a>(
     log_config: PolicyLogConfig,
 ) -> PolicyOutcome<'a> {
     let log_ctx = RequestLogContext::new(peer, parsed, log_queries);
-    let policy_request = Request {
-        method: &parsed.method,
-        scheme: parsed.scheme,
-        host: &parsed.host,
-        port: parsed.port,
-        path: parsed.policy_path(),
-    };
+    let policy_request = parsed.as_policy_request();
 
     match snapshot.evaluate_request(peer.ip(), &policy_request) {
         Some(result) => match into_decision(result) {

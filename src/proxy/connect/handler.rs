@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::{
     config::Scheme,
     logging::AccessLogBuilder,
-    policy::matcher::{PolicySnapshot, Request},
+    policy::matcher::PolicySnapshot,
     proxy::{
         AppContext,
         http::respond_with_access_log,
@@ -138,13 +138,7 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
         &mut self,
         outcome: policy_eval::DefaultDenyOutcome<'_>,
     ) -> Result<Self::Output> {
-        let request = Request {
-            method: &self.parsed_request.method,
-            scheme: self.parsed_request.scheme,
-            host: &self.parsed_request.host,
-            port: self.parsed_request.port,
-            path: self.parsed_request.policy_path(),
-        };
+        let request = self.parsed_request.as_policy_request();
         if let Some(preflight) = self
             .snapshot
             .evaluate_tls_bump_preflight(self.peer.ip(), &request)
