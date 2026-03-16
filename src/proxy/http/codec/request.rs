@@ -87,7 +87,7 @@ where
         let read =
             read_line_with_deadline(reader, &mut header_line, deadline, peer, remaining).await?;
         if read == 0 {
-            break;
+            bail!("connection closed before end of headers from {peer}");
         }
         if !headers
             .push_line(&header_line)
@@ -265,6 +265,35 @@ mod tests {
         };
         assert!(
             err.to_string().contains("unexpected data"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_truncated_headers() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n")
+            .await
+            .expect("write truncated request");
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = match read_http1_request_head(
+            &mut reader,
+            peer,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        {
+            Ok(_) => panic!("truncated headers should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("before end of headers"),
             "unexpected error: {err}"
         );
     }
