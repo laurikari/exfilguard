@@ -42,7 +42,7 @@ the **Dispatcher**.
 
 ### 2. The Dispatcher Layer (`src/proxy/http/dispatch.rs`)
 Determines the protocol (HTTP/1.1, HTTP/2, or CONNECT). If a `CONNECT`
-request is received and the policy requires `inspect_payload = true`, it
+request is received and the policy has matching HTTPS inspection rules, it
 triggers the **TLS Bumping** flow.
 
 ### 3. The Policy Engine (`src/policy/`)
@@ -64,8 +64,8 @@ requests, supporting both HTTP/1.1 and H2 multiplexing.
 
 ### Full example lab
 
-Use the richer sample layout when you need multiple clients, a mix of inspection
-settings, or runtime policy reload demonstrations:
+Use the richer sample layout when you need multiple clients, a mix of HTTPS
+inspection settings, or runtime policy reload demonstrations:
 
 ```shell
 cp examples/full/exfilguard.toml exfilguard.toml
@@ -177,16 +177,17 @@ others.
 
 ### TLS inspection vs. pass-through
 
-Each policy rule declares whether ExfilGuard bumps TLS:
+Each HTTPS policy rule declares an explicit mode:
 
-- `inspect_payload = true` (default) terminates TLS so the proxy can enforce
-  scheme, host, path, and method checks—and log bodies if needed. HTTPS rules
-  implicitly authorize CONNECT bumping for the same host/port. Private upstream
+- `https_mode = "inspect"` (default) terminates TLS so the proxy can enforce
+  scheme, host, path, and method checks on the inner HTTP request. Matching
+  HTTPS rules authorize a TLS bump preflight for the same host/port, but the
+  real policy decision is attached to the inner request. Private upstream
   addresses are still blocked.
-- `inspect_payload = false` only enforces scheme/host/port. These rules must use
-  `methods = ["CONNECT"]` and a `url_pattern` ending in `/**`, making it clear
-  that the intent is to tunnel the host untouched. Use this for pinned TLS or
-  non-HTTP payloads that cannot tolerate MITM.
+- `https_mode = "tunnel"` only enforces scheme/host/port on the outer CONNECT.
+  These rules must use `methods = ["CONNECT"]` and a `url_pattern` ending in
+  `/**`, making it clear that the intent is to tunnel the host untouched. Use
+  this for pinned TLS or non-HTTP payloads that cannot tolerate MITM.
 
 Example from `examples/full/policies.toml`:
 
@@ -204,11 +205,10 @@ name = "pinned-payments-egress"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/**"
-  inspect_payload = false
+  https_mode = "tunnel"
 ```
 
-The loader aborts if the inspection settings are inconsistent (for example:
-`inspect_payload=false is not allowed for DENY action`).
+The loader aborts if the HTTPS mode and method set are inconsistent.
 
 ### Policy evaluation
 
@@ -216,8 +216,8 @@ The loader aborts if the inspection settings are inconsistent (for example:
    selectors must not overlap, so the match is unambiguous.
 2. If no selector matches, the `fallback` client is used.
 3. It evaluates that client's policies in-order; the first matching rule wins.
-4. Rules that disable inspection still use the same logging path—they simply skip
-   the TLS bump step and stream bytes once allowed.
+4. Tunnel-mode CONNECT rules stream bytes once allowed; inspect-mode HTTPS rules
+   authorize TLS bump preflight and then evaluate the inner request normally.
 
 ## Configuration Basics
 
@@ -309,7 +309,9 @@ Set `metrics_listen = "127.0.0.1:9090"` in your config to expose Prometheus
 metrics at `/metrics`. Provide `metrics_tls_cert` and `metrics_tls_key` to serve
 the endpoint over HTTPS. The listener is intended for internal use only—keep it
 firewalled to your Prometheus (or front it with an authenticating reverse
-proxy) because the metrics include internal hosts and policy decisions.
+proxy) because the metrics include internal hosts and policy decisions. Request
+series are labeled with `effective_mode=direct|bump|tunnel` so inspected HTTPS
+and explicit CONNECT tunnels stay distinct.
 
 ## Learn more
 

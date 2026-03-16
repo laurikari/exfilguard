@@ -4,11 +4,25 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use http::StatusCode;
 use time::OffsetDateTime;
+use tracing::{Level, debug, error, info, trace, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::cli::LogFormat;
+use crate::proxy::request::RequestFlowContext;
 
 const DEFAULT_FILTER: &str = "info";
+
+macro_rules! log_with_level {
+    ($level:expr, $($tt:tt)*) => {
+        match $level {
+            Level::ERROR => error!($($tt)*),
+            Level::WARN => warn!($($tt)*),
+            Level::INFO => info!($($tt)*),
+            Level::DEBUG => debug!($($tt)*),
+            Level::TRACE => trace!($($tt)*),
+        }
+    };
+}
 
 pub fn init_logger(format: LogFormat) -> Result<()> {
     let filter =
@@ -50,7 +64,12 @@ pub struct AccessLogEvent {
     pub decision: String,
     pub policy: Option<String>,
     pub rule: Option<String>,
-    pub inspect_payload: bool,
+    pub policy_basis: Option<String>,
+    pub session_id: Option<String>,
+    pub outer_method: Option<String>,
+    pub inner_method: Option<String>,
+    pub effective_mode: Option<String>,
+    pub transport: Option<String>,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub elapsed_ms: u128,
@@ -82,7 +101,12 @@ impl AccessLogBuilder {
                 decision: String::from("UNKNOWN"),
                 policy: None,
                 rule: None,
-                inspect_payload: true,
+                policy_basis: None,
+                session_id: None,
+                outer_method: None,
+                inner_method: None,
+                effective_mode: None,
+                transport: None,
                 bytes_in: 0,
                 bytes_out: 0,
                 elapsed_ms: 0,
@@ -145,12 +169,55 @@ impl AccessLogBuilder {
     }
 
     pub fn rule(mut self, rule: impl Into<String>) -> Self {
-        self.event.rule = Some(rule.into());
+        let rule = rule.into();
+        self.event.policy_basis = Some(rule.clone());
+        self.event.rule = Some(rule);
         self
     }
 
-    pub fn inspect_payload(mut self, inspect: bool) -> Self {
-        self.event.inspect_payload = inspect;
+    pub fn policy_basis(mut self, basis: impl Into<String>) -> Self {
+        self.event.policy_basis = Some(basis.into());
+        self
+    }
+
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.event.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn outer_method(mut self, method: impl Into<String>) -> Self {
+        self.event.outer_method = Some(method.into());
+        self
+    }
+
+    pub fn inner_method(mut self, method: impl Into<String>) -> Self {
+        self.event.inner_method = Some(method.into());
+        self
+    }
+
+    pub fn effective_mode(mut self, mode: impl Into<String>) -> Self {
+        self.event.effective_mode = Some(mode.into());
+        self
+    }
+
+    pub fn transport(mut self, transport: impl Into<String>) -> Self {
+        self.event.transport = Some(transport.into());
+        self
+    }
+
+    pub fn apply_flow_context(
+        mut self,
+        flow: Option<&RequestFlowContext>,
+        inner_method: &str,
+    ) -> Self {
+        if let Some(flow) = flow {
+            self.event.session_id = Some(flow.session_id.to_string());
+            self.event.outer_method = Some(flow.outer_method.to_string());
+            self.event.effective_mode = Some(flow.effective_mode.as_str().to_string());
+            if flow.outer_method.as_ref() != inner_method {
+                self.event.inner_method = Some(inner_method.to_string());
+            }
+        }
         self
     }
 
@@ -203,6 +270,10 @@ impl AccessLogBuilder {
         log_access(self.build());
     }
 
+    pub fn log_with_level(self, level: Level) {
+        log_access_with_level(self.build(), level);
+    }
+
     pub fn for_connect(peer: SocketAddr, host: impl Into<String>, path: impl Into<String>) -> Self {
         Self::new(peer)
             .method("CONNECT")
@@ -213,6 +284,18 @@ impl AccessLogBuilder {
 }
 
 pub fn log_access(event: AccessLogEvent) {
+    log_access_with_level(event, Level::INFO);
+}
+
+fn metrics_effective_mode<'a>(method: &str, effective_mode: Option<&'a str>) -> &'a str {
+    match effective_mode {
+        Some(mode) if !mode.is_empty() => mode,
+        _ if method.eq_ignore_ascii_case("CONNECT") => "unknown",
+        _ => "direct",
+    }
+}
+
+pub fn log_access_with_level(event: AccessLogEvent, level: Level) {
     let AccessLogEvent {
         client_ip,
         client_port,
@@ -227,7 +310,12 @@ pub fn log_access(event: AccessLogEvent) {
         decision,
         policy,
         rule,
-        inspect_payload,
+        policy_basis,
+        session_id,
+        outer_method,
+        inner_method,
+        effective_mode,
+        transport,
         bytes_in,
         bytes_out,
         elapsed_ms,
@@ -252,12 +340,19 @@ pub fn log_access(event: AccessLogEvent) {
     let client_field = client.as_deref();
     let policy_field = policy.as_deref();
     let rule_field = rule.as_deref();
+    let policy_basis_field = policy_basis.as_deref();
+    let session_id_field = session_id.as_deref();
+    let outer_method_field = outer_method.as_deref();
+    let inner_method_field = inner_method.as_deref();
+    let effective_mode_field = effective_mode.as_deref();
+    let transport_field = transport.as_deref();
     let upstream_addr_field = upstream_addr.as_deref();
     let upstream_reused_field = upstream_reused;
     let error_reason_field = error_reason.as_deref();
     let error_detail_field = error_detail.as_deref();
 
-    tracing::info!(
+    log_with_level!(
+        level,
         target = "access_log",
         ts,
         client_ip = %client_ip,
@@ -272,7 +367,12 @@ pub fn log_access(event: AccessLogEvent) {
         decision,
         policy = policy_field,
         rule = rule_field,
-        inspect_payload,
+        policy_basis = policy_basis_field,
+        session_id = session_id_field,
+        outer_method = outer_method_field,
+        inner_method = inner_method_field,
+        effective_mode = effective_mode_field,
+        transport = transport_field,
         bytes_in,
         bytes_out,
         elapsed_ms,
@@ -283,14 +383,18 @@ pub fn log_access(event: AccessLogEvent) {
         error_detail = error_detail_field
     );
 
-    crate::metrics::record_request(
-        client.as_deref(),
-        policy.as_deref(),
-        &decision,
-        &method,
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        Duration::from_millis(elapsed_ms as u64),
-    );
+    if level == Level::INFO {
+        let metrics_mode = metrics_effective_mode(&method, effective_mode.as_deref());
+        crate::metrics::record_request(
+            client.as_deref(),
+            policy.as_deref(),
+            &decision,
+            metrics_mode,
+            &method,
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Duration::from_millis(elapsed_ms as u64),
+        );
+    }
 }
 
 #[cfg(test)]

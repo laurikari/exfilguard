@@ -23,8 +23,12 @@ use tokio::{
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 static REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let opts = Opts::new("requests_total", "Total requests by decision");
-    let vec = IntCounterVec::new(opts, &["decision"]).expect("create counter vec");
+    let opts = Opts::new(
+        "requests_total",
+        "Total requests by decision and effective mode",
+    );
+    let vec =
+        IntCounterVec::new(opts, &["decision", "effective_mode"]).expect("create counter vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register requests_total");
@@ -34,9 +38,10 @@ static REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 static CLIENT_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new(
         "client_requests_total",
-        "Total requests by client and decision",
+        "Total requests by client, decision, and effective mode",
     );
-    let vec = IntCounterVec::new(opts, &["client", "decision"]).expect("create counter vec");
+    let vec = IntCounterVec::new(opts, &["client", "decision", "effective_mode"])
+        .expect("create counter vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register client_requests_total");
@@ -46,9 +51,10 @@ static CLIENT_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 static POLICY_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new(
         "policy_requests_total",
-        "Total requests by policy and decision",
+        "Total requests by policy, decision, and effective mode",
     );
-    let vec = IntCounterVec::new(opts, &["policy", "decision"]).expect("create counter vec");
+    let vec = IntCounterVec::new(opts, &["policy", "decision", "effective_mode"])
+        .expect("create counter vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register policy_requests_total");
@@ -65,8 +71,12 @@ static RULE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 static REQUEST_STATUS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let opts = Opts::new("requests_status_total", "Requests by status class");
-    let vec = IntCounterVec::new(opts, &["status_class"]).expect("create counter vec");
+    let opts = Opts::new(
+        "requests_status_total",
+        "Requests by status class and effective mode",
+    );
+    let vec =
+        IntCounterVec::new(opts, &["status_class", "effective_mode"]).expect("create counter vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register requests_status_total");
@@ -74,8 +84,11 @@ static REQUEST_STATUS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 static REQUEST_METHOD_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let opts = Opts::new("requests_method_total", "Requests by method");
-    let vec = IntCounterVec::new(opts, &["method"]).expect("create counter vec");
+    let opts = Opts::new(
+        "requests_method_total",
+        "Requests by method and effective mode",
+    );
+    let vec = IntCounterVec::new(opts, &["method", "effective_mode"]).expect("create counter vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register requests_method_total");
@@ -85,10 +98,11 @@ static REQUEST_METHOD_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 static CLIENT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "client_request_duration_seconds",
-        "Request latency per client",
+        "Request latency per client, decision, and effective mode",
     )
     .buckets(latency_buckets());
-    let vec = HistogramVec::new(opts, &["client", "decision"]).expect("create histogram vec");
+    let vec = HistogramVec::new(opts, &["client", "decision", "effective_mode"])
+        .expect("create histogram vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register client_request_duration_seconds");
@@ -98,10 +112,11 @@ static CLIENT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 static POLICY_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "policy_request_duration_seconds",
-        "Request latency per policy",
+        "Request latency per policy, decision, and effective mode",
     )
     .buckets(latency_buckets());
-    let vec = HistogramVec::new(opts, &["policy", "decision"]).expect("create histogram vec");
+    let vec = HistogramVec::new(opts, &["policy", "decision", "effective_mode"])
+        .expect("create histogram vec");
     REGISTRY
         .register(Box::new(vec.clone()))
         .expect("register policy_request_duration_seconds");
@@ -322,34 +337,40 @@ pub fn record_request(
     client: Option<&str>,
     policy: Option<&str>,
     decision: &str,
+    effective_mode: &str,
     method: &str,
     status: StatusCode,
     elapsed: Duration,
 ) {
     let decision = normalize_label(decision, "unknown");
+    let effective_mode = normalize_label(effective_mode, "unknown");
     let status_class = status_class(status.as_u16());
 
-    REQUESTS_TOTAL.with_label_values(&[decision.as_str()]).inc();
-    REQUEST_STATUS_TOTAL
-        .with_label_values(&[status_class])
+    REQUESTS_TOTAL
+        .with_label_values(&[decision.as_str(), effective_mode.as_str()])
         .inc();
-    REQUEST_METHOD_TOTAL.with_label_values(&[method]).inc();
+    REQUEST_STATUS_TOTAL
+        .with_label_values(&[status_class, effective_mode.as_str()])
+        .inc();
+    REQUEST_METHOD_TOTAL
+        .with_label_values(&[method, effective_mode.as_str()])
+        .inc();
 
     if let Some(client) = client {
         CLIENT_REQUESTS_TOTAL
-            .with_label_values(&[client, decision.as_str()])
+            .with_label_values(&[client, decision.as_str(), effective_mode.as_str()])
             .inc();
         CLIENT_LATENCY_SECONDS
-            .with_label_values(&[client, decision.as_str()])
+            .with_label_values(&[client, decision.as_str(), effective_mode.as_str()])
             .observe(duration_to_seconds(elapsed));
     }
 
     if let Some(policy) = policy {
         POLICY_REQUESTS_TOTAL
-            .with_label_values(&[policy, decision.as_str()])
+            .with_label_values(&[policy, decision.as_str(), effective_mode.as_str()])
             .inc();
         POLICY_LATENCY_SECONDS
-            .with_label_values(&[policy, decision.as_str()])
+            .with_label_values(&[policy, decision.as_str(), effective_mode.as_str()])
             .observe(duration_to_seconds(elapsed));
     }
 }
@@ -665,6 +686,7 @@ mod tests {
             Some("client-a"),
             Some("policy-a"),
             "ALLOW",
+            "bump",
             "GET",
             StatusCode::OK,
             Duration::from_millis(10),
@@ -674,6 +696,10 @@ mod tests {
         assert!(
             text.contains("requests_total"),
             "expected requests_total in metrics output"
+        );
+        assert!(
+            text.contains("effective_mode=\"bump\""),
+            "expected effective_mode label in metrics output"
         );
         assert!(
             text.contains("rule_hits_total"),

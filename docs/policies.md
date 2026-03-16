@@ -86,7 +86,7 @@ Rules are evaluated in order. The first matching rule determines the action.
 | `action` | String | Required | `"ALLOW"` or `"DENY"` |
 | `methods` | Array | `["ANY"]` | HTTP methods to match (non-CONNECT by default) |
 | `url_pattern` | String | None | URL pattern to match (see syntax below) |
-| `inspect_payload` | Boolean | true | Whether to inspect request/response bodies |
+| `https_mode` | String | `"inspect"` | HTTPS handling mode: `"inspect"` or `"tunnel"` |
 | `cache` | Table | None | Cache configuration (see below) |
 | `status` | u16 | Required for DENY | HTTP status code for denial response |
 | `reason` | String | None | HTTP reason phrase (DENY only) |
@@ -98,7 +98,7 @@ Rules are evaluated in order. The first matching rule determines the action.
 
 - Permit the request to proceed upstream
 - Must not set `status`, `reason`, or `body`
-- Can use `inspect_payload = false` for tunnel mode
+- Can use `https_mode = "tunnel"` for explicit CONNECT tunneling
 
 #### DENY Rules
 
@@ -131,11 +131,12 @@ methods = ["ANY"]
     Cannot mix `"ANY"` with explicit methods in the same array.
     `"CONNECT"` must be the only method in its rule.
 
-CONNECT requests are evaluated against explicit CONNECT rules first. If no
-explicit CONNECT rule matches, HTTPS rules can implicitly allow a bumped tunnel,
-and DENY rules with `methods = ["ANY"]` can supply custom CONNECT denial
-responses. Private upstream addresses are never permitted, whether the request
-is plain HTTP, tunneled CONNECT, or bumped HTTPS.
+CONNECT requests are evaluated against explicit CONNECT tunnel rules first. If
+no tunnel rule matches, ExfilGuard can still perform a TLS bump preflight when
+matching HTTPS inspect rules exist for the same host/port. The real policy
+decision is then attached to the inner HTTP request. Private upstream addresses
+are never permitted, whether the request is plain HTTP, tunneled CONNECT, or
+bumped HTTPS.
 
 ---
 
@@ -208,25 +209,28 @@ url_pattern = "https://example.com:8443/api/**"
 
 ---
 
-## Payload Inspection
+## HTTPS Modes
 
-The `inspect_payload` option controls whether ExfilGuard inspects request/response bodies.
+The `https_mode` option controls how ExfilGuard handles HTTPS traffic.
 
-### inspect_payload = true (default)
+### https_mode = "inspect" (default)
 
-- Full HTTP inspection including headers and body
+- Full HTTP inspection after TLS interception
 - TLS is terminated and re-encrypted (MITM)
-- Required for non-CONNECT methods
-- HTTPS rules implicitly authorize CONNECT bumping for the same host/port
+- Used for normal HTTPS `GET`/`POST`/`PUT`/`DELETE` style rules
+- Matching HTTPS rules authorize a TLS bump preflight for the same host/port
+- The real policy decision is attached to the inner HTTP request
 - Private upstream resolution is still blocked
-- Enables full request/response inspection for logging, metrics, and caching (when configured)
+- Enables normal request logging, metrics, and caching (when configured)
+- Request metrics are labeled `effective_mode="bump"` on the inspected inner request
 
-### inspect_payload = false (tunnel mode)
+### https_mode = "tunnel"
 
 - Traffic is tunneled without inspection
 - Only valid with `methods = ["CONNECT"]`
 - Only valid with URL pattern path `/**` (e.g., `https://secure.partner.com/**`)
 - CONNECT tunnel rules must appear before non-CONNECT rules inside each policy
+- Request metrics are labeled `effective_mode="tunnel"` on the CONNECT tunnel request
 - Useful for certificate-pinned services that refuse MITM
 
 !!! warning
@@ -305,7 +309,7 @@ name = "pinned-payments"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://secure.partner.com/**"
-  inspect_payload = false
+  https_mode = "tunnel"
 ```
 
 ### Cached Static Content

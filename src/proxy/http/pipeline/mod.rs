@@ -193,7 +193,8 @@ name = "allow"
         };
 
         let result =
-            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None).await?;
+            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None, None)
+                .await?;
         assert!(matches!(result, ClientDisposition::Close));
 
         drop(reader);
@@ -232,7 +233,8 @@ name = "allow"
         };
 
         let result =
-            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None).await?;
+            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None, None)
+                .await?;
         assert!(matches!(result, ClientDisposition::Close));
 
         drop(reader);
@@ -270,7 +272,8 @@ name = "allow"
         };
 
         let result =
-            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None).await?;
+            handle_non_connect(&mut reader, peer, &app, &mut upstream_pool, ctx, None, None)
+                .await?;
         assert!(matches!(result, ClientDisposition::Close));
 
         drop(reader);

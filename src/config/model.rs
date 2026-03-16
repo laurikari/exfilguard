@@ -36,7 +36,7 @@ pub struct Rule {
     pub action: RuleAction,
     pub methods: MethodMatch,
     pub url_pattern: Option<UrlPattern>,
-    pub inspect_payload: bool,
+    pub https_mode: HttpsMode,
     pub cache: Option<CacheConfig>,
 }
 
@@ -81,6 +81,22 @@ impl Scheme {
         match self {
             Scheme::Http => 80,
             Scheme::Https => 443,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HttpsMode {
+    #[default]
+    Inspect,
+    Tunnel,
+}
+
+impl HttpsMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inspect => "inspect",
+            Self::Tunnel => "tunnel",
         }
     }
 }

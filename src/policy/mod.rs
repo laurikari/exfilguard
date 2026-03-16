@@ -1,3 +1,5 @@
+use crate::config::HttpsMode;
+
 use std::sync::Arc;
 
 use http::StatusCode;
@@ -13,7 +15,7 @@ pub enum Decision {
     Allow {
         policy: Arc<str>,
         rule: Arc<str>,
-        inspect_payload: bool,
+        https_mode: HttpsMode,
         cache: Option<CompiledCacheConfig>,
     },
     Deny {

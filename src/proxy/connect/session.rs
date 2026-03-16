@@ -1,20 +1,24 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use http::StatusCode;
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::{Level, warn};
+use uuid::Uuid;
 
 use crate::{
     logging::AccessLogBuilder,
     proxy::{
         AppContext,
+        forward_error::{classify_forward_error, log_forward_error},
         http::respond_with_access_log,
         policy_eval::{AllowDecision, DenyDecision, RequestLogContext},
         policy_response::{self, ForwardErrorSpec, ForwardOutcome},
+        request::{EffectiveMode, RequestFlowContext},
     },
     util::is_private_ip,
 };
@@ -31,13 +35,14 @@ use super::{
 /// A session is responsible for:
 /// 1. Resolving the upstream target (with DNS and private-IP checks).
 /// 2. Executing the "Decision Path":
-///    - Splicing: Raw byte streaming for pass-through (inspect_payload=false).
-///    - Bumping: Handing off to the TLS interceptor for inspection (inspect_payload=true).
+///    - Tunnel mode: Raw byte streaming for explicit CONNECT tunnel rules.
+///    - Bump mode: TLS interception after a transport-only preflight.
 pub struct ConnectSession {
     peer: SocketAddr,
     parsed: ConnectTarget,
     literal_ip: Option<IpAddr>,
     target: String,
+    session_id: Arc<str>,
     bytes_in: u64,
     start: Instant,
     response_timeout: Duration,
@@ -58,6 +63,7 @@ impl ConnectSession {
             parsed,
             literal_ip,
             target,
+            session_id: Arc::<str>::from(Uuid::new_v4().to_string()),
             bytes_in,
             start,
             response_timeout,
@@ -72,15 +78,21 @@ impl ConnectSession {
         &self.target
     }
 
-    pub async fn process_allow(
+    pub fn bump_flow_context(&self) -> RequestFlowContext {
+        RequestFlowContext {
+            session_id: self.session_id.clone(),
+            outer_method: Arc::<str>::from("CONNECT"),
+            effective_mode: EffectiveMode::Bump,
+        }
+    }
+
+    pub async fn process_tunnel_allow(
         &mut self,
         stream: TcpStream,
         allow: AllowDecision,
         log: RequestLogContext<'_>,
         app: &AppContext,
     ) -> Result<()> {
-        log_allow(&self.peer, &self.parsed, &allow);
-
         let resolve_timeout = app.settings.dns_resolve_timeout();
         let resolved = match resolve_connect_target(
             &self.parsed,
@@ -92,19 +104,42 @@ impl ConnectSession {
             Ok(resolved) => resolved,
             Err(err) => {
                 let mut stream = stream;
-                self.respond_resolution_error(&mut stream, &allow, err)
+                self.respond_tunnel_resolution_error(&mut stream, &allow, err)
                     .await?;
                 return Ok(());
             }
         };
 
-        if allow.inspect_payload {
-            self.handle_bump_path(stream, allow, log, resolved, app)
-                .await
-        } else {
-            self.handle_splice_path(stream, allow, log, resolved, app)
-                .await
-        }
+        self.handle_splice_path(stream, allow, log, resolved, app)
+            .await
+    }
+
+    pub async fn process_tls_bump_preflight(
+        &mut self,
+        stream: TcpStream,
+        client: Arc<str>,
+        log: RequestLogContext<'_>,
+        app: &AppContext,
+    ) -> Result<()> {
+        let resolve_timeout = app.settings.dns_resolve_timeout();
+        let resolved = match resolve_connect_target(
+            &self.parsed,
+            resolve_timeout,
+            app.settings.allow_test_upstreams,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let mut stream = stream;
+                self.respond_preflight_resolution_error(&mut stream, client.as_ref(), err)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        self.handle_bump_preflight_path(stream, client, log, resolved, app)
+            .await
     }
 
     pub async fn respond_policy_deny(
@@ -112,16 +147,6 @@ impl ConnectSession {
         stream: &mut TcpStream,
         deny: &DenyDecision,
     ) -> Result<()> {
-        info!(
-            peer = %self.peer,
-            client = %deny.client,
-            policy = %deny.policy,
-            rule = %deny.rule,
-            host = %self.parsed.host,
-            port = self.parsed.port,
-            status = deny.status.as_u16(),
-            "policy deny decision (CONNECT)"
-        );
         let spec = policy_response::policy_deny_spec(deny);
         self.respond_with_builder(
             stream,
@@ -129,7 +154,9 @@ impl ConnectSession {
             spec.reason,
             spec.body_http1,
             "DENY",
-            |builder| policy_response::decorate_policy_deny_log(builder, deny),
+            |builder| {
+                policy_response::decorate_policy_deny_log(builder.effective_mode("tunnel"), deny)
+            },
         )
         .await
     }
@@ -156,7 +183,7 @@ impl ConnectSession {
                 peer = %self.peer,
                 host = %self.parsed.host,
                 port = self.parsed.port,
-                "no matching policy decision for CONNECT; default deny"
+                "no matching CONNECT tunnel policy or TLS bump preflight; default deny"
             );
             let spec = policy_response::default_deny_spec();
             self.respond_with_builder(
@@ -186,7 +213,7 @@ impl ConnectSession {
             .client(allow.client.as_ref())
             .policy(allow.policy.as_ref())
             .rule(allow.rule.as_ref())
-            .inspect_payload(false)
+            .effective_mode("tunnel")
             .bytes(
                 self.bytes_in,
                 stats.handshake_bytes + stats.upstream_stream_bytes,
@@ -202,20 +229,27 @@ impl ConnectSession {
         &mut self,
         stream: TcpStream,
         resolved: ResolvedTarget,
-        allow: &AllowDecision,
+        client: &str,
         app: &AppContext,
     ) -> Result<()> {
-        let bump_stats = handle_bump(stream, &self.parsed, resolved, app, self.peer).await?;
+        let bump_stats = handle_bump(
+            stream,
+            &self.parsed,
+            resolved,
+            app,
+            self.peer,
+            self.bump_flow_context(),
+        )
+        .await?;
         self.access_log_builder()
             .status(StatusCode::OK)
             .decision("ALLOW")
-            .client(allow.client.as_ref())
-            .policy(allow.policy.as_ref())
-            .rule(allow.rule.as_ref())
-            .inspect_payload(true)
+            .client(client)
+            .effective_mode("bump")
+            .transport("tls_bump_preflight")
             .bytes(self.bytes_in, bump_stats.handshake_bytes)
             .elapsed(self.start.elapsed())
-            .log();
+            .log_with_level(Level::DEBUG);
         Ok(())
     }
 
@@ -251,7 +285,7 @@ impl ConnectSession {
                 .client(allow.client.as_ref())
                 .policy(allow.policy.as_ref())
                 .rule(allow.rule.as_ref())
-                .inspect_payload(false)
+                .effective_mode("tunnel")
                 .bytes(self.bytes_in, 0)
                 .elapsed(self.start.elapsed())
                 .upstream_reused(false)
@@ -285,28 +319,44 @@ impl ConnectSession {
         }
     }
 
-    async fn handle_bump_path(
+    async fn handle_bump_preflight_path(
         &mut self,
         stream: TcpStream,
-        allow: AllowDecision,
-        log: RequestLogContext<'_>,
+        client: Arc<str>,
+        _log: RequestLogContext<'_>,
         resolved: ResolvedTarget,
         app: &AppContext,
     ) -> Result<()> {
-        let bump_result = self.run_bump(stream, resolved, &allow, app).await;
-        match policy_response::handle_forward_result(
-            &allow,
-            log,
-            bump_result,
-            self.peer,
-            &self.parsed.host,
-        )
-        .await?
-        {
-            ForwardOutcome::Completed(()) => Ok(()),
-            ForwardOutcome::Responded(ctx) => {
-                self.log_forward_error(ctx.spec, ctx.log, ctx.decision, &ctx.error_detail)
-                    .await
+        let bump_result = self.run_bump(stream, resolved, client.as_ref(), app).await;
+        match bump_result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let kind = classify_forward_error(&err);
+                crate::metrics::record_upstream_error(match kind {
+                    crate::proxy::forward_error::ForwardErrorKind::RequestTimeout => {
+                        "request_timeout"
+                    }
+                    crate::proxy::forward_error::ForwardErrorKind::BodyTooLarge(_) => {
+                        "body_too_large"
+                    }
+                    crate::proxy::forward_error::ForwardErrorKind::PrivateAddress(_) => {
+                        "private_address"
+                    }
+                    crate::proxy::forward_error::ForwardErrorKind::MisdirectedRequest(_) => {
+                        "misdirected_request"
+                    }
+                    crate::proxy::forward_error::ForwardErrorKind::UpstreamClosed => {
+                        "upstream_closed"
+                    }
+                    crate::proxy::forward_error::ForwardErrorKind::Other => "other",
+                });
+                log_forward_error(&kind, self.peer, &self.parsed.host, &err);
+                self.log_bump_preflight_error(
+                    policy_response::forward_error_spec(&kind),
+                    client.as_ref(),
+                    &err.to_string(),
+                )
+                .await
             }
         }
     }
@@ -340,30 +390,30 @@ impl ConnectSession {
         .await
     }
 
-    async fn log_forward_error(
+    async fn log_bump_preflight_error(
         &mut self,
         spec: ForwardErrorSpec,
-        log: RequestLogContext<'_>,
-        allow: AllowDecision,
+        client: &str,
         error_detail: &str,
     ) -> Result<()> {
         if spec.extra_client_bytes > 0 {
             self.bytes_in = self.bytes_in.saturating_add(spec.extra_client_bytes);
         }
-        policy_response::forward_error_log_builder(
-            log.access_log_builder(),
-            &allow,
-            &spec,
-            error_detail,
-        )
-        .status(spec.status)
-        .bytes(self.bytes_in, 0)
-        .elapsed(self.start.elapsed())
-        .log();
+        self.access_log_builder()
+            .status(spec.status)
+            .decision(spec.decision)
+            .client(client)
+            .effective_mode("bump")
+            .transport("tls_bump_preflight")
+            .error_reason(spec.log_reason)
+            .error_detail(error_detail)
+            .bytes(self.bytes_in, 0)
+            .elapsed(self.start.elapsed())
+            .log_with_level(Level::DEBUG);
         Ok(())
     }
 
-    async fn respond_resolution_error(
+    async fn respond_tunnel_resolution_error(
         &self,
         stream: &mut TcpStream,
         allow: &AllowDecision,
@@ -390,6 +440,7 @@ impl ConnectSession {
                         .client(allow.client.as_ref())
                         .policy(allow.policy.as_ref())
                         .rule(allow.rule.as_ref())
+                        .effective_mode("tunnel")
                 },
             )
             .await
@@ -412,6 +463,62 @@ impl ConnectSession {
                         .client(allow.client.as_ref())
                         .policy(allow.policy.as_ref())
                         .rule(allow.rule.as_ref())
+                        .effective_mode("tunnel")
+                },
+            )
+            .await
+        }
+    }
+
+    async fn respond_preflight_resolution_error(
+        &self,
+        stream: &mut TcpStream,
+        client: &str,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        if err
+            .downcast_ref::<crate::proxy::resolver::PrivateAddressError>()
+            .is_some()
+        {
+            warn!(
+                peer = %self.peer,
+                host = %self.parsed.host,
+                port = self.parsed.port,
+                "CONNECT target resolved to private network; blocking"
+            );
+            self.respond_with_builder(
+                stream,
+                StatusCode::FORBIDDEN,
+                None,
+                b"CONNECT to private networks is not allowed\r\n",
+                "DENY",
+                |builder| {
+                    builder
+                        .client(client)
+                        .effective_mode("bump")
+                        .transport("tls_bump_preflight")
+                },
+            )
+            .await
+        } else {
+            warn!(
+                peer = %self.peer,
+                host = %self.parsed.host,
+                port = self.parsed.port,
+                error = %err,
+                "failed to resolve CONNECT target"
+            );
+            self.respond_with_builder(
+                stream,
+                StatusCode::BAD_GATEWAY,
+                None,
+                b"failed to resolve CONNECT target\r\n",
+                "ERROR",
+                |builder| {
+                    builder
+                        .client(client)
+                        .effective_mode("bump")
+                        .transport("tls_bump_preflight")
                 },
             )
             .await
@@ -420,6 +527,7 @@ impl ConnectSession {
 
     fn access_log_builder(&self) -> AccessLogBuilder {
         AccessLogBuilder::for_connect(self.peer, self.parsed.host.clone(), self.target.clone())
+            .session_id(self.session_id.as_ref())
     }
 
     async fn respond_with_builder<F>(
@@ -445,29 +553,5 @@ impl ConnectSession {
             build(self.access_log_builder()).decision(decision),
         )
         .await
-    }
-}
-
-fn log_allow(peer: &SocketAddr, target: &ConnectTarget, allow: &AllowDecision) {
-    if allow.inspect_payload {
-        info!(
-            peer = %peer,
-            client = %allow.client,
-            policy = %allow.policy,
-            rule = %allow.rule,
-            host = %target.host,
-            port = target.port,
-            "policy allow decision (CONNECT bump)"
-        );
-    } else {
-        info!(
-            peer = %peer,
-            client = %allow.client,
-            policy = %allow.policy,
-            rule = %allow.rule,
-            host = %target.host,
-            port = target.port,
-            "policy allow decision (CONNECT pass-through)"
-        );
     }
 }

@@ -12,8 +12,8 @@ use serde::Deserialize;
 use super::{
     ValidatedConfig,
     model::{
-        CacheConfig, Client, ClientSelector, Config, MethodMatch, Policy, Rule, RuleAction, Scheme,
-        UrlPattern,
+        CacheConfig, Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule,
+        RuleAction, Scheme, UrlPattern,
     },
 };
 use crate::util::{IpOrCidr, parse_ip_or_cidr};
@@ -162,28 +162,15 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
                 })?),
                 None => None,
             };
-            if rule.splice.is_some() {
-                bail!(
-                    "policy '{}' rule {} uses deprecated field 'splice'; set inspect_payload instead",
-                    name,
-                    idx
-                );
-            }
-            if matches!(action, RuleAction::Deny { .. }) && !rule.inspect_payload {
-                bail!(
-                    "policy '{}' rule {}: inspect_payload=false is not allowed for DENY action",
-                    name,
-                    idx
-                );
-            }
+            let https_mode = parse_https_mode(&name, idx, &rule)?;
             let id = Arc::<str>::from(format!("{}#{}", policy_name, idx));
-            validate_rule_constraints(&name, idx, rule.inspect_payload, &methods, &url_pattern)?;
+            validate_rule_constraints(&name, idx, https_mode, &methods, &url_pattern)?;
             compiled_rules.push(Rule {
                 id,
                 action,
                 methods,
                 url_pattern,
-                inspect_payload: rule.inspect_payload,
+                https_mode,
                 cache: rule.cache.map(|c| CacheConfig {
                     force_cache_duration: c.force_cache_duration,
                 }),
@@ -548,54 +535,55 @@ struct RawRule {
     reason: Option<String>,
     #[serde(default)]
     body: Option<String>,
-    #[serde(default = "default_inspect_payload")]
-    inspect_payload: bool,
     #[serde(default)]
-    splice: Option<bool>,
+    https_mode: Option<String>,
     #[serde(default)]
     cache: Option<RawCacheConfig>,
 }
 
-fn default_inspect_payload() -> bool {
-    true
+fn parse_https_mode(policy: &str, idx: usize, rule: &RawRule) -> Result<HttpsMode> {
+    match rule.https_mode.as_deref() {
+        Some("inspect" | "INSPECT") | None => Ok(HttpsMode::Inspect),
+        Some("tunnel" | "TUNNEL") => Ok(HttpsMode::Tunnel),
+        Some(other) => bail!(
+            "policy '{}' rule {}: unsupported https_mode '{}'",
+            policy,
+            idx,
+            other
+        ),
+    }
 }
 
 fn validate_rule_constraints(
     policy: &str,
     idx: usize,
-    inspect_payload: bool,
+    https_mode: HttpsMode,
     methods: &MethodMatch,
     url_pattern: &Option<UrlPattern>,
 ) -> Result<()> {
     let connect_only = methods_connect_only(methods);
-    if connect_only {
-        validate_connect_pattern(policy, idx, url_pattern)?;
-    }
-
-    if inspect_payload {
-        return Ok(());
-    }
-
-    match methods {
-        MethodMatch::Any => bail!(
-            "policy '{}' rule {}: inspect_payload=false rules must restrict methods to CONNECT",
-            policy,
-            idx
-        ),
-        MethodMatch::List(list) => {
-            if !list.iter().all(|method| method == Method::CONNECT) {
+    match https_mode {
+        HttpsMode::Inspect => {
+            if connect_only {
                 bail!(
-                    "policy '{}' rule {}: inspect_payload=false rules must restrict methods to CONNECT",
+                    "policy '{}' rule {}: CONNECT rules must set https_mode = \"tunnel\"",
                     policy,
                     idx
                 );
             }
+            Ok(())
+        }
+        HttpsMode::Tunnel => {
+            if !connect_only {
+                bail!(
+                    "policy '{}' rule {}: https_mode=\"tunnel\" rules must restrict methods to CONNECT",
+                    policy,
+                    idx
+                );
+            }
+            validate_connect_pattern(policy, idx, url_pattern)
         }
     }
-
-    validate_connect_pattern(policy, idx, url_pattern)?;
-
-    Ok(())
 }
 
 fn validate_connect_pattern(
@@ -860,7 +848,7 @@ name = "allow"
     }
 
     #[test]
-    fn reject_inspect_payload_false_without_connect_methods() {
+    fn reject_tunnel_mode_without_connect_methods() {
         let clients = write_temp(
             r#"[[client]]
 name = "default"
@@ -876,13 +864,13 @@ name = "pass"
   action = "ALLOW"
   methods = ["ANY"]
   url_pattern = "https://example.com/**"
-  inspect_payload = false
+  https_mode = "tunnel"
 "#,
         );
         let err = load_config(clients.path(), policies.path()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("inspect_payload=false rules must restrict methods to CONNECT")
+                .contains("https_mode=\"tunnel\" rules must restrict methods to CONNECT")
         );
     }
 
@@ -903,7 +891,7 @@ name = "pass"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://example.com/strict"
-  inspect_payload = false
+  https_mode = "tunnel"
 "#,
         );
         let err = load_config(clients.path(), policies.path()).unwrap_err();
@@ -935,7 +923,7 @@ name = "allow"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://example.com/**"
-  inspect_payload = false
+  https_mode = "tunnel"
 "#,
         );
         let err = load_config(clients.path(), policies.path()).unwrap_err();
@@ -946,7 +934,32 @@ name = "allow"
     }
 
     #[test]
-    fn allow_connect_bump_rule() {
+    fn reject_legacy_inspect_payload_field() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+fallback = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["GET"]
+  url_pattern = "https://example.com/**"
+  inspect_payload = true
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("unknown field `inspect_payload`"));
+    }
+
+    #[test]
+    fn reject_legacy_splice_field() {
         let clients = write_temp(
             r#"[[client]]
 name = "default"
@@ -962,6 +975,32 @@ name = "allow"
   action = "ALLOW"
   methods = ["CONNECT"]
   url_pattern = "https://example.com/**"
+  splice = true
+"#,
+        );
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("unknown field `splice`"));
+    }
+
+    #[test]
+    fn allow_explicit_connect_tunnel_rule() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+cidr = "0.0.0.0/0"
+policies = ["allow"]
+fallback = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  methods = ["CONNECT"]
+  url_pattern = "https://example.com/**"
+  https_mode = "tunnel"
 "#,
         );
         let config = load_config(clients.path(), policies.path()).expect("config should load");

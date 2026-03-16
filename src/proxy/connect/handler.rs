@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::{
     config::Scheme,
     logging::AccessLogBuilder,
-    policy::matcher::PolicySnapshot,
+    policy::matcher::{PolicySnapshot, Request},
     proxy::{
         AppContext,
         http::respond_with_access_log,
@@ -81,12 +81,16 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         port: Some(session.parsed().port),
         path: session.original_target().to_string(),
         policy_path: session.original_target().to_string(),
+        flow: None,
     };
 
     let mut handler = ConnectRequestHandler {
         session: &mut session,
         stream: &mut stream,
         app,
+        peer,
+        snapshot: &snapshot,
+        parsed_request: &parsed_request,
     };
 
     request_pipeline::process_request(
@@ -94,7 +98,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         &parsed_request,
         &snapshot,
         app.settings.log_queries,
-        PolicyLogConfig::connect(),
+        PolicyLogConfig::connect_tunnel(),
         &mut handler,
     )
     .await
@@ -104,6 +108,9 @@ struct ConnectRequestHandler<'a> {
     session: &'a mut ConnectSession,
     stream: &'a mut Option<TcpStream>,
     app: &'a AppContext,
+    peer: SocketAddr,
+    snapshot: &'a PolicySnapshot,
+    parsed_request: &'a ParsedRequest,
 }
 
 #[async_trait]
@@ -114,7 +121,7 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
         let stream = self.stream.take().expect("stream present");
         let policy_eval::AllowOutcome { decision, log } = outcome;
         self.session
-            .process_allow(stream, decision, log, self.app)
+            .process_tunnel_allow(stream, decision, log, self.app)
             .await
     }
 
@@ -129,8 +136,25 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
 
     async fn on_default_deny(
         &mut self,
-        _outcome: policy_eval::DefaultDenyOutcome<'_>,
+        outcome: policy_eval::DefaultDenyOutcome<'_>,
     ) -> Result<Self::Output> {
+        let request = Request {
+            method: &self.parsed_request.method,
+            scheme: self.parsed_request.scheme,
+            host: &self.parsed_request.host,
+            port: self.parsed_request.port,
+            path: self.parsed_request.policy_path(),
+        };
+        if let Some(preflight) = self
+            .snapshot
+            .evaluate_tls_bump_preflight(self.peer.ip(), &request)
+        {
+            let stream = self.stream.take().expect("stream present");
+            return self
+                .session
+                .process_tls_bump_preflight(stream, preflight.client, outcome.log, self.app)
+                .await;
+        }
         self.session
             .respond_default_denial(self.stream.as_mut().expect("stream present"))
             .await

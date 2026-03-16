@@ -10,7 +10,8 @@ use ipnet::IpNet;
 
 pub use loader::{load_config, load_config_with_dirs};
 pub use model::{
-    Client, ClientSelector, Config, MethodMatch, Policy, Rule, RuleAction, Scheme, UrlPattern,
+    Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
+    UrlPattern,
 };
 
 use crate::util::cidrs_overlap;

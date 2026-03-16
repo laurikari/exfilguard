@@ -99,8 +99,12 @@ impl TestConfigBuilder {
                 if let Some(pattern) = &rule.url_pattern {
                     let _ = writeln!(policies_doc, "  url_pattern = \"{}\"", toml_escape(pattern));
                 }
-                if let Some(inspect_payload) = rule.inspect_payload {
-                    let _ = writeln!(policies_doc, "  inspect_payload = {}", inspect_payload);
+                if let Some(https_mode) = &rule.https_mode {
+                    let _ = writeln!(
+                        policies_doc,
+                        "  https_mode = \"{}\"",
+                        toml_escape(https_mode)
+                    );
                 }
                 if let Some(cache) = &rule.cache {
                     let _ = writeln!(policies_doc, "  [policy.rule.cache]");
@@ -180,7 +184,7 @@ pub struct RuleSpec {
     action: ActionSpec,
     methods: Option<Vec<String>>,
     url_pattern: Option<String>,
-    inspect_payload: Option<bool>,
+    https_mode: Option<String>,
     status: Option<u16>,
     reason: Option<String>,
     body: Option<String>,
@@ -199,7 +203,7 @@ impl RuleSpec {
             action: ActionSpec::Allow,
             methods: Some(methods.iter().map(|method| (*method).to_string()).collect()),
             url_pattern: Some(url_pattern.into()),
-            inspect_payload: None,
+            https_mode: None,
             status: None,
             reason: None,
             body: None,
@@ -216,7 +220,7 @@ impl RuleSpec {
             action: ActionSpec::Deny,
             methods: Some(methods.iter().map(|method| (*method).to_string()).collect()),
             url_pattern: Some(url_pattern.into()),
-            inspect_payload: None,
+            https_mode: None,
             status: None,
             reason: None,
             body: None,
@@ -224,8 +228,8 @@ impl RuleSpec {
         }
     }
 
-    pub fn inspect_payload(mut self, inspect_payload: bool) -> Self {
-        self.inspect_payload = Some(inspect_payload);
+    pub fn https_mode(mut self, https_mode: &str) -> Self {
+        self.https_mode = Some(https_mode.to_string());
         self
     }
 

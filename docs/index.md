@@ -43,7 +43,7 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 :   JSON or text format logging with decision tracking. Logs each request's allow/deny decision with structured metadata.
 
 **Metrics Exporter**
-:   Optional Prometheus endpoint (`/metrics`) with counters/histograms per client/policy for traffic, decisions, cache, and pool health. Supports HTTPS when given a cert/key.
+:   Optional Prometheus endpoint (`/metrics`) with counters/histograms per client/policy for traffic, decisions, effective mode (`direct`, `bump`, `tunnel`), cache, and pool health. Supports HTTPS when given a cert/key.
 
 ---
 
@@ -106,7 +106,7 @@ sudo systemctl enable --now exfilguard
 
 ```toml
 # Allow analytics service to reach trusted endpoint
-# HTTPS rules implicitly allow the CONNECT bump for the same host/port.
+# HTTPS inspect rules authorize TLS bump preflight for the same host/port.
 [[policy.rule]]
 action = "ALLOW"
 methods = ["GET", "POST"]
@@ -121,7 +121,7 @@ url_pattern = "https://api.trusted-analytics.com/v1/exports/**"
 action = "ALLOW"
 methods = ["CONNECT"]
 url_pattern = "https://secure.payment-gateway.com/**"
-inspect_payload = false
+https_mode = "tunnel"
 ```
 
 ### Client mapping by CIDR

@@ -27,6 +27,7 @@ use crate::{
         forward_limits::AllowLogTracker,
         policy_eval::{self, AllowDecision, PolicyLogConfig, RequestLogContext},
         policy_response::{self, ForwardErrorSpec},
+        request::RequestFlowContext,
         request_pipeline::{self, RequestHandler},
     },
 };
@@ -44,9 +45,17 @@ pub async fn serve_bumped_http2(
     app: AppContext,
     connect_binding: Option<ResolvedTarget>,
     primed_upstream: Option<PrimedHttp2Upstream>,
+    flow_context: RequestFlowContext,
 ) -> Result<()> {
-    let mut service =
-        Http2BumpService::new(stream, peer, app, connect_binding, primed_upstream).await?;
+    let mut service = Http2BumpService::new(
+        stream,
+        peer,
+        app,
+        connect_binding,
+        primed_upstream,
+        flow_context,
+    )
+    .await?;
     service.run().await
 }
 
@@ -56,6 +65,7 @@ struct Http2BumpService {
     connection: server::Connection<TlsStream<TcpStream>, Bytes>,
     upstream: Arc<Mutex<Http2Upstream>>,
     upstream_closed: watch::Receiver<bool>,
+    flow_context: RequestFlowContext,
 }
 
 impl Http2BumpService {
@@ -65,6 +75,7 @@ impl Http2BumpService {
         app: AppContext,
         connect_binding: Option<ResolvedTarget>,
         primed_upstream: Option<PrimedHttp2Upstream>,
+        flow_context: RequestFlowContext,
     ) -> Result<Self> {
         let connection = server::handshake(stream)
             .await
@@ -77,6 +88,7 @@ impl Http2BumpService {
             connection,
             upstream: Arc::new(Mutex::new(upstream)),
             upstream_closed,
+            flow_context,
         })
     }
 
@@ -115,9 +127,18 @@ impl Http2BumpService {
                             let peer = self.peer;
                             let app = self.app.clone();
                             let upstream = self.upstream.clone();
+                            let flow_context = self.flow_context.clone();
                             tasks.spawn(async move {
                                 if let Err(err) =
-                                    process_downstream_request(request, respond, peer, app, upstream).await
+                                    process_downstream_request(
+                                        request,
+                                        respond,
+                                        peer,
+                                        app,
+                                        upstream,
+                                        flow_context,
+                                    )
+                                    .await
                                 {
                                     warn!(
                                         peer = %peer,
@@ -152,6 +173,7 @@ async fn process_downstream_request(
     peer: SocketAddr,
     app: AppContext,
     upstream: Arc<Mutex<Http2Upstream>>,
+    flow_context: RequestFlowContext,
 ) -> Result<()> {
     if let Err(err) = reject_expect_header(request.headers()) {
         warn!(
@@ -172,7 +194,7 @@ async fn process_downstream_request(
     let start = Instant::now();
     let snapshot = app.policies.snapshot();
     let max_request_header_size = app.settings.max_request_header_size;
-    let (meta, body) = match sanitize_request(request, max_request_header_size) {
+    let (meta, body) = match sanitize_request(request, max_request_header_size, &flow_context) {
         Ok(result) => result,
         Err(err) => {
             warn!(
@@ -255,7 +277,7 @@ impl DownstreamRequestCtx {
             &parsed_for_policy,
             &snapshot,
             log_queries,
-            PolicyLogConfig::http2_connect_bump(),
+            PolicyLogConfig::http1(),
             &mut handler,
         )
         .await
@@ -440,7 +462,6 @@ impl Http2RequestHandler {
             .rule(decision.rule.as_ref())
             .error_reason(Self::forward_error_kind_label(kind))
             .error_detail(error_detail)
-            .inspect_payload(decision.inspect_payload)
             .bytes(self.ctx.log_tracker.current_bytes(), 0)
             .elapsed(self.ctx.log_tracker.elapsed())
             .log();
