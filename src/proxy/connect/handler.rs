@@ -25,7 +25,6 @@ pub struct ConnectRequest<'a> {
     pub stream: TcpStream,
     pub peer: SocketAddr,
     pub target: &'a str,
-    pub host_header: Option<&'a str>,
     pub snapshot: PolicySnapshot,
     pub app: &'a AppContext,
     pub request_bytes: usize,
@@ -39,7 +38,6 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         stream,
         peer,
         target,
-        host_header,
         snapshot,
         app,
         request_bytes,
@@ -47,7 +45,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
     } = ctx;
     let response_timeout = app.settings.response_body_idle_timeout();
     let mut stream = Some(stream);
-    let parsed_target = match parse_connect_target(target, host_header) {
+    let parsed_target = match parse_connect_target(target) {
         Ok(parsed) => parsed,
         Err(err) => {
             warn!(peer = %peer, target, error = %err, "invalid CONNECT target");

@@ -49,7 +49,6 @@ async fn serve_plain_http(stream: TcpStream, peer: SocketAddr, app: AppContext) 
                 stream: connect.stream,
                 peer,
                 target: connect.target.as_str(),
-                host_header: connect.host_header.as_deref(),
                 snapshot,
                 app: &app,
                 request_bytes: connect.request_bytes,

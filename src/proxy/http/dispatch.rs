@@ -33,7 +33,6 @@ pub(super) enum LoopOutcome<S> {
 pub(super) struct ConnectRequest<S> {
     pub stream: S,
     pub target: String,
-    pub host_header: Option<String>,
     pub request_bytes: usize,
     pub start: Instant,
 }
@@ -109,7 +108,6 @@ where
         } = request_head;
 
         if allow_connect && method == Method::CONNECT {
-            let host_header = headers.host().map(|h| h.to_owned());
             let request_bytes = request_line_bytes + header_bytes;
             let stream = reader.into_inner();
             upstream_pool
@@ -118,7 +116,6 @@ where
             return Ok(LoopOutcome::Connect(ConnectRequest {
                 stream,
                 target,
-                host_header,
                 request_bytes,
                 start,
             }));
