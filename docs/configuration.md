@@ -1,13 +1,13 @@
 # Configuration Reference
 
-Global settings for ExfilGuard defined in `exfilguard.toml`. These settings are
-loaded at process startup.
+These are the global settings in `exfilguard.toml`. ExfilGuard reads them at
+startup.
 
 ---
 
 ## Core Settings
 
-Required settings to run ExfilGuard.
+These settings are required.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -24,25 +24,30 @@ Required settings to run ExfilGuard.
     Relative paths are resolved from the directory containing the main config file.
 
 !!! note
-    When `proxy_protocol` is `"optional"` or `"required"`, ExfilGuard auto-detects PROXY
-    protocol v1 or v2 headers. If the peer IP is not in `proxy_protocol_allowed_cidrs`,
-    ExfilGuard ignores any PROXY headers and treats the connection as a plain client.
+    Use ExfilGuard as an explicit proxy. Clients should know they are talking
+    to one.
 
 !!! note
-    `proxy_protocol_allowed_cidrs` must be set when PROXY protocol is enabled.
+    When `proxy_protocol` is `"optional"` or `"required"`, ExfilGuard
+    auto-detects PROXY protocol v1 or v2 headers. If the peer IP is not in
+    `proxy_protocol_allowed_cidrs`, ExfilGuard ignores any PROXY headers and
+    treats the connection as a normal client connection.
 
 !!! note
-    `exfilguard.toml` is startup-only. Sending `SIGHUP` reloads only the
-    client/policy data read from the already configured `clients`,
-    `clients_dir`, `policies`, and `policies_dir` paths. Changes to fields in
-    `exfilguard.toml` itself, including `listen`, metrics, cache, TLS,
-    logging, and timeout settings, require restart.
+    Set `proxy_protocol_allowed_cidrs` when PROXY protocol is enabled.
+
+!!! note
+    ExfilGuard reads `exfilguard.toml` only at startup. `SIGHUP` reloads only
+    the client and policy data read from the configured `clients`,
+    `clients_dir`, `policies`, and `policies_dir` paths. If you change fields
+    in `exfilguard.toml` itself, including `listen`, metrics, cache, TLS,
+    logging, and timeout settings, restart the server.
 
 ---
 
 ## TLS / Certificate Settings
 
-Settings for TLS interception and certificate generation.
+These settings control TLS interception and leaf certificate generation.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -51,7 +56,7 @@ Settings for TLS interception and certificate generation.
 
 ### CA Directory Structure
 
-ExfilGuard uses a two-tier CA hierarchy. The `ca_dir` must contain:
+ExfilGuard uses a root CA plus an intermediate CA. `ca_dir` must contain:
 
 ```
 ca_dir/
@@ -61,22 +66,30 @@ ca_dir/
 └── intermediate.key   # Intermediate CA private key
 ```
 
-- **Leaf certificates** are signed by the intermediate CA
-- **Certificate chain** sent to clients: Leaf → Intermediate → Root
-- Clients only need to trust the root CA
-- If using an externally signed intermediate, `root.key` may be omitted
+- The intermediate CA signs leaf certificates.
+- ExfilGuard sends the chain `Leaf -> Intermediate -> Root` to clients.
+- Clients only need to trust the root CA.
+- If you use an externally signed intermediate, `root.key` may be omitted.
 
 If `ca_dir` is empty, ExfilGuard generates all four files automatically on first startup.
 
+!!! note
+    If you change files under `ca_dir`, restart the server. If you replace the
+    signing CA and use `cert_cache_dir`, clear the cached leaf certificates
+    before restart if you need clients to see the new issuer right away.
+
 ### Using Your Corporate CA
 
-To integrate with an existing PKI so clients already trust ExfilGuard's certificates:
+Use this flow if you want clients to trust ExfilGuard through your existing
+PKI:
 
-1. **Let ExfilGuard generate its keys** (start with empty `ca_dir`, then stop):
+1. **Let ExfilGuard generate its keys**:
    ```bash
    # Creates root.crt, root.key, intermediate.crt, intermediate.key
    exfilguard --config exfilguard.toml
    ```
+   Start with an empty `ca_dir`, then stop the process after it creates the
+   files.
 
 2. **Create a CSR from the generated intermediate key**:
    ```bash
@@ -85,7 +98,7 @@ To integrate with an existing PKI so clients already trust ExfilGuard's certific
      -subj "/CN=ExfilGuard Intermediate CA"
    ```
 
-3. **Get your corporate CA to sign the CSR** (produces a new certificate):
+3. **Get your corporate CA to sign the CSR**:
    ```bash
    # Example using openssl (adjust to your CA's process)
    openssl x509 -req -in intermediate.csr \
@@ -104,10 +117,13 @@ To integrate with an existing PKI so clients already trust ExfilGuard's certific
    # root.key is no longer needed (can be removed or kept)
    ```
 
-5. **Restart ExfilGuard** - clients that trust your corporate CA will now trust intercepted connections.
+5. **Restart ExfilGuard**.
+   Clients that trust your corporate CA will then trust intercepted
+   connections.
 
 !!! note
-    The private key (`intermediate.key`) stays the same. You're replacing the certificate with one signed by a different authority.
+    The private key (`intermediate.key`) stays the same. Only the certificate
+    changes.
 
 ---
 
@@ -169,13 +185,15 @@ All size values are in bytes and must be greater than 0.
 | `metrics_tls_cert` | Path | None | PEM certificate chain to enable HTTPS for `/metrics` |
 | `metrics_tls_key` | Path | None | PEM private key matching `metrics_tls_cert` |
 
-Exports counters and histograms for per-client/policy decisions and latency, cache activity, and connection pool health.
+ExfilGuard exports counters and histograms for per-client and per-policy
+decisions, latency, cache activity, and connection pool health.
 
 ---
 
 ## Cache Settings
 
-Response caching is opt-in per rule. The cache settings here configure the shared cache storage.
+Response caching is opt-in per rule. The settings here configure the shared
+cache storage.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -188,13 +206,14 @@ Response caching is opt-in per rule. The cache settings here configure the share
 
 ### Cache Behavior
 
-The cache respects standard HTTP caching semantics from upstream servers.
+The cache follows standard HTTP cache headers from upstream servers.
 
 #### Scope
 
-The cache is shared across all clients. Responses are keyed by method + absolute URI, with
-`Vary` request headers used to decide cache hits. Enable caching only if cross-client sharing
-is acceptable for your deployment.
+The cache is shared across all clients. Responses are keyed by method and
+absolute URI. `Vary` headers decide which request headers are part of the cache
+key. Enable caching only if cross-client sharing is acceptable in your
+environment.
 
 #### Supported Headers
 
@@ -204,7 +223,7 @@ is acceptable for your deployment.
 
 #### TTL Priority
 
-Cache lifetime is determined in this order:
+Cache lifetime is chosen in this order:
 
 1. `s-maxage` (shared cache max-age) - highest priority
 2. `max-age`
@@ -215,28 +234,31 @@ Cache lifetime is determined in this order:
 
 - **Methods**: Only `GET` and `HEAD` requests
 - **Status codes**: 200, 203, 204, 205, 206, 301, 302
-- **Bypass**: Requests with `Authorization` or `Cookie` headers are never served from cache
-  and are not stored
-- **Not cached**: Responses with `no-store`, `no-cache`, or `private` directives, or any `Set-Cookie` header
+- **Bypass**: Requests with `Authorization` or `Cookie` headers are never
+  served from cache and are not stored
+- **Not cached**: Responses with `no-store`, `no-cache`, or `private`
+  directives, or any `Set-Cookie` header
 
 #### Request Cache Directives
 
-Request-side cache controls are honored for bypass. If a request includes `Cache-Control:
-no-cache`, `Cache-Control: no-store`, `Cache-Control: max-age=0`, or `Pragma: no-cache`, the
-cache will not be used and the response will not be stored. Caching decisions otherwise
-follow upstream response headers plus `force_cache_duration` from policy rules.
+Request-side cache controls can force a bypass. If a request includes
+`Cache-Control: no-cache`, `Cache-Control: no-store`, `Cache-Control: max-age=0`,
+or `Pragma: no-cache`, the cache will not be used and the response will not be
+stored. Otherwise, caching follows the upstream response headers plus
+`force_cache_duration` from policy rules.
 
 #### Eviction
 
-Uses LRU (Least Recently Used) eviction when capacity is reached. Expired entries are removed on lookup.
+The cache uses LRU eviction when capacity is reached. Expired entries are
+removed on lookup.
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`v1` under the cache root). When the layout
-version changes, old version directories are deleted asynchronously. A background
-sweeper runs every `cache_sweeper_interval` seconds and inspects up to
-`cache_sweeper_batch_size` entries, removing expired entries and pruning empty shard
-directories.
+Cache entries live under a versioned subdirectory (`v1` under the cache root).
+When the layout changes, old version directories are deleted asynchronously. A
+background sweeper runs every `cache_sweeper_interval` seconds and inspects up
+to `cache_sweeper_batch_size` entries, removing expired entries and pruning
+empty shard directories.
 
 !!! note
     The cache does not support conditional revalidation (ETag/If-None-Match, Last-Modified/If-Modified-Since). Stale entries are discarded and fetched fresh from upstream.
@@ -245,7 +267,8 @@ directories.
 
 ## Environment Variables
 
-All settings can be overridden via environment variables using the `EXFILGUARD__` prefix with double underscores for nesting.
+You can override any setting with environment variables. Use the
+`EXFILGUARD__` prefix and double underscores for nesting.
 
 ```bash
 # Override listen address

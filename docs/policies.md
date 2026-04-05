@@ -1,12 +1,13 @@
 # Clients & Policies
 
-Define who can access what with client mappings and policy rules.
+Use clients and policies to decide who can reach what.
 
 ---
 
 ## Client Configuration
 
-Clients map source IP addresses to policies. Defined in `clients.toml` or files in `clients.d/`.
+Clients map source IP addresses to policies. Define them in `clients.toml` or
+files in `clients.d/`.
 
 ### Client Fields
 
@@ -21,7 +22,7 @@ Clients map source IP addresses to policies. Defined in `clients.toml` or files 
 ### Matching
 
 Client selectors must not overlap, so each source IP maps to at most one
-non-fallback client. If no selector matches, the fallback client is used.
+non-fallback client. If nothing matches, ExfilGuard uses the fallback client.
 
 ### Validation Rules
 
@@ -64,7 +65,8 @@ fallback = true
 
 ## Policy Configuration
 
-Policies contain ordered rules that determine whether requests are allowed or denied. Defined in `policies.toml` or files in `policies.d/`.
+Policies contain ordered rules that allow or deny requests. Define them in
+`policies.toml` or files in `policies.d/`.
 
 ### Policy Structure
 
@@ -75,7 +77,7 @@ name = "policy-name"
   # rule fields...
 ```
 
-Rules are evaluated in order. The first matching rule determines the action.
+Rules run in order. The first matching rule decides the action.
 
 ---
 
@@ -131,12 +133,13 @@ methods = ["ANY"]
     Cannot mix `"ANY"` with explicit methods in the same array.
     `"CONNECT"` must be the only method in its rule.
 
-CONNECT requests are evaluated against explicit CONNECT tunnel rules first. If
-no tunnel rule matches, ExfilGuard can still perform a TLS bump preflight when
-matching HTTPS inspect rules exist for the same host/port. The real policy
-decision is then attached to the inner HTTP request. Private upstream addresses
-are never permitted, whether the request is plain HTTP, tunneled CONNECT, or
-bumped HTTPS.
+ExfilGuard evaluates CONNECT requests against explicit CONNECT tunnel rules
+first. If no tunnel rule matches, it can still perform a TLS bump preflight
+when matching HTTPS inspect rules exist for the same host and port. It then
+attaches the real policy decision to the inner HTTP request. ExfilGuard still
+blocks private upstream addresses in every mode. That includes plain HTTP,
+tunneled CONNECT, and bumped HTTPS. The point is to reduce SSRF risk and stop
+clients from reaching internal address space by mistake.
 
 ---
 
@@ -146,7 +149,7 @@ URL patterns follow the format: `scheme://host[:port][/path]`
 
 ### Scheme
 
-`http` or `https` (required)
+Use `http` or `https`.
 
 ### Host Matching
 
@@ -161,7 +164,9 @@ URL patterns follow the format: `scheme://host[:port][/path]`
 | `[2001:db8::1]` | Exact IPv6 address (bracketed) |
 
 !!! note
-    Host matching is case-insensitive. Wildcards can only appear as entire labels: `*.example.com` and `**.example.com` are valid, `a*b.com` is not. `*` matches a single label and `**` matches one or more labels.
+    Host matching is case-insensitive. Wildcards must be whole labels:
+    `*.example.com` and `**.example.com` are valid, but `a*b.com` is not.
+    `*` matches one label. `**` matches one or more labels.
 
 ### Port
 
@@ -181,11 +186,11 @@ url_pattern = "https://example.com:8443/api/**"
 | `/users/*/profile` | `/users/123/profile`, `/users/abc/profile` |
 
 !!! note
-    Policy path matching uses a canonical path view. Query strings are ignored,
-    literal `.` and `..` segments are normalized, and ambiguous path syntax is
-    rejected instead of being rewritten. ExfilGuard preserves the raw request
-    target for upstream forwarding, so signed requests keep their original path
-    bytes.
+    Policy path matching uses a canonical path view. It ignores query strings,
+    normalizes literal `.` and `..` segments, and rejects ambiguous path
+    syntax instead of rewriting it. ExfilGuard still preserves the raw request
+    target for upstream forwarding, so signed requests keep their original
+    path bytes.
 
 !!! note
     Requests are rejected if the path contains invalid escapes, backslashes,
@@ -211,18 +216,18 @@ url_pattern = "https://example.com:8443/api/**"
 
 ## HTTPS Modes
 
-The `https_mode` option controls how ExfilGuard handles HTTPS traffic.
+`https_mode` controls how ExfilGuard handles HTTPS traffic.
 
 ### https_mode = "inspect" (default)
 
-- Full HTTP inspection after TLS interception
-- TLS is terminated and re-encrypted (MITM)
+- Decrypted HTTP requests are checked after TLS interception
+- TLS is terminated and re-encrypted
 - Used for normal HTTPS `GET`/`POST`/`PUT`/`DELETE` style rules
 - Matching HTTPS rules authorize a TLS bump preflight for the same host/port
 - The real policy decision is attached to the inner HTTP request
 - Private upstream resolution is still blocked
-- Enables normal request logging, metrics, and caching (when configured)
-- Request metrics are labeled `effective_mode="bump"` on the inspected inner request
+- Enables normal request logging, metrics, and caching when configured
+- Request metrics use `effective_mode="bump"` on the inspected inner request
 
 ### https_mode = "tunnel"
 
@@ -230,17 +235,19 @@ The `https_mode` option controls how ExfilGuard handles HTTPS traffic.
 - Only valid with `methods = ["CONNECT"]`
 - Only valid with URL pattern path `/**` (e.g., `https://secure.partner.com/**`)
 - CONNECT tunnel rules must appear before non-CONNECT rules inside each policy
-- Request metrics are labeled `effective_mode="tunnel"` on the CONNECT tunnel request
-- Useful for certificate-pinned services that refuse MITM
+- Request metrics use `effective_mode="tunnel"` on the CONNECT tunnel request
+- Useful for certificate-pinned services that refuse TLS interception
 
 !!! warning
-    Tunnel mode bypasses content inspection. Use only when necessary (e.g., payment gateways with certificate pinning).
+    Tunnel mode bypasses content inspection. Use it only when necessary, such
+    as payment gateways with certificate pinning.
 
 ---
 
 ## Response Caching
 
-Rules can enable caching for matched responses when the cache subsystem is configured globally.
+Rules can enable caching for matched responses when the shared cache is
+configured globally.
 
 ```toml
 [[policy.rule]]
@@ -257,13 +264,15 @@ url_pattern = "https://cdn.example.com/**"
 
 ### How Caching Works
 
-The cache respects standard HTTP caching headers from upstream:
+The cache follows standard HTTP caching headers from upstream:
 
 - **Cache-Control**: `s-maxage`, `max-age`, `public`, `private`, `no-cache`, `no-store`
 - **Expires**: HTTP date for expiration
 - **Vary**: Responses vary by specified request headers
 
-`force_cache_duration` is a **fallback only** - it does not override upstream freshness. It applies when the upstream response omits `s-maxage`, `max-age`, and `Expires` (including cases where only `public` is set).
+`force_cache_duration` is a fallback only. It does not override upstream
+freshness. It applies when the upstream response omits `s-maxage`, `max-age`,
+and `Expires`, including cases where only `public` is set.
 
 !!! note
     Only `GET` and `HEAD` responses with status 200, 203, 204, 205, 206, 301, or 302 are cached. See [Cache Settings](configuration.md#cache-settings) for full details.

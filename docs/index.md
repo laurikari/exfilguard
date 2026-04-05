@@ -1,16 +1,21 @@
 # ExfilGuard
 
-**Egress proxy for data exfiltration prevention**
+**Egress proxy for outbound HTTP and HTTPS**
 
-Control and monitor outbound HTTP/HTTPS traffic from your organization. Enforce per-client policies that determine exactly which external endpoints are reachable.
+Control outbound HTTP and HTTPS traffic. Set per-client rules for which
+external endpoints are reachable, and log what happened.
 
 ---
 
 ## What is ExfilGuard?
 
-ExfilGuard is a Rust-based explicit egress proxy that acts as a gatekeeper for all outbound traffic. It solves the critical security problem of **data exfiltration prevention** by ensuring that internal services and applications can only send data to explicitly approved external endpoints.
+ExfilGuard is an explicit egress proxy written in Rust. Clients should know
+they are talking to a proxy. Each request is checked against the client's
+policy, then either forwarded or denied.
 
-Organizations face risks from malicious insiders, compromised services attempting to exfiltrate sensitive data, accidental data leakage through misconfigured integrations, and compliance violations when data leaves uncontrolled. ExfilGuard addresses all of these by enforcing fine-grained, per-client policies at the application layer.
+The main use case is simple: internal services should only reach approved
+external endpoints. ExfilGuard helps enforce that and leaves an audit trail in
+the logs.
 
 ExfilGuard targets Unix-like systems only; Windows is not supported.
 
@@ -21,29 +26,29 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 **Per-Client Policy Enforcement**
 :   Map clients by exact IP address or CIDR ranges. Each client references ordered policies; the first matching rule wins.
 
-**Fine-Grained URL Matching**
+**URL Matching**
 :   Policies specify allowed destinations using wildcard patterns for hostnames and paths.
 
 **TLS Inspection**
-:   Terminates TLS and mints leaf certificates on-the-fly for full request/response inspection including headers and body.
+:   Terminates TLS and mints leaf certificates on the fly so ExfilGuard can apply normal HTTP rules to the decrypted request.
 
 **Pass-Through Mode**
-:   Tunnel CONNECT streams without decryption for services that use certificate pinning or refuse MITM.
+:   Tunnels CONNECT streams without decryption for services that use certificate pinning or do not allow TLS interception.
 
 **Optional Response Caching**
-:   Shared HTTP response cache that follows standard cache headers; opt-in per rule via a `cache` block (requires cache storage configured globally).
+:   Shared HTTP response cache that follows standard cache headers. Enable it globally and opt in per rule.
 
-**Private Upstream Guardrails**
-:   Blocks upstream connections to private IPs to reduce SSRF risk.
+**Private Upstream Blocking**
+:   Blocks upstream connections to non-public addresses to reduce SSRF risk.
 
 **Runtime Policy Reload**
-:   Supports SIGHUP signal to reload client/policy data from the configured files without restarting the process. Listener, metrics, cache, TLS, logging, and timeout settings still require restart.
+:   `SIGHUP` reloads client and policy data from the configured files without restarting the process. If you change listener, metrics, cache, TLS, logging, or timeout settings, restart the server.
 
 **Structured Logging**
-:   JSON or text format logging with decision tracking. Logs each request's allow/deny decision with structured metadata.
+:   JSON or text logs with the allow or deny decision and related request metadata.
 
 **Metrics Exporter**
-:   Optional Prometheus endpoint (`/metrics`) with counters/histograms per client/policy for traffic, decisions, effective mode (`direct`, `bump`, `tunnel`), cache, and pool health. Supports HTTPS when given a cert/key.
+:   Optional Prometheus endpoint (`/metrics`) with counters and histograms for traffic, decisions, effective mode (`direct`, `bump`, `tunnel`), cache, and pool health. Supports HTTPS when given a cert and key.
 
 ---
 
@@ -51,19 +56,23 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 
 ### Data Exfiltration Prevention
 
-Block unauthorized attempts to send data to cloud storage, analytics platforms, or communication services.
+Block attempts to send data to unapproved cloud storage, analytics, or
+communication services.
 
 ### Compliance & Audit
 
-Generate audit logs showing all external data flows. Demonstrate to regulators what data can leave your organization.
+Keep audit logs of outbound traffic. Show which destinations are allowed and
+which requests were blocked.
 
 ### Multi-Tenant SaaS
 
-Control what external APIs different backend services can reach. Prevent rogue services from connecting to unauthorized platforms.
+Control which external APIs different backend services can reach. Stop one
+service from talking to destinations meant for another.
 
 ### Integration Management
 
-Control integrations with external partners. Enforce OAuth/API credentials usage policies by restricting host access.
+Control integrations with external partners. Restrict which hosts and paths
+each service may use.
 
 ---
 
@@ -102,6 +111,8 @@ sudo systemctl enable --now exfilguard
 
 ## Quick Examples
 
+These examples assume ExfilGuard is being used as an explicit proxy.
+
 ### Allow specific API endpoint
 
 ```toml
@@ -136,7 +147,8 @@ policies = ["analytics-policy", "default-deny"]
 
 ---
 
-## Next Steps
+## Further Reading
 
 - [Configuration Reference](configuration.md) - Global settings and options
 - [Policies Guide](policies.md) - Client mapping and policy rules
+- [Design Decisions](design-decisions.md) - Why the code works this way
