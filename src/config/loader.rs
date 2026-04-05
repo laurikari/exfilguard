@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,24 +31,18 @@ pub fn load_config_with_dirs<P: AsRef<Path>, Q: AsRef<Path>>(
     policies_dir: Option<&Path>,
 ) -> Result<ValidatedConfig> {
     let policies = load_policies(policies_path.as_ref(), policies_dir)?;
-    let clients = load_clients(clients_path.as_ref(), clients_dir, &policies)?;
+    let clients = load_clients(clients_path.as_ref(), clients_dir)?;
     let config = Config { clients, policies };
     super::ValidatedConfig::new(config)
 }
 
-fn load_clients(path: &Path, dir: Option<&Path>, policies: &[Policy]) -> Result<Vec<Client>> {
+fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
     let mut raw_clients = parse_clients_file(path)?;
     if let Some(dir) = dir {
         let files = collect_toml_files(dir, "clients")?;
         for file in files {
             raw_clients.extend(parse_clients_file(&file)?);
         }
-    }
-
-    let mut seen_names = HashSet::new();
-    let mut policy_lookup: HashMap<&str, Arc<str>> = HashMap::new();
-    for policy in policies {
-        policy_lookup.insert(policy.name.as_ref(), policy.name.clone());
     }
 
     let mut clients = Vec::with_capacity(raw_clients.len());
@@ -61,9 +55,6 @@ fn load_clients(path: &Path, dir: Option<&Path>, policies: &[Policy]) -> Result<
             fallback,
         } = client;
 
-        if !seen_names.insert(name.clone()) {
-            bail!("duplicate client name '{}'", name);
-        }
         let selector = match (ip, cidr) {
             (Some(ip), None) => match parse_ip_or_cidr(&ip)? {
                 IpOrCidr::Ip(addr) => ClientSelector::Ip(addr),
@@ -77,20 +68,9 @@ fn load_clients(path: &Path, dir: Option<&Path>, policies: &[Policy]) -> Result<
             (Some(_), Some(_)) => bail!("client '{}' must not specify both ip and cidr", name),
         };
 
-        if policy_names.is_empty() {
-            bail!("client '{}' must reference at least one policy", name);
-        }
-
         let mut policy_refs = Vec::with_capacity(policy_names.len());
         for policy_name in policy_names {
-            let policy = policy_lookup.get(policy_name.as_str()).ok_or_else(|| {
-                anyhow!(
-                    "client '{}' references unknown policy '{}'",
-                    name,
-                    policy_name
-                )
-            })?;
-            policy_refs.push(policy.clone());
+            policy_refs.push(Arc::<str>::from(policy_name.as_str()));
         }
 
         let arc_name = Arc::<str>::from(name.as_str());
@@ -113,48 +93,14 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
             raw_policies.extend(parse_policies_file(&file)?);
         }
     }
-
-    if raw_policies.is_empty() {
-        bail!("policies config must define at least one policy");
-    }
-
-    let mut seen_names = HashSet::new();
     let mut policies = Vec::with_capacity(raw_policies.len());
     for policy in raw_policies {
         let RawPolicy { name, rules } = policy;
-        if !seen_names.insert(name.clone()) {
-            bail!("duplicate policy name '{}'", name);
-        }
-        if rules.is_empty() {
-            bail!("policy '{}' must contain at least one rule", name);
-        }
-
         let mut compiled_rules = Vec::with_capacity(rules.len());
-        let mut seen_non_connect_rule = false;
         let policy_name = Arc::<str>::from(name.as_str());
         for (idx, rule) in rules.into_iter().enumerate() {
             let action = parse_action(&name, &rule)?;
             let methods = parse_methods(&rule)?;
-            let has_connect = super::methods_include_connect(&methods);
-            let is_connect_only = super::methods_connect_only(&methods);
-            if has_connect && !is_connect_only {
-                bail!(
-                    "policy '{}' rule {}: CONNECT method must not be combined with other methods",
-                    name,
-                    idx
-                );
-            }
-            if is_connect_only {
-                if seen_non_connect_rule {
-                    bail!(
-                        "policy '{}' rule {}: CONNECT rules must appear before non-CONNECT rules",
-                        name,
-                        idx
-                    );
-                }
-            } else {
-                seen_non_connect_rule = true;
-            }
             let url_pattern = match &rule.url_pattern {
                 Some(pattern) => Some(parse_url_pattern(pattern).with_context(|| {
                     format!("policy '{}' has invalid url_pattern '{}'", name, pattern)
@@ -163,7 +109,6 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
             };
             let https_mode = parse_https_mode(&name, idx, &rule)?;
             let id = Arc::<str>::from(format!("{}#{}", policy_name, idx));
-            super::validate_rule_constraints(&name, idx, https_mode, &methods, &url_pattern)?;
             compiled_rules.push(Rule {
                 id,
                 action,
@@ -271,18 +216,10 @@ fn parse_action(policy: &str, rule: &RawRule) -> Result<RuleAction> {
                     policy, raw_status
                 )
             })?;
-            let reason = match &rule.reason {
-                Some(reason) => {
-                    super::validate_reason(reason).with_context(|| {
-                        format!(
-                            "policy '{}' DENY rule has invalid reason phrase '{}'",
-                            policy, reason
-                        )
-                    })?;
-                    Some(Arc::<str>::from(reason.as_str()))
-                }
-                None => None,
-            };
+            let reason = rule
+                .reason
+                .as_ref()
+                .map(|reason| Arc::<str>::from(reason.as_str()));
             let body = rule.body.clone().map(Arc::<str>::from);
             Ok(RuleAction::Deny {
                 status,

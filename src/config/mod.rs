@@ -277,10 +277,11 @@ fn validate_config(config: &Config) -> Result<()> {
     validate_clients(&config.clients)
 }
 
-/// Ensures that client selectors do not conflict (duplicate IPs or overlapping CIDRs except for the
-/// designated fallback). This validation is shared by both the configuration loader and
-/// the policy compiler so that runtime policy reloads and programmatic configs
-/// get identical guarantees.
+/// Ensures that client selectors do not conflict (duplicate IPs or overlapping
+/// CIDRs except for the designated fallback).
+///
+/// This remains the single semantic check used by loaded configs, runtime
+/// reloads, and programmatic configs so those paths keep identical guarantees.
 pub fn validate_clients(clients: &[Client]) -> Result<()> {
     struct CidrClaim<'a> {
         name: &'a str,
