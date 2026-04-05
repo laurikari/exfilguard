@@ -38,6 +38,7 @@ async fn run_with_test_upstreams(
     settings: Settings,
     allow_private_test_upstreams: bool,
 ) -> Result<()> {
+    settings.validate()?;
     let settings = Arc::new(settings);
     let metrics = settings.metrics_listen.map(|addr| {
         let path = "/metrics".to_string();
