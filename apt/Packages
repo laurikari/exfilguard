@@ -1,0 +1,36 @@
+Package: exfilguard
+Version: 0.6.0-1
+Architecture: amd64
+Maintainer: Ville Laurikari <ville@laurikari.net>
+Installed-Size: 11325
+Depends: adduser, ca-certificates, systemd
+Filename: ./exfilguard_0.6.0-1_amd64.deb
+Size: 3173112
+MD5sum: d23762466c4cb78a340cbe2dff3e6894
+SHA1: be4659f5c8ae88725493b31a21dc3e3c2dcefd11
+SHA256: c2debe62d8c24dcfecf43de32bc2562578fb1ee5cd55e5ab33c10ab9b18f4172
+Section: net
+Priority: optional
+Description: Rust egress proxy that enforces outbound network policies with TLS interception
+ support.
+ ExfilGuard is a Rust egress proxy that enforces outbound policies with TLS
+ interception support.
+
+Package: exfilguard
+Version: 0.6.0-1
+Architecture: arm64
+Maintainer: Ville Laurikari <ville@laurikari.net>
+Installed-Size: 10076
+Depends: adduser, ca-certificates, systemd
+Filename: ./exfilguard_0.6.0-1_arm64.deb
+Size: 2779920
+MD5sum: c4c883cd09f9a08d376b032493654b39
+SHA1: ec5244098ebb8d74949f3fa84030aa4870e97136
+SHA256: 7f63b101f87302c56ef6a376fe5a481903579c0011a8b6eda0d0274d48bffab7
+Section: net
+Priority: optional
+Description: Rust egress proxy that enforces outbound network policies with TLS interception
+ support.
+ ExfilGuard is a Rust egress proxy that enforces outbound policies with TLS
+ interception support.
+
