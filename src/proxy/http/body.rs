@@ -2,7 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::time::timeout;
@@ -10,7 +10,9 @@ use tokio::time::timeout;
 use crate::{
     io_util::write_all_with_timeout,
     proxy::{
-        forward_error::RequestTimeout, forward_limits::BodySizeTracker,
+        forward_error::RequestTimeout,
+        forward_limits::BodySizeTracker,
+        headers::{sanitize_request_trailer_lines, sanitize_response_trailer_lines},
         http::codec::read_line_with_timeout,
     },
     util::timeout_with_context,
@@ -30,6 +32,15 @@ pub enum BodyPlan {
     Fixed(usize),
     Chunked,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkedRelayStats {
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub had_trailers: bool,
+}
+
+type TrailerSanitizer = fn(&[String]) -> Result<Vec<Vec<u8>>>;
 
 async fn with_total_deadline<F, T>(total_deadline: Option<Instant>, future: F) -> Result<T>
 where
@@ -117,12 +128,15 @@ async fn relay_chunked_body_generic<R, W>(
     peer: SocketAddr,
     write_target: &str,
     mut limit: Option<&mut BodySizeTracker>,
-) -> Result<u64>
+    max_trailer_bytes: usize,
+    trailer_limit_error: &'static str,
+    sanitize_trailers: TrailerSanitizer,
+) -> Result<ChunkedRelayStats>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut total_bytes = 0u64;
+    let mut stats = ChunkedRelayStats::default();
     let mut line = String::new();
 
     loop {
@@ -135,7 +149,7 @@ where
         if size_bytes == 0 {
             bail!("unexpected EOF while reading chunk size from {peer}");
         }
-        total_bytes = total_bytes.saturating_add(size_bytes as u64);
+        stats.bytes_read = stats.bytes_read.saturating_add(size_bytes as u64);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         let size_str = trimmed
             .split_once(';')
@@ -158,11 +172,14 @@ where
             ),
         )
         .await?;
+        stats.bytes_written = stats.bytes_written.saturating_add(line.len() as u64);
 
         if chunk_size == 0 {
+            let mut trailer_lines = Vec::new();
+            let mut trailer_bytes_total = 0usize;
             loop {
                 line.clear();
-                let trailer_bytes = with_total_deadline(
+                let trailer_line_bytes = with_total_deadline(
                     total_deadline,
                     read_line_with_timeout(
                         reader,
@@ -173,24 +190,50 @@ where
                     ),
                 )
                 .await?;
-                if trailer_bytes == 0 {
+                if trailer_line_bytes == 0 {
                     bail!("unexpected EOF while reading chunk trailer from {peer}");
                 }
+                stats.bytes_read = stats.bytes_read.saturating_add(trailer_line_bytes as u64);
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    break;
+                }
+                trailer_bytes_total = trailer_bytes_total
+                    .checked_add(line.len())
+                    .ok_or_else(|| anyhow!("{trailer_limit_error}"))?;
+                if trailer_bytes_total > max_trailer_bytes {
+                    bail!("{trailer_limit_error}");
+                }
+                trailer_lines.push(trimmed.to_string());
+            }
+
+            stats.had_trailers = !trailer_lines.is_empty();
+            for trailer_line in sanitize_trailers(&trailer_lines)? {
                 with_total_deadline(
                     total_deadline,
                     write_all_with_timeout(
                         writer,
-                        line.as_bytes(),
+                        &trailer_line,
                         write_timeout,
                         format!("forwarding chunk trailer {write_target}"),
                     ),
                 )
                 .await?;
-                total_bytes = total_bytes.saturating_add(trailer_bytes as u64);
-                if line.trim_end_matches(['\r', '\n']).is_empty() {
-                    break;
-                }
+                stats.bytes_written = stats
+                    .bytes_written
+                    .saturating_add(trailer_line.len() as u64);
             }
+            with_total_deadline(
+                total_deadline,
+                write_all_with_timeout(
+                    writer,
+                    b"\r\n",
+                    write_timeout,
+                    format!("forwarding chunk trailer terminator {write_target}"),
+                ),
+            )
+            .await?;
+            stats.bytes_written = stats.bytes_written.saturating_add(2);
             break;
         }
 
@@ -219,7 +262,8 @@ where
                 ),
             )
             .await?;
-            total_bytes = total_bytes.saturating_add(read as u64);
+            stats.bytes_read = stats.bytes_read.saturating_add(read as u64);
+            stats.bytes_written = stats.bytes_written.saturating_add(read as u64);
         }
 
         let mut crlf = [0u8; 2];
@@ -243,12 +287,14 @@ where
             ),
         )
         .await?;
-        total_bytes = total_bytes.saturating_add(2);
+        stats.bytes_read = stats.bytes_read.saturating_add(2);
+        stats.bytes_written = stats.bytes_written.saturating_add(2);
     }
 
-    Ok(total_bytes)
+    Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_chunked_body<S, U>(
     reader: &mut BufReader<S>,
     upstream: &mut U,
@@ -257,6 +303,7 @@ pub async fn stream_chunked_body<S, U>(
     total_deadline: Option<Instant>,
     peer: SocketAddr,
     max_request_body_size: usize,
+    max_request_trailer_bytes: usize,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -272,8 +319,12 @@ where
         peer,
         "to upstream",
         Some(&mut tracker),
+        max_request_trailer_bytes,
+        "request trailer section exceeds configured limit",
+        sanitize_request_trailer_lines,
     )
     .await
+    .map(|stats| stats.bytes_read)
 }
 
 pub async fn relay_fixed_body<S, C>(
@@ -328,7 +379,8 @@ pub async fn relay_chunked_body<S, C>(
     write_timeout: Duration,
     peer: SocketAddr,
     total_deadline: Option<Instant>,
-) -> Result<u64>
+    max_response_trailer_bytes: usize,
+) -> Result<ChunkedRelayStats>
 where
     S: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
@@ -342,6 +394,9 @@ where
         peer,
         "to client",
         None,
+        max_response_trailer_bytes,
+        "response trailer section exceeds configured limit",
+        sanitize_response_trailer_lines,
     )
     .await
 }
@@ -386,4 +441,93 @@ where
         total = total.saturating_add(read as u64);
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{relay_chunked_body, stream_chunked_body};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
+
+    fn peer() -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443))
+    }
+
+    #[tokio::test]
+    async fn stream_chunked_body_strips_forwarding_request_trailers() {
+        let body = b"5\r\nhello\r\n0\r\nX-Forwarded-For: 1.2.3.4\r\nDigest: sha-256=abc\r\n\r\n";
+        let expected = b"5\r\nhello\r\n0\r\nDigest: sha-256=abc\r\n\r\n";
+
+        let (client_stream, mut client_writer) = duplex(1024);
+        let (mut upstream_source, mut upstream_sink) = duplex(1024);
+        client_writer
+            .write_all(body)
+            .await
+            .expect("write chunked body");
+        drop(client_writer);
+
+        let mut reader = BufReader::new(client_stream);
+        let transferred = stream_chunked_body(
+            &mut reader,
+            &mut upstream_sink,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            peer(),
+            4096,
+            1024,
+        )
+        .await
+        .expect("chunked request should stream successfully");
+
+        assert_eq!(transferred, body.len() as u64);
+
+        drop(upstream_sink);
+        let mut forwarded = Vec::new();
+        upstream_source
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read forwarded body");
+        assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_body_strips_hop_by_hop_response_trailers() {
+        let body = b"5\r\nhello\r\n0\r\nConnection: close\r\nETag: abc\r\n\r\n";
+        let expected = b"5\r\nhello\r\n0\r\nETag: abc\r\n\r\n";
+
+        let (upstream_stream, mut upstream_writer) = duplex(1024);
+        let (mut client_reader, mut client_stream) = duplex(1024);
+        upstream_writer
+            .write_all(body)
+            .await
+            .expect("write chunked response");
+        drop(upstream_writer);
+
+        let mut upstream = BufReader::new(upstream_stream);
+        let stats = relay_chunked_body(
+            &mut upstream,
+            &mut client_stream,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            peer(),
+            None,
+            1024,
+        )
+        .await
+        .expect("chunked response should relay successfully");
+
+        assert_eq!(stats.bytes_read, body.len() as u64);
+        assert_eq!(stats.bytes_written, expected.len() as u64);
+        assert!(stats.had_trailers);
+
+        drop(client_stream);
+        let mut forwarded = Vec::new();
+        client_reader
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read relayed response");
+        assert_eq!(forwarded, expected);
+    }
 }

@@ -135,6 +135,7 @@ where
                 request_deadline,
                 peer,
                 max_request_body_size,
+                app.settings.max_request_header_size,
             )
             .await?;
         }
@@ -175,7 +176,8 @@ where
         client_close = true;
     }
 
-    let cache_state = prepare_cache_write(decision, app, request, headers, &head, peer).await;
+    let cache_state =
+        prepare_cache_write(decision, app, request, headers, body_plan, &head, peer).await;
 
     let override_connection = if client_close {
         Some(ConnectionOverride::Close)
@@ -204,6 +206,7 @@ where
             timeouts,
             connection.peer,
             request_deadline,
+            max_response_header_bytes,
             peer,
             request,
         )

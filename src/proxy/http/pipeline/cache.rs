@@ -12,6 +12,7 @@ use super::ClientDisposition;
 use super::handler::Http1RequestHandler;
 use super::respond::shutdown_stream;
 
+use super::super::body::BodyPlan;
 use super::super::codec::{ConnectionOverride, encode_cached_http1_response};
 use super::super::forward::{ResponseBodyPlan, determine_response_body_plan};
 
@@ -29,6 +30,10 @@ pub(super) async fn evaluate_cache<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    if matches!(handler.body_plan, BodyPlan::Chunked) {
+        return Ok(CacheEvaluation::Bypass);
+    }
+
     let cache = match (&decision.cache, &handler.app.cache) {
         (Some(_cache_config), Some(cache)) => cache,
         _ => return Ok(CacheEvaluation::Bypass),

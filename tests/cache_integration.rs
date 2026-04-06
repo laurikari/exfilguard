@@ -24,6 +24,7 @@ struct MockUpstream {
     headers: String,
     body: String,
     delay: Option<StdDuration>,
+    raw_response: Option<String>,
 }
 
 impl MockUpstream {
@@ -39,6 +40,19 @@ impl MockUpstream {
             headers: headers.to_string(),
             body: "cached-response".to_string(),
             delay,
+            raw_response: None,
+        })
+    }
+
+    async fn new_raw(raw_response: &str) -> Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        Ok(Self {
+            listener,
+            requests: Arc::new(AtomicUsize::new(0)),
+            headers: String::new(),
+            body: String::new(),
+            delay: None,
+            raw_response: Some(raw_response.to_string()),
         })
     }
 
@@ -49,11 +63,13 @@ impl MockUpstream {
     async fn run(self) -> Result<()> {
         let delay = self.delay;
         let body = self.body;
+        let raw_response = self.raw_response;
         loop {
             let (mut socket, _) = self.listener.accept().await?;
             let requests = self.requests.clone();
             let headers = self.headers.clone();
             let body = body.clone();
+            let raw_response = raw_response.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 let mut data = Vec::new();
@@ -73,6 +89,12 @@ impl MockUpstream {
                 }
 
                 requests.fetch_add(1, Ordering::SeqCst);
+
+                if let Some(raw_response) = raw_response {
+                    socket.write_all(raw_response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.ok();
+                    return;
+                }
 
                 let response_head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n\r\n",
@@ -211,6 +233,87 @@ async fn test_cache_hit_avoids_upstream() -> Result<()> {
         request_counter.load(Ordering::SeqCst),
         1,
         "Should NOT hit upstream again (cache hit expected)"
+    );
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_chunked_response_with_trailers_is_not_cached() -> Result<()> {
+    let raw_response = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Cache-Control: public, max-age=60\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "f\r\ncached-response\r\n",
+        "0\r\n",
+        "Set-Cookie: session=abc\r\n",
+        "\r\n",
+    );
+    let upstream = MockUpstream::new_raw(raw_response).await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/resource HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.contains("cached-response"),
+        "Unexpected response: {}",
+        response
+    );
+    assert!(
+        response.contains("Set-Cookie: session=abc"),
+        "Response trailers should still be forwarded"
+    );
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        1,
+        "Should hit upstream once"
+    );
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.contains("cached-response"),
+        "Unexpected response: {}",
+        response
+    );
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        2,
+        "Trailer-bearing response should not be served from cache"
     );
 
     harness.shutdown().await;

@@ -98,6 +98,7 @@ mod tests {
             None,
             peer,
             2,
+            1024,
         )
         .await
         .expect_err("expected body size limit error");
@@ -127,6 +128,7 @@ mod tests {
             None,
             peer,
             0,
+            1024,
         )
         .await
         .expect("unlimited body size should stream successfully");

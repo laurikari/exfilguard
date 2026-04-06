@@ -14,6 +14,7 @@ use crate::proxy::cache::{
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 
+use super::super::body::BodyPlan;
 use super::super::codec::{Http1HeaderAccumulator, Http1ResponseHead};
 use super::response::{ResponseBodyPlan, relay_body};
 use super::{CacheStoreResult, ForwardTimeouts};
@@ -35,9 +36,14 @@ pub(super) async fn prepare_cache_write(
     app: &AppContext,
     request: &ParsedRequest,
     headers: &Http1HeaderAccumulator,
+    request_body_plan: BodyPlan,
     head: &Http1ResponseHead,
     peer: SocketAddr,
 ) -> CacheWriteState {
+    if matches!(request_body_plan, BodyPlan::Chunked) {
+        return CacheWriteState::Bypass;
+    }
+
     let cache_config = match decision.cache.as_ref() {
         Some(config) => config,
         None => return CacheWriteState::Bypass,
@@ -121,6 +127,7 @@ impl CacheWriteState {
         timeouts: &ForwardTimeouts,
         upstream_peer: SocketAddr,
         total_deadline: Option<Instant>,
+        max_response_trailer_bytes: usize,
         peer: SocketAddr,
         request: &ParsedRequest,
     ) -> Result<(u64, CacheStoreResult)>
@@ -137,9 +144,10 @@ impl CacheWriteState {
                     timeouts,
                     upstream_peer,
                     total_deadline,
+                    max_response_trailer_bytes,
                 )
                 .await?;
-                Ok((bytes, CacheStoreResult::Bypassed))
+                Ok((bytes.bytes, CacheStoreResult::Bypassed))
             }
             CacheWriteState::Skip => {
                 let bytes = relay_body(
@@ -149,9 +157,10 @@ impl CacheWriteState {
                     timeouts,
                     upstream_peer,
                     total_deadline,
+                    max_response_trailer_bytes,
                 )
                 .await?;
-                Ok((bytes, CacheStoreResult::Skipped))
+                Ok((bytes.bytes, CacheStoreResult::Skipped))
             }
             CacheWriteState::Store(ctx) => {
                 let CacheStoreContext {
@@ -169,12 +178,14 @@ impl CacheWriteState {
                         timeouts,
                         upstream_peer,
                         total_deadline,
+                        max_response_trailer_bytes,
                     )
                     .await?
                 };
 
                 let cache_error = best_effort.take_error();
                 let cache_failed = cache_error.is_some();
+                let discarded_for_trailers = bytes.had_trailers;
                 drop(best_effort);
                 if let Some(err) = cache_error.as_ref() {
                     warn!(
@@ -184,6 +195,9 @@ impl CacheWriteState {
                         "cache write failed"
                     );
                     crate::metrics::record_cache_store_error();
+                    writer.discard();
+                }
+                if discarded_for_trailers {
                     writer.discard();
                 }
 
@@ -196,7 +210,7 @@ impl CacheWriteState {
 
                 let cache_store = match finish_result {
                     Ok(()) => {
-                        if !cache_failed {
+                        if !cache_failed && !discarded_for_trailers {
                             crate::metrics::record_cache_store();
                             CacheStoreResult::Stored
                         } else {
@@ -215,7 +229,7 @@ impl CacheWriteState {
                     }
                 };
 
-                Ok((bytes, cache_store))
+                Ok((bytes.bytes, cache_store))
             }
         }
     }

@@ -20,6 +20,12 @@ pub(crate) enum ResponseBodyPlan {
     UntilClose,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResponseRelayStats {
+    pub bytes: u64,
+    pub had_trailers: bool,
+}
+
 pub(super) async fn read_final_response_head<S, C>(
     upstream_reader: &mut BufReader<S>,
     client: &mut C,
@@ -120,47 +126,55 @@ pub(super) async fn relay_body<S, C>(
     timeouts: &ForwardTimeouts,
     upstream_peer: SocketAddr,
     total_deadline: Option<Instant>,
-) -> Result<u64>
+    max_response_trailer_bytes: usize,
+) -> Result<ResponseRelayStats>
 where
     S: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
     match body_plan {
-        ResponseBodyPlan::Empty => Ok(0),
-        ResponseBodyPlan::Fixed(length) => {
-            relay_fixed_body(
-                upstream,
-                client,
-                length,
-                timeouts.response_io,
-                timeouts.response_io,
-                upstream_peer,
-                total_deadline,
-            )
-            .await
-        }
-        ResponseBodyPlan::Chunked => {
-            relay_chunked_body(
-                upstream,
-                client,
-                timeouts.response_io,
-                timeouts.response_io,
-                upstream_peer,
-                total_deadline,
-            )
-            .await
-        }
-        ResponseBodyPlan::UntilClose => {
-            relay_until_close(
-                upstream,
-                client,
-                timeouts.response_io,
-                timeouts.response_io,
-                upstream_peer,
-                total_deadline,
-            )
-            .await
-        }
+        ResponseBodyPlan::Empty => Ok(ResponseRelayStats::default()),
+        ResponseBodyPlan::Fixed(length) => relay_fixed_body(
+            upstream,
+            client,
+            length,
+            timeouts.response_io,
+            timeouts.response_io,
+            upstream_peer,
+            total_deadline,
+        )
+        .await
+        .map(|bytes| ResponseRelayStats {
+            bytes,
+            had_trailers: false,
+        }),
+        ResponseBodyPlan::Chunked => relay_chunked_body(
+            upstream,
+            client,
+            timeouts.response_io,
+            timeouts.response_io,
+            upstream_peer,
+            total_deadline,
+            max_response_trailer_bytes,
+        )
+        .await
+        .map(|stats| ResponseRelayStats {
+            bytes: stats.bytes_written,
+            had_trailers: stats.had_trailers,
+        }),
+        ResponseBodyPlan::UntilClose => relay_until_close(
+            upstream,
+            client,
+            timeouts.response_io,
+            timeouts.response_io,
+            upstream_peer,
+            total_deadline,
+        )
+        .await
+        .map(|bytes| ResponseRelayStats {
+            bytes,
+            had_trailers: false,
+        }),
     }
 }
 
@@ -253,6 +267,7 @@ mod tests {
                 &timeouts,
                 upstream_peer,
                 total_deadline,
+                1024,
             )
             .await
         });

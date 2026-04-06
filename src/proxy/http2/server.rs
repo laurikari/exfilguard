@@ -228,6 +228,7 @@ struct DownstreamRequestCtx {
     request_total_timeout: Option<Duration>,
     request_start: Instant,
     max_request_body_size: usize,
+    max_request_header_bytes: usize,
     max_response_header_bytes: usize,
     log_queries: bool,
     log_tracker: AllowLogTracker,
@@ -257,6 +258,7 @@ impl DownstreamRequestCtx {
             request_total_timeout: app.settings.request_total_timeout(),
             request_start: start,
             max_request_body_size: app.settings.max_request_body_size,
+            max_request_header_bytes: app.settings.max_request_header_size,
             max_response_header_bytes: app.settings.max_response_header_size,
             log_queries,
             log_tracker: AllowLogTracker::new(request_base, start),
@@ -392,6 +394,7 @@ impl Http2RequestHandler {
             self.ctx.request_start,
             self.ctx.request_total_timeout,
             self.ctx.max_request_body_size,
+            self.ctx.max_request_header_bytes,
             self.ctx.max_response_header_bytes,
         )
         .await

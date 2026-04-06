@@ -15,6 +15,9 @@ use tokio::time::timeout;
 use crate::{
     proxy::forward_error::RequestTimeout,
     proxy::forward_limits::{BodySizeTracker, HeaderBudget},
+    proxy::headers::{
+        response_header_should_skip, sanitize_request_trailer_map, sanitize_response_trailer_map,
+    },
     util::timeout_with_context,
 };
 
@@ -83,6 +86,7 @@ pub(super) async fn forward_request_to_upstream(
     request_start: Instant,
     request_total_timeout: Option<Duration>,
     max_request_body_size: usize,
+    max_request_header_bytes: usize,
     max_response_header_bytes: usize,
 ) -> Result<ForwardOutcome> {
     let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
@@ -156,9 +160,17 @@ pub(super) async fn forward_request_to_upstream(
         .await?
         {
             Some(trailers) => {
-                send_stream
-                    .send_trailers(trailers)
-                    .context("failed to forward HTTP/2 request trailers upstream")?;
+                let sanitized = sanitize_request_trailer_map(&trailers, max_request_header_bytes)
+                    .context("invalid HTTP/2 request trailers from client")?;
+                if sanitized.is_empty() {
+                    send_stream
+                        .send_data(Bytes::new(), true)
+                        .context("failed to terminate upstream HTTP/2 request stream")?;
+                } else {
+                    send_stream
+                        .send_trailers(sanitized)
+                        .context("failed to forward HTTP/2 request trailers upstream")?;
+                }
             }
             None => {
                 send_stream
@@ -200,16 +212,7 @@ pub(super) async fn forward_request_to_upstream(
     for (name, value) in response.headers().iter() {
         let name_str = name.as_str();
         let lower = name_str.to_ascii_lowercase();
-        if lower == "connection"
-            || lower == "transfer-encoding"
-            || lower == "keep-alive"
-            || lower == "proxy-connection"
-            || lower == "proxy-authenticate"
-            || lower == "proxy-authorization"
-            || lower == "trailer"
-            || lower == "upgrade"
-            || connection_tokens.contains(lower.as_str())
-        {
+        if response_header_should_skip(&lower, &connection_tokens) {
             continue;
         }
         header_budget.record(name_str.len() + value.as_bytes().len() + HEADER_PADDING)?;
@@ -271,9 +274,17 @@ pub(super) async fn forward_request_to_upstream(
         .await?
         {
             Some(trailers) => {
-                send_body
-                    .send_trailers(trailers)
-                    .context("failed to forward HTTP/2 response trailers to client")?;
+                let sanitized = sanitize_response_trailer_map(&trailers, max_response_header_bytes)
+                    .context("invalid HTTP/2 response trailers from upstream")?;
+                if sanitized.is_empty() {
+                    send_body
+                        .send_data(Bytes::new(), true)
+                        .context("failed to terminate downstream HTTP/2 response stream")?;
+                } else {
+                    send_body
+                        .send_trailers(sanitized)
+                        .context("failed to forward HTTP/2 response trailers to client")?;
+                }
             }
             None => {
                 send_body
