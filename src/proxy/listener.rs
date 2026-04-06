@@ -54,6 +54,13 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, app: AppCont
         ProxyProtocolMode::Off => peer,
         mode => {
             if !app.settings.proxy_protocol_allows_peer(peer.ip()) {
+                if mode == ProxyProtocolMode::Required {
+                    warn!(
+                        peer = %peer,
+                        "rejecting connection from peer outside proxy_protocol_allowed_cidrs"
+                    );
+                    return Ok(());
+                }
                 peer
             } else {
                 match detect_proxy_header(&stream, peer, app.settings.request_header_timeout())

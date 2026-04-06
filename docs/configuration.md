@@ -29,9 +29,14 @@ These settings are required.
 
 !!! note
     When `proxy_protocol` is `"optional"` or `"required"`, ExfilGuard
-    auto-detects PROXY protocol v1 or v2 headers. If the peer IP is not in
-    `proxy_protocol_allowed_cidrs`, ExfilGuard ignores any PROXY headers and
-    treats the connection as a normal client connection.
+    auto-detects PROXY protocol v1 or v2 headers for peers in
+    `proxy_protocol_allowed_cidrs`.
+
+    In `"optional"` mode, peers outside that allowlist are treated as normal
+    client connections.
+
+    In `"required"` mode, peers outside that allowlist are rejected before
+    HTTP parsing, and allowlisted peers must send a valid PROXY header.
 
 !!! note
     Set `proxy_protocol_allowed_cidrs` when PROXY protocol is enabled.

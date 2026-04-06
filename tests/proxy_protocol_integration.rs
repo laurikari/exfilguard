@@ -51,7 +51,45 @@ async fn proxy_protocol_allows_forwarded_client() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxy_protocol_allowlist_skips_untrusted_peer() -> Result<()> {
+async fn proxy_protocol_optional_allows_untrusted_direct_peer() -> Result<()> {
+    let upstream = TestUpstream::http_ok("ok").await?;
+    let upstream_port = upstream.port();
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .client_ip("local", "127.0.0.1", &["allow-local"], true)
+        .policy(
+            PolicySpec::new("allow-local").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(|settings| {
+            settings.proxy_protocol = ProxyProtocolMode::Optional;
+            settings.proxy_protocol_allowed_cidrs =
+                Some(vec!["198.51.100.0/24".parse::<IpNet>().unwrap()]);
+        })
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(request).await?;
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected response: {response}"
+    );
+
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_protocol_required_rejects_untrusted_direct_peer() -> Result<()> {
     let upstream = TestUpstream::http_ok("ok").await?;
     let upstream_port = upstream.port();
 
@@ -77,12 +115,28 @@ async fn proxy_protocol_allowlist_skips_untrusted_peer() -> Result<()> {
     let request = format!(
         "GET http://127.0.0.1:{upstream_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
     );
-    client.send(request).await?;
-    let response = client.read_response().await?;
-    assert!(
-        response.starts_with("HTTP/1.1 200"),
-        "unexpected response: {response}"
-    );
+    match async {
+        client.send(request).await?;
+        client.read_response().await
+    }
+    .await
+    {
+        Ok(response) => {
+            assert!(
+                response.is_empty(),
+                "expected connection to close without HTTP response, got: {response}"
+            );
+        }
+        Err(err) => {
+            let detail = err.to_string();
+            assert!(
+                detail.contains("Connection reset by peer")
+                    || detail.contains("Broken pipe")
+                    || detail.contains("not connected"),
+                "unexpected error while probing rejected connection: {detail}"
+            );
+        }
+    }
 
     harness.shutdown().await;
     Ok(())
