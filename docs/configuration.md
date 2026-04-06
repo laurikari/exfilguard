@@ -159,13 +159,14 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 
 ## Request Size Limits
 
-All size values are in bytes and must be greater than 0.
+All size values are in bytes. Header limits must be greater than 0.
+Set `max_request_body_size = 0` to disable the global request-body cap.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_request_header_size` | usize | 32768 (32 KiB) | Maximum HTTP request header size |
 | `max_response_header_size` | usize | 32768 (32 KiB) | Maximum HTTP response header size |
-| `max_request_body_size` | usize | 67108864 (64 MiB) | Maximum HTTP request body size |
+| `max_request_body_size` | usize | 0 (unlimited) | Maximum HTTP request body size during forwarding (0 disables the limit) |
 
 ---
 
@@ -322,7 +323,7 @@ upstream_pool_capacity = 32
 # Size limits (bytes)
 max_request_header_size = 32768
 max_response_header_size = 32768
-max_request_body_size = 67108864
+max_request_body_size = 0
 
 # Cache (optional)
 cache_dir = "./cache"

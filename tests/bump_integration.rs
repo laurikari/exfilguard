@@ -990,6 +990,68 @@ async fn connect_bump_relays_https_response() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_allows_large_streamed_upload_with_default_unlimited_body_size() -> Result<()>
+{
+    let upstream_host = "localhost";
+    let policy_name = "allow-large-upload";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["PUT"],
+        format!("https://{upstream_host}/upload/**"),
+    ));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .upstream_mode(UpstreamMode::Http1Inspect),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.http1_client();
+
+    let body_size = 64 * 1024 * 1024 + 1;
+    let request = format!(
+        "PUT /upload/layer HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nContent-Length: {body_size}\r\nConnection: close\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port()
+    );
+    client.send(request.as_bytes()).await?;
+
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut remaining = body_size;
+    while remaining > 0 {
+        let to_write = remaining.min(chunk.len());
+        client.stream_mut().write_all(&chunk[..to_write]).await?;
+        remaining -= to_write;
+    }
+    client.stream_mut().flush().await?;
+
+    let response = timeout(
+        StdDuration::from_secs(30),
+        client.read_response_with_length(),
+    )
+    .await??;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected bumped response: {response}"
+    );
+    assert!(
+        response.contains("path=/upload/layer"),
+        "expected upstream path echo, got: {response}"
+    );
+    assert!(
+        response.contains(&format!("content-length={body_size}")),
+        "expected upstream content-length echo, got: {response}"
+    );
+    assert!(
+        response.contains(&format!("body-len={body_size}")),
+        "expected full upstream body length echo, got: {response}"
+    );
+
+    client.stream_mut().shutdown().await.ok();
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";

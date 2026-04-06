@@ -79,7 +79,7 @@ impl SettingsDefaults {
     }
 
     const fn max_request_body_size() -> usize {
-        64 * 1024 * 1024
+        0
     }
 
     const fn log_format() -> LogFormat {
@@ -333,6 +333,14 @@ impl Settings {
         }
     }
 
+    pub fn max_request_body_size_limit(&self) -> Option<usize> {
+        if self.max_request_body_size == 0 {
+            None
+        } else {
+            Some(self.max_request_body_size)
+        }
+    }
+
     pub fn proxy_protocol_allows_peer(&self, peer: IpAddr) -> bool {
         match &self.proxy_protocol_allowed_cidrs {
             None => true,
@@ -444,11 +452,6 @@ impl Settings {
             self.max_response_header_size > 0,
             "max_response_header_size must be greater than 0 (got {})",
             self.max_response_header_size
-        );
-        ensure!(
-            self.max_request_body_size > 0,
-            "max_request_body_size must be greater than 0 (got {})",
-            self.max_request_body_size
         );
         ensure!(
             self.dns_resolve_timeout > 0,
@@ -596,6 +599,10 @@ mod tests {
             metrics_tls_key: None,
         };
         assert!(settings.validate().is_ok());
+
+        let mut unlimited = settings.clone();
+        unlimited.max_request_body_size = 0;
+        assert!(unlimited.validate().is_ok());
     }
 
     #[test]

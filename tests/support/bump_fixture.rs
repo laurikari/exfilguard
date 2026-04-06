@@ -47,6 +47,7 @@ impl ClientProtocols {
 #[derive(Clone, Copy)]
 pub enum UpstreamMode {
     Http1Keepalive,
+    Http1Inspect,
     Http1Redirect,
     Http2,
     Http2CloseBeforeResponse,
@@ -262,9 +263,9 @@ impl BumpedTlsFixture {
             .await?;
 
         let upstream_config = match upstream_mode {
-            UpstreamMode::Http1Keepalive | UpstreamMode::Http1Redirect => {
-                build_upstream_tls_config(&ca, upstream_host)?
-            }
+            UpstreamMode::Http1Keepalive
+            | UpstreamMode::Http1Inspect
+            | UpstreamMode::Http1Redirect => build_upstream_tls_config(&ca, upstream_host)?,
             UpstreamMode::Http2
             | UpstreamMode::Http2CloseBeforeResponse
             | UpstreamMode::Http2HeadersThenStallBody
@@ -298,6 +299,9 @@ impl BumpedTlsFixture {
                                 let result = match upstream_mode {
                                     UpstreamMode::Http1Keepalive => {
                                         serve_tls_keepalive(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http1Inspect => {
+                                        serve_tls_http1_inspect(stream, acceptor, peer).await
                                     }
                                     UpstreamMode::Http1Redirect => {
                                         serve_redirect(stream, acceptor, peer).await
@@ -453,6 +457,64 @@ async fn serve_tls_keepalive(
     tls.shutdown()
         .await
         .context("failed to shutdown TLS upstream stream")?;
+    Ok(())
+}
+
+async fn serve_tls_http1_inspect(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let mut tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    loop {
+        let request_bytes = read_request(&mut tls).await?;
+        if request_bytes.is_empty() {
+            break;
+        }
+        let request = String::from_utf8(request_bytes)?;
+        let path = request_path(&request);
+        let close = request.to_ascii_lowercase().contains("connection: close");
+        let content_length = request_header_value(&request, "content-length")
+            .unwrap_or("0")
+            .parse::<usize>()
+            .context("invalid content-length in inspected upstream request")?;
+
+        let mut remaining = content_length;
+        let mut body_len = 0usize;
+        let mut buffer = [0u8; 8192];
+        while remaining > 0 {
+            let to_read = remaining.min(buffer.len());
+            tls.read_exact(&mut buffer[..to_read])
+                .await
+                .context("failed to read inspected upstream request body")?;
+            remaining -= to_read;
+            body_len += to_read;
+        }
+
+        let response_body =
+            format!("path={path}\ncontent-length={content_length}\nbody-len={body_len}");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}",
+            response_body.len(),
+            if close { "close" } else { "keep-alive" },
+            response_body
+        );
+        tls.write_all(response.as_bytes())
+            .await
+            .context("failed to write inspected TLS upstream response")?;
+        tls.flush()
+            .await
+            .context("failed to flush inspected TLS upstream response")?;
+        if close {
+            break;
+        }
+    }
+    tls.shutdown()
+        .await
+        .context("failed to shutdown inspected TLS upstream stream")?;
     Ok(())
 }
 
@@ -709,4 +771,14 @@ fn request_path(request: &str) -> &str {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/")
+}
+
+fn request_header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request.lines().find_map(|line| {
+        let (header_name, value) = line.split_once(':')?;
+        header_name
+            .trim()
+            .eq_ignore_ascii_case(name)
+            .then_some(value.trim())
+    })
 }

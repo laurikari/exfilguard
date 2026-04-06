@@ -105,6 +105,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chunked_body_allows_unlimited_body_size() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let (client_stream, mut client_writer) = duplex(1024);
+        let (mut upstream_source, mut upstream_sink) = duplex(1024);
+
+        client_writer
+            .write_all(b"5\r\nhello\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        drop(client_writer);
+
+        let mut reader = BufReader::new(client_stream);
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443));
+        let transferred = stream_chunked_body(
+            &mut reader,
+            &mut upstream_sink,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            peer,
+            0,
+        )
+        .await
+        .expect("unlimited body size should stream successfully");
+
+        assert_eq!(transferred, 15);
+
+        drop(upstream_sink);
+        let mut forwarded = Vec::new();
+        upstream_source.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
     async fn read_request_head_parses_basic_request() -> anyhow::Result<()> {
         use tokio::io::{AsyncWriteExt, duplex};
 

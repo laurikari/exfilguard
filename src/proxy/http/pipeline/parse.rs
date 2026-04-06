@@ -100,12 +100,13 @@ where
 
     if !headers.is_chunked()
         && let Some(length) = content_length
-        && length > app.settings.max_request_body_size
+        && let Some(limit) = app.settings.max_request_body_size_limit()
+        && length > limit
     {
         warn!(
             peer = %peer,
             length,
-            max = app.settings.max_request_body_size,
+            max = limit,
             "request body exceeds limit"
         );
         respond_with_access_log(

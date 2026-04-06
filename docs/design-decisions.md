@@ -81,6 +81,15 @@ Clients are expected to know they are talking to a proxy.
 This keeps request meaning, client intent, and logging straightforward.
 Transparent proxying may come later.
 
+## Request body limits are opt-in
+
+By default, ExfilGuard does not cap inspected request body size.
+
+It streams request bodies incrementally and relies on backpressure plus timeout
+controls for transport safety. Body size alone does not make a request invalid
+for policy purposes. Operators can still opt into a global request-body cap
+with `max_request_body_size` when that tradeoff fits their environment.
+
 ## Real trust store for outbound TLS
 
 If the system trust store is empty, startup fails.

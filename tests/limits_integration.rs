@@ -67,30 +67,19 @@ async fn test_max_request_body_size_enforced() -> Result<()> {
     stream.write_all(&body).await?;
     stream.flush().await?;
 
-    // We expect the proxy to close the connection or return an error before finishing reading
-    // In many implementations, it might return 413 Payload Too Large
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.ok();
-
-    // We expect either a 413 or 500/502 depending on how the error is propagated,
-    // or just a closed connection. But the upload should definitely NOT succeed (200 OK).
-    // The current implementation of `BodySizeTracker` returns `BodyTooLarge` error which typically results in 413 or 502/500 or disconnect.
-
-    if !response.is_empty() {
-        assert!(
-            !response.contains("200 OK"),
-            "Upload should not succeed. Response: {}",
-            response
-        );
-        // Ideally we check for 413
-        if response.contains("HTTP/1.1") {
-            assert!(
-                response.contains("413") || response.contains("500") || response.contains("502"),
-                "Expected error status, got: {}",
-                response
-            );
-        }
-    }
+    let response = timeout(
+        StdDuration::from_secs(2),
+        read_http_response_with_length(&mut stream),
+    )
+    .await??;
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("request body exceeds configured limit"),
+        "missing limit body: {response}"
+    );
 
     stream.shutdown().await.ok();
     harness.shutdown().await;

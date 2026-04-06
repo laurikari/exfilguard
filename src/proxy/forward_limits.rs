@@ -8,14 +8,14 @@ use crate::proxy::{allow_log::AllowLogStats, http::BodyTooLarge};
 
 /// Tracks cumulative payload bytes and enforces a configured limit.
 pub struct BodySizeTracker {
-    max_bytes: usize,
+    max_bytes: Option<u64>,
     total_bytes: u64,
 }
 
 impl BodySizeTracker {
     pub fn new(max_bytes: usize) -> Self {
         Self {
-            max_bytes,
+            max_bytes: (max_bytes > 0).then_some(max_bytes as u64),
             total_bytes: 0,
         }
     }
@@ -30,7 +30,9 @@ impl BodySizeTracker {
             .ok_or(BodyTooLarge {
                 bytes_read: self.total_bytes,
             })?;
-        if self.total_bytes as usize > self.max_bytes {
+        if let Some(max_bytes) = self.max_bytes
+            && self.total_bytes > max_bytes
+        {
             return Err(BodyTooLarge {
                 bytes_read: self.total_bytes,
             }

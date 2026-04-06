@@ -52,7 +52,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         upstream_pool_capacity: 32,
         max_request_header_size: 32 * 1024,
         max_response_header_size: 4096,
-        max_request_body_size: 1024 * 1024,
+        max_request_body_size: 0,
         cache_dir: dirs.cache_dir.clone(),
         cache_max_entry_size: 10 * 1024 * 1024,
         cache_max_entries: 10_000,
