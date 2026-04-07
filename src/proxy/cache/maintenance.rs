@@ -133,6 +133,7 @@ impl CacheState {
         self.store.remove_temp_files()?;
         let mut guard = self.index.lock();
         guard.reset();
+        crate::metrics::set_cache_usage(guard.len(), guard.bytes_in_use());
         drop(guard);
 
         if !self.store.disk_dir().exists() {

@@ -170,6 +170,10 @@ impl HttpCache {
 }
 
 impl CacheState {
+    fn update_cache_metrics(index: &CacheIndex) {
+        crate::metrics::set_cache_usage(index.len(), index.bytes_in_use());
+    }
+
     fn body_path(&self, entry_id: &str) -> PathBuf {
         self.store.body_path(entry_id)
     }
@@ -184,12 +188,15 @@ impl CacheState {
 
     fn remove_entry_if_id_matches(&self, key_base: &str, entry_id: u64) -> bool {
         let mut guard = self.index.lock();
-        guard.remove_if_id_matches(key_base, entry_id).is_some()
+        let removed = guard.remove_if_id_matches(key_base, entry_id).is_some();
+        Self::update_cache_metrics(&guard);
+        removed
     }
 
     fn remove_entry_by_key_base(&self, key_base: &str) {
         let mut guard = self.index.lock();
         guard.remove_by_key(key_base);
+        Self::update_cache_metrics(&guard);
     }
 
     async fn write_metadata_async(&self, entry_id: &str, entry: &PersistedEntry) -> Result<()> {
@@ -198,7 +205,9 @@ impl CacheState {
 
     fn insert_entry(&self, key_base: String, entry: CacheEntry) -> Vec<CacheEntry> {
         let mut guard = self.index.lock();
-        guard.insert(key_base, entry)
+        let evicted = guard.insert(key_base, entry);
+        Self::update_cache_metrics(&guard);
+        evicted
     }
 }
 

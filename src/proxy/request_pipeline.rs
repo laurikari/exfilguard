@@ -37,6 +37,19 @@ pub async fn process_request<H: RequestHandler>(
 ) -> Result<H::Output> {
     let policy_outcome =
         policy_eval::evaluate_request(peer, parsed, snapshot, log_queries, log_config);
+    let inflight_client = match &policy_outcome {
+        PolicyOutcome::Allow(outcome) => Some(outcome.decision.client.as_ref()),
+        PolicyOutcome::Deny(outcome) => Some(outcome.decision.client.as_ref()),
+        PolicyOutcome::DefaultDeny(_) => None,
+    };
+    crate::metrics::inc_inflight(inflight_client);
+    struct InflightGuard(Option<String>);
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            crate::metrics::dec_inflight(self.0.as_deref());
+        }
+    }
+    let _guard = InflightGuard(inflight_client.map(str::to_owned));
     match policy_outcome {
         PolicyOutcome::Allow(outcome) => handler.on_allow(outcome).await,
         PolicyOutcome::Deny(outcome) => handler.on_deny(outcome).await,

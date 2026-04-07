@@ -49,6 +49,7 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
 }
 
 async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, app: AppContext) -> Result<()> {
+    let _connection_guard = crate::metrics::track_downstream_connection();
     let original_peer = peer;
     let peer = match app.settings.proxy_protocol {
         ProxyProtocolMode::Off => peer,

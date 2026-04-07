@@ -76,12 +76,10 @@ impl CacheIndex {
         evicted
     }
 
-    #[cfg(test)]
     pub(super) fn bytes_in_use(&self) -> u64 {
         self.bytes_in_use
     }
 
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.lru.len()
     }

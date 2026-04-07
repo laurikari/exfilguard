@@ -40,6 +40,7 @@ pub async fn handle_splice(
     let tunnel_max_lifetime = app.settings.connect_tunnel_max_lifetime();
 
     let handshake_bytes = send_connect_established(client_stream, tunnel_idle_timeout).await?;
+    let _tunnel_guard = crate::metrics::track_connect_tunnel();
 
     let relay = relay_with_idle_timeouts(client_stream, &mut upstream_stream, tunnel_idle_timeout);
     let relay_result = if let Some(limit) = tunnel_max_lifetime {

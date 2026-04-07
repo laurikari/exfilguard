@@ -74,6 +74,7 @@ pub async fn handle_bump(
         .1
         .alpn_protocol()
         .map(|proto| proto.to_vec());
+    let _bump_guard = crate::metrics::track_tls_bump_session();
 
     let serve = async {
         if supports_h2 && negotiated.as_deref() == Some(b"h2") {
