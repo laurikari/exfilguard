@@ -134,6 +134,28 @@ pub async fn copy_with_write_timeout<R: AsyncRead + Unpin, W: AsyncWrite + Unpin
     Ok(total)
 }
 
+pub async fn copy_n_with_write_timeout<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    mut remaining: u64,
+    timeout: Duration,
+    context: &str,
+) -> Result<u64> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..to_read]).await?;
+        if read == 0 {
+            anyhow::bail!("unexpected EOF while {context}");
+        }
+        write_all_with_timeout(writer, &buffer[..read], timeout, context).await?;
+        total = total.saturating_add(read as u64);
+        remaining -= read as u64;
+    }
+    Ok(total)
+}
+
 struct PendingWrite {
     buf: Vec<u8>,
     w1_pos: usize,

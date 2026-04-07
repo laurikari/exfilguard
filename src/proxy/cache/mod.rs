@@ -599,6 +599,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_lookup_rejects_body_size_mismatch() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = build_cache(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/tampered-size");
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"body",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        let hit = cache.lookup(&method, &uri, &req_headers).await.unwrap();
+        fs::write(&hit.body_path, b"tampered-body")?;
+
+        assert!(
+            cache.lookup(&method, &uri, &req_headers).await.is_none(),
+            "tampered body size should invalidate live cache entry"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_lookup_rejects_symlinked_body() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new()?;
+        let cache = build_cache(4, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
+
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/tampered-link");
+        let req_headers = HeaderMap::new();
+        let resp_headers = HeaderMap::new();
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"body",
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        let hit = cache.lookup(&method, &uri, &req_headers).await.unwrap();
+        let replacement = dir.path().join("replacement-body");
+        fs::write(&replacement, b"replacement")?;
+        fs::remove_file(&hit.body_path)?;
+        symlink(&replacement, &hit.body_path)?;
+
+        assert!(
+            cache.lookup(&method, &uri, &req_headers).await.is_none(),
+            "symlinked body should invalidate live cache entry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_drops_invalid_content_hash_metadata() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();

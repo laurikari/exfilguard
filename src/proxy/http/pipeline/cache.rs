@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
-use crate::io_util::{copy_with_write_timeout, write_all_with_timeout};
+use crate::io_util::{copy_n_with_write_timeout, write_all_with_timeout};
 use crate::proxy::{
     cache::CacheLookupOutcome,
     policy_eval::{AllowDecision, RequestLogContext},
@@ -76,9 +76,10 @@ where
             let mut copied = 0u64;
             if !matches!(body_plan, ResponseBodyPlan::Empty) {
                 let mut file = tokio::fs::File::open(&cached.body_path).await?;
-                copied = copy_with_write_timeout(
+                copied = copy_n_with_write_timeout(
                     &mut file,
                     client_stream,
+                    cached.content_length,
                     handler.response_body_timeout,
                     "writing cached response body",
                 )

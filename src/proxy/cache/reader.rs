@@ -58,11 +58,33 @@ impl CacheReader {
         }
 
         let body_path = self.state.body_path(&entry.entry_id);
-        if let Err(err) = async_fs::metadata(&body_path).await {
+        let metadata = match async_fs::symlink_metadata(&body_path).await {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %body_path.display(),
+                    "cache body missing on disk"
+                );
+                if self
+                    .state
+                    .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
+                {
+                    self.state
+                        .remove_entry_files_for_entry_id_async(&entry.entry_id)
+                        .await;
+                }
+                crate::metrics::record_cache_lookup(false);
+                return None;
+            }
+        };
+
+        if !metadata.file_type().is_file() || metadata.len() != entry.content_length {
             warn!(
-                error = %err,
                 path = %body_path.display(),
-                "cache body missing on disk"
+                expected_length = entry.content_length,
+                actual_length = metadata.len(),
+                "cache body failed validation on disk"
             );
             if self
                 .state
