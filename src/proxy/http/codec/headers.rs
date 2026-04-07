@@ -79,8 +79,11 @@ impl Http1HeaderAccumulator {
     }
 
     pub fn push_line(&mut self, line: &str) -> Result<bool> {
+        if !line.ends_with("\r\n") {
+            bail!("header line must end with CRLF");
+        }
         let line_len = line.len();
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let trimmed = &line[..line_len - 2];
         if trimmed.is_empty() {
             self.sanitizer.reserve(line_len)?;
             return Ok(false);
@@ -253,5 +256,14 @@ mod tests {
             err.to_string().contains("invalid header value"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn reject_header_line_without_crlf() {
+        let mut accumulator = Http1HeaderAccumulator::new(256);
+        let err = accumulator
+            .push_line("Host: example.com\n")
+            .expect_err("header line without CRLF should error");
+        assert!(err.to_string().contains("CRLF"), "unexpected error: {err}");
     }
 }

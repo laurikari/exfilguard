@@ -155,13 +155,10 @@ where
     let mut string = String::from_utf8(line)
         .map_err(|_| anyhow!("request line for {peer} contained invalid bytes"))?;
 
-    if !string.ends_with('\n') {
-        bail!("request line for {peer} missing newline terminator");
+    if !string.ends_with("\r\n") {
+        bail!("request line for {peer} must end with CRLF");
     }
-    string.pop();
-    if string.ends_with('\r') {
-        string.pop();
-    }
+    string.truncate(string.len() - 2);
 
     Ok(Some((string, total)))
 }
@@ -238,6 +235,59 @@ mod tests {
             err.to_string().contains("HTTP/1.0"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_bare_lf_request_line() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\nHost: example.com\r\n\r\n")
+            .await
+            .expect("write request");
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = read_http1_request_head(
+            &mut reader,
+            peer,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await;
+        let err = match err {
+            Ok(_) => panic!("bare-LF request line should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("CRLF"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_bare_lf_header_line() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\n\r\n")
+            .await
+            .expect("write request");
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = read_http1_request_head(
+            &mut reader,
+            peer,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await;
+        let err = match err {
+            Ok(_) => panic!("bare-LF header line should be rejected"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("CRLF"), "unexpected error: {message}");
     }
 
     #[tokio::test]
