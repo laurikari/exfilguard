@@ -1,8 +1,11 @@
-use std::{future::Future, net::IpAddr, time::Duration};
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
-use once_cell::sync::Lazy;
 use tokio::time::timeout;
 
 /// Represents either a single IP address or a CIDR network.
@@ -32,20 +35,20 @@ pub fn parse_ip_or_cidr(value: &str) -> Result<IpOrCidr> {
     }
 }
 
-/// Returns true if the provided IP address is within a private, loopback, or link-local range.
+/// Returns true if the provided IP address should be treated as non-public for upstream filtering.
+///
+/// Historical note: despite the name, this is intentionally broader than RFC1918/RFC4193 private
+/// space. ExfilGuard blocks upstream addresses that are not valid public-Internet destinations by
+/// default.
+///
+/// Keep this aligned with the current unstable `std::net::IpAddr::is_global()` logic until that
+/// API stabilizes. The stdlib logic is based on the IANA special-purpose registries, but we also
+/// reject multicast here because ExfilGuard only makes unicast upstream TCP connections.
 pub fn is_private_ip(addr: IpAddr) -> bool {
-    if PRIVATE_NETS.iter().any(|net| net.contains(&addr)) {
-        return true;
+    match addr {
+        IpAddr::V4(v4) => ipv4_is_non_global_upstream(v4),
+        IpAddr::V6(v6) => ipv6_is_non_global_upstream(v6),
     }
-
-    if let IpAddr::V6(v6) = addr
-        && let Some(mapped) = v6.to_ipv4_mapped()
-    {
-        let mapped_addr = IpAddr::V4(mapped);
-        return PRIVATE_NETS.iter().any(|net| net.contains(&mapped_addr));
-    }
-
-    false
 }
 
 /// Returns true if the provided CIDR ranges overlap (including identical ranges).
@@ -75,41 +78,93 @@ where
         .with_context(|| format!("failed while {context}"))
 }
 
-static PRIVATE_NETS: Lazy<Vec<IpNet>> = Lazy::new(|| {
-    [
-        // IPv4 local-use and special-purpose ranges (RFC 6890, RFC 5735)
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.0.0.0/24",
-        "192.0.2.0/24",
-        "192.168.0.0/16",
-        "192.88.99.0/24",
-        "198.18.0.0/15",
-        "198.51.100.0/24",
-        "203.0.113.0/24",
-        "224.0.0.0/4",
-        "240.0.0.0/4",
-        "255.255.255.255/32",
-        // IPv6 local-use and special-purpose ranges (RFC 6890)
-        "::/128",
-        "::1/128",
-        "100::/64",
-        "2001:2::/48",
-        "2001:10::/28",
-        "2001:20::/28",
-        "2001:db8::/32",
-        "fc00::/7",
-        "fe80::/10",
-        "ff00::/8",
-    ]
-    .into_iter()
-    .map(|cidr| cidr.parse::<IpNet>().expect("static CIDR parse failed"))
-    .collect()
-});
+fn ipv4_is_non_global_upstream(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 0
+        || addr.is_private()
+        || ipv4_is_shared(addr)
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || ipv4_is_protocol_assignment(addr)
+        || addr.is_documentation()
+        || ipv4_is_benchmarking(addr)
+        || ipv4_is_reserved(addr)
+        || addr.is_broadcast()
+        || addr.is_multicast()
+}
+
+fn ipv4_is_shared(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
+}
+
+fn ipv4_is_protocol_assignment(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 192 && octets[1] == 0 && octets[2] == 0 && octets[3] != 9 && octets[3] != 10
+}
+
+fn ipv4_is_benchmarking(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 198 && (octets[1] & 0xfe) == 18
+}
+
+fn ipv4_is_reserved(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    (octets[0] & 0xf0) == 0xf0 && !addr.is_broadcast()
+}
+
+fn ipv6_is_non_global_upstream(addr: Ipv6Addr) -> bool {
+    addr.is_unspecified()
+        || addr.is_loopback()
+        || addr.to_ipv4_mapped().is_some()
+        || ipv6_is_ipv4_ipv6_translation(addr)
+        || ipv6_is_discard_only(addr)
+        || ipv6_is_protocol_assignment(addr)
+        || ipv6_is_6to4(addr)
+        || ipv6_is_documentation(addr)
+        || ipv6_is_srv6_sid(addr)
+        || addr.is_unique_local()
+        || addr.is_unicast_link_local()
+        || addr.is_multicast()
+}
+
+fn ipv6_is_ipv4_ipv6_translation(addr: Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0x64, 0xff9b, 1, _, _, _, _, _])
+}
+
+fn ipv6_is_discard_only(addr: Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0x100, 0, 0, 0, _, _, _, _])
+}
+
+fn ipv6_is_protocol_assignment(addr: Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0x2001, b, _, _, _, _, _, _] if b < 0x200)
+        && !ipv6_is_protocol_assignment_exception(addr)
+}
+
+fn ipv6_is_protocol_assignment_exception(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    let bits = u128::from_be_bytes(addr.octets());
+    bits == 0x2001_0001_0000_0000_0000_0000_0000_0001
+        || bits == 0x2001_0001_0000_0000_0000_0000_0000_0002
+        || matches!(segments, [0x2001, 3, _, _, _, _, _, _])
+        || matches!(segments, [0x2001, 4, 0x112, _, _, _, _, _])
+        || matches!(segments, [0x2001, b, _, _, _, _, _, _] if (0x20..=0x3f).contains(&b))
+}
+
+fn ipv6_is_6to4(addr: Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0x2002, _, _, _, _, _, _, _])
+}
+
+fn ipv6_is_documentation(addr: Ipv6Addr) -> bool {
+    matches!(
+        addr.segments(),
+        [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..]
+    )
+}
+
+fn ipv6_is_srv6_sid(addr: Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0x5f00, ..])
+}
 
 #[cfg(test)]
 mod tests {
@@ -171,8 +226,11 @@ mod tests {
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 20))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 10, 10))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 8))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 5))));
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 9))));
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 10))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
@@ -191,7 +249,22 @@ mod tests {
             "2001:db8::1".parse::<Ipv6Addr>().unwrap()
         )));
         assert!(is_private_ip(IpAddr::V6(
+            "64:ff9b:1::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_private_ip(IpAddr::V6(
+            "100::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_private_ip(IpAddr::V6(
+            "2002::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_private_ip(IpAddr::V6(
+            "3fff::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_private_ip(IpAddr::V6(
             "ff02::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_private_ip(IpAddr::V6(
+            "64:ff9b::1".parse::<Ipv6Addr>().unwrap()
         )));
         assert!(!is_private_ip(IpAddr::V6(
             "2001:4860::1".parse::<Ipv6Addr>().unwrap()
@@ -207,9 +280,9 @@ mod tests {
     }
 
     #[test]
-    fn allows_public_ipv4_mapped_ipv6() {
+    fn blocks_ipv4_mapped_ipv6_even_when_embedded_ipv4_is_public() {
         let mapped = IpAddr::V6("::ffff:8.8.8.8".parse::<Ipv6Addr>().unwrap());
-        assert!(!is_private_ip(mapped));
+        assert!(is_private_ip(mapped));
     }
 
     #[test]
