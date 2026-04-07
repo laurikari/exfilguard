@@ -94,27 +94,24 @@ impl ConnectSession {
         app: &AppContext,
     ) -> Result<()> {
         let resolve_timeout = app.settings.dns_resolve_timeout();
-        let resolved = match resolve_connect_target(
-            &self.parsed,
-            resolve_timeout,
-            app.allow_private_test_upstreams(),
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                let mut stream = stream;
-                self.respond_resolution_error(&mut stream, err, |builder| {
-                    builder
-                        .client(allow.client.as_ref())
-                        .policy(allow.policy.as_ref())
-                        .rule(allow.rule.as_ref())
-                        .effective_mode("tunnel")
-                })
-                .await?;
-                return Ok(());
-            }
-        };
+        let resolved =
+            match resolve_connect_target(&self.parsed, resolve_timeout, app.upstream_resolver())
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    let mut stream = stream;
+                    self.respond_resolution_error(&mut stream, err, |builder| {
+                        builder
+                            .client(allow.client.as_ref())
+                            .policy(allow.policy.as_ref())
+                            .rule(allow.rule.as_ref())
+                            .effective_mode("tunnel")
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            };
 
         self.handle_splice_path(stream, allow, log, resolved, app)
             .await
@@ -128,26 +125,23 @@ impl ConnectSession {
         app: &AppContext,
     ) -> Result<()> {
         let resolve_timeout = app.settings.dns_resolve_timeout();
-        let resolved = match resolve_connect_target(
-            &self.parsed,
-            resolve_timeout,
-            app.allow_private_test_upstreams(),
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                let mut stream = stream;
-                self.respond_resolution_error(&mut stream, err, |builder| {
-                    builder
-                        .client(client.as_ref())
-                        .effective_mode("bump")
-                        .transport("tls_bump_preflight")
-                })
-                .await?;
-                return Ok(());
-            }
-        };
+        let resolved =
+            match resolve_connect_target(&self.parsed, resolve_timeout, app.upstream_resolver())
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    let mut stream = stream;
+                    self.respond_resolution_error(&mut stream, err, |builder| {
+                        builder
+                            .client(client.as_ref())
+                            .effective_mode("bump")
+                            .transport("tls_bump_preflight")
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            };
 
         self.handle_bump_preflight_path(stream, client, log, resolved, app)
             .await

@@ -18,6 +18,9 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+pub(crate) use self::resolver::{
+    UpstreamResolver, default_upstream_resolver, permissive_test_upstream_resolver,
+};
 use crate::{
     policy::matcher::PolicySnapshot,
     settings::Settings,
@@ -46,7 +49,7 @@ pub struct AppContext {
     pub policies: PolicyStore,
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
-    allow_private_test_upstreams: bool,
+    upstream_resolver: Arc<dyn UpstreamResolver>,
 }
 
 impl AppContext {
@@ -61,18 +64,25 @@ impl AppContext {
             policies,
             tls,
             cache,
-            allow_private_test_upstreams: false,
+            upstream_resolver: default_upstream_resolver(),
         }
     }
 
-    #[doc(hidden)]
-    pub fn with_private_test_upstreams(mut self, allow: bool) -> Self {
-        self.allow_private_test_upstreams = allow;
+    pub(crate) fn with_upstream_resolver(
+        mut self,
+        upstream_resolver: Arc<dyn UpstreamResolver>,
+    ) -> Self {
+        self.upstream_resolver = upstream_resolver;
         self
     }
 
-    pub(crate) fn allow_private_test_upstreams(&self) -> bool {
-        self.allow_private_test_upstreams
+    #[doc(hidden)]
+    pub fn with_permissive_test_upstream_resolver(self) -> Self {
+        self.with_upstream_resolver(permissive_test_upstream_resolver())
+    }
+
+    pub(crate) fn upstream_resolver(&self) -> &dyn UpstreamResolver {
+        self.upstream_resolver.as_ref()
     }
 }
 

@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use async_trait::async_trait;
 use thiserror::Error;
 use tokio::net::lookup_host;
 
@@ -32,50 +34,54 @@ pub struct FilteredAddresses {
     pub filtered_private: usize,
 }
 
-/// Builder-style configuration for DNS resolution that enforces policy constraints.
-pub struct ResolveRequest<'a> {
-    host: &'a str,
-    port: u16,
-    timeout: Duration,
-    allow_private: bool,
-    context: &'static str,
+#[async_trait]
+pub(crate) trait UpstreamResolver: Send + Sync {
+    async fn resolve_filtered(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_dur: Duration,
+        context: &'static str,
+    ) -> Result<FilteredAddresses>;
 }
 
-impl<'a> ResolveRequest<'a> {
-    pub fn new(host: &'a str, port: u16, timeout: Duration) -> Self {
-        Self {
-            host,
-            port,
-            timeout,
-            allow_private: false,
-            context: "host",
-        }
-    }
+#[derive(Debug, Default)]
+pub(crate) struct PublicInternetResolver;
 
-    pub fn allow_private(mut self, allow: bool) -> Self {
-        self.allow_private = allow;
-        self
-    }
+#[derive(Debug, Default)]
+pub(crate) struct PermissiveTestResolver;
 
-    pub fn context(mut self, context: &'static str) -> Self {
-        self.context = context;
-        self
-    }
+pub(crate) fn default_upstream_resolver() -> Arc<dyn UpstreamResolver> {
+    Arc::new(PublicInternetResolver)
+}
 
-    pub async fn resolve_filtered(self) -> Result<FilteredAddresses> {
-        let Self {
-            host,
-            port,
-            timeout,
-            allow_private,
-            context,
-        } = self;
-        resolve_host_with_policy_inner(host, port, timeout, allow_private, context).await
-    }
+pub(crate) fn permissive_test_upstream_resolver() -> Arc<dyn UpstreamResolver> {
+    Arc::new(PermissiveTestResolver)
+}
 
-    pub async fn resolve(self) -> Result<Vec<SocketAddr>> {
-        let filtered = self.resolve_filtered().await?;
-        Ok(filtered.allowed)
+#[async_trait]
+impl UpstreamResolver for PublicInternetResolver {
+    async fn resolve_filtered(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_dur: Duration,
+        context: &'static str,
+    ) -> Result<FilteredAddresses> {
+        resolve_host_with_policy_inner(host, port, timeout_dur, false, context).await
+    }
+}
+
+#[async_trait]
+impl UpstreamResolver for PermissiveTestResolver {
+    async fn resolve_filtered(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_dur: Duration,
+        context: &'static str,
+    ) -> Result<FilteredAddresses> {
+        resolve_host_with_policy_inner(host, port, timeout_dur, true, context).await
     }
 }
 
@@ -180,22 +186,17 @@ mod tests {
         let port = 8443;
         let timeout = Duration::from_secs(1);
 
-        let err = ResolveRequest::new(host, port, timeout)
-            .context("unit-test")
-            .resolve()
+        let err = resolve_host_with_policy_inner(host, port, timeout, false, "unit-test")
             .await
             .expect_err("private address should be rejected");
         assert!(err.downcast_ref::<PrivateAddressError>().is_some());
 
-        let addrs = ResolveRequest::new(host, port, timeout)
-            .context("unit-test")
-            .allow_private(true)
-            .resolve()
+        let addrs = resolve_host_with_policy_inner(host, port, timeout, true, "unit-test")
             .await
             .expect("private address allowed");
-        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs.allowed.len(), 1);
         assert_eq!(
-            addrs[0],
+            addrs.allowed[0],
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port)
         );
     }

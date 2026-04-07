@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use http::StatusCode;
@@ -225,24 +226,105 @@ static INFLIGHT_REQUESTS_BY_CLIENT: Lazy<IntGaugeVec> = Lazy::new(|| {
     vec
 });
 
-static UPSTREAM_POOL_IN_USE: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::new("upstream_pool_in_use", "Idle upstream pool size")
-        .expect("create upstream_pool_in_use");
+static DOWNSTREAM_CONNECTIONS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "downstream_connections_active",
+        "Current accepted downstream client connections",
+    )
+    .expect("create downstream_connections_active");
     REGISTRY
         .register(Box::new(gauge.clone()))
-        .expect("register upstream_pool_in_use");
+        .expect("register downstream_connections_active");
     gauge
 });
 
-static UPSTREAM_POOL_CAPACITY: Lazy<IntGauge> = Lazy::new(|| {
+static CONNECT_TUNNELS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
     let gauge = IntGauge::new(
-        "upstream_pool_capacity",
-        "Configured upstream pool capacity",
+        "connect_tunnels_active",
+        "Current CONNECT tunnels relaying bytes",
     )
-    .expect("create upstream_pool_capacity");
+    .expect("create connect_tunnels_active");
     REGISTRY
         .register(Box::new(gauge.clone()))
-        .expect("register upstream_pool_capacity");
+        .expect("register connect_tunnels_active");
+    gauge
+});
+
+static TLS_BUMP_SESSIONS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "tls_bump_sessions_active",
+        "Current bumped TLS sessions serving decrypted requests",
+    )
+    .expect("create tls_bump_sessions_active");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register tls_bump_sessions_active");
+    gauge
+});
+
+static HTTP2_STREAMS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "http2_streams_active",
+        "Current active downstream HTTP/2 request streams",
+    )
+    .expect("create http2_streams_active");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register http2_streams_active");
+    gauge
+});
+
+static UPSTREAM_CONNECTIONS_OPEN: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "upstream_connections_open",
+        "Current open upstream connections",
+    )
+    .expect("create upstream_connections_open");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register upstream_connections_open");
+    gauge
+});
+
+static UPSTREAM_CONNECTIONS_IDLE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "upstream_connections_idle",
+        "Current idle reusable upstream HTTP/1.1 connections",
+    )
+    .expect("create upstream_connections_idle");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register upstream_connections_idle");
+    gauge
+});
+
+static CACHE_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new("cache_entries", "Current cached response entries")
+        .expect("create cache_entries");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register cache_entries");
+    gauge
+});
+
+static CACHE_BYTES_USED: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new("cache_bytes_used", "Current cache bytes in use")
+        .expect("create cache_bytes_used");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register cache_bytes_used");
+    gauge
+});
+
+static POLICY_RELOAD_LAST_SUCCESS_UNIXTIME: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "policy_reload_last_success_unixtime",
+        "Unix timestamp of the last successful policy load or reload",
+    )
+    .expect("create policy_reload_last_success_unixtime");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register policy_reload_last_success_unixtime");
     gauge
 });
 
@@ -409,12 +491,107 @@ pub fn record_cache_cleanup_dir() {
     CACHE_CLEANUP_DIRS_TOTAL.inc();
 }
 
-pub fn set_pool_capacity(capacity: usize) {
-    UPSTREAM_POOL_CAPACITY.set(capacity as i64);
+#[must_use]
+pub struct MetricGuard {
+    on_drop: fn(),
 }
 
-pub fn set_pool_in_use(size: usize) {
-    UPSTREAM_POOL_IN_USE.set(size as i64);
+impl Drop for MetricGuard {
+    fn drop(&mut self) {
+        (self.on_drop)();
+    }
+}
+
+#[derive(Clone)]
+pub struct UpstreamConnectionTracker {
+    open: Arc<AtomicBool>,
+}
+
+impl UpstreamConnectionTracker {
+    fn new() -> Self {
+        UPSTREAM_CONNECTIONS_OPEN.inc();
+        Self {
+            open: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn close(&self) {
+        if self.open.swap(false, Ordering::Relaxed) {
+            UPSTREAM_CONNECTIONS_OPEN.dec();
+        }
+    }
+}
+
+impl Drop for UpstreamConnectionTracker {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn guard(on_drop: fn()) -> MetricGuard {
+    MetricGuard { on_drop }
+}
+
+fn dec_downstream_connections_active() {
+    DOWNSTREAM_CONNECTIONS_ACTIVE.dec();
+}
+
+fn dec_connect_tunnels_active() {
+    CONNECT_TUNNELS_ACTIVE.dec();
+}
+
+fn dec_tls_bump_sessions_active() {
+    TLS_BUMP_SESSIONS_ACTIVE.dec();
+}
+
+fn dec_http2_streams_active() {
+    HTTP2_STREAMS_ACTIVE.dec();
+}
+
+pub fn track_downstream_connection() -> MetricGuard {
+    DOWNSTREAM_CONNECTIONS_ACTIVE.inc();
+    guard(dec_downstream_connections_active)
+}
+
+pub fn track_connect_tunnel() -> MetricGuard {
+    CONNECT_TUNNELS_ACTIVE.inc();
+    guard(dec_connect_tunnels_active)
+}
+
+pub fn track_tls_bump_session() -> MetricGuard {
+    TLS_BUMP_SESSIONS_ACTIVE.inc();
+    guard(dec_tls_bump_sessions_active)
+}
+
+pub fn track_http2_stream() -> MetricGuard {
+    HTTP2_STREAMS_ACTIVE.inc();
+    guard(dec_http2_streams_active)
+}
+
+pub fn track_upstream_connection() -> UpstreamConnectionTracker {
+    UpstreamConnectionTracker::new()
+}
+
+pub fn inc_upstream_connections_idle() {
+    UPSTREAM_CONNECTIONS_IDLE.inc();
+}
+
+pub fn dec_upstream_connections_idle() {
+    UPSTREAM_CONNECTIONS_IDLE.dec();
+}
+
+pub fn set_cache_usage(entries: usize, bytes: u64) {
+    CACHE_ENTRIES.set(entries.min(i64::MAX as usize) as i64);
+    CACHE_BYTES_USED.set(bytes.min(i64::MAX as u64) as i64);
+}
+
+pub fn mark_policy_reload_success() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    POLICY_RELOAD_LAST_SUCCESS_UNIXTIME.set(now);
 }
 
 pub fn record_pool_reuse(reused: bool) {

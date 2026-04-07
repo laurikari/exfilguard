@@ -50,6 +50,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         connect_tunnel_idle_timeout: 60,
         connect_tunnel_max_lifetime: 0,
         upstream_pool_capacity: 32,
+        http2_max_concurrent_streams: 100,
         max_request_header_size: 32 * 1024,
         max_response_header_size: 4096,
         max_request_body_size: 0,
@@ -196,8 +197,12 @@ impl ProxyHarnessBuilder {
             proxy_client_config,
             proxy_client_h2_config,
         ));
-        let app = AppContext::new(settings.clone(), policy_store, tls, cache.clone())
-            .with_private_test_upstreams(self.allow_private_test_upstreams);
+        let app = if self.allow_private_test_upstreams {
+            AppContext::new(settings.clone(), policy_store, tls, cache.clone())
+                .with_permissive_test_upstream_resolver()
+        } else {
+            AppContext::new(settings.clone(), policy_store, tls, cache.clone())
+        };
 
         let handle = tokio::spawn(async move {
             if let Err(err) = proxy::run(app).await {

@@ -70,6 +70,10 @@ impl SettingsDefaults {
         32
     }
 
+    const fn http2_max_concurrent_streams() -> u32 {
+        100
+    }
+
     const fn max_request_header_size() -> usize {
         32 * 1024
     }
@@ -211,6 +215,8 @@ pub struct Settings {
     pub connect_tunnel_max_lifetime: u64,
     #[serde(default = "SettingsDefaults::upstream_pool_capacity")]
     pub upstream_pool_capacity: usize,
+    #[serde(default = "SettingsDefaults::http2_max_concurrent_streams")]
+    pub http2_max_concurrent_streams: u32,
     #[serde(default = "SettingsDefaults::max_request_header_size")]
     pub max_request_header_size: usize,
     #[serde(default = "SettingsDefaults::max_response_header_size")]
@@ -356,6 +362,10 @@ impl Settings {
         std::num::NonZeroUsize::new(self.upstream_pool_capacity)
             .expect("upstream_pool_capacity must be at least 1")
     }
+
+    pub fn http2_max_concurrent_streams_usize(&self) -> usize {
+        self.http2_max_concurrent_streams as usize
+    }
 }
 
 fn to_anyhow(err: ConfigError) -> anyhow::Error {
@@ -442,6 +452,11 @@ impl Settings {
             self.upstream_pool_capacity > 0,
             "upstream_pool_capacity must be at least 1 (got {})",
             self.upstream_pool_capacity
+        );
+        ensure!(
+            self.http2_max_concurrent_streams > 0,
+            "http2_max_concurrent_streams must be at least 1 (got {})",
+            self.http2_max_concurrent_streams
         );
         ensure!(
             self.max_request_header_size > 0,
@@ -584,6 +599,7 @@ mod tests {
             connect_tunnel_idle_timeout: 60,
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
+            http2_max_concurrent_streams: 100,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -632,6 +648,7 @@ mod tests {
             connect_tunnel_idle_timeout: 60,
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
+            http2_max_concurrent_streams: 100,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -680,6 +697,7 @@ mod tests {
             connect_tunnel_idle_timeout: 60,
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
+            http2_max_concurrent_streams: 100,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -725,6 +743,7 @@ mod tests {
             connect_tunnel_idle_timeout: 60,
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
+            http2_max_concurrent_streams: 100,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,

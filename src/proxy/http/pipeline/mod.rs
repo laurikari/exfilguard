@@ -110,6 +110,7 @@ name = "allow"
             connect_tunnel_idle_timeout: 1,
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 4,
+            http2_max_concurrent_streams: 100,
             max_request_header_size: 4096,
             max_response_header_size: 4096,
             max_request_body_size: 1024 * 1024,

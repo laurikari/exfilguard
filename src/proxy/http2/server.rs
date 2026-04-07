@@ -11,7 +11,7 @@ use h2::server::{self, SendResponse};
 use http;
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, watch},
+    sync::{Mutex, Semaphore, watch},
     task::JoinSet,
 };
 use tokio_rustls::server::TlsStream;
@@ -66,6 +66,7 @@ struct Http2BumpService {
     upstream: Arc<Mutex<Http2Upstream>>,
     upstream_closed: watch::Receiver<bool>,
     flow_context: RequestFlowContext,
+    request_slots: Arc<Semaphore>,
 }
 
 impl Http2BumpService {
@@ -77,11 +78,19 @@ impl Http2BumpService {
         primed_upstream: Option<PrimedHttp2Upstream>,
         flow_context: RequestFlowContext,
     ) -> Result<Self> {
-        let connection = server::handshake(stream)
+        let mut builder = server::Builder::new();
+        builder
+            .max_header_list_size(app.settings.max_request_header_size.min(u32::MAX as usize) as u32)
+            .max_concurrent_streams(app.settings.http2_max_concurrent_streams);
+        let connection = builder
+            .handshake(stream)
             .await
             .context("failed to handshake HTTP/2 with downstream client")?;
         let upstream = Http2Upstream::new(app.clone(), connect_binding, primed_upstream);
         let upstream_closed = upstream.closed_receiver();
+        let request_slots = Arc::new(Semaphore::new(
+            app.settings.http2_max_concurrent_streams_usize(),
+        ));
         Ok(Self {
             peer,
             app,
@@ -89,6 +98,7 @@ impl Http2BumpService {
             upstream: Arc::new(Mutex::new(upstream)),
             upstream_closed,
             flow_context,
+            request_slots,
         })
     }
 
@@ -128,7 +138,14 @@ impl Http2BumpService {
                             let app = self.app.clone();
                             let upstream = self.upstream.clone();
                             let flow_context = self.flow_context.clone();
+                            let permit = self
+                                .request_slots
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .expect("HTTP/2 request semaphore should remain open");
                             tasks.spawn(async move {
+                                let _permit = permit;
                                 if let Err(err) =
                                     process_downstream_request(
                                         request,
@@ -175,6 +192,8 @@ async fn process_downstream_request(
     upstream: Arc<Mutex<Http2Upstream>>,
     flow_context: RequestFlowContext,
 ) -> Result<()> {
+    let _stream_guard = crate::metrics::track_http2_stream();
+
     if let Err(err) = reject_expect_header(request.headers()) {
         warn!(
             peer = %peer,

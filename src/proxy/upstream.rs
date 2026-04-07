@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::proxy::{connect::ResolvedTarget, resolver};
+use crate::proxy::{connect::ResolvedTarget, resolver::UpstreamResolver};
 
 /// Attempt to connect to the supplied socket addresses without performing name resolution.
 pub async fn connect_to_addrs(
@@ -46,12 +46,12 @@ pub async fn connect_to_addrs(
 
 /// Returns the socket addresses to use for an upstream request, either by reusing a validated
 /// CONNECT binding or by resolving the hostname with the standard policy filters applied.
-pub async fn resolve_or_use_binding(
+pub(crate) async fn resolve_or_use_binding(
     host: &str,
     port: u16,
     binding: Option<&ResolvedTarget>,
+    resolver: &dyn UpstreamResolver,
     resolve_timeout: Duration,
-    allow_private: bool,
 ) -> Result<Vec<SocketAddr>> {
     if let Some(binding) = binding {
         if host != binding.host() || port != binding.port() {
@@ -66,10 +66,8 @@ pub async fn resolve_or_use_binding(
         return Ok(binding.addresses().to_vec());
     }
 
-    let filtered = resolver::ResolveRequest::new(host, port, resolve_timeout)
-        .allow_private(allow_private)
-        .context("upstream")
-        .resolve_filtered()
+    let filtered = resolver
+        .resolve_filtered(host, port, resolve_timeout, "upstream")
         .await?;
     Ok(filtered.allowed)
 }
@@ -83,6 +81,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_reuses_validated_private_target() -> Result<()> {
+        let resolver = crate::proxy::resolver::PublicInternetResolver;
         let binding = ResolvedTarget::from_addresses(
             "internal.test".to_string(),
             443,
@@ -92,8 +91,8 @@ mod tests {
             "internal.test",
             443,
             Some(&binding),
+            &resolver,
             Duration::from_secs(1),
-            false,
         )
         .await?;
         assert_eq!(addrs, vec!["10.0.0.5:443".parse().unwrap()]);
@@ -102,7 +101,8 @@ mod tests {
 
     #[tokio::test]
     async fn direct_resolution_rejects_private_targets_when_disallowed() {
-        let err = resolve_or_use_binding("10.0.0.5", 443, None, Duration::from_secs(1), false)
+        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let err = resolve_or_use_binding("10.0.0.5", 443, None, &resolver, Duration::from_secs(1))
             .await
             .expect_err("private upstream should be rejected");
         assert!(err.downcast_ref::<PrivateAddressError>().is_some());

@@ -34,30 +34,32 @@ pub(super) struct UpstreamConnection {
     pub(super) scheme: Scheme,
     pub(super) host: String,
     pub(super) port: u16,
+    metrics: crate::metrics::UpstreamConnectionTracker,
+    idle: bool,
 }
 
 impl UpstreamPool {
     pub(super) fn new(capacity: NonZeroUsize) -> Self {
-        crate::metrics::set_pool_capacity(capacity.get());
         let entries = LruCache::new(capacity);
-        let pool = Self { entries };
-        crate::metrics::set_pool_in_use(pool.entries.len());
-        pool
+        Self { entries }
     }
 
     pub(super) fn take(&mut self, key: &UpstreamKey) -> Option<UpstreamConnection> {
-        let value = self.entries.pop(key);
-        crate::metrics::set_pool_in_use(self.entries.len());
-        value
+        self.entries.pop(key).map(|mut conn| {
+            conn.mark_active();
+            conn
+        })
     }
 
     pub(super) fn put(
         &mut self,
         key: UpstreamKey,
-        conn: UpstreamConnection,
+        mut conn: UpstreamConnection,
         shutdown_timeout: Duration,
     ) {
+        conn.mark_idle();
         if let Some((_evicted_key, mut evicted_conn)) = self.entries.push(key, conn) {
+            evicted_conn.mark_active();
             tokio::spawn(async move {
                 if let Err(err) = evicted_conn.shutdown(shutdown_timeout).await {
                     debug!(
@@ -70,11 +72,11 @@ impl UpstreamPool {
                 }
             });
         }
-        crate::metrics::set_pool_in_use(self.entries.len());
     }
 
     pub(super) async fn shutdown_all(&mut self, timeout: Duration) -> Result<()> {
         while let Some((_key, mut conn)) = self.entries.pop_lru() {
+            conn.mark_active();
             if let Err(err) = conn.shutdown(timeout).await {
                 debug!(
                     host = %conn.host,
@@ -85,7 +87,6 @@ impl UpstreamPool {
                 );
             }
         }
-        crate::metrics::set_pool_in_use(0);
         Ok(())
     }
 }
@@ -104,6 +105,20 @@ impl UpstreamKey {
 }
 
 impl UpstreamConnection {
+    fn mark_idle(&mut self) {
+        if !self.idle {
+            self.idle = true;
+            crate::metrics::inc_upstream_connections_idle();
+        }
+    }
+
+    fn mark_active(&mut self) {
+        if self.idle {
+            self.idle = false;
+            crate::metrics::dec_upstream_connections_idle();
+        }
+    }
+
     pub(super) async fn connect(
         request: &ParsedRequest,
         app: &AppContext,
@@ -117,11 +132,12 @@ impl UpstreamConnection {
             &request.host,
             port,
             binding,
+            app.upstream_resolver(),
             app.settings.dns_resolve_timeout(),
-            app.allow_private_test_upstreams(),
         )
         .await?;
         let (upstream_tcp, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;
+        let metrics = crate::metrics::track_upstream_connection();
         let stream = if request.scheme == Scheme::Https {
             let server_name = ServerName::try_from(request.host.as_str())
                 .map_err(|_| anyhow!("invalid upstream host for TLS '{}'", request.host))?
@@ -149,11 +165,24 @@ impl UpstreamConnection {
             scheme: request.scheme,
             host: request.host.clone(),
             port,
+            metrics,
+            idle: false,
         })
     }
 
     pub(super) async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        self.mark_active();
         shutdown_stream(&mut self.stream, timeout).await
+    }
+}
+
+impl Drop for UpstreamConnection {
+    fn drop(&mut self) {
+        if self.idle {
+            self.idle = false;
+            crate::metrics::dec_upstream_connections_idle();
+        }
+        self.metrics.close();
     }
 }
 

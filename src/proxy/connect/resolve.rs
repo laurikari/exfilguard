@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::proxy::resolver;
+use crate::proxy::resolver::UpstreamResolver;
 
 use super::target::ConnectTarget;
 
@@ -42,19 +42,16 @@ impl ResolvedTarget {
 pub async fn resolve_connect_target(
     target: &ConnectTarget,
     resolve_timeout: Duration,
-    allow_private: bool,
+    resolver: &dyn UpstreamResolver,
 ) -> Result<ResolvedTarget> {
-    let addresses =
-        resolver::ResolveRequest::new(target.host.as_str(), target.port, resolve_timeout)
-            .allow_private(allow_private)
-            .context("host")
-            .resolve()
-            .await?;
+    let filtered = resolver
+        .resolve_filtered(target.host.as_str(), target.port, resolve_timeout, "host")
+        .await?;
 
     Ok(ResolvedTarget::from_addresses(
         target.host.clone(),
         target.port,
-        addresses,
+        filtered.allowed,
     ))
 }
 
@@ -73,7 +70,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_private_ip_when_disallowed() {
-        let err = resolve_connect_target(&target("10.0.0.5"), Duration::from_secs(1), false)
+        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let err = resolve_connect_target(&target("10.0.0.5"), Duration::from_secs(1), &resolver)
             .await
             .expect_err("private IP should be rejected");
         assert!(err.downcast_ref::<PrivateAddressError>().is_some());
@@ -81,9 +79,11 @@ mod tests {
 
     #[tokio::test]
     async fn allows_private_ip_when_permitted() {
-        let resolved = resolve_connect_target(&target("10.0.0.5"), Duration::from_secs(1), true)
-            .await
-            .expect("private IP allowed");
+        let resolver = crate::proxy::resolver::PermissiveTestResolver;
+        let resolved =
+            resolve_connect_target(&target("10.0.0.5"), Duration::from_secs(1), &resolver)
+                .await
+                .expect("private IP allowed");
         assert_eq!(resolved.addresses().len(), 1);
         assert_eq!(resolved.addresses()[0], "10.0.0.5:443".parse().unwrap());
     }

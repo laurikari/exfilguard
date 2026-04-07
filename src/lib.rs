@@ -19,6 +19,7 @@ use tracing::warn;
 
 use crate::{
     policy::matcher::PolicySnapshot,
+    proxy::{default_upstream_resolver, permissive_test_upstream_resolver},
     settings::Settings,
     tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
 };
@@ -26,17 +27,17 @@ use crate::{
 const DEFAULT_CERT_CACHE_CAPACITY: usize = 512;
 
 pub async fn run(settings: Settings) -> Result<()> {
-    run_with_test_upstreams(settings, false).await
+    run_with_upstream_resolver(settings, default_upstream_resolver()).await
 }
 
 #[doc(hidden)]
 pub async fn run_for_tests(settings: Settings) -> Result<()> {
-    run_with_test_upstreams(settings, true).await
+    run_with_upstream_resolver(settings, permissive_test_upstream_resolver()).await
 }
 
-async fn run_with_test_upstreams(
+async fn run_with_upstream_resolver(
     settings: Settings,
-    allow_private_test_upstreams: bool,
+    upstream_resolver: Arc<dyn proxy::UpstreamResolver>,
 ) -> Result<()> {
     settings.validate()?;
     let settings = Arc::new(settings);
@@ -64,6 +65,7 @@ async fn run_with_test_upstreams(
     )?);
     let TlsClientConfigs { http1, http2 } = build_tls_client_configs(&settings)?;
     let snapshot = build_runtime_policy_snapshot(&settings)?;
+    crate::metrics::mark_policy_reload_success();
     let (policy_tx, policy_rx) = watch::channel(snapshot.clone());
     spawn_runtime_policy_reload_task(settings.clone(), policy_tx);
     let policy_store = proxy::PolicyStore::new(policy_rx);
@@ -86,7 +88,7 @@ async fn run_with_test_upstreams(
     };
 
     let app = proxy::AppContext::new(settings, policy_store, tls_context, cache)
-        .with_private_test_upstreams(allow_private_test_upstreams);
+        .with_upstream_resolver(upstream_resolver);
 
     if let Some((addr, path, tls)) = metrics {
         tracing::info!(address = %addr, tls = tls.is_some(), "metrics endpoint starting");
@@ -184,6 +186,7 @@ fn spawn_runtime_policy_reload_task(
                         );
                         break;
                     }
+                    crate::metrics::mark_policy_reload_success();
                     tracing::info!(client_count, policy_count, "runtime policy reloaded");
                 }
                 Err(err) => {

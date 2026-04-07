@@ -42,6 +42,7 @@ pub(super) struct UpstreamHandle {
     pub port: u16,
     pub scheme: Scheme,
     pub reused: bool,
+    _metrics: crate::metrics::UpstreamConnectionTracker,
     connection_task: JoinHandle<()>,
 }
 
@@ -125,6 +126,10 @@ impl Http2Upstream {
                 primed.host,
                 primed.port,
                 request.scheme,
+                self.app
+                    .settings
+                    .max_response_header_size
+                    .min(u32::MAX as usize) as u32,
                 self.closed_tx.clone(),
             )
             .await;
@@ -135,8 +140,8 @@ impl Http2Upstream {
             &request.host,
             port,
             self.binding.as_ref(),
+            self.app.upstream_resolver(),
             self.app.settings.dns_resolve_timeout(),
-            self.app.allow_private_test_upstreams(),
         )
         .await?;
         let (tcp_stream, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;
@@ -169,6 +174,10 @@ impl Http2Upstream {
             request.host.clone(),
             port,
             request.scheme,
+            self.app
+                .settings
+                .max_response_header_size
+                .min(u32::MAX as usize) as u32,
             self.closed_tx.clone(),
         )
         .await
@@ -207,9 +216,15 @@ async fn make_handle_from_stream(
     host: String,
     port: u16,
     scheme: Scheme,
+    max_response_header_size: u32,
     closed_tx: watch::Sender<bool>,
 ) -> Result<UpstreamHandle> {
-    let (sender, connection) = client::handshake(tls_stream)
+    let mut builder = client::Builder::new();
+    builder.max_header_list_size(max_response_header_size);
+    let metrics = crate::metrics::track_upstream_connection();
+    let task_metrics = metrics.clone();
+    let (sender, connection) = builder
+        .handshake(tls_stream)
         .await
         .context("failed to complete HTTP/2 handshake with upstream")?;
 
@@ -217,6 +232,7 @@ async fn make_handle_from_stream(
         if let Err(err) = connection.await {
             debug!(error = %err, "HTTP/2 upstream connection terminated with error");
         }
+        task_metrics.close();
         let _ = closed_tx.send(true);
     });
 
@@ -228,6 +244,7 @@ async fn make_handle_from_stream(
         port,
         scheme,
         reused: false,
+        _metrics: metrics,
     })
 }
 
