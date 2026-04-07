@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -197,9 +197,22 @@ pub fn parse_host_header(value: &str) -> Result<(String, Option<u16>)> {
         .host()
         .ok_or_else(|| anyhow!("Host header missing hostname"))?
         .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
+        .trim_end_matches(']');
+    let host = canonicalize_policy_host(host)?;
     Ok((host, uri.port_u16()))
+}
+
+fn canonicalize_policy_host(host: &str) -> Result<String> {
+    let host = host.to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(host);
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if host.is_empty() {
+        bail!("Host header missing hostname");
+    }
+    Ok(host.to_string())
 }
 
 /// Helper for converting [`Scheme`] into a displayable string.
@@ -573,6 +586,24 @@ mod tests {
             err.to_string().contains("path or query"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_host_header_strips_trailing_root_dot_from_reg_name() -> Result<()> {
+        let (host, port) = parse_host_header("Example.COM.:8443")?;
+        assert_eq!(host, "example.com");
+        assert_eq!(port, Some(8443));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_uri_request_preserves_authority_with_trailing_root_dot() -> Result<()> {
+        let uri: Uri = "https://example.com./admin".parse()?;
+        let parsed = parse_uri_request(Method::GET, &uri, Scheme::Https)?;
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.authority_host(), "example.com.");
+        assert_eq!(parsed.as_policy_request().host, "example.com");
+        Ok(())
     }
 
     #[test]
