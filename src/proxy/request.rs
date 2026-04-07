@@ -326,6 +326,9 @@ fn canonicalize_policy_path(raw_path: &str) -> Result<String> {
 }
 
 fn validate_policy_path(path: &str) -> Result<()> {
+    if path.contains("//") {
+        bail!("request path must not contain repeated slashes");
+    }
     for segment in path.split('/') {
         validate_policy_segment(segment)?;
     }
@@ -679,6 +682,31 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string().contains("backslashes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_request_rejects_repeated_slashes() {
+        let err = parse_http1_request(
+            Method::GET,
+            "/public//admin",
+            Some("example.com"),
+            Scheme::Https,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("repeated slashes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_request_rejects_repeated_leading_slashes() {
+        let err = parse_http1_request(Method::GET, "//admin", Some("example.com"), Scheme::Https)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("repeated slashes"),
             "unexpected error: {err:?}"
         );
     }
