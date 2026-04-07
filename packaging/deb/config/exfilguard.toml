@@ -17,6 +17,9 @@ log = "json"
 # Uncomment to enable verbose request logging
 # log_queries = true
 
+# Bumped downstream HTTP/2 concurrency per connection
+# http2_max_concurrent_streams = 100
+
 # Response cache storage (rules opt-in)
 cache_dir = "/var/lib/exfilguard/cache"
 cache_max_entry_size = 10485760

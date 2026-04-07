@@ -311,7 +311,10 @@ the endpoint over HTTPS. Use this listener for internal access only. Keep it
 firewalled to Prometheus, or put an authenticating reverse proxy in front of
 it, because the metrics include internal hosts and policy decisions. Request
 series are labeled with `effective_mode=direct|bump|tunnel`, so inspected HTTPS
-and explicit CONNECT tunnels stay distinct.
+and explicit CONNECT tunnels stay distinct. Current-state gauges cover
+downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
+sessions, active HTTP/2 streams, upstream connections, cache usage, and the
+last successful policy reload time.
 
 ## Learn more
 

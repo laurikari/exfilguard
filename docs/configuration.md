@@ -169,8 +169,8 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_request_header_size` | usize | 32768 (32 KiB) | Maximum HTTP request header size |
-| `max_response_header_size` | usize | 32768 (32 KiB) | Maximum HTTP response header size |
+| `max_request_header_size` | usize | 32768 (32 KiB) | Maximum HTTP request header size, including bumped HTTP/2 header lists |
+| `max_response_header_size` | usize | 32768 (32 KiB) | Maximum HTTP response header size, including upstream HTTP/2 header lists |
 | `max_request_body_size` | usize | 0 (unlimited) | Maximum HTTP request body size during forwarding (0 disables the limit) |
 
 ---
@@ -183,6 +183,14 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 
 ---
 
+## HTTP/2
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `http2_max_concurrent_streams` | u32 | 100 | Maximum concurrent bumped downstream HTTP/2 streams per connection (must be >= 1) |
+
+---
+
 ## Metrics
 
 | Field | Type | Default | Description |
@@ -192,7 +200,10 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 | `metrics_tls_key` | Path | None | PEM private key matching `metrics_tls_cert` |
 
 ExfilGuard exports counters and histograms for per-client and per-policy
-decisions, latency, cache activity, and connection pool health.
+decisions, latency, cache activity, and upstream reuse, plus gauges for current
+downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
+sessions, active HTTP/2 streams, upstream connections, cache usage, and the
+last successful policy reload time.
 
 ---
 
@@ -324,6 +335,9 @@ connect_tunnel_max_lifetime = 0
 
 # Connection pool
 upstream_pool_capacity = 32
+
+# HTTP/2
+http2_max_concurrent_streams = 100
 
 # Size limits (bytes)
 max_request_header_size = 32768

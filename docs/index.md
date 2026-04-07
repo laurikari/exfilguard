@@ -48,7 +48,7 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 :   JSON or text logs with the allow or deny decision and related request metadata.
 
 **Metrics Exporter**
-:   Optional Prometheus endpoint (`/metrics`) with counters and histograms for traffic, decisions, effective mode (`direct`, `bump`, `tunnel`), cache, and pool health. Supports HTTPS when given a cert and key.
+:   Optional Prometheus endpoint (`/metrics`) with counters and histograms for traffic, decisions, effective mode (`direct`, `bump`, `tunnel`), cache, and upstream reuse, plus gauges for current connections, in-flight work, cache usage, and last successful reload. Supports HTTPS when given a cert and key.
 
 ---
 
