@@ -252,11 +252,10 @@ impl UrlMatcher {
         if !self.host.matches(host) {
             return false;
         }
-        if let Some(expected) = self.port {
-            let actual = port.or_else(|| Some(scheme.default_port()));
-            if Some(expected) != actual {
-                return false;
-            }
+        let expected = self.port.unwrap_or(self.scheme.default_port());
+        let actual = port.unwrap_or(scheme.default_port());
+        if expected != actual {
+            return false;
         }
         true
     }
@@ -474,6 +473,21 @@ mod tests {
         };
 
         assert!(matcher.matches_authority(Scheme::Https, "example.com", None));
+        assert!(!matcher.matches_authority(Scheme::Https, "example.com", Some(8443)));
+    }
+
+    #[test]
+    fn url_matcher_without_explicit_port_uses_scheme_default() {
+        let matcher = UrlMatcher {
+            scheme: Scheme::Https,
+            host: HostMatcher::Exact("example.com".to_string()),
+            port: None,
+            path: None,
+            original: Arc::from("https://example.com/**"),
+        };
+
+        assert!(matcher.matches_authority(Scheme::Https, "example.com", None));
+        assert!(matcher.matches_authority(Scheme::Https, "example.com", Some(443)));
         assert!(!matcher.matches_authority(Scheme::Https, "example.com", Some(8443)));
     }
 }

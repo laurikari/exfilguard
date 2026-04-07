@@ -549,15 +549,16 @@ async fn connect_splice_relays_payload() -> Result<()> {
     const UPSTREAM_PAYLOAD: &[u8] = b"upstream->client";
 
     let dirs = TestDirs::new()?;
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-splice"])
         .policy(
             PolicySpec::new("allow-splice")
-                .rule(RuleSpec::allow(&["CONNECT"], "https://localhost/**").https_mode("tunnel")),
+                .rule(RuleSpec::allow(&["CONNECT"], "https://localhost/**").https_mode("tunnel"))
+                .bind_host_port("localhost", upstream_addr.port()),
         )
         .render();
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_addr = upstream_listener.local_addr()?;
     let upstream_task = tokio::spawn(async move {
         let (mut socket, _) = upstream_listener.accept().await.context("accept failed")?;
         let mut buffer = vec![0u8; CLIENT_PAYLOAD.len()];
@@ -665,18 +666,19 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
     let workspace = dirs.config_dir.parent().expect("temp workspace directory");
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
 
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-http"])
         .policy(
             PolicySpec::new("allow-http")
-                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**"))),
+                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**")))
+                .bind_host_port(upstream_host, upstream_addr.port()),
         )
         .render();
 
     let accept_count = Arc::new(AtomicUsize::new(0));
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_addr = upstream_listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let accept_counter = accept_count.clone();
     let upstream_task = tokio::spawn(async move {
@@ -770,18 +772,19 @@ async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
     let workspace = dirs.config_dir.parent().expect("temp workspace directory");
     let cert_cache_dir = workspace.join("cert_cache");
     std::fs::create_dir_all(&cert_cache_dir)?;
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
 
     let (clients, policies) = TestConfigBuilder::new()
         .default_client(&["allow-http"])
         .policy(
             PolicySpec::new("allow-http")
-                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**"))),
+                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**")))
+                .bind_host_port(upstream_host, upstream_addr.port()),
         )
         .render();
 
     let accept_count = Arc::new(AtomicUsize::new(0));
-    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let upstream_addr = upstream_listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let accept_counter = accept_count.clone();
     let upstream_task = tokio::spawn(async move {

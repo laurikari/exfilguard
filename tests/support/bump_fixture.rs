@@ -238,8 +238,11 @@ impl BumpedTlsFixture {
         let workspace = dirs.config_dir.parent().expect("temp workspace directory");
         let cert_cache_dir = workspace.join("cert_cache");
         std::fs::create_dir_all(&cert_cache_dir)?;
+        let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let upstream_addr = upstream_listener.local_addr()?;
 
         let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
+        let policy = policy.bind_host_port(upstream_host, upstream_addr.port());
         let (clients, policies) = TestConfigBuilder::new()
             .default_client(&[policy_name])
             .policy(policy)
@@ -275,8 +278,6 @@ impl BumpedTlsFixture {
         };
 
         let accept_count = Arc::new(AtomicUsize::new(0));
-        let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let upstream_addr = upstream_listener.local_addr()?;
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let accept_counter = accept_count.clone();
         let upstream_task = {

@@ -177,6 +177,13 @@ impl PolicySpec {
         self.rules.push(rule);
         self
     }
+
+    pub fn bind_host_port(mut self, host: &str, port: u16) -> Self {
+        for rule in &mut self.rules {
+            rule.bind_host_port(host, port);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +267,22 @@ impl RuleSpec {
             force_cache_duration: Some(duration_seconds),
         });
         self
+    }
+
+    fn bind_host_port(&mut self, host: &str, port: u16) {
+        let Some(pattern) = &mut self.url_pattern else {
+            return;
+        };
+        let Some((scheme, remainder)) = pattern.split_once("://") else {
+            return;
+        };
+        let Some((authority, suffix)) = remainder.split_once('/') else {
+            return;
+        };
+        if authority != host {
+            return;
+        }
+        *pattern = format!("{scheme}://{host}:{port}/{suffix}");
     }
 }
 
