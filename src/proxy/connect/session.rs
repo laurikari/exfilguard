@@ -101,7 +101,7 @@ impl ConnectSession {
                 Ok(resolved) => resolved,
                 Err(err) => {
                     let mut stream = stream;
-                    self.respond_resolution_error(&mut stream, err, |builder| {
+                    self.respond_resolution_error(&mut stream, err, &log, |builder| {
                         builder
                             .client(allow.client.as_ref())
                             .policy(allow.policy.as_ref())
@@ -132,7 +132,7 @@ impl ConnectSession {
                 Ok(resolved) => resolved,
                 Err(err) => {
                     let mut stream = stream;
-                    self.respond_resolution_error(&mut stream, err, |builder| {
+                    self.respond_resolution_error(&mut stream, err, &log, |builder| {
                         builder
                             .client(client.as_ref())
                             .effective_mode("bump")
@@ -151,6 +151,7 @@ impl ConnectSession {
         &self,
         stream: &mut TcpStream,
         deny: &DenyDecision,
+        log: &RequestLogContext<'_>,
     ) -> Result<()> {
         let spec = policy_response::policy_deny_spec(deny);
         self.respond_with_builder(
@@ -160,17 +161,29 @@ impl ConnectSession {
             spec.body_http1,
             "DENY",
             |builder| {
-                policy_response::decorate_policy_deny_log(builder.effective_mode("tunnel"), deny)
+                policy_response::decorate_policy_deny_log(
+                    builder
+                        .request_id(log.request_id())
+                        .effective_mode("tunnel"),
+                    deny,
+                )
             },
         )
         .await
     }
 
-    pub async fn respond_default_denial(&self, stream: &mut TcpStream) -> Result<()> {
+    pub async fn respond_default_denial(
+        &self,
+        stream: &mut TcpStream,
+        log: &RequestLogContext<'_>,
+    ) -> Result<()> {
         if self.literal_ip.is_some_and(is_private_ip) {
             warn!(
                 peer = %self.peer,
+                request_id = log.request_id(),
+                method = log.method(),
                 host = %self.parsed.host,
+                path = log.logged_path(),
                 port = self.parsed.port,
                 "CONNECT target is private network; blocking"
             );
@@ -180,13 +193,16 @@ impl ConnectSession {
                 None,
                 b"CONNECT to private networks is not allowed\r\n",
                 "DENY",
-                |builder| builder,
+                |builder| builder.request_id(log.request_id()),
             )
             .await
         } else {
             warn!(
                 peer = %self.peer,
+                request_id = log.request_id(),
+                method = log.method(),
                 host = %self.parsed.host,
+                path = log.logged_path(),
                 port = self.parsed.port,
                 "no matching CONNECT tunnel policy or TLS bump preflight; default deny"
             );
@@ -197,7 +213,9 @@ impl ConnectSession {
                 spec.reason,
                 spec.body_http1,
                 "DENY",
-                policy_response::decorate_default_deny_log,
+                |builder| {
+                    policy_response::decorate_default_deny_log(builder.request_id(log.request_id()))
+                },
             )
             .await
         }
@@ -208,11 +226,13 @@ impl ConnectSession {
         stream: &mut TcpStream,
         resolved: &ResolvedTarget,
         allow: &AllowDecision,
+        log: &RequestLogContext<'_>,
         app: &AppContext,
     ) -> Result<()> {
         let stats = handle_splice(stream, &self.parsed, resolved, app).await?;
         self.bytes_in = self.bytes_in.saturating_add(stats.client_stream_bytes);
         self.access_log_builder()
+            .request_id(log.request_id())
             .status(StatusCode::OK)
             .decision("ALLOW")
             .client(allow.client.as_ref())
@@ -236,6 +256,7 @@ impl ConnectSession {
         resolved: ResolvedTarget,
         client: &str,
         app: &AppContext,
+        log: &RequestLogContext<'_>,
     ) -> Result<()> {
         let bump_stats = handle_bump(
             stream,
@@ -247,6 +268,7 @@ impl ConnectSession {
         )
         .await?;
         self.access_log_builder()
+            .request_id(log.request_id())
             .status(StatusCode::OK)
             .decision("ALLOW")
             .client(client)
@@ -272,6 +294,7 @@ impl ConnectSession {
                 stream_holder.as_mut().expect("CONNECT stream present"),
                 &resolved,
                 &allow,
+                &log,
                 app,
             )
             .await;
@@ -280,11 +303,15 @@ impl ConnectSession {
         {
             warn!(
                 peer = %self.peer,
+                request_id = log.request_id(),
+                method = log.method(),
                 host = %self.parsed.host,
+                path = log.logged_path(),
                 port = self.parsed.port,
                 "CONNECT tunnel exceeded max lifetime"
             );
             self.access_log_builder()
+                .request_id(log.request_id())
                 .status(StatusCode::GATEWAY_TIMEOUT)
                 .decision("ERROR")
                 .client(allow.client.as_ref())
@@ -298,15 +325,7 @@ impl ConnectSession {
             return Ok(());
         }
         let stream_for_error = stream_holder;
-        match policy_response::handle_forward_result(
-            &allow,
-            log,
-            splice_result,
-            self.peer,
-            &self.parsed.host,
-        )
-        .await?
-        {
+        match policy_response::handle_forward_result(&allow, log, splice_result).await? {
             ForwardOutcome::Completed(()) => Ok(()),
             ForwardOutcome::Responded(ctx) => {
                 if let Some(mut stream) = stream_for_error {
@@ -328,21 +347,24 @@ impl ConnectSession {
         &mut self,
         stream: TcpStream,
         client: Arc<str>,
-        _log: RequestLogContext<'_>,
+        log: RequestLogContext<'_>,
         resolved: ResolvedTarget,
         app: &AppContext,
     ) -> Result<()> {
-        let bump_result = self.run_bump(stream, resolved, client.as_ref(), app).await;
+        let bump_result = self
+            .run_bump(stream, resolved, client.as_ref(), app, &log)
+            .await;
         match bump_result {
             Ok(()) => Ok(()),
             Err(err) => {
                 let kind = classify_forward_error(&err);
                 crate::metrics::record_upstream_error(kind.as_metric_label());
-                log_forward_error(&kind, self.peer, &self.parsed.host, &err);
+                log_forward_error(&kind, &log, &err);
                 self.log_bump_preflight_error(
                     policy_response::forward_error_spec(&kind),
                     client.as_ref(),
                     &err.to_string(),
+                    &log,
                 )
                 .await
             }
@@ -383,11 +405,13 @@ impl ConnectSession {
         spec: ForwardErrorSpec,
         client: &str,
         error_detail: &str,
+        log: &RequestLogContext<'_>,
     ) -> Result<()> {
         if spec.extra_client_bytes > 0 {
             self.bytes_in = self.bytes_in.saturating_add(spec.extra_client_bytes);
         }
         self.access_log_builder()
+            .request_id(log.request_id())
             .status(spec.status)
             .decision(spec.decision)
             .client(client)
@@ -405,6 +429,7 @@ impl ConnectSession {
         &self,
         stream: &mut TcpStream,
         err: anyhow::Error,
+        log: &RequestLogContext<'_>,
         build: F,
     ) -> Result<()>
     where
@@ -416,7 +441,10 @@ impl ConnectSession {
         {
             warn!(
                 peer = %self.peer,
+                request_id = log.request_id(),
+                method = log.method(),
                 host = %self.parsed.host,
+                path = log.logged_path(),
                 port = self.parsed.port,
                 "CONNECT target resolved to private network; blocking"
             );
@@ -426,13 +454,16 @@ impl ConnectSession {
                 None,
                 b"CONNECT to private networks is not allowed\r\n",
                 "DENY",
-                build,
+                |builder| build(builder.request_id(log.request_id())),
             )
             .await
         } else {
             warn!(
                 peer = %self.peer,
+                request_id = log.request_id(),
+                method = log.method(),
                 host = %self.parsed.host,
+                path = log.logged_path(),
                 port = self.parsed.port,
                 error = %err,
                 "failed to resolve CONNECT target"
@@ -443,7 +474,7 @@ impl ConnectSession {
                 None,
                 b"failed to resolve CONNECT target\r\n",
                 "ERROR",
-                build,
+                |builder| build(builder.request_id(log.request_id())),
             )
             .await
         }

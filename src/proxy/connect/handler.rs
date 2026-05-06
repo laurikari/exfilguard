@@ -128,6 +128,7 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
             .respond_policy_deny(
                 self.stream.as_mut().expect("stream present"),
                 &outcome.decision,
+                &outcome.log,
             )
             .await
     }
@@ -148,7 +149,7 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
                 .await;
         }
         self.session
-            .respond_default_denial(self.stream.as_mut().expect("stream present"))
+            .respond_default_denial(self.stream.as_mut().expect("stream present"), &outcome.log)
             .await
     }
 }

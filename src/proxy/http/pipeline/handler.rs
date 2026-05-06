@@ -60,14 +60,8 @@ where
         };
 
         let forward_result = forward_request(self, &decision).await;
-        let handled = policy_response::handle_forward_result(
-            &decision,
-            log.clone(),
-            forward_result,
-            self.peer,
-            &self.parsed.host,
-        )
-        .await?;
+        let handled =
+            policy_response::handle_forward_result(&decision, log.clone(), forward_result).await?;
         match handled {
             policy_response::ForwardOutcome::Completed(success) => {
                 let stats = build_allow_log_stats(self, &success);

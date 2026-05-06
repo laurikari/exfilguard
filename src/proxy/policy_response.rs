@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use anyhow::Result;
 use http::StatusCode;
 
@@ -106,15 +104,13 @@ pub async fn handle_forward_result<'a, T>(
     decision: &AllowDecision,
     log: RequestLogContext<'a>,
     result: anyhow::Result<T>,
-    peer: SocketAddr,
-    host: &str,
 ) -> Result<ForwardOutcome<T, ForwardErrorContext<'a>>> {
     match result {
         Ok(value) => Ok(ForwardOutcome::Completed(value)),
         Err(err) => {
             let kind = classify_forward_error(&err);
             crate::metrics::record_upstream_error(kind.as_metric_label());
-            log_forward_error(&kind, peer, host, &err);
+            log_forward_error(&kind, &log, &err);
             let spec = forward_error_spec(&kind);
             Ok(ForwardOutcome::Responded(ForwardErrorContext {
                 spec,
@@ -252,15 +248,7 @@ mod tests {
         let decision = sample_decision();
         let parsed = sample_request();
         let log = sample_log(&parsed);
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let outcome = handle_forward_result(
-            &decision,
-            log,
-            Ok::<_, anyhow::Error>(()),
-            peer,
-            parsed.host.as_str(),
-        )
-        .await?;
+        let outcome = handle_forward_result(&decision, log, Ok::<_, anyhow::Error>(())).await?;
 
         assert!(matches!(outcome, ForwardOutcome::Completed(())));
         Ok(())
@@ -271,16 +259,8 @@ mod tests {
         let decision = sample_decision();
         let parsed = sample_request();
         let log = sample_log(&parsed);
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090);
 
-        let outcome = handle_forward_result(
-            &decision,
-            log,
-            Err::<(), _>(anyhow!("boom")),
-            peer,
-            parsed.host.as_str(),
-        )
-        .await?;
+        let outcome = handle_forward_result(&decision, log, Err::<(), _>(anyhow!("boom"))).await?;
 
         if let ForwardOutcome::Responded(ctx) = outcome {
             assert_eq!(ctx.spec.status, StatusCode::BAD_GATEWAY);

@@ -67,6 +67,7 @@ pub struct AccessLogEvent {
     pub policy: Option<String>,
     pub rule: Option<String>,
     pub policy_basis: Option<String>,
+    pub request_id: Option<String>,
     pub session_id: Option<String>,
     pub outer_method: Option<String>,
     pub inner_method: Option<String>,
@@ -104,6 +105,7 @@ impl AccessLogBuilder {
                 policy: None,
                 rule: None,
                 policy_basis: None,
+                request_id: None,
                 session_id: None,
                 outer_method: None,
                 inner_method: None,
@@ -179,6 +181,11 @@ impl AccessLogBuilder {
 
     pub fn policy_basis(mut self, basis: impl Into<String>) -> Self {
         self.event.policy_basis = Some(basis.into());
+        self
+    }
+
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.event.request_id = Some(request_id.into());
         self
     }
 
@@ -313,6 +320,7 @@ pub fn log_access_with_level(event: AccessLogEvent, level: Level) {
         policy,
         rule,
         policy_basis,
+        request_id,
         session_id,
         outer_method,
         inner_method,
@@ -343,6 +351,7 @@ pub fn log_access_with_level(event: AccessLogEvent, level: Level) {
     let policy_field = policy.as_deref();
     let rule_field = rule.as_deref();
     let policy_basis_field = policy_basis.as_deref();
+    let request_id_field = request_id.as_deref();
     let session_id_field = session_id.as_deref();
     let outer_method_field = outer_method.as_deref();
     let inner_method_field = inner_method.as_deref();
@@ -370,6 +379,7 @@ pub fn log_access_with_level(event: AccessLogEvent, level: Level) {
         policy = policy_field,
         rule = rule_field,
         policy_basis = policy_basis_field,
+        request_id = request_id_field,
         session_id = session_id_field,
         outer_method = outer_method_field,
         inner_method = inner_method_field,

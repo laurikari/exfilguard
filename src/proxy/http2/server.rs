@@ -442,7 +442,7 @@ impl Http2RequestHandler {
         let error_detail = err.to_string();
 
         crate::metrics::record_upstream_error(kind.as_metric_label());
-        log_forward_error(&kind, self.ctx.peer, &self.ctx.meta.parsed.host, &err);
+        log_forward_error(&kind, &log, &err);
 
         if should_disconnect {
             {

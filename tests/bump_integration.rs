@@ -22,6 +22,19 @@ use tokio::{
 
 use support::*;
 
+fn log_field_value(line: &str, field: &str) -> Option<String> {
+    let needle = format!("{field}=");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    } else {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_default_deny_returns_403() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
@@ -144,6 +157,44 @@ async fn http_upstream_failure_returns_502() -> Result<()> {
         logs.contains("error_reason=\"upstream_closed\"")
             || logs.contains("error_reason=\"upstream_failed\""),
         "expected upstream failure access log entry, got: {logs}"
+    );
+    let access_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("error_reason=\"upstream_closed\"")
+                || line.contains("error_reason=\"upstream_failed\"")
+        })
+        .expect("upstream failure access log line should exist");
+    let forward_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("upstream closed connection before response headers")
+                || line.contains("upstream request failed")
+        })
+        .expect("forward error warning line should exist");
+    let access_request_id =
+        log_field_value(access_line, "request_id").expect("access log request_id missing");
+    let forward_request_id =
+        log_field_value(forward_line, "request_id").expect("forward_error request_id missing");
+    assert_eq!(
+        access_request_id, forward_request_id,
+        "forward_error and access log request IDs should match; logs: {logs}"
+    );
+    assert!(
+        forward_line.contains("method=GET") || forward_line.contains("method=\"GET\""),
+        "forward_error should include method, got: {forward_line}"
+    );
+    assert!(
+        forward_line.contains("host=127.0.0.1") || forward_line.contains("host=\"127.0.0.1\""),
+        "forward_error should include host, got: {forward_line}"
+    );
+    assert!(
+        forward_line.contains("path=/oops") || forward_line.contains("path=\"/oops\""),
+        "forward_error should include path, got: {forward_line}"
+    );
+    assert!(
+        access_line.contains("error_detail="),
+        "access log should include forward error detail, got: {access_line}"
     );
 
     Ok(())

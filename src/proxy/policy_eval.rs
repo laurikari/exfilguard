@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use http::StatusCode;
 use tracing::Level;
+use uuid::Uuid;
 
 use crate::{
     logging::{AccessLogBuilder, log_with_level},
@@ -72,6 +73,7 @@ pub struct RequestLogContext<'a> {
     peer: SocketAddr,
     parsed: &'a ParsedRequest,
     logged_path: String,
+    request_id: Arc<str>,
 }
 
 impl<'a> RequestLogContext<'a> {
@@ -85,16 +87,58 @@ impl<'a> RequestLogContext<'a> {
             peer,
             parsed,
             logged_path,
+            request_id: Arc::<str>::from(Uuid::new_v4().to_string()),
         }
+    }
+
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    pub fn request_id(&self) -> &str {
+        self.request_id.as_ref()
+    }
+
+    pub fn method(&self) -> &str {
+        self.parsed.method.as_str()
+    }
+
+    pub fn host(&self) -> &str {
+        &self.parsed.host
     }
 
     pub fn logged_path(&self) -> &str {
         &self.logged_path
     }
 
+    pub fn session_id(&self) -> Option<&str> {
+        self.parsed
+            .flow_context()
+            .map(|flow| flow.session_id.as_ref())
+    }
+
+    pub fn outer_method(&self) -> Option<&str> {
+        self.parsed
+            .flow_context()
+            .map(|flow| flow.outer_method.as_ref())
+    }
+
+    pub fn inner_method(&self) -> Option<&str> {
+        self.parsed
+            .flow_context()
+            .map(|_| self.parsed.method.as_str())
+    }
+
+    pub fn effective_mode(&self) -> Option<&str> {
+        self.parsed
+            .flow_context()
+            .map(|flow| flow.effective_mode.as_str())
+    }
+
     pub fn access_log_builder(&self) -> AccessLogBuilder {
         self.parsed
             .access_log_builder(self.peer, self.logged_path.clone())
+            .request_id(self.request_id.as_ref())
     }
 }
 
@@ -118,6 +162,7 @@ pub fn evaluate_request<'a>(
                     peer,
                     parsed,
                     log_ctx.logged_path(),
+                    log_ctx.request_id(),
                     &decision,
                 );
                 PolicyOutcome::Allow(AllowOutcome {
@@ -133,6 +178,7 @@ pub fn evaluate_request<'a>(
                     peer,
                     parsed,
                     log_ctx.logged_path(),
+                    log_ctx.request_id(),
                     &decision,
                 );
                 PolicyOutcome::Deny(DenyOutcome {
@@ -148,6 +194,7 @@ pub fn evaluate_request<'a>(
                 peer,
                 parsed,
                 log_ctx.logged_path(),
+                log_ctx.request_id(),
             );
             PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx })
         }
@@ -197,6 +244,7 @@ fn log_policy_allow(
     peer: SocketAddr,
     parsed: &ParsedRequest,
     logged_path: &str,
+    request_id: &str,
     decision: &AllowDecision,
 ) {
     let flow = parsed.flow_context();
@@ -217,6 +265,7 @@ fn log_policy_allow(
         scheme = scheme_name(parsed.scheme),
         host = %parsed.host,
         path = %logged_path,
+        request_id = request_id,
         session_id = session_id,
         outer_method = outer_method,
         inner_method = inner_method,
@@ -231,6 +280,7 @@ fn log_policy_deny(
     peer: SocketAddr,
     parsed: &ParsedRequest,
     logged_path: &str,
+    request_id: &str,
     decision: &DenyDecision,
 ) {
     let flow = parsed.flow_context();
@@ -252,6 +302,7 @@ fn log_policy_deny(
         scheme = scheme_name(parsed.scheme),
         host = %parsed.host,
         path = %logged_path,
+        request_id = request_id,
         session_id = session_id,
         outer_method = outer_method,
         inner_method = inner_method,
@@ -266,6 +317,7 @@ fn log_policy_default(
     peer: SocketAddr,
     parsed: &ParsedRequest,
     logged_path: &str,
+    request_id: &str,
 ) {
     let flow = parsed.flow_context();
     let session_id = flow.map(|flow| flow.session_id.as_ref());
@@ -279,6 +331,7 @@ fn log_policy_default(
         scheme = scheme_name(parsed.scheme),
         host = %parsed.host,
         path = %logged_path,
+        request_id = request_id,
         session_id = session_id,
         outer_method = outer_method,
         inner_method = inner_method,

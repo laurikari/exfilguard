@@ -1,10 +1,10 @@
-use std::net::SocketAddr;
-
 use anyhow::Error;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::{proxy::http::BodyTooLarge, proxy::resolver::PrivateAddressError};
+use crate::proxy::{
+    http::BodyTooLarge, policy_eval::RequestLogContext, resolver::PrivateAddressError,
+};
 
 #[derive(Debug, Error)]
 #[error("request timed out")]
@@ -76,22 +76,53 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
     }
 }
 
-pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &str, err: &Error) {
+pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_>, err: &Error) {
+    let peer = log.peer();
+    let request_id = log.request_id();
+    let method = log.method();
+    let host = log.host();
+    let path = log.logged_path();
+    let session_id = log.session_id();
+    let outer_method = log.outer_method();
+    let inner_method = log.inner_method();
+    let effective_mode = log.effective_mode();
+
     match kind {
         ForwardErrorKind::RequestTimeout => warn!(
             peer = %peer,
+            request_id = request_id,
+            method,
             host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
             "request timed out while forwarding"
         ),
         ForwardErrorKind::PrivateAddress(private_err) => warn!(
             peer = %peer,
+            request_id = request_id,
+            method,
             host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
             port = private_err.port,
             "policy allow decision rejected private upstream address"
         ),
         ForwardErrorKind::MisdirectedRequest(misdirected) => warn!(
             peer = %peer,
+            request_id = request_id,
+            method,
             host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
             upstream_host = %misdirected.upstream_host,
             upstream_port = misdirected.upstream_port,
             requested_host = %misdirected.requested_host,
@@ -100,13 +131,27 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, peer: SocketAddr, host: &s
         ),
         ForwardErrorKind::UpstreamClosed => warn!(
             peer = %peer,
+            request_id = request_id,
+            method,
             host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
             error = %err,
             "upstream closed connection before response headers"
         ),
         ForwardErrorKind::Other => warn!(
             peer = %peer,
+            request_id = request_id,
+            method,
             host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
             error = %err,
             "upstream request failed"
         ),
