@@ -161,19 +161,24 @@ async fn http_upstream_failure_returns_502() -> Result<()> {
     let access_line = logs
         .lines()
         .find(|line| {
-            line.contains("error_reason=\"upstream_closed\"")
-                || line.contains("error_reason=\"upstream_failed\"")
+            line.contains("target=\"access_log\"")
+                && line.contains("host=\"127.0.0.1\"")
+                && line.contains("path=\"/oops\"")
+                && (line.contains("error_reason=\"upstream_closed\"")
+                    || line.contains("error_reason=\"upstream_failed\""))
         })
         .expect("upstream failure access log line should exist");
+    let access_request_id =
+        log_field_value(access_line, "request_id").expect("access log request_id missing");
+    let request_id_needle = format!("request_id=\"{access_request_id}\"");
     let forward_line = logs
         .lines()
         .find(|line| {
-            line.contains("upstream closed connection before response headers")
-                || line.contains("upstream request failed")
+            line.contains(&request_id_needle)
+                && (line.contains("upstream closed connection before response headers")
+                    || line.contains("upstream request failed"))
         })
-        .expect("forward error warning line should exist");
-    let access_request_id =
-        log_field_value(access_line, "request_id").expect("access log request_id missing");
+        .expect("matching forward error warning line should exist");
     let forward_request_id =
         log_field_value(forward_line, "request_id").expect("forward_error request_id missing");
     assert_eq!(
