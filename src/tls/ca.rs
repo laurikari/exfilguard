@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SerialNumber,
@@ -75,14 +75,14 @@ impl CertificateAuthority {
     fn generate(paths: &CaPaths) -> Result<Self> {
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
-        let root_params = build_root_params();
+        let root_params = build_root_params()?;
         let root_cert = root_params
             .self_signed(&root_key)
             .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
 
         let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
-        let intermediate_params = build_intermediate_params();
+        let intermediate_params = build_intermediate_params()?;
         let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let intermediate_cert =
             sign_certificate(&intermediate_params, &intermediate_key, &root_issuer)?;
@@ -211,25 +211,25 @@ impl CertificateAuthority {
     }
 }
 
-fn build_root_params() -> CertificateParams {
+fn build_root_params() -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params.serial_number = Some(random_serial());
+    params.serial_number = Some(random_serial()?);
     params.distinguished_name = distinguished_name("ExfilGuard Root CA");
     set_validity(&mut params, ROOT_VALIDITY_YEARS);
-    params
+    Ok(params)
 }
 
-fn build_intermediate_params() -> CertificateParams {
+fn build_intermediate_params() -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.use_authority_key_identifier_extension = true;
-    params.serial_number = Some(random_serial());
+    params.serial_number = Some(random_serial()?);
     params.distinguished_name = distinguished_name("ExfilGuard Intermediate CA");
     set_validity(&mut params, INTERMEDIATE_VALIDITY_YEARS);
-    params
+    Ok(params)
 }
 
 fn distinguished_name(common_name: &str) -> DistinguishedName {
@@ -244,15 +244,17 @@ fn set_validity(params: &mut CertificateParams, years: i64) {
     params.not_after = now + Duration::days(years * 365);
 }
 
-fn random_serial() -> SerialNumber {
+fn random_serial() -> Result<SerialNumber> {
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|err| anyhow!("failed to generate certificate serial number: {err}"))?;
     // Ensure the serial number is treated as positive and non-zero.
     bytes[0] &= 0x7F;
     if bytes.iter().all(|byte| *byte == 0) {
         bytes[bytes.len() - 1] = 1;
     }
-    SerialNumber::from(bytes.to_vec())
+    Ok(SerialNumber::from(bytes.to_vec()))
 }
 
 fn write_pem_file(path: &Path, contents: &str, private: bool) -> Result<()> {
@@ -333,7 +335,7 @@ fn build_leaf_params(
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.use_authority_key_identifier_extension = true;
-    params.serial_number = Some(random_serial());
+    params.serial_number = Some(random_serial()?);
     if let Some(primary) = names.first() {
         params.distinguished_name = distinguished_name(primary);
     }
@@ -446,14 +448,14 @@ mod tests {
         let dir = TempDir::new()?;
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
-        let root_params = build_root_params();
+        let root_params = build_root_params()?;
         let root_cert = root_params
             .self_signed(&root_key)
             .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
 
         let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
-        let mut intermediate_params = build_intermediate_params();
+        let mut intermediate_params = build_intermediate_params()?;
         intermediate_params.distinguished_name = distinguished_name("Corp Intermediate CA");
         let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let intermediate_cert =
@@ -507,14 +509,14 @@ mod tests {
         let dir = TempDir::new()?;
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
-        let root_params = build_root_params();
+        let root_params = build_root_params()?;
         let root_cert = root_params
             .self_signed(&root_key)
             .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
 
         let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
-        let intermediate_params = build_intermediate_params();
+        let intermediate_params = build_intermediate_params()?;
         let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let intermediate_cert =
             sign_certificate(&intermediate_params, &intermediate_key, &root_issuer)?;

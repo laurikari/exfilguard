@@ -14,12 +14,7 @@ fuzz_target!(|data: &[u8]| {
     let (target_bytes, host_bytes) = payload.split_at(split);
     let target = String::from_utf8_lossy(target_bytes);
     let host = String::from_utf8_lossy(host_bytes);
-    let host_opt = if host.is_empty() {
-        None
-    } else {
-        Some(host.as_ref())
-    };
 
-    let _ = parse_connect_target(target.as_ref(), host_opt);
-    let _ = parse_connect_target(target.as_ref(), None);
+    let _ = parse_connect_target(target.as_ref());
+    let _ = parse_connect_target(host.as_ref());
 });

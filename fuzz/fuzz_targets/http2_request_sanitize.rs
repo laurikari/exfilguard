@@ -131,7 +131,10 @@ fuzz_target!(|data: &[u8]| {
 
     let mut headers = HeaderMap::new();
     if data[0] & 0x01 != 0 {
-        headers.insert(http::header::EXPECT, HeaderValue::from_static("100-continue"));
+        headers.insert(
+            http::header::EXPECT,
+            HeaderValue::from_static("100-continue"),
+        );
     }
     if data[0] & 0x02 != 0 {
         headers.insert(

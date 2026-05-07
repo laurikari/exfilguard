@@ -59,8 +59,10 @@ fuzz_target!(|data: &[u8]| {
             &mut sink,
             Duration::from_millis(10),
             Duration::from_millis(10),
+            None,
             peer,
             max_request_body_size,
+            32 * 1024,
         )
         .await;
     });
