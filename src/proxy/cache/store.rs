@@ -77,25 +77,14 @@ impl CacheStore {
         hasher.finalize().to_hex().to_string() == expected_hex
     }
 
-    pub(super) fn remove_entry_files_from_meta(&self, meta_path: &Path) {
-        if let Some(stem) = meta_path.file_stem().and_then(|s| s.to_str()) {
-            let body_path = self.body_path(stem);
-            fs::remove_file(body_path).ok();
-        }
-        fs::remove_file(meta_path).ok();
+    pub(super) fn remove_entry_files(&self, key_id: &str, body_id: &str) {
+        fs::remove_file(self.body_path(body_id)).ok();
+        fs::remove_file(self.meta_path(key_id)).ok();
     }
 
-    pub(super) async fn remove_entry_files_from_meta_async(&self, meta_path: &Path) {
-        if let Some(stem) = meta_path.file_stem().and_then(|s| s.to_str()) {
-            let body_path = self.body_path(stem);
-            let _ = async_fs::remove_file(&body_path).await;
-        }
-        let _ = async_fs::remove_file(meta_path).await;
-    }
-
-    pub(super) async fn remove_entry_files_for_entry_id_async(&self, entry_id: &str) {
-        let meta_path = self.meta_path(entry_id);
-        self.remove_entry_files_from_meta_async(&meta_path).await;
+    pub(super) async fn remove_entry_files_async(&self, key_id: &str, body_id: &str) {
+        let _ = async_fs::remove_file(self.body_path(body_id)).await;
+        let _ = async_fs::remove_file(self.meta_path(key_id)).await;
     }
 
     pub(super) async fn dir_is_empty(path: &Path) -> bool {
@@ -143,18 +132,36 @@ impl CacheStore {
                 .with_context(|| format!("failed to create cache shard {}", parent.display()))?;
         }
         let data = serde_json::to_vec(entry)?;
+        let temp_path = self.temp_path(&format!("tmp_meta_{}", uuid::Uuid::new_v4()));
         let mut options = async_fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
             options.mode(0o600);
         }
-        let mut file = options
-            .open(&meta_path)
-            .await
-            .with_context(|| format!("failed to write cache metadata {}", meta_path.display()))?;
-        file.write_all(&data).await?;
-        file.flush().await?;
+        let mut file = options.open(&temp_path).await.with_context(|| {
+            format!(
+                "failed to write cache metadata temp file {}",
+                temp_path.display()
+            )
+        })?;
+        if let Err(err) = async {
+            file.write_all(&data).await?;
+            file.flush().await
+        }
+        .await
+        {
+            drop(file);
+            let _ = async_fs::remove_file(&temp_path).await;
+            return Err(err).context("failed to write cache metadata temp file");
+        }
+        drop(file);
+        if let Err(err) = async_fs::rename(&temp_path, &meta_path).await {
+            let _ = async_fs::remove_file(&temp_path).await;
+            return Err(err).with_context(|| {
+                format!("failed to publish cache metadata {}", meta_path.display())
+            });
+        }
         Ok(())
     }
 }

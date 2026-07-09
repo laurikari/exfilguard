@@ -431,7 +431,7 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         .cache_dir
         .as_ref()
         .expect("cache dir enabled")
-        .join("v1");
+        .join("v2");
 
     let readonly_marker = Arc::new(AtomicUsize::new(0));
     let watcher_dir = cache_version_dir.clone();

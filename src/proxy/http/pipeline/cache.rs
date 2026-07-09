@@ -75,7 +75,7 @@ where
 
             let mut copied = 0u64;
             if !matches!(body_plan, ResponseBodyPlan::Empty) {
-                let mut file = tokio::fs::File::open(&cached.body_path).await?;
+                let mut file = cached.body;
                 copied = copy_n_with_write_timeout(
                     &mut file,
                     client_stream,

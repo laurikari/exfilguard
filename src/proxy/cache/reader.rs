@@ -5,7 +5,7 @@ use http::{HeaderMap, Method, Uri};
 use tokio::fs as async_fs;
 use tracing::{trace, warn};
 
-use super::{CacheKey, CacheState, CachedResponse};
+use super::{CacheEntry, CacheKey, CacheState, CachedResponse};
 
 pub(super) struct CacheReader {
     state: Arc<CacheState>,
@@ -14,6 +14,16 @@ pub(super) struct CacheReader {
 impl CacheReader {
     pub(super) fn new(state: Arc<CacheState>) -> Self {
         Self { state }
+    }
+
+    async fn invalidate_entry(&self, key_base: &str, entry: &CacheEntry) {
+        let _publish_guard = self.state.publish_lock().lock().await;
+        if let Some(removed) = self.state.remove_entry_if_id_matches(key_base, entry.id) {
+            self.state
+                .store
+                .remove_entry_files_async(&removed.key_id, &removed.body_id)
+                .await;
+        }
     }
 
     pub(super) async fn lookup(
@@ -39,14 +49,7 @@ impl CacheReader {
 
         if SystemTime::now() > entry.expires_at {
             trace!("cache entry expired");
-            if self
-                .state
-                .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
-            {
-                self.state
-                    .remove_entry_files_for_entry_id_async(&entry.entry_id)
-                    .await;
-            }
+            self.invalidate_entry(cache_key.key_base(), &entry).await;
             crate::metrics::record_cache_lookup(false);
             return None;
         }
@@ -57,7 +60,7 @@ impl CacheReader {
             return None;
         }
 
-        let body_path = self.state.body_path(&entry.entry_id);
+        let body_path = self.state.body_path(&entry.body_id);
         let metadata = match async_fs::symlink_metadata(&body_path).await {
             Ok(metadata) => metadata,
             Err(err) => {
@@ -66,14 +69,7 @@ impl CacheReader {
                     path = %body_path.display(),
                     "cache body missing on disk"
                 );
-                if self
-                    .state
-                    .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
-                {
-                    self.state
-                        .remove_entry_files_for_entry_id_async(&entry.entry_id)
-                        .await;
-                }
+                self.invalidate_entry(cache_key.key_base(), &entry).await;
                 crate::metrics::record_cache_lookup(false);
                 return None;
             }
@@ -86,23 +82,31 @@ impl CacheReader {
                 actual_length = metadata.len(),
                 "cache body failed validation on disk"
             );
-            if self
-                .state
-                .remove_entry_if_id_matches(cache_key.key_base(), entry.id)
-            {
-                self.state
-                    .remove_entry_files_for_entry_id_async(&entry.entry_id)
-                    .await;
-            }
+            self.invalidate_entry(cache_key.key_base(), &entry).await;
             crate::metrics::record_cache_lookup(false);
             return None;
         }
+
+        let body = match async_fs::File::open(&body_path).await {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %body_path.display(),
+                    "cache body could not be opened"
+                );
+                self.invalidate_entry(cache_key.key_base(), &entry).await;
+                crate::metrics::record_cache_lookup(false);
+                return None;
+            }
+        };
 
         crate::metrics::record_cache_lookup(true);
         Some(CachedResponse {
             status: entry.status,
             headers: entry.headers.clone(),
             body_path,
+            body,
             content_length: entry.content_length,
         })
     }

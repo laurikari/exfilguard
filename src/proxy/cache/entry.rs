@@ -8,7 +8,8 @@ use super::VaryKey;
 #[derive(Debug, Clone)]
 pub(super) struct CacheEntry {
     pub id: u64,
-    pub entry_id: String,
+    pub key_id: String,
+    pub body_id: String,
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub vary: VaryKey,
@@ -20,6 +21,7 @@ pub(super) struct CacheEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PersistedEntry {
     pub key_base: String,
+    pub body_id: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub vary_headers: Vec<(String, String)>,
@@ -32,6 +34,7 @@ impl CacheEntry {
     pub(super) fn to_persisted(&self, key_base: &str) -> PersistedEntry {
         PersistedEntry {
             key_base: key_base.to_string(),
+            body_id: self.body_id.clone(),
             status: self.status.as_u16(),
             headers: headermap_to_vec(&self.headers),
             vary_headers: headermap_to_vec(self.vary.headers()),
@@ -47,7 +50,7 @@ impl CacheEntry {
 
     pub(super) fn from_persisted(
         persisted: &PersistedEntry,
-        entry_id: &str,
+        key_id: &str,
         id: u64,
         expires_at: SystemTime,
     ) -> Self {
@@ -61,7 +64,8 @@ impl CacheEntry {
             headers,
             vary,
             expires_at,
-            entry_id: entry_id.to_string(),
+            key_id: key_id.to_string(),
+            body_id: persisted.body_id.clone(),
             content_hash: persisted.content_hash.clone(),
             content_length: persisted.content_length,
         }

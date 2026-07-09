@@ -11,7 +11,7 @@ use tracing::{trace, warn};
 
 use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 
-const CACHE_LAYOUT_VERSION: u32 = 1;
+const CACHE_LAYOUT_VERSION: u32 = 2;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
 
@@ -217,7 +217,7 @@ impl CacheState {
                     meta_path.display(),
                     err
                 );
-                self.remove_entry_files_from_meta(meta_path);
+                fs::remove_file(meta_path).ok();
                 return Ok(None);
             }
         };
@@ -231,7 +231,16 @@ impl CacheState {
                 actual = file_stem,
                 "cache metadata key mismatch; removing entry"
             );
-            self.remove_entry_files_from_meta(meta_path);
+            fs::remove_file(meta_path).ok();
+            return Ok(None);
+        }
+
+        if !Self::valid_body_id(&persisted.body_id, entry_id) {
+            warn!(
+                "cache metadata {} has invalid body id; removing entry",
+                meta_path.display()
+            );
+            fs::remove_file(meta_path).ok();
             return Ok(None);
         }
 
@@ -240,20 +249,20 @@ impl CacheState {
                 "cache metadata {} has invalid content hash; removing entry",
                 meta_path.display()
             );
-            fs::remove_file(meta_path).ok();
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
 
         // Basic validation
         let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.expires_at);
         if SystemTime::now() > expires_at {
-            self.remove_entry_files_from_meta(meta_path);
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
 
-        let body_path = self.body_path(entry_id);
+        let body_path = self.body_path(&persisted.body_id);
         if !body_path.exists() {
-            self.remove_entry_files_from_meta(meta_path);
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
 
@@ -265,16 +274,16 @@ impl CacheState {
                 "cache content hash mismatch for {}; removing entry",
                 body_path.display()
             );
-            self.remove_entry_files_from_meta(meta_path);
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
 
         if persisted.content_length > self.max_entry_size {
-            self.remove_entry_files_from_meta(meta_path);
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
         if persisted.content_length > self.max_bytes {
-            self.remove_entry_files_from_meta(meta_path);
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
 
@@ -283,18 +292,14 @@ impl CacheState {
 
         let evicted = self.insert_entry(key.key_base().to_string(), entry);
         self.remove_evicted_files(evicted);
-        Ok(Some(entry_id.to_string()))
-    }
-
-    fn remove_entry_files_from_meta(&self, meta_path: &Path) {
-        self.store.remove_entry_files_from_meta(meta_path);
+        Ok(Some(persisted.body_id))
     }
 
     fn remove_evicted_files(&self, evicted: Vec<CacheEntry>) {
         for evicted_entry in evicted {
             crate::metrics::record_cache_eviction();
-            let path = self.body_path(&evicted_entry.entry_id);
-            let meta = self.meta_path(&evicted_entry.entry_id);
+            let path = self.body_path(&evicted_entry.body_id);
+            let meta = self.meta_path(&evicted_entry.key_id);
             trace!("removing evicted cache file: {}", path.display());
             if let Err(e) = fs::remove_file(path) {
                 warn!("failed to remove evicted cache file: {}", e);
@@ -307,16 +312,10 @@ impl CacheState {
         value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
     }
 
-    async fn remove_entry_files_from_meta_async(&self, meta_path: &Path) {
-        self.store
-            .remove_entry_files_from_meta_async(meta_path)
-            .await;
-    }
-
-    pub(super) async fn remove_entry_files_for_entry_id_async(&self, entry_id: &str) {
-        self.store
-            .remove_entry_files_for_entry_id_async(entry_id)
-            .await;
+    fn valid_body_id(value: &str, key_id: &str) -> bool {
+        value.len() == 64
+            && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+            && value[..4] == key_id[..4]
     }
 
     async fn prune_empty_shards(&self, entry_id: &str) {
@@ -366,6 +365,7 @@ impl CacheState {
                         continue;
                     }
                     stats.inspected += 1;
+                    let _publish_guard = self.publish_lock().lock().await;
                     let data = match async_fs::read(&path).await {
                         Ok(data) => data,
                         Err(err) if err.kind() == ErrorKind::NotFound => continue,
@@ -381,7 +381,14 @@ impl CacheState {
                         continue;
                     }
                     self.remove_entry_by_key_base(&persisted.key_base);
-                    self.remove_entry_files_from_meta_async(&path).await;
+                    let key = CacheKey::from_key_base(persisted.key_base.clone());
+                    if Self::valid_body_id(&persisted.body_id, key.entry_id()) {
+                        self.store
+                            .remove_entry_files_async(key.entry_id(), &persisted.body_id)
+                            .await;
+                    } else {
+                        let _ = async_fs::remove_file(&path).await;
+                    }
                     if let Some(entry_id) = path.file_stem().and_then(|s| s.to_str()) {
                         self.prune_empty_shards(entry_id).await;
                     }
@@ -396,16 +403,24 @@ impl CacheState {
         Ok(stats)
     }
 
-    pub(super) async fn remove_evicted_files_async(&self, evicted: Vec<CacheEntry>) {
+    pub(super) async fn remove_evicted_files_async(
+        &self,
+        evicted: Vec<CacheEntry>,
+        active_key_id: &str,
+    ) {
         for evicted_entry in evicted {
-            crate::metrics::record_cache_eviction();
-            let path = self.body_path(&evicted_entry.entry_id);
-            let meta = self.meta_path(&evicted_entry.entry_id);
+            let replaced = evicted_entry.key_id == active_key_id;
+            if !replaced {
+                crate::metrics::record_cache_eviction();
+            }
+            let path = self.body_path(&evicted_entry.body_id);
             trace!("removing evicted cache file: {}", path.display());
             if let Err(e) = async_fs::remove_file(&path).await {
                 warn!("failed to remove evicted cache file: {}", e);
             }
-            let _ = async_fs::remove_file(&meta).await;
+            if !replaced {
+                let _ = async_fs::remove_file(self.meta_path(&evicted_entry.key_id)).await;
+            }
         }
     }
 }

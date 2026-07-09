@@ -186,7 +186,13 @@ impl CacheWriter {
 
         let hash = self.hasher.finalize();
         let content_hash = hash.to_hex().to_string();
-        let final_path = self.state.body_path(self.key.entry_id());
+        let key_id = self.key.entry_id().to_string();
+        let random_id = blake3::hash(uuid::Uuid::new_v4().as_bytes())
+            .to_hex()
+            .to_string();
+        let body_id = format!("{}{}", &key_id[..4], &random_id[4..]);
+        let _publish_guard = self.state.publish_lock().lock().await;
+        let final_path = self.state.body_path(&body_id);
         let shard_dir = final_path
             .parent()
             .map(|path| path.to_path_buf())
@@ -198,27 +204,21 @@ impl CacheWriter {
 
         let entry = CacheEntry {
             id: self.state.next_entry_id(),
+            key_id: key_id.clone(),
+            body_id: body_id.clone(),
             status,
             headers,
             vary: self.vary.clone(),
             expires_at: SystemTime::now() + ttl,
-            entry_id: self.key.entry_id().to_string(),
             content_hash,
             content_length: self.current_size,
         };
 
         let persisted = entry.to_persisted(self.key.key_base());
 
-        if let Err(err) = self
-            .state
-            .write_metadata_async(self.key.entry_id(), &persisted)
-            .await
-        {
+        if let Err(err) = self.state.write_metadata_async(&key_id, &persisted).await {
             warn!("failed to write cache metadata: {}", err);
-            async_fs::remove_file(&self.state.meta_path(&entry.entry_id))
-                .await
-                .ok();
-            async_fs::remove_file(self.state.body_path(&entry.entry_id))
+            async_fs::remove_file(self.state.body_path(&body_id))
                 .await
                 .ok();
             self.finished = true;
@@ -230,7 +230,9 @@ impl CacheWriter {
             .insert_entry(self.key.key_base().to_string(), entry);
         trace!("stored cache entry for {}", self.key.key_base());
 
-        self.state.remove_evicted_files_async(evicted).await;
+        self.state
+            .remove_evicted_files_async(evicted, &key_id)
+            .await;
 
         self.finished = true;
         Ok(())
@@ -314,6 +316,7 @@ mod tests {
         let store = CacheStore::new(dir.path().to_path_buf());
         Arc::new(CacheState {
             index: Mutex::new(index),
+            publish_lock: tokio::sync::Mutex::new(()),
             store,
             max_entry_size: 1024 * 1024,
             max_bytes: 1024 * 1024,
@@ -367,7 +370,7 @@ mod tests {
             blake3::hash(body).to_hex().to_string()
         );
 
-        let body_path = state.body_path(key.entry_id());
+        let body_path = state.body_path(&persisted.body_id);
         let stored = async_fs::read(&body_path).await?;
         assert_eq!(stored, body);
 

@@ -36,11 +36,12 @@ pub(crate) use request::{CacheRequestContext, build_cache_request_context};
 use store::CacheStore;
 pub(crate) use writer::CacheWriter;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CachedResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body_path: PathBuf,
+    pub(crate) body: async_fs::File,
     pub content_length: u64,
 }
 
@@ -52,6 +53,7 @@ pub struct HttpCache {
 #[derive(Debug)]
 struct CacheState {
     index: Mutex<CacheIndex>,
+    publish_lock: tokio::sync::Mutex<()>,
     store: CacheStore,
     max_entry_size: u64,
     max_bytes: u64,
@@ -83,6 +85,7 @@ impl HttpCache {
         let store = CacheStore::new(disk_dir.clone());
         let state = Arc::new(CacheState {
             index: Mutex::new(index),
+            publish_lock: tokio::sync::Mutex::new(()),
             store,
             max_entry_size,
             max_bytes,
@@ -174,8 +177,8 @@ impl CacheState {
         crate::metrics::set_cache_usage(index.len(), index.bytes_in_use());
     }
 
-    fn body_path(&self, entry_id: &str) -> PathBuf {
-        self.store.body_path(entry_id)
+    fn body_path(&self, body_id: &str) -> PathBuf {
+        self.store.body_path(body_id)
     }
 
     fn meta_path(&self, entry_id: &str) -> PathBuf {
@@ -186,9 +189,9 @@ impl CacheState {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn remove_entry_if_id_matches(&self, key_base: &str, entry_id: u64) -> bool {
+    fn remove_entry_if_id_matches(&self, key_base: &str, entry_id: u64) -> Option<CacheEntry> {
         let mut guard = self.index.lock();
-        let removed = guard.remove_if_id_matches(key_base, entry_id).is_some();
+        let removed = guard.remove_if_id_matches(key_base, entry_id);
         Self::update_cache_metrics(&guard);
         removed
     }
@@ -201,6 +204,10 @@ impl CacheState {
 
     async fn write_metadata_async(&self, entry_id: &str, entry: &PersistedEntry) -> Result<()> {
         self.store.write_metadata_async(entry_id, entry).await
+    }
+
+    fn publish_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.publish_lock
     }
 
     fn insert_entry(&self, key_base: String, entry: CacheEntry) -> Vec<CacheEntry> {
@@ -244,6 +251,18 @@ mod tests {
             TEST_SWEEPER_BATCH_SIZE,
         )
         .await
+    }
+
+    fn cache_entry_paths(
+        cache: &HttpCache,
+        method: &Method,
+        uri: &Uri,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let key_id = CacheKey::new(method, uri).entry_id().to_string();
+        let meta_path = cache.state.meta_path(&key_id);
+        let persisted: PersistedEntry = serde_json::from_slice(&fs::read(&meta_path)?)?;
+        let body_path = cache.state.body_path(&persisted.body_id);
+        Ok((body_path, meta_path))
     }
 
     #[tokio::test]
@@ -380,9 +399,7 @@ mod tests {
             )
             .await?;
 
-        let entry_id = CacheKey::new(&method, &uri).entry_id().to_string();
-        let body_path = cache.state.store.body_path(&entry_id);
-        let meta_path = cache.state.store.meta_path(&entry_id);
+        let (body_path, meta_path) = cache_entry_paths(&cache, &method, &uri)?;
 
         assert!(body_path.exists(), "expected cached body to exist");
         assert!(meta_path.exists(), "expected cached metadata to exist");
@@ -501,6 +518,75 @@ mod tests {
             .expect("entry should be restored from disk");
         let body = fs::read(hit.body_path)?;
         assert_eq!(body, b"persisted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_replacements_keep_headers_and_body_together() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let cache = build_cache(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/replace");
+        let req_headers = HeaderMap::new();
+        let mut headers_a = HeaderMap::new();
+        headers_a.insert("x-variant", "a".parse()?);
+        let mut headers_b = HeaderMap::new();
+        headers_b.insert("x-variant", "b".parse()?);
+
+        let store_a = cache.store(
+            &method,
+            &uri,
+            &req_headers,
+            StatusCode::OK,
+            &headers_a,
+            b"body-a",
+            Duration::from_secs(60),
+        );
+        let store_b = cache.store(
+            &method,
+            &uri,
+            &req_headers,
+            StatusCode::OK,
+            &headers_b,
+            b"body-b",
+            Duration::from_secs(60),
+        );
+        let (result_a, result_b) = tokio::join!(store_a, store_b);
+        result_a?;
+        result_b?;
+
+        let assert_consistent = |hit: CachedResponse| -> Result<()> {
+            let variant = hit
+                .headers
+                .get("x-variant")
+                .and_then(|value| value.to_str().ok());
+            let body = fs::read(hit.body_path)?;
+            assert!(
+                matches!(
+                    (variant, body.as_slice()),
+                    (Some("a"), b"body-a") | (Some("b"), b"body-b")
+                ),
+                "cache metadata and body must come from the same writer"
+            );
+            Ok(())
+        };
+
+        assert_consistent(
+            cache
+                .lookup(&method, &uri, &req_headers)
+                .await
+                .expect("replacement should remain live"),
+        )?;
+        drop(cache);
+
+        let rebuilt = build_cache(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        assert_consistent(
+            rebuilt
+                .lookup(&method, &uri, &req_headers)
+                .await
+                .expect("replacement should survive rebuild"),
+        )?;
         Ok(())
     }
 
@@ -689,6 +775,7 @@ mod tests {
         let meta_path = shard_dir.join(format!("{entry_id}.meta"));
         let persisted = PersistedEntry {
             key_base,
+            body_id: format!("{}{}", &entry_id[..4], "0".repeat(60)),
             status: 200,
             headers: Vec::new(),
             vary_headers: Vec::new(),
@@ -762,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn uses_versioned_cache_dir_and_cleans_old_versions() -> Result<()> {
         let dir = TempDir::new()?;
-        let old_dir = dir.path().join("v0");
+        let old_dir = dir.path().join("v1");
         fs::create_dir_all(&old_dir)?;
         fs::write(old_dir.join("old"), b"data")?;
 
@@ -817,8 +904,7 @@ mod tests {
             .await?;
 
         std::thread::sleep(Duration::from_millis(5));
-        let entry_id = CacheKey::new(&method, &uri).entry_id().to_string();
-        let body_path = cache.state.body_path(&entry_id);
+        let (body_path, _) = cache_entry_paths(&cache, &method, &uri)?;
         assert!(body_path.exists(), "expected cached body to exist");
 
         let stats = cache.state.sweep_expired_entries(10).await?;
