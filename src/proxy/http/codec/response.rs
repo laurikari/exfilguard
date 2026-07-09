@@ -262,6 +262,55 @@ pub(crate) fn encode_cached_http1_response(
     buffer
 }
 
+fn parse_transfer_codings(value: &str) -> Result<Vec<String>> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+
+    for (index, byte) in value.bytes().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == b',' {
+            items.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    if quoted || escaped {
+        bail!("unterminated quoted string in upstream Transfer-Encoding");
+    }
+    items.push(&value[start..]);
+
+    let mut codings = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item.trim();
+        if item.is_empty() {
+            bail!("empty transfer coding in upstream Transfer-Encoding");
+        }
+        let (coding, parameters) = item
+            .split_once(';')
+            .map_or((item, None), |(coding, parameters)| {
+                (coding, Some(parameters))
+            });
+        let coding = coding.trim();
+        parse_header_name(coding)
+            .map_err(|_| anyhow!("invalid transfer coding '{coding}' from upstream"))?;
+        if coding.eq_ignore_ascii_case("chunked") && parameters.is_some() {
+            bail!("chunked transfer coding must not include parameters");
+        }
+        codings.push(coding.to_ascii_lowercase());
+    }
+    Ok(codings)
+}
+
 pub(crate) async fn read_http1_response_head<S>(
     reader: &mut BufReader<S>,
     timeout_dur: Duration,
@@ -299,7 +348,7 @@ where
     let mut headers = Vec::new();
     let mut content_length = None;
     let mut content_length_seen = false;
-    let mut chunked = false;
+    let mut transfer_codings = Vec::new();
     let mut transfer_encoding_present = false;
     let mut connection_close = matches!(version, Version::HTTP_10);
 
@@ -341,9 +390,7 @@ where
         }
         if name.eq_ignore_ascii_case("transfer-encoding") {
             transfer_encoding_present = true;
-            if value.to_ascii_lowercase().contains("chunked") {
-                chunked = true;
-            }
+            transfer_codings.extend(parse_transfer_codings(value)?);
         }
         if name.eq_ignore_ascii_case("connection") {
             let mut saw_close = false;
@@ -371,6 +418,18 @@ where
         );
         bail!("upstream response must not include both Transfer-Encoding and Content-Length");
     }
+
+    let chunked_count = transfer_codings
+        .iter()
+        .filter(|coding| coding.as_str() == "chunked")
+        .count();
+    if chunked_count > 1 {
+        bail!("chunked transfer coding must not appear more than once");
+    }
+    if chunked_count == 1 && transfer_codings.last().map(String::as_str) != Some("chunked") {
+        bail!("chunked transfer coding must be final");
+    }
+    let chunked = transfer_codings.last().map(String::as_str) == Some("chunked");
 
     Ok(Http1ResponseHead {
         status_line: trimmed.to_string(),
@@ -642,6 +701,59 @@ mod tests {
         } else {
             panic!("Transfer-Encoding with Content-Length should be rejected");
         }
+    }
+
+    #[tokio::test]
+    async fn read_response_head_requires_exact_chunked_coding() -> anyhow::Result<()> {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: xchunked\r\n\r\n";
+        let mut reader = tokio::io::BufReader::new(&response[..]);
+        let head = read_http1_response_head(
+            &mut reader,
+            Duration::from_secs(1),
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await?;
+        assert!(head.transfer_encoding_present);
+        assert!(!head.chunked);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_response_head_parses_ordered_transfer_codings() -> anyhow::Result<()> {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip; note=\"a,b\", chunked\r\n\r\n";
+        let mut reader = tokio::io::BufReader::new(&response[..]);
+        let head = read_http1_response_head(
+            &mut reader,
+            Duration::from_secs(1),
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await?;
+        assert!(head.chunked);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_response_head_rejects_non_final_chunked_coding() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n";
+        let mut reader = tokio::io::BufReader::new(&response[..]);
+        let result = read_http1_response_head(
+            &mut reader,
+            Duration::from_secs(1),
+            "127.0.0.1:80".parse().unwrap(),
+            1024,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("non-final chunked coding should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("chunked transfer coding must be final"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
