@@ -67,7 +67,6 @@ pub fn is_cacheable(method: &Method, status: StatusCode, headers: &HeaderMap) ->
             | StatusCode::NON_AUTHORITATIVE_INFORMATION
             | StatusCode::NO_CONTENT
             | StatusCode::RESET_CONTENT
-            | StatusCode::PARTIAL_CONTENT
     ) {
         return false;
     }
@@ -129,6 +128,10 @@ pub fn get_freshness_lifetime(headers: &HeaderMap) -> Option<Duration> {
 }
 
 pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
+    if headers.contains_key(http::header::RANGE) {
+        return true;
+    }
+
     for value in headers.get_all(http::header::CACHE_CONTROL) {
         if let Ok(s) = value.to_str() {
             for part in s.split(',') {
@@ -274,6 +277,20 @@ mod tests {
     }
 
     #[test]
+    fn test_not_cacheable_partial_content() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        assert!(!is_cacheable(
+            &Method::GET,
+            StatusCode::PARTIAL_CONTENT,
+            &headers
+        ));
+    }
+
+    #[test]
     fn test_freshness_lifetime_max_age() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -320,6 +337,13 @@ mod tests {
     fn request_cache_bypass_pragma_no_cache() {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
+        assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_range() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=0-99"));
         assert!(request_cache_bypass(&headers));
     }
 

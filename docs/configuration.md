@@ -250,9 +250,9 @@ Cache lifetime is chosen in this order:
 #### What Gets Cached
 
 - **Methods**: Only `GET` and `HEAD` requests
-- **Status codes**: 200, 203, 204, 205, 206, 301, 302
+- **Status codes**: 200, 203, 204, 205, 301, 302
 - **Bypass**: Requests with `Authorization` or `Cookie` headers are never
-  served from cache and are not stored
+  served from cache and are not stored. Requests with `Range` are also bypassed.
 - **Not cached**: Responses with `no-store`, `no-cache`, or `private`
   directives, or any `Set-Cookie` header
 
@@ -260,8 +260,8 @@ Cache lifetime is chosen in this order:
 
 Request-side cache controls can force a bypass. If a request includes
 `Cache-Control: no-cache`, `Cache-Control: no-store`, `Cache-Control: max-age=0`,
-or `Pragma: no-cache`, the cache will not be used and the response will not be
-stored. Otherwise, caching follows the upstream response headers plus
+`Pragma: no-cache`, or `Range`, the cache will not be used and the response will
+not be stored. Otherwise, caching follows the upstream response headers plus
 `force_cache_duration` from policy rules.
 
 #### Eviction

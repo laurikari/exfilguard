@@ -275,7 +275,7 @@ freshness. It applies when the upstream response omits `s-maxage`, `max-age`,
 and `Expires`, including cases where only `public` is set.
 
 !!! note
-    Only `GET` and `HEAD` responses with status 200, 203, 204, 205, 206, 301, or 302 are cached. See [Cache Settings](configuration.md#cache-settings) for full details.
+    Only `GET` and `HEAD` responses with status 200, 203, 204, 205, 301, or 302 are cached. Requests with `Range` bypass the cache. See [Cache Settings](configuration.md#cache-settings) for full details.
 
 ---
 
