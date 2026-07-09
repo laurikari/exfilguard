@@ -675,38 +675,68 @@ async fn serve_tls_h2_inspect(
     let mut connection = h2_server::handshake(tls)
         .await
         .context("failed to establish HTTP/2 handshake with proxy")?;
+    let mut handlers = tokio::task::JoinSet::new();
 
-    while let Some(result) = connection.accept().await {
-        let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
-        let content_length = request
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("<missing>")
-            .to_string();
-        let mut request_body = request.into_body();
-        let mut body = Vec::new();
-        while let Some(frame) = request_body.data().await {
-            let chunk = frame.context("failed to read HTTP/2 request body")?;
-            body.extend_from_slice(&chunk);
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) = result.context("failed to accept HTTP/2 request")?;
+                    handlers.spawn(serve_h2_inspect_request(request, respond));
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 handler available")
+                    .context("HTTP/2 request handler task failed")??;
+            }
         }
+    }
+    while let Some(result) = handlers.join_next().await {
+        result.context("HTTP/2 request handler task failed")??;
+    }
 
-        let response_body = format!(
-            "content-length={content_length}\nbody-len={}\nbody={}",
-            body.len(),
-            String::from_utf8_lossy(&body)
-        );
-        let response = http::Response::builder()
-            .status(StatusCode::OK)
-            .body(())
-            .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
-        let mut send = respond
-            .send_response(response, response_body.is_empty())
-            .context("failed to send HTTP/2 response headers")?;
-        if !response_body.is_empty() {
-            send.send_data(Bytes::from(response_body), true)
-                .context("failed to send HTTP/2 response body")?;
-        }
+    Ok(())
+}
+
+async fn serve_h2_inspect_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2_server::SendResponse<Bytes>,
+) -> Result<()> {
+    let content_length = request
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_string();
+    let mut request_body = request.into_body();
+    let mut body = Vec::new();
+    while let Some(frame) = request_body.data().await {
+        let chunk = frame.context("failed to read HTTP/2 request body")?;
+        let chunk_len = chunk.len();
+        body.extend_from_slice(&chunk);
+        request_body
+            .flow_control()
+            .release_capacity(chunk_len)
+            .context("failed to release HTTP/2 request body capacity")?;
+    }
+
+    let response_body = format!(
+        "content-length={content_length}\nbody-len={}\nbody={}",
+        body.len(),
+        String::from_utf8_lossy(&body)
+    );
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+    let mut send = respond
+        .send_response(response, response_body.is_empty())
+        .context("failed to send HTTP/2 response headers")?;
+    if !response_body.is_empty() {
+        send.send_data(Bytes::from(response_body), true)
+            .context("failed to send HTTP/2 response body")?;
     }
 
     Ok(())

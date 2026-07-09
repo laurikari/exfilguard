@@ -7,8 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use h2::RecvStream;
+use futures::future::poll_fn;
 use h2::server::SendResponse;
+use h2::{RecvStream, SendStream};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use tokio::time::timeout;
 
@@ -45,6 +46,38 @@ where
     } else {
         future.await
     }
+}
+
+async fn send_data_with_backpressure(
+    stream: &mut SendStream<Bytes>,
+    mut data: Bytes,
+    idle_timeout: Duration,
+    total_deadline: Option<Instant>,
+    context: &'static str,
+) -> Result<()> {
+    stream.reserve_capacity(data.len());
+    while !data.is_empty() {
+        let capacity = if stream.capacity() > 0 {
+            stream.capacity()
+        } else {
+            with_total_deadline(total_deadline, async {
+                timeout(idle_timeout, poll_fn(|cx| stream.poll_capacity(cx)))
+                    .await
+                    .map_err(|_| anyhow!("timed out {context}"))?
+                    .ok_or_else(|| anyhow!("{context}: stream closed"))?
+                    .with_context(|| context)
+            })
+            .await?
+        };
+        if capacity == 0 {
+            continue;
+        }
+
+        let send_len = capacity.min(data.len());
+        let chunk = data.split_to(send_len);
+        stream.send_data(chunk, false).with_context(|| context)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -141,9 +174,14 @@ pub(super) async fn forward_request_to_upstream(
             }
             let chunk_len = chunk.len();
             body_tracker.record(chunk_len)?;
-            send_stream
-                .send_data(chunk, false)
-                .context("failed to forward HTTP/2 request body upstream")?;
+            send_data_with_backpressure(
+                &mut send_stream,
+                chunk,
+                request_body_timeout,
+                request_deadline,
+                "forwarding HTTP/2 request body upstream",
+            )
+            .await?;
             body.flow_control()
                 .release_capacity(chunk_len)
                 .context("failed to release HTTP/2 request body flow-control capacity")?;
@@ -254,9 +292,14 @@ pub(super) async fn forward_request_to_upstream(
             upstream_body_bytes = upstream_body_bytes
                 .checked_add(chunk_len as u64)
                 .ok_or_else(|| anyhow!("response body size overflow"))?;
-            send_body
-                .send_data(chunk, false)
-                .context("failed to forward HTTP/2 response body to client")?;
+            send_data_with_backpressure(
+                &mut send_body,
+                chunk,
+                response_body_timeout,
+                request_deadline,
+                "forwarding HTTP/2 response body to client",
+            )
+            .await?;
             response_body
                 .flow_control()
                 .release_capacity(chunk_len)
