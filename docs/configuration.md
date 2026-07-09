@@ -174,7 +174,7 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | `tls_handshake_timeout` | u64 | 10 | Maximum time for TLS handshakes (client or upstream) |
 | `request_header_timeout` | u64 | 10 | Maximum time to read an HTTP request line + headers |
 | `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |
-| `response_header_timeout` | u64 | 30 | Maximum time to receive upstream response headers |
+| `response_header_timeout` | u64 | 60 | Maximum time to receive upstream response headers |
 | `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
 | `request_total_timeout` | u64 | 0 | Maximum total time from request start until the response has been fully forwarded (0 disables) |
 | `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an idle client keep-alive connection |
@@ -348,7 +348,7 @@ upstream_connect_timeout = 5
 tls_handshake_timeout = 10
 request_header_timeout = 10
 request_body_idle_timeout = 30
-response_header_timeout = 30
+response_header_timeout = 60
 response_body_idle_timeout = 60
 request_total_timeout = 0
 client_keepalive_idle_timeout = 30

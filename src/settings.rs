@@ -47,7 +47,7 @@ impl SettingsDefaults {
     }
 
     const fn response_header_timeout() -> u64 {
-        30
+        60
     }
 
     const fn response_body_idle_timeout() -> u64 {
