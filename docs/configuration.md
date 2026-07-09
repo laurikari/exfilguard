@@ -62,7 +62,7 @@ For the default `/etc/exfilguard/exfilguard.toml`, a long-polling override could
 be written as `/etc/exfilguard/config.d/50-long-polls.toml`:
 
 ```toml
-response_header_timeout = 60
+response_header_timeout = 90
 ```
 
 All relative paths, including paths set by fragments, are resolved from the
