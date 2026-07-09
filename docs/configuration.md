@@ -236,7 +236,7 @@ cache storage.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `cache_dir` | Path | None | Directory for response cache storage |
-| `cache_max_entry_size` | u64 | 10485760 (10 MiB) | Maximum size of individual cache entries |
+| `cache_max_entry_size` | u64 | 104857600 (100 MiB) | Maximum size of individual cache entries |
 | `cache_max_entries` | usize | 10000 | Maximum number of cached responses (LRU) |
 | `cache_total_capacity` | u64 | 1073741824 (1 GiB) | Total cache capacity |
 | `cache_sweeper_interval` | u64 | 300 | Interval in seconds between cache sweeper runs |
@@ -368,7 +368,7 @@ max_request_body_size = 0
 
 # Cache (optional)
 cache_dir = "./cache"
-cache_max_entry_size = 10485760
+cache_max_entry_size = 104857600
 cache_max_entries = 10000
 cache_total_capacity = 1073741824
 cache_sweeper_interval = 300

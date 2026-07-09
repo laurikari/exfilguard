@@ -95,7 +95,7 @@ impl SettingsDefaults {
     }
 
     const fn cache_max_entry_size() -> u64 {
-        10 * 1024 * 1024
+        100 * 1024 * 1024
     }
 
     const fn cache_max_entries() -> usize {

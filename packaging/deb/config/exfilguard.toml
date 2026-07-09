@@ -22,7 +22,7 @@ log = "json"
 
 # Response cache storage (rules opt-in)
 cache_dir = "/var/lib/exfilguard/cache"
-cache_max_entry_size = 10485760
+cache_max_entry_size = 104857600
 cache_max_entries = 10000
 cache_total_capacity = 1073741824
 cache_sweeper_interval = 300
