@@ -1,8 +1,10 @@
+use std::ffi::OsStr;
+use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -12,6 +14,8 @@ use crate::cli::{Cli, LogFormat};
 use crate::config as runtime_config;
 
 struct SettingsDefaults;
+
+const CONFIG_FRAGMENT_DIR: &str = "config.d";
 
 impl SettingsDefaults {
     const fn leaf_ttl() -> u64 {
@@ -249,6 +253,9 @@ impl Settings {
         let config_path = resolve_config_path(cli)?;
 
         builder = builder.add_source(File::from(config_path.clone()).required(true));
+        for fragment in collect_config_fragments(&config_path)? {
+            builder = builder.add_source(File::from(fragment).required(true));
+        }
 
         builder = builder.add_source(
             Environment::with_prefix("EXFILGUARD")
@@ -366,6 +373,53 @@ impl Settings {
     pub fn http2_max_concurrent_streams_usize(&self) -> usize {
         self.http2_max_concurrent_streams as usize
     }
+}
+
+fn collect_config_fragments(config_path: &Path) -> Result<Vec<PathBuf>> {
+    let base_dir = config_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let fragment_dir = base_dir.join(CONFIG_FRAGMENT_DIR);
+    if !fragment_dir.exists() {
+        return Ok(Vec::new());
+    }
+    if !fragment_dir.is_dir() {
+        bail!(
+            "global config fragment path {} is not a directory",
+            fragment_dir.display()
+        );
+    }
+
+    let mut fragments = Vec::new();
+    let entries = fs::read_dir(&fragment_dir).with_context(|| {
+        format!(
+            "failed to read global config fragment directory {}",
+            fragment_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read entry in global config fragment directory {}",
+                fragment_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat global config fragment {}", path.display()))?;
+        if file_type.is_file()
+            && path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+        {
+            fragments.push(path);
+        }
+    }
+    fragments.sort();
+    Ok(fragments)
 }
 
 fn to_anyhow(err: ConfigError) -> anyhow::Error {
@@ -568,9 +622,68 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::LogFormat;
+    use crate::cli::{Cli, LogFormat};
     use crate::settings::{ProxyProtocolMode, Settings};
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_merges_config_fragments_in_filename_order() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("exfilguard.toml");
+        fs::write(
+            &config_path,
+            r#"
+listen = "127.0.0.1:3128"
+ca_dir = "ca"
+clients = "clients.toml"
+policies = "policies.toml"
+response_header_timeout = 30
+"#,
+        )
+        .unwrap();
+        let fragment_dir = dir.path().join("config.d");
+        fs::create_dir(&fragment_dir).unwrap();
+        fs::write(
+            fragment_dir.join("10-long-polls.toml"),
+            "response_header_timeout = 45\n",
+        )
+        .unwrap();
+        fs::write(
+            fragment_dir.join("20-local.toml"),
+            "response_header_timeout = 60\n",
+        )
+        .unwrap();
+        fs::write(fragment_dir.join("README"), "ignored").unwrap();
+
+        let settings = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap();
+
+        assert_eq!(settings.response_header_timeout, 60);
+        assert_eq!(settings.ca_dir, dir.path().join("ca"));
+        assert_eq!(settings.clients, dir.path().join("clients.toml"));
+    }
+
+    #[test]
+    fn load_rejects_config_fragment_path_that_is_not_directory() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("exfilguard.toml");
+        fs::write(&config_path, "").unwrap();
+        fs::write(dir.path().join("config.d"), "not a directory").unwrap();
+
+        let error = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn test_settings_validation_cache_enabled() {

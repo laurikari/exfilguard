@@ -1,7 +1,7 @@
 # Configuration Reference
 
-These are the global settings in `exfilguard.toml`. ExfilGuard reads them at
-startup.
+These are the global settings in `exfilguard.toml` and optional
+`config.d/*.toml` fragments. ExfilGuard reads them at startup.
 
 ---
 
@@ -42,11 +42,32 @@ These settings are required.
     Set `proxy_protocol_allowed_cidrs` when PROXY protocol is enabled.
 
 !!! note
-    ExfilGuard reads `exfilguard.toml` only at startup. `SIGHUP` reloads only
-    the client and policy data read from the configured `clients`,
+    ExfilGuard reads `exfilguard.toml` and `config.d/*.toml` only at startup.
+    `SIGHUP` reloads only the client and policy data read from the configured `clients`,
     `clients_dir`, `policies`, and `policies_dir` paths. If you change fields
     in `exfilguard.toml` itself, including `listen`, metrics, cache, TLS,
     logging, and timeout settings, restart the server.
+
+---
+
+## Global Configuration Fragments
+
+ExfilGuard reads regular `*.toml` files from a `config.d` directory beside the
+selected main configuration file. Fragments load in lexicographic filename
+order after the main file and before `EXFILGUARD__*` environment overrides.
+Later values replace earlier values, and fragments may contain only the fields
+they override.
+
+For the default `/etc/exfilguard/exfilguard.toml`, a long-polling override could
+be written as `/etc/exfilguard/config.d/50-long-polls.toml`:
+
+```toml
+response_header_timeout = 60
+```
+
+All relative paths, including paths set by fragments, are resolved from the
+directory containing the main configuration file. Changing a fragment requires
+restarting ExfilGuard.
 
 ---
 

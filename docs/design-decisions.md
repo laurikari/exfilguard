@@ -131,6 +131,12 @@ or helper layers. The config is still checked strictly. Deserialization checks
 basic structure and types. Validation checks cross-field rules. Startup checks
 settings again before we start serving traffic.
 
+Startup layers the main file, lexically ordered `config.d/*.toml` fragments,
+and environment overrides in that order. Fragments are partial global settings;
+all relative paths retain the main file's directory as their base. Global
+settings remain restart-only, while SIGHUP reload stays limited to client and
+policy data.
+
 ## Some protocol features stay out of scope
 
 ExfilGuard does not currently support some protocol features, including

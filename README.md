@@ -74,8 +74,8 @@ policies.
 
 `SIGHUP` reloads only the client/policy data from the already configured
 `clients`, `clients_dir`, `policies`, and `policies_dir` paths. Changes to
-`exfilguard.toml` itself, including listener, metrics, cache, TLS, logging, and
-timeout settings, require restarting the process.
+`exfilguard.toml` or `config.d/*.toml`, including listener, metrics, cache, TLS,
+logging, and timeout settings, require restarting the process.
 
 ## Platform Support
 
@@ -224,6 +224,9 @@ Config loading fails if the HTTPS mode and method set are inconsistent.
   `/etc/exfilguard/exfilguard.toml` before falling back to `./exfilguard.toml`.
 - Relative paths in the config are resolved from the directory that contains the
   config file, which keeps packaged installs self-contained.
+- Global overrides can be placed in `config.d/*.toml` beside the selected main
+  config. Files load alphabetically after the main config and may contain only
+  the settings they override.
 - `clients_dir` and `policies_dir` can point at optional `*.d` directories. Every
   `.toml` file in those directories loads in alphabetical order after the base
   file. Names must be unique across all files.
