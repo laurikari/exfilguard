@@ -118,6 +118,8 @@ canonical path view so rule matching does not depend on origin-specific path
 normalization.
 
 - Query strings are ignored for path matching.
+- Percent-encoded RFC-unreserved characters are decoded and other valid
+  escapes use uppercase hex in the policy view.
 - Literal `.` and `..` path segments are normalized before policy evaluation.
 - Ambiguous path syntax is rejected with `400 Bad Request` instead of being
   silently rewritten. This includes invalid escapes, backslashes, encoded path

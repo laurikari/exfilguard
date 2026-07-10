@@ -189,10 +189,11 @@ url_pattern = "https://example.com:8443/api/**"
 
 !!! note
     Policy path matching uses a canonical path view. It ignores query strings,
-    normalizes literal `.` and `..` segments, and rejects ambiguous path
-    syntax instead of rewriting it. ExfilGuard still preserves the raw request
-    target for upstream forwarding, so signed requests keep their original
-    path bytes.
+    decodes percent-encoded RFC-unreserved characters, normalizes other valid
+    escapes to uppercase hex, normalizes literal `.` and `..` segments, and
+    rejects ambiguous path syntax instead of rewriting it. ExfilGuard still
+    preserves the raw request target for upstream forwarding, so signed
+    requests keep their original path bytes.
 
 !!! note
     Requests are rejected if the path contains invalid escapes, backslashes,

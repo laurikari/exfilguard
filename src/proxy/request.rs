@@ -322,7 +322,44 @@ fn canonicalize_policy_path(raw_path: &str) -> Result<String> {
     }
 
     validate_policy_path(path)?;
-    Ok(remove_literal_dot_segments(path))
+    let path = canonicalize_policy_escapes(path)?;
+    Ok(remove_literal_dot_segments(&path))
+}
+
+fn canonicalize_policy_escapes(path: &str) -> Result<String> {
+    const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let bytes = path.as_bytes();
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] != b'%' {
+            canonical.push(bytes[idx]);
+            idx += 1;
+            continue;
+        }
+
+        if idx + 2 >= bytes.len() {
+            bail!("request path contains invalid percent-escape");
+        }
+        let decoded = decode_hex_byte(bytes[idx + 1], bytes[idx + 2])?;
+        if is_rfc3986_unreserved(decoded) {
+            canonical.push(decoded);
+        } else {
+            canonical.push(b'%');
+            canonical.push(UPPER_HEX[usize::from(decoded >> 4)]);
+            canonical.push(UPPER_HEX[usize::from(decoded & 0x0f)]);
+        }
+        idx += 3;
+    }
+
+    Ok(String::from_utf8(canonical)
+        .expect("canonical path preserves UTF-8 and decodes only ASCII bytes"))
+}
+
+fn is_rfc3986_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn validate_policy_path(path: &str) -> Result<()> {
@@ -619,6 +656,23 @@ mod tests {
         )?;
         assert_eq!(parsed.path, "/public/../admin/./panel?token=abc");
         assert_eq!(parsed.policy_path(), "/admin/panel");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_request_canonicalizes_percent_escapes_for_policy_only() -> Result<()> {
+        let parsed = parse_http1_request(
+            Method::GET,
+            "/%61lias/../%61dmin/%7euser/%3a/%c3%af?sig=%7e",
+            Some("example.com"),
+            Scheme::Https,
+        )?;
+
+        assert_eq!(
+            parsed.path,
+            "/%61lias/../%61dmin/%7euser/%3a/%c3%af?sig=%7e"
+        );
+        assert_eq!(parsed.policy_path(), "/admin/~user/%3A/%C3%AF");
         Ok(())
     }
 

@@ -1155,7 +1155,7 @@ async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Re
     let upstream_addr = fixture.upstream_addr();
     let mut client = fixture.http1_client();
     let request = format!(
-        "GET /alias/../canonical/report?sig=abc HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
+        "GET /alias/../c%61nonical/report?sig=abc HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
         host = upstream_host,
         port = upstream_addr.port()
     );
@@ -1167,8 +1167,49 @@ async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Re
         "unexpected bumped response: {response}"
     );
     assert!(
-        response.contains("/alias/../canonical/report?sig=abc"),
+        response.contains("/alias/../c%61nonical/report?sig=abc"),
         "expected upstream to see raw request target, got: {response}"
+    );
+
+    client.stream_mut().shutdown().await.ok();
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http1_encoded_unreserved_hits_ordered_deny() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "deny-canonical-admin";
+    let policy = PolicySpec::new(policy_name)
+        .rule(
+            RuleSpec::deny(&["GET"], format!("https://{upstream_host}/admin/**"))
+                .status(451)
+                .body("canonical path denied"),
+        )
+        .rule(RuleSpec::allow(
+            &["GET"],
+            format!("https://{upstream_host}/**"),
+        ));
+    let mut fixture =
+        BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.http1_client();
+    let request = format!(
+        "GET /%61dmin/export HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port()
+    );
+    client.send(request.as_bytes()).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 451"),
+        "encoded admin path bypassed ordered deny: {response}"
+    );
+    assert!(
+        response.contains("canonical path denied"),
+        "unexpected deny response: {response}"
     );
 
     client.stream_mut().shutdown().await.ok();
@@ -1352,6 +1393,50 @@ async fn connect_bump_http2_invalid_request_path_returns_400() -> Result<()> {
     let (status, text) = client.request_text(request).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(text, "invalid request");
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_encoded_unreserved_hits_ordered_deny() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "deny-h2-canonical-admin";
+    let policy = PolicySpec::new(policy_name)
+        .rule(
+            RuleSpec::deny(&["GET"], format!("https://{upstream_host}/admin/**"))
+                .status(451)
+                .body("canonical path denied"),
+        )
+        .rule(RuleSpec::allow(
+            &["GET"],
+            format!("https://{upstream_host}/**"),
+        ));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/%61dmin/export")
+                .build()?,
+        )
+        .body(())?;
+    let (status, text) = client.request_text(request).await?;
+    assert_eq!(status, StatusCode::from_u16(451)?);
+    assert_eq!(text, "canonical path denied");
 
     client.shutdown().await;
     fixture.shutdown().await;
