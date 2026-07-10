@@ -48,7 +48,7 @@ async fn run_upstream(listener: TcpListener) -> Result<()> {
 fn write_main_config(dirs: &TestDirs, addr: SocketAddr) -> Result<()> {
     let config_path = dirs.config_dir.join("exfilguard.toml");
     let config = format!(
-        "listen = \"{addr}\"\n\nca_dir = \"{}\"\nclients = \"clients.toml\"\npolicies = \"policies.toml\"\nlog = \"text\"\n",
+        "listen = \"{addr}\"\nca = {{ source = \"builtin\", dir = \"{}\" }}\nclients = \"clients.toml\"\npolicies = \"policies.toml\"\nlog = \"text\"\n",
         dirs.ca_dir.display()
     );
     std::fs::write(&config_path, config)?;

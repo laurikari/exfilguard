@@ -85,6 +85,29 @@ signing key can impersonate every inspected origin, so deployment convenience
 does not justify accepting material another local principal can replace or
 read.
 
+## CA lifecycle is selected explicitly
+
+ExfilGuard has three CA sources with deliberately different ownership models.
+`builtin` creates a long-lived root and intermediate once, persists only the
+certificates and intermediate key, and does not renew them. `files` loads the
+same three artifacts but never creates or changes them. `vault` generates each
+intermediate key in memory, has a selected Vault PKI issuer sign it, and renews
+the complete issuer generation before expiry.
+
+The sources never silently fall back to one another. In particular, Vault
+unavailability after a restart prevents inspected HTTPS from starting because
+the previous in-memory issuer key is gone. During a running process, a failed
+renewal retains the current valid generation; after it expires, inspection
+fails closed instead of becoming a CONNECT tunnel. Replacing an issuer also
+replaces its leaf cache atomically so new handshakes cannot receive a leaf from
+the previous generation.
+
+ExfilGuard never loads or stores a root private key. File mode makes external
+ownership explicit, while Vault mode keeps CA and leaf private keys off disk.
+This separation is preferable to accepting partially managed directories or
+guessing an operator's intended lifecycle from whichever files happen to be
+present.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that

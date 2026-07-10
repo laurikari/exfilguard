@@ -96,7 +96,7 @@ environment, such as a minimal container, install the standard CA bundle
 - `src/config/` — config schema and loaders.
 - `src/policy/` — policy compiler and matcher.
 - `src/proxy/` — listeners, HTTP handlers, and upstream clients.
-- `src/tls/` — CA lifecycle plus the on-disk leaf cache.
+- `src/tls/` — CA lifecycle and the in-memory leaf cache.
 - `examples/` — ready-to-run configs (`quickstart/`, `full/`).
 - `docs/design-decisions.md` — why the code works this way.
 
@@ -155,9 +155,9 @@ strict, and policy checks run before any upstream connection is made.
   sane defaults.
 - Run as a non-root user and only listen on the interfaces you need. Put a
   firewall in front.
-- Keep `ca_dir` and its keys owned by the ExfilGuard process UID. Startup
-  enforces owner-only directory/key modes and rejects symlinks. Back up and
-  rotate the CA files regularly.
+- Choose an explicit `builtin`, `files`, or `vault` CA source. For file-backed
+  sources, startup enforces owner-only directory/key modes and rejects
+  symlinks. Vault mode keeps CA and leaf private keys in memory.
 - Review timeout and size limits for your setup (see `docs/configuration.md`).
 - Set `max_request_body_size`, `max_request_header_size`, and
   `max_response_header_size` to reasonable values.
@@ -242,15 +242,15 @@ fallback clients exist. The fallback must not set `ip` or `cidr`.
 
 ## Certificate storage and permissions
 
-`--ca-dir` holds the root and intermediate CA material. ExfilGuard writes keys
-with `0o600` and the directory with `0o700`. At startup it requires the final
-directory and every CA file to be owned by its process UID, rejects symlinks
-and non-regular files, and rejects group/world access to private keys. Read-only
-owner modes (`0o500` for the directory and `0o400` for keys) are supported.
-See `docs/configuration.md` for the exact certificate modes and remediation
-commands. Anyone who can read the signing key can mint certificates or
-impersonate the proxy, so run ExfilGuard as an unprivileged user and store the
-CA on trusted disks. Generated leaf keys are cached only in process memory.
+The required `ca` table chooses one explicit source: `builtin` generates a
+long-lived local hierarchy, `files` loads an externally managed hierarchy, and
+`vault` obtains and renews an in-memory intermediate from HashiCorp Vault. The
+two file-backed sources require owner-controlled directories and private keys;
+both reject `root.key` because ExfilGuard never needs the root signing key.
+See `docs/configuration.md` for lifecycle, permission, Vault, and migration
+details. Anyone who can use the intermediate key or Vault signing credential
+can mint certificates, so run ExfilGuard as an unprivileged user. Generated
+leaf keys are cached only in process memory.
 
 ## Testing
 
@@ -331,7 +331,9 @@ series are labeled with `effective_mode=direct|bump|tunnel`, so inspected HTTPS
 and explicit CONNECT tunnels stay distinct. Current-state gauges cover
 downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
 sessions, active HTTP/2 streams, upstream connections, cache usage, and the
-last successful policy reload time.
+last successful policy reload time. CA metrics report the configured source,
+root and intermediate expiry, issuer usability and generation, and Vault
+renewal outcomes. Example alert rules are in `docs/prometheus-alerts.yml`.
 
 ## Learn more
 

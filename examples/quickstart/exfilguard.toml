@@ -1,7 +1,7 @@
 listen = "127.0.0.1:3128"
 proxy_protocol = "off"
 
-ca_dir = "/tmp/exfilguard/quickstart/ca"
+ca = { source = "builtin", dir = "/tmp/exfilguard/quickstart/ca" }
 
 clients = "clients.toml"
 policies = "policies.toml"

@@ -12,7 +12,7 @@ use exfilguard::{
     config,
     policy::{self, matcher::PolicySnapshot},
     proxy::{self, AppContext, PolicyStore},
-    settings::{ProxyProtocolMode, Settings},
+    settings::{CaSettings, ProxyProtocolMode, Settings},
     tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
 };
 
@@ -27,7 +27,9 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         listen,
         proxy_protocol: ProxyProtocolMode::Off,
         proxy_protocol_allowed_cidrs: None,
-        ca_dir: dirs.ca_dir.clone(),
+        ca: CaSettings::Builtin {
+            dir: dirs.ca_dir.clone(),
+        },
         clients: dirs.clients_path.clone(),
         clients_dir: None,
         policies: dirs.policies_path.clone(),
@@ -144,7 +146,7 @@ impl ProxyHarnessBuilder {
     pub async fn spawn(mut self) -> Result<ProxyHarness> {
         write_clients_and_policies(&self.dirs, &self.clients, &self.policies)?;
 
-        let ca = Arc::new(CertificateAuthority::load_or_generate(&self.dirs.ca_dir)?);
+        let ca = Arc::new(CertificateAuthority::load_builtin(&self.dirs.ca_dir)?);
         let config_doc = config::load_config(&self.dirs.clients_path, &self.dirs.policies_path)?;
         let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
         let snapshot = PolicySnapshot::new(compiled);
@@ -193,7 +195,6 @@ impl ProxyHarnessBuilder {
         };
 
         let tls = Arc::new(proxy::TlsContext::new(
-            ca.clone(),
             tls_issuer,
             proxy_client_config,
             proxy_client_h2_config,

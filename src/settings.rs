@@ -18,6 +18,26 @@ struct SettingsDefaults;
 const CONFIG_FRAGMENT_DIR: &str = "config.d";
 
 impl SettingsDefaults {
+    fn vault_pki_mount() -> String {
+        "pki".to_string()
+    }
+
+    const fn vault_intermediate_ttl() -> u64 {
+        2_592_000
+    }
+
+    const fn vault_renewal_threshold() -> u64 {
+        1_296_000
+    }
+
+    const fn vault_request_timeout() -> u64 {
+        10
+    }
+
+    fn vault_approle_mount() -> String {
+        "approle".to_string()
+    }
+
     const fn leaf_ttl() -> u64 {
         86_400
     }
@@ -123,6 +143,173 @@ impl SettingsDefaults {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CaSettings {
+    Builtin { dir: PathBuf },
+    Files { dir: PathBuf },
+    Vault(Box<VaultCaSettings>),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VaultCaSettings {
+    pub address: String,
+    #[serde(default)]
+    pub tls_ca_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default = "SettingsDefaults::vault_pki_mount")]
+    pub pki_mount: String,
+    pub issuer: String,
+    pub expected_root_certs: PathBuf,
+    #[serde(default = "SettingsDefaults::vault_intermediate_ttl")]
+    pub intermediate_ttl: u64,
+    #[serde(default = "SettingsDefaults::vault_renewal_threshold")]
+    pub renewal_threshold: u64,
+    #[serde(default = "SettingsDefaults::vault_request_timeout")]
+    pub request_timeout: u64,
+    #[serde(default)]
+    pub tls_client_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_client_key: Option<PathBuf>,
+    pub auth: VaultAuth,
+}
+
+impl VaultCaSettings {
+    pub fn intermediate_ttl(&self) -> Duration {
+        Duration::from_secs(self.intermediate_ttl)
+    }
+
+    pub fn renewal_threshold(&self) -> Duration {
+        Duration::from_secs(self.renewal_threshold)
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout)
+    }
+}
+
+impl CaSettings {
+    fn apply_base_dir(&mut self, base_dir: &Path) {
+        match self {
+            Self::Builtin { dir } | Self::Files { dir } => {
+                *dir = absolutize(dir, base_dir);
+            }
+            Self::Vault(settings) => settings.apply_base_dir(base_dir),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Builtin { .. } | Self::Files { .. } => Ok(()),
+            Self::Vault(settings) => settings.validate(),
+        }
+    }
+}
+
+impl VaultCaSettings {
+    fn apply_base_dir(&mut self, base_dir: &Path) {
+        self.tls_ca_cert = self
+            .tls_ca_cert
+            .as_ref()
+            .map(|path| absolutize(path, base_dir));
+        self.expected_root_certs = absolutize(&self.expected_root_certs, base_dir);
+        self.tls_client_cert = self
+            .tls_client_cert
+            .as_ref()
+            .map(|path| absolutize(path, base_dir));
+        self.tls_client_key = self
+            .tls_client_key
+            .as_ref()
+            .map(|path| absolutize(path, base_dir));
+        self.auth.apply_base_dir(base_dir);
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure_nonempty("ca.address", &self.address)?;
+        if let Some(server_name) = self.tls_server_name.as_deref() {
+            ensure_nonempty("ca.tls_server_name", server_name)?;
+        }
+        if let Some(namespace) = self.namespace.as_deref() {
+            ensure_nonempty("ca.namespace", namespace)?;
+        }
+        ensure_nonempty("ca.pki_mount", &self.pki_mount)?;
+        ensure_nonempty("ca.issuer", &self.issuer)?;
+        ensure!(
+            self.intermediate_ttl > 0,
+            "ca.intermediate_ttl must be greater than 0 seconds (got {})",
+            self.intermediate_ttl
+        );
+        ensure!(
+            self.renewal_threshold > 0,
+            "ca.renewal_threshold must be greater than 0 seconds (got {})",
+            self.renewal_threshold
+        );
+        ensure!(
+            self.renewal_threshold < self.intermediate_ttl,
+            "ca.renewal_threshold must be less than ca.intermediate_ttl"
+        );
+        ensure!(
+            self.request_timeout > 0,
+            "ca.request_timeout must be greater than 0 seconds (got {})",
+            self.request_timeout
+        );
+        ensure!(
+            self.tls_client_cert.is_some() == self.tls_client_key.is_some(),
+            "ca.tls_client_cert and ca.tls_client_key must both be set or both be absent"
+        );
+        self.auth.validate()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VaultAuth {
+    #[serde(rename = "approle")]
+    AppRole {
+        #[serde(default = "SettingsDefaults::vault_approle_mount")]
+        mount: String,
+        role_id: String,
+        secret_id_file: PathBuf,
+    },
+    TokenFile {
+        token_file: PathBuf,
+    },
+    Proxy {},
+}
+
+impl VaultAuth {
+    fn apply_base_dir(&mut self, base_dir: &Path) {
+        match self {
+            Self::AppRole { secret_id_file, .. } => {
+                *secret_id_file = absolutize(secret_id_file, base_dir);
+            }
+            Self::TokenFile { token_file } => {
+                *token_file = absolutize(token_file, base_dir);
+            }
+            Self::Proxy {} => {}
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::AppRole { mount, role_id, .. } => {
+                ensure_nonempty("ca.auth.mount", mount)?;
+                ensure_nonempty("ca.auth.role_id", role_id)
+            }
+            Self::TokenFile { .. } | Self::Proxy {} => Ok(()),
+        }
+    }
+}
+
+fn ensure_nonempty(field: &str, value: &str) -> Result<()> {
+    ensure!(!value.trim().is_empty(), "{field} must not be empty");
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyProtocolMode {
@@ -189,7 +376,7 @@ pub struct Settings {
     pub proxy_protocol: ProxyProtocolMode,
     #[serde(default)]
     pub proxy_protocol_allowed_cidrs: Option<Vec<IpNet>>,
-    pub ca_dir: PathBuf,
+    pub ca: CaSettings,
     pub clients: PathBuf,
     pub policies: PathBuf,
     #[serde(default)]
@@ -478,7 +665,7 @@ impl Settings {
             .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
 
-        self.ca_dir = absolutize(&self.ca_dir, base_dir);
+        self.ca.apply_base_dir(base_dir);
         if let Some(cache_dir) = self.cache_dir.clone() {
             self.cache_dir = Some(absolutize(&cache_dir, base_dir));
         }
@@ -501,6 +688,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.ca.validate()?;
         if self.proxy_protocol != ProxyProtocolMode::Off {
             ensure!(
                 matches!(
@@ -641,13 +829,243 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use crate::cli::{Cli, LogFormat};
-    use crate::settings::{ProxyProtocolMode, Settings};
+    use crate::settings::{CaSettings, ProxyProtocolMode, Settings, VaultAuth, VaultCaSettings};
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tempfile::TempDir;
 
+    fn write_settings_config(dir: &TempDir, ca_config: &str) -> PathBuf {
+        let config_path = dir.path().join("exfilguard.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+listen = "127.0.0.1:3128"
+clients = "clients.toml"
+policies = "policies.toml"
+
+{ca_config}
+"#
+            ),
+        )
+        .unwrap();
+        config_path
+    }
+
+    fn valid_vault_settings(auth: VaultAuth) -> VaultCaSettings {
+        VaultCaSettings {
+            address: "https://vault.example.com".to_string(),
+            tls_ca_cert: Some(PathBuf::from("vault-ca.pem")),
+            tls_server_name: Some("vault.example.com".to_string()),
+            namespace: Some("team-a".to_string()),
+            pki_mount: "pki".to_string(),
+            issuer: "exfilguard".to_string(),
+            expected_root_certs: PathBuf::from("expected-roots.pem"),
+            intermediate_ttl: 2_592_000,
+            renewal_threshold: 1_296_000,
+            request_timeout: 10,
+            tls_client_cert: Some(PathBuf::from("client.pem")),
+            tls_client_key: Some(PathBuf::from("client.key")),
+            auth,
+        }
+    }
+
     #[test]
-    fn load_merges_config_fragments_in_filename_order() {
+    fn load_resolves_builtin_and_files_ca_directories() {
+        for source in ["builtin", "files"] {
+            let dir = TempDir::new().unwrap();
+            let config_path = write_settings_config(
+                &dir,
+                &format!(
+                    r#"[ca]
+source = "{source}"
+dir = "ca-material""#
+                ),
+            );
+
+            let settings = Settings::load(&Cli {
+                config: Some(config_path),
+            })
+            .unwrap();
+
+            let ca_dir = match settings.ca {
+                CaSettings::Builtin { dir } | CaSettings::Files { dir } => dir,
+                CaSettings::Vault(_) => panic!("unexpected Vault CA settings"),
+            };
+            assert_eq!(ca_dir, dir.path().join("ca-material"));
+        }
+    }
+
+    #[test]
+    fn load_vault_ca_applies_defaults_and_resolves_paths() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"[ca]
+source = "vault"
+address = "https://vault.example.com"
+tls_ca_cert = "vault-ca.pem"
+tls_server_name = "vault.internal"
+namespace = "team-a"
+issuer = "exfilguard"
+expected_root_certs = "expected-roots.pem"
+tls_client_cert = "client.pem"
+tls_client_key = "client.key"
+
+[ca.auth]
+method = "approle"
+role_id = "role-id"
+secret_id_file = "secret-id""#,
+        );
+
+        let settings = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap();
+        let CaSettings::Vault(vault) = settings.ca else {
+            panic!("expected Vault CA settings");
+        };
+
+        assert_eq!(vault.pki_mount, "pki");
+        assert_eq!(vault.intermediate_ttl(), Duration::from_secs(2_592_000));
+        assert_eq!(vault.renewal_threshold(), Duration::from_secs(1_296_000));
+        assert_eq!(vault.request_timeout(), Duration::from_secs(10));
+        assert_eq!(vault.tls_ca_cert, Some(dir.path().join("vault-ca.pem")));
+        assert_eq!(
+            vault.expected_root_certs,
+            dir.path().join("expected-roots.pem")
+        );
+        assert_eq!(vault.tls_client_cert, Some(dir.path().join("client.pem")));
+        assert_eq!(vault.tls_client_key, Some(dir.path().join("client.key")));
+        assert_eq!(
+            vault.auth,
+            VaultAuth::AppRole {
+                mount: "approle".to_string(),
+                role_id: "role-id".to_string(),
+                secret_id_file: dir.path().join("secret-id"),
+            }
+        );
+    }
+
+    #[test]
+    fn load_vault_token_file_and_proxy_auth() {
+        let token_dir = TempDir::new().unwrap();
+        let token_config = write_settings_config(
+            &token_dir,
+            r#"[ca]
+source = "vault"
+address = "https://vault.example.com"
+issuer = "exfilguard"
+expected_root_certs = "roots.pem"
+
+[ca.auth]
+method = "token_file"
+token_file = "vault-token""#,
+        );
+        let token_settings = Settings::load(&Cli {
+            config: Some(token_config),
+        })
+        .unwrap();
+        let CaSettings::Vault(token_vault) = token_settings.ca else {
+            panic!("expected Vault CA settings");
+        };
+        assert_eq!(
+            token_vault.auth,
+            VaultAuth::TokenFile {
+                token_file: token_dir.path().join("vault-token")
+            }
+        );
+
+        let proxy_dir = TempDir::new().unwrap();
+        let proxy_config = write_settings_config(
+            &proxy_dir,
+            r#"[ca]
+source = "vault"
+address = "https://vault.example.com"
+issuer = "exfilguard"
+expected_root_certs = "roots.pem"
+
+[ca.auth]
+method = "proxy""#,
+        );
+        let proxy_settings = Settings::load(&Cli {
+            config: Some(proxy_config),
+        })
+        .unwrap();
+        let CaSettings::Vault(proxy_vault) = proxy_settings.ca else {
+            panic!("expected Vault CA settings");
+        };
+        assert_eq!(proxy_vault.auth, VaultAuth::Proxy {});
+    }
+
+    #[test]
+    fn vault_ca_validation_rejects_invalid_values() {
+        let auth = VaultAuth::AppRole {
+            mount: "approle".to_string(),
+            role_id: "role-id".to_string(),
+            secret_id_file: PathBuf::from("secret-id"),
+        };
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.address = " ".to_string();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.tls_server_name = Some(String::new());
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.namespace = Some(String::new());
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.pki_mount = String::new();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.issuer = String::new();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.intermediate_ttl = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.renewal_threshold = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.renewal_threshold = invalid.intermediate_ttl;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.request_timeout = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.tls_client_key = None;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth.clone());
+        invalid.auth = VaultAuth::AppRole {
+            mount: String::new(),
+            role_id: "role-id".to_string(),
+            secret_id_file: PathBuf::from("secret-id"),
+        };
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = valid_vault_settings(auth);
+        invalid.auth = VaultAuth::AppRole {
+            mount: "approle".to_string(),
+            role_id: String::new(),
+            secret_id_file: PathBuf::from("secret-id"),
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn load_rejects_removed_ca_dir_setting() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("exfilguard.toml");
         fs::write(
@@ -657,7 +1075,35 @@ listen = "127.0.0.1:3128"
 ca_dir = "ca"
 clients = "clients.toml"
 policies = "policies.toml"
-response_header_timeout = 30
+"#,
+        )
+        .unwrap();
+
+        let error = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ca_dir") && error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn load_merges_config_fragments_in_filename_order() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("exfilguard.toml");
+        fs::write(
+            &config_path,
+            r#"
+	listen = "127.0.0.1:3128"
+	clients = "clients.toml"
+	policies = "policies.toml"
+	response_header_timeout = 30
+
+	[ca]
+	source = "builtin"
+	dir = "ca"
 "#,
         )
         .unwrap();
@@ -681,7 +1127,12 @@ response_header_timeout = 30
         .unwrap();
 
         assert_eq!(settings.response_header_timeout, 60);
-        assert_eq!(settings.ca_dir, dir.path().join("ca"));
+        assert_eq!(
+            settings.ca,
+            CaSettings::Builtin {
+                dir: dir.path().join("ca")
+            }
+        );
         assert_eq!(settings.clients, dir.path().join("clients.toml"));
     }
 
@@ -710,11 +1161,14 @@ response_header_timeout = 30
         fs::write(
             &config_path,
             r#"
-listen = "127.0.0.1:3128"
-ca_dir = "ca"
-clients = "clients.toml"
-policies = "policies.toml"
-cert_cache_dir = "leaf-cache"
+	listen = "127.0.0.1:3128"
+	clients = "clients.toml"
+	policies = "policies.toml"
+	cert_cache_dir = "leaf-cache"
+
+	[ca]
+	source = "builtin"
+	dir = "ca"
 "#,
         )
         .unwrap();
@@ -736,7 +1190,9 @@ cert_cache_dir = "leaf-cache"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
-            ca_dir: PathBuf::from("ca"),
+            ca: CaSettings::Builtin {
+                dir: PathBuf::from("ca"),
+            },
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
@@ -779,6 +1235,12 @@ cert_cache_dir = "leaf-cache"
         unlimited.max_request_body_size = 0;
         assert!(unlimited.validate().is_ok());
 
+        let mut invalid_ca = settings.clone();
+        let mut vault = valid_vault_settings(VaultAuth::Proxy {});
+        vault.request_timeout = 0;
+        invalid_ca.ca = CaSettings::Vault(Box::new(vault));
+        assert!(invalid_ca.validate().is_err());
+
         let mut invalid_leaf_cache = settings.clone();
         invalid_leaf_cache.leaf_cache_capacity = 0;
         assert!(invalid_leaf_cache.validate().is_err());
@@ -794,7 +1256,9 @@ cert_cache_dir = "leaf-cache"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
-            ca_dir: PathBuf::from("ca"),
+            ca: CaSettings::Builtin {
+                dir: PathBuf::from("ca"),
+            },
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
@@ -844,7 +1308,9 @@ cert_cache_dir = "leaf-cache"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
-            ca_dir: PathBuf::from("ca"),
+            ca: CaSettings::Builtin {
+                dir: PathBuf::from("ca"),
+            },
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
@@ -891,7 +1357,9 @@ cert_cache_dir = "leaf-cache"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Required,
             proxy_protocol_allowed_cidrs: None,
-            ca_dir: PathBuf::from("ca"),
+            ca: CaSettings::Builtin {
+                dir: PathBuf::from("ca"),
+            },
             clients: PathBuf::from("clients.toml"),
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,

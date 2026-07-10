@@ -45,7 +45,7 @@ mod tests {
         config::Scheme,
         policy::{self, matcher::PolicySnapshot},
         proxy::{self, PolicyStore, http::upstream::UpstreamPool},
-        settings::{ProxyProtocolMode, Settings},
+        settings::{CaSettings, ProxyProtocolMode, Settings},
         tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
     };
     use anyhow::Result;
@@ -87,7 +87,9 @@ name = "allow"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
-            ca_dir: ca_dir.clone(),
+            ca: CaSettings::Builtin {
+                dir: ca_dir.clone(),
+            },
             clients: clients_path.clone(),
             clients_dir: None,
             policies: policies_path.clone(),
@@ -124,7 +126,7 @@ name = "allow"
             metrics_tls_key: None,
         };
 
-        let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
+        let ca = Arc::new(CertificateAuthority::load_builtin(&ca_dir)?);
         let cert_cache = Arc::new(CertificateCache::new(settings.leaf_cache_capacity)?);
         let tls_issuer = Arc::new(TlsIssuer::new(
             ca.clone(),
@@ -140,7 +142,6 @@ name = "allow"
         let tls_client_config = Arc::new(build_test_client_config());
         let tls_client_h2_config = Arc::new(build_test_client_config_h2());
         let tls_context = Arc::new(proxy::TlsContext::new(
-            ca,
             tls_issuer,
             tls_client_config,
             tls_client_h2_config,

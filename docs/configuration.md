@@ -14,7 +14,7 @@ These settings are required.
 | `listen` | String | Yes | Listen address and port (e.g., `"127.0.0.1:3128"`) |
 | `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
 | `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
-| `ca_dir` | Path | Yes | Directory containing CA certificate and private key for TLS interception |
+| `ca` | Table | Yes | Explicit TLS interception CA source: `builtin`, `files`, or `vault` |
 | `clients` | Path | Yes | Path to clients configuration file |
 | `policies` | Path | Yes | Path to policies configuration file |
 | `clients_dir` | Path | No | Directory containing additional client config files (*.toml) |
@@ -81,112 +81,210 @@ These settings control TLS interception and leaf certificate generation.
 | `leaf_cache_capacity` | usize | 4096 | Maximum number of generated TLS leaves retained in memory (must be > 0) |
 | `leaf_mint_concurrency` | usize | 4 | Maximum concurrent blocking TLS leaf mint jobs (must be > 0) |
 
-### CA Directory Structure
+### CA Sources
 
-ExfilGuard uses a root CA plus an intermediate CA. `ca_dir` must contain:
+ExfilGuard uses a root CA and a path-length-zero intermediate CA. The
+intermediate signs generated leaves, ExfilGuard sends `Leaf -> Intermediate ->
+Root`, and clients trust the root. Choose the component that owns this
+lifecycle explicitly; ExfilGuard never guesses from the files it finds and
+never falls back to another source. In every mode, leaf validity is capped by
+the active intermediate's remaining validity, with a safety margin; issuance
+stops when too little safe lifetime remains.
 
+#### `builtin`
+
+```toml
+ca = { source = "builtin", dir = "/var/lib/exfilguard/ca" }
 ```
-ca_dir/
-├── root.crt           # Root CA certificate
-├── root.key           # Root CA private key (optional when using external CA)
-├── intermediate.crt   # Intermediate CA certificate (signed by root)
-└── intermediate.key   # Intermediate CA private key
+
+On the first start with an empty directory, ExfilGuard generates certificates
+valid for approximately ten years and persists exactly:
+
+```text
+ca/
+├── root.crt
+├── intermediate.crt
+└── intermediate.key
 ```
 
-- The intermediate CA signs leaf certificates.
-- ExfilGuard sends the chain `Leaf -> Intermediate -> Root` to clients.
-- Clients only need to trust the root CA.
-- If you use an externally signed intermediate, `root.key` may be omitted.
+The root key exists only while the hierarchy is generated and is never written
+to disk. Consequently, `builtin` cannot renew or replace its intermediate
+under the same root. An incomplete directory fails startup rather than
+silently creating a new trust anchor. Before the hierarchy expires, or after a
+key compromise, generate a new hierarchy and distribute its new root to
+clients.
 
-If `ca_dir` is empty, ExfilGuard generates all four files automatically on first startup.
+The Debian package selects `builtin`, creates `/var/lib/exfilguard/ca` as
+`exfilguard:exfilguard` mode `0700`, and runs the service with `UMask=0077`.
+It therefore works on a clean installation without an operator permission
+step.
 
-ExfilGuard enforces owner-only control of this material at every startup:
+#### `files`
 
-- `ca_dir` must be a real directory, not a symlink, owned by the process UID,
-  with mode `0700` or read-only mode `0500`.
+```toml
+ca = { source = "files", dir = "/var/lib/exfilguard/ca" }
+```
+
+`files` treats all three artifacts above as externally managed. ExfilGuard
+neither creates nor renews them. Provision a new intermediate certificate and
+matching key as one generation, replace the directory contents safely, and
+restart ExfilGuard. The new process starts with an empty in-memory leaf cache.
+
+Startup validates that the intermediate key matches its certificate, the
+intermediate chains to the root, both certificates are currently valid, and
+CA basic constraints, path length, key usage, and issuer validity allow safe
+leaf issuance. `root.key` is always rejected: neither file-backed source uses
+it, and leaving a root signing key beside the online intermediate needlessly
+increases exposure.
+
+#### File permissions
+
+For `builtin` and `files`, ExfilGuard enforces owner-only control at every
+startup:
+
+- The directory must be real, not a symlink, owned by the process UID, and
+  mode `0700` or read-only mode `0500`.
 - Every CA file must be a regular, non-symlink file owned by the process UID.
-- `root.key` and `intermediate.key` must have mode `0600` or read-only mode
-  `0400`.
-- Certificates must be owner-readable, non-executable, and not writable by
-  group or other users. Generated certificates request mode `0644`; the Debian
-  service's `UMask=0077` reduces that to `0600`. Read-only modes such as `0444`
-  are also suitable.
+- `intermediate.key` must have mode `0600` or read-only mode `0400`.
+- Certificates must be owner-readable and non-executable, and must not be
+  writable by group or other users. Modes `0600`, `0644`, and read-only
+  equivalents are suitable.
 
-Startup fails with a remediation command when these requirements are not met;
-ExfilGuard does not change the ownership or permissions of provisioned files.
+Startup reports a remediation command instead of changing provisioned files.
 For the packaged service, a typical repair is:
 
 ```bash
 sudo chown -R exfilguard:exfilguard /var/lib/exfilguard/ca
 sudo chmod 0700 /var/lib/exfilguard/ca
-sudo chmod 0600 /var/lib/exfilguard/ca/root.key \
-  /var/lib/exfilguard/ca/intermediate.key
+sudo chmod 0600 /var/lib/exfilguard/ca/intermediate.key
 sudo chmod 0644 /var/lib/exfilguard/ca/root.crt \
   /var/lib/exfilguard/ca/intermediate.crt
 ```
 
-If `root.key` is intentionally absent, omit it from the command.
+Package upgrades restore the CA directory ownership and mode but deliberately
+do not rewrite operator-provisioned files.
 
-The Debian package creates `/var/lib/exfilguard/ca` as
-`exfilguard:exfilguard` mode `0700` and runs the service with `UMask=0077`, so
-a clean installation satisfies these rules on its first start. Package
-upgrades restore the directory ownership and mode but deliberately do not
-change existing CA files; operator-provisioned material must already satisfy
-the file rules above.
+#### `vault`
 
-!!! note
-    If you change files under `ca_dir`, restart the server. Generated leaf
-    certificates are cached only in process memory and disappear on restart.
+This integration is for HashiCorp Vault's PKI secrets engine, including Vault
+Enterprise namespaces. HCP Vault Secrets is a different product and API.
 
-### Using Your Corporate CA
+Vault mode generates a fresh intermediate key in process memory and submits
+its CSR to the configured selected Vault PKI issuer. The intermediate key and
+all generated leaf keys remain in memory. ExfilGuard authenticates only when
+it needs a signing operation, discards direct-auth tokens after that request,
+and renews the whole issuer generation before expiry. The immutable issuer and
+its empty leaf cache become active in one atomic switch.
 
-Use this flow if you want clients to trust ExfilGuard through your existing
-PKI:
+```toml
+[ca]
+source = "vault"
+address = "https://vault.internal.example:8200"
+tls_ca_cert = "/etc/exfilguard/vault-tls-ca.crt"
+# namespace = "team-a"
+pki_mount = "pki"
+issuer = "exfilguard-parent"
+expected_root_certs = "/etc/exfilguard/exfilguard-roots.pem"
+intermediate_ttl = 2592000       # 30 days
+renewal_threshold = 1296000      # renew with 15 days remaining
+request_timeout = 10
+# tls_client_cert = "/etc/exfilguard/vault-client.crt"
+# tls_client_key = "/etc/exfilguard/vault-client.key"
 
-1. **Let ExfilGuard generate its keys**:
-   ```bash
-   # Creates root.crt, root.key, intermediate.crt, intermediate.key
-   exfilguard --config exfilguard.toml
-   ```
-   Start with an empty `ca_dir`, then stop the process after it creates the
-   files.
+[ca.auth]
+method = "approle"
+mount = "approle"
+role_id = "00000000-0000-0000-0000-000000000000"
+secret_id_file = "/etc/exfilguard/vault-secret-id"
+```
 
-2. **Create a CSR from the generated intermediate key**:
-   ```bash
-   openssl req -new -key ca_dir/intermediate.key \
-     -out intermediate.csr \
-     -subj "/CN=ExfilGuard Intermediate CA"
-   ```
+`pki_mount` defaults to `pki`, `intermediate_ttl` to 30 days,
+`renewal_threshold` to 15 days, and `request_timeout` to 10 seconds. The
+threshold must be shorter than the requested lifetime. Set it early enough to
+cover a realistic Vault outage and operator response window.
 
-3. **Get your corporate CA to sign the CSR**:
-   ```bash
-   # Example using openssl (adjust to your CA's process)
-   openssl x509 -req -in intermediate.csr \
-     -CA corporate-ca.crt -CAkey corporate-ca.key \
-     -CAcreateserial -out intermediate-signed.crt \
-     -days 365 -sha256 \
-     -extfile <(echo "basicConstraints=CA:TRUE,pathlen:0
-   keyUsage=keyCertSign,cRLSign")
-   ```
+Set `tls_server_name` when `address` uses an IP literal but the Vault server
+certificate names a DNS host. It controls certificate verification while the
+client still connects to the configured IP.
 
-4. **Replace the certificates**:
-   ```bash
-   cp corporate-ca.crt ca_dir/root.crt
-   cp intermediate-signed.crt ca_dir/intermediate.crt
-   # Keep the original intermediate.key - it matches the CSR
-   # root.key is no longer needed (can be removed or kept)
-   ```
+ExfilGuard calls only:
 
-   Ensure the copied files are owned by the same UID that runs ExfilGuard and
-   restore the directory, key, and certificate modes documented above.
+```text
+POST /v1/<pki_mount>/issuer/<issuer>/sign-intermediate
+```
 
-5. **Restart ExfilGuard**.
-   Clients that trust your corporate CA will then trust intercepted
-   connections.
+Vault must support selected issuers. ExfilGuard does not fall back to the
+older default-issuer endpoint because that could select a different trust
+hierarchy. Give the AppRole or token `update` permission only on that exact
+path. If possible, use a selected signing issuer constrained to `pathlen:1` so
+the ExfilGuard intermediate is cryptographically limited to `pathlen:0`.
 
-!!! note
-    The private key (`intermediate.key`) stays the same. Only the certificate
-    changes.
+`expected_root_certs` is a PEM bundle independent of the TLS CA used to reach
+Vault. ExfilGuard accepts the returned issuer only when it chains to one of
+these explicitly pinned roots and passes the same key, constraint, usage, and
+validity checks as file mode. Put old and new roots in the bundle during a
+planned root rotation, switch the Vault issuer, then remove the old root after
+the overlap period. Changing the bundle requires restarting ExfilGuard.
+
+Vault supports three authentication transports:
+
+- `approle` performs a just-in-time login at
+  `/v1/auth/<mount>/login`. Keep `role_id` in TOML and the durable SecretID in
+  the dedicated owner-only `secret_id_file`. Prefer a narrowly scoped AppRole,
+  CIDR bindings where addresses are stable, no default policy, and a one-use
+  token for the signing request. The reusable SecretID remains durable signing
+  authority: keeping CA keys in memory does not make a compromised host or
+  credential harmless.
+- `token_file` reads a token supplied and renewed by another component:
+
+  ```toml
+  [ca.auth]
+  method = "token_file"
+  token_file = "/run/exfilguard/vault-token"
+  ```
+
+- `proxy` sends the request without a token so a local Vault Proxy can attach
+  its auto-auth token. Point `ca.address` at its restricted listener:
+
+  ```toml
+  [ca.auth]
+  method = "proxy"
+  ```
+
+Credential files must be regular, non-symlink, owned by the ExfilGuard process
+UID, and readable only by that owner. Literal SecretIDs and tokens are not
+accepted in TOML or command-line arguments. Vault requests do not follow
+redirects or inherit ambient HTTP proxy settings, preventing credentials from
+being forwarded to another origin or back through ExfilGuard itself. Vault
+connections must use HTTPS; plaintext HTTP is accepted only for a loopback IP
+listener such as a local Vault Proxy.
+
+Vault mode has a deliberate availability dependency: after every process
+restart, Vault must be reachable because the old intermediate key was never
+persisted. If a renewal fails while the active issuer is still valid,
+ExfilGuard keeps serving with it, retries with bounded backoff, and exposes the
+failure to Prometheus. An invalid Vault response never replaces the issuer. If
+no usable issuer exists, inspected HTTPS fails closed; it never falls back to
+`builtin`, `files`, direct forwarding, or CONNECT tunneling. Renewal failures
+do not crash a process that still has a valid issuer.
+
+### Migrating from `ca_dir`
+
+The old top-level `ca_dir` setting is not accepted. Replace it with one of the
+explicit configurations above. Existing installations must also remove
+`root.key` from the active CA directory before starting this version. If it is
+a real root key that must be retained, move it to appropriately protected
+offline storage; ExfilGuard never reads it. Remove the older compatibility
+workaround that copied `intermediate.key` to `root.key`.
+
+For an existing locally generated directory, the direct migration is:
+
+```toml
+ca = { source = "builtin", dir = "/var/lib/exfilguard/ca" }
+```
+
+Retain `root.crt`, `intermediate.crt`, and `intermediate.key`, remove
+`root.key`, restore the documented ownership and modes, then restart.
 
 ---
 
@@ -262,6 +360,24 @@ decisions, latency, cache activity, and upstream reuse, plus gauges for current
 downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
 sessions, active HTTP/2 streams, upstream connections, cache usage, and the
 last successful policy reload time.
+
+CA lifecycle metrics are intentionally low-cardinality:
+
+| Metric | Description |
+|--------|-------------|
+| `ca_source_info{source}` | Selected `builtin`, `files`, or `vault` source |
+| `ca_certificate_not_after_timestamp_seconds{certificate}` | Root or active intermediate expiry as a Unix timestamp |
+| `ca_issuer_usable` | `1` while the active issuer can safely mint a leaf, otherwise `0` |
+| `ca_issuer_generation` | In-process issuer generation; increments on a successful Vault replacement |
+| `ca_vault_renewal_attempts_total{result,reason}` | Vault renewal outcomes with bounded reason labels |
+| `ca_vault_last_renewal_attempt_timestamp_seconds` | Last Vault renewal attempt time |
+| `ca_vault_last_renewal_success_timestamp_seconds` | Last successful Vault renewal time |
+
+Scrape these metrics in every CA mode: certificate expiry matters for
+`builtin` and `files` even though ExfilGuard does not renew those sources. See
+[`prometheus-alerts.yml`](prometheus-alerts.yml) for example expiry, usability,
+and Vault failure alerts. Adjust the warning windows to your certificate TTL
+and incident-response policy.
 
 ---
 
@@ -370,7 +486,7 @@ EXFILGUARD__UPSTREAM_CONNECT_TIMEOUT=120
 ```toml
 # Core settings
 listen = "127.0.0.1:3128"
-ca_dir = "./ca"
+ca = { source = "builtin", dir = "./ca" }
 clients = "clients.toml"
 policies = "policies.toml"
 clients_dir = "clients.d"

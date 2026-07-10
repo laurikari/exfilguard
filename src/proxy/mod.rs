@@ -21,11 +21,7 @@ use tokio::sync::watch;
 pub(crate) use self::resolver::{
     UpstreamResolver, default_upstream_resolver, permissive_test_upstream_resolver,
 };
-use crate::{
-    policy::matcher::PolicySnapshot,
-    settings::Settings,
-    tls::{ca::CertificateAuthority, issuer::TlsIssuer},
-};
+use crate::{policy::matcher::PolicySnapshot, settings::Settings, tls::issuer::TlsIssuer};
 use rustls::client::ClientConfig;
 
 #[derive(Clone)]
@@ -88,7 +84,6 @@ impl AppContext {
 
 #[derive(Clone)]
 pub struct TlsContext {
-    pub ca: Arc<CertificateAuthority>,
     pub issuer: Arc<TlsIssuer>,
     pub client_http1: Arc<ClientConfig>,
     pub client_http2: Arc<ClientConfig>,
@@ -96,13 +91,11 @@ pub struct TlsContext {
 
 impl TlsContext {
     pub fn new(
-        ca: Arc<CertificateAuthority>,
         issuer: Arc<TlsIssuer>,
         client_http1: Arc<ClientConfig>,
         client_http2: Arc<ClientConfig>,
     ) -> Self {
         Self {
-            ca,
             issuer,
             client_http1,
             client_http2,

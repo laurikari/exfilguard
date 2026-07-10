@@ -17,7 +17,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SerialNumber,
 };
 use rustls::crypto::ring;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 use time::{Duration, OffsetDateTime};
 use tracing::info;
@@ -28,26 +28,35 @@ const ROOT_KEY_FILE: &str = "root.key";
 const INTERMEDIATE_CERT_FILE: &str = "intermediate.crt";
 const INTERMEDIATE_KEY_FILE: &str = "intermediate.key";
 const ROOT_VALIDITY_YEARS: i64 = 10;
-const INTERMEDIATE_VALIDITY_YEARS: i64 = 1;
+const LEAF_ISSUER_EXPIRY_MARGIN: Duration = Duration::minutes(5);
 
 /// Handles lifecycle management for the root and intermediate certificate authority.
 #[derive(Clone)]
 pub struct CertificateAuthority {
-    root_cert: Arc<Vec<u8>>,
-    intermediate_cert: Arc<Vec<u8>>,
+    certificate_chain: Arc<Vec<Vec<u8>>>,
     intermediate_key: Arc<KeyPair>,
+    root_not_after: OffsetDateTime,
+    intermediate_not_after: OffsetDateTime,
 }
 
 impl CertificateAuthority {
-    /// Load existing CA material from `ca_dir`, generating a new root and intermediate if none
-    /// exists yet. When generating, the material is written to disk before being returned.
-    pub fn load_or_generate<P: AsRef<Path>>(ca_dir: P) -> Result<Self> {
-        let ca_dir = ca_dir.as_ref();
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(ca_dir)
-            .with_context(|| format!("failed to create CA directory {}", ca_dir.display()))?;
+    /// Load or initialize ExfilGuard's built-in CA hierarchy.
+    pub fn load_builtin<P: AsRef<Path>>(ca_dir: P) -> Result<Self> {
+        Self::load_from_directory(ca_dir.as_ref(), true)
+    }
+
+    pub fn load_files<P: AsRef<Path>>(ca_dir: P) -> Result<Self> {
+        Self::load_from_directory(ca_dir.as_ref(), false)
+    }
+
+    fn load_from_directory(ca_dir: &Path, allow_generation: bool) -> Result<Self> {
+        if allow_generation {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(ca_dir)
+                .with_context(|| format!("failed to create CA directory {}", ca_dir.display()))?;
+        }
 
         let expected_uid = geteuid().as_raw();
         validate_ca_directory(ca_dir, expected_uid)?;
@@ -77,16 +86,31 @@ impl CertificateAuthority {
             }
         }
 
+        if has_root_key {
+            bail!(
+                "obsolete {} found in {}; ExfilGuard never loads a root private key; move it to offline storage or remove the invalid compatibility copy",
+                ROOT_KEY_FILE,
+                ca_dir.display()
+            );
+        }
+
         match (
             has_root_cert,
             has_root_key,
             has_intermediate_cert,
             has_intermediate_key,
         ) {
-            (false, false, false, false) => Self::generate(&paths),
-            (true, _, true, true) => Self::load_existing(&paths),
+            (false, false, false, false) if allow_generation => Self::generate(&paths),
+            (false, false, false, false) => bail!(
+                "files CA source requires {}, {}, and {} in {}",
+                ROOT_CERT_FILE,
+                INTERMEDIATE_CERT_FILE,
+                INTERMEDIATE_KEY_FILE,
+                ca_dir.display()
+            ),
+            (true, false, true, true) => Self::load_existing(&paths),
             _ => bail!(
-                "incomplete CA material detected in {}; expected {}, {}, {} (and optionally {})",
+                "incomplete CA material detected in {}; expected exactly {}, {}, and {}; {} is forbidden",
                 ca_dir.display(),
                 ROOT_CERT_FILE,
                 INTERMEDIATE_CERT_FILE,
@@ -99,39 +123,39 @@ impl CertificateAuthority {
     fn generate(paths: &CaPaths) -> Result<Self> {
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
-        let root_params = build_root_params()?;
+        let now = OffsetDateTime::now_utc();
+        let not_before = now - Duration::days(1);
+        let not_after = now + Duration::days(ROOT_VALIDITY_YEARS * 365);
+        let root_params = build_root_params(not_before, not_after)?;
         let root_cert = root_params
             .self_signed(&root_key)
             .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
 
         let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
-        let intermediate_params = build_intermediate_params()?;
+        let intermediate_params = build_intermediate_params(not_before, not_after)?;
         let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let intermediate_cert =
             sign_certificate(&intermediate_params, &intermediate_key, &root_issuer)?;
 
         let root_cert_pem = root_cert.pem();
-        let root_key_pem = Zeroizing::new(root_key.serialize_pem());
         let intermediate_cert_pem = intermediate_cert.pem();
         let intermediate_key_pem = Zeroizing::new(intermediate_key.serialize_pem());
 
         write_pem_file(&paths.root_cert, &root_cert_pem, false)?;
-        write_pem_file(&paths.root_key, root_key_pem.as_str(), true)?;
         write_pem_file(&paths.intermediate_cert, &intermediate_cert_pem, false)?;
         write_pem_file(&paths.intermediate_key, intermediate_key_pem.as_str(), true)?;
 
         let expected_uid = geteuid().as_raw();
         for (path, kind) in [
             (&paths.root_cert, CaFileKind::Certificate),
-            (&paths.root_key, CaFileKind::PrivateKey),
             (&paths.intermediate_cert, CaFileKind::Certificate),
             (&paths.intermediate_key, CaFileKind::PrivateKey),
         ] {
             validate_ca_file(path, kind, expected_uid)?;
         }
 
-        // Drop root key as soon as we've finished persisting it.
+        // The built-in root key is intentionally never persisted.
         drop(root_key);
 
         let root_der = root_cert.der().as_ref().to_vec();
@@ -157,16 +181,31 @@ impl CertificateAuthority {
         Self::from_material(root_der, intermediate_der, intermediate_key)
     }
 
-    fn from_material(
+    pub(crate) fn from_material(
         root_der: Vec<u8>,
         intermediate_der: Vec<u8>,
         intermediate_key: KeyPair,
     ) -> Result<Self> {
-        ensure_key_matches_cert(&intermediate_der, &intermediate_key)?;
+        Self::from_chain(vec![intermediate_der, root_der], intermediate_key)
+    }
+
+    pub(crate) fn from_chain(
+        certificate_chain: Vec<Vec<u8>>,
+        intermediate_key: KeyPair,
+    ) -> Result<Self> {
+        let now = OffsetDateTime::now_utc();
+        let chain_refs: Vec<&[u8]> = certificate_chain.iter().map(Vec::as_slice).collect();
+        let validity =
+            super::validation::validate_ca_hierarchy(&chain_refs, &intermediate_key, now)?;
+        ensure!(
+            validity.intermediate_not_after > now + LEAF_ISSUER_EXPIRY_MARGIN,
+            "intermediate certificate has too little remaining validity to issue a leaf"
+        );
         Ok(Self {
-            root_cert: Arc::new(root_der),
-            intermediate_cert: Arc::new(intermediate_der),
+            certificate_chain: Arc::new(certificate_chain),
             intermediate_key: Arc::new(intermediate_key),
+            root_not_after: validity.root_not_after,
+            intermediate_not_after: validity.intermediate_not_after,
         })
     }
 
@@ -178,22 +217,40 @@ impl CertificateAuthority {
 
     /// Returns the DER-encoded root certificate.
     pub fn root_certificate_der(&self) -> CertificateDer<'static> {
-        CertificateDer::from(self.root_cert.as_ref().clone())
+        CertificateDer::from(
+            self.certificate_chain
+                .last()
+                .expect("validated CA chain is nonempty")
+                .clone(),
+        )
     }
 
     /// Returns the DER-encoded intermediate certificate.
     pub fn intermediate_certificate_der(&self) -> CertificateDer<'static> {
-        CertificateDer::from(self.intermediate_cert.as_ref().clone())
+        CertificateDer::from(
+            self.certificate_chain
+                .first()
+                .expect("validated CA chain is nonempty")
+                .clone(),
+        )
+    }
+
+    pub fn root_not_after(&self) -> OffsetDateTime {
+        self.root_not_after
+    }
+
+    pub fn intermediate_not_after(&self) -> OffsetDateTime {
+        self.intermediate_not_after
     }
 
     /// Returns the certificate chain to present to clients. The leaf certificate is expected
     /// to be prepended by the caller.
     pub fn certificate_chain(&self) -> Vec<CertificateDer<'static>> {
-        let _ = &self.intermediate_key;
-        vec![
-            self.intermediate_certificate_der(),
-            self.root_certificate_der(),
-        ]
+        self.certificate_chain
+            .iter()
+            .cloned()
+            .map(CertificateDer::from)
+            .collect()
     }
 
     /// Mint a new leaf certificate for the provided subject names with the requested validity.
@@ -201,10 +258,11 @@ impl CertificateAuthority {
     pub fn mint_leaf(&self, names: &[&str], ttl: StdDuration) -> Result<MintedLeaf> {
         ensure!(!names.is_empty(), "at least one subject name is required");
         ensure!(ttl > StdDuration::from_secs(0), "leaf ttl must be positive");
-        let (leaf_params, expires_at) = build_leaf_params(names, ttl)?;
+        let issuer_not_after = self.root_not_after.min(self.intermediate_not_after);
+        let (leaf_params, expires_at) = build_leaf_params(names, ttl, issuer_not_after)?;
         let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate leaf key: {err}"))?;
-        let intermediate_cert = CertificateDer::from(self.intermediate_cert.as_ref().clone());
+        let intermediate_cert = self.intermediate_certificate_der();
         let issuer = rcgen::Issuer::from_ca_cert_der(&intermediate_cert, &*self.intermediate_key)
             .map_err(|err| anyhow!("failed to parse intermediate certificate: {err}"))?;
         let leaf_cert = sign_certificate(&leaf_params, &leaf_key, &issuer)?;
@@ -238,24 +296,32 @@ impl CertificateAuthority {
     }
 }
 
-fn build_root_params() -> Result<CertificateParams> {
+fn build_root_params(
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
+) -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.serial_number = Some(random_serial()?);
     params.distinguished_name = distinguished_name("ExfilGuard Root CA");
-    set_validity(&mut params, ROOT_VALIDITY_YEARS);
+    params.not_before = not_before;
+    params.not_after = not_after;
     Ok(params)
 }
 
-fn build_intermediate_params() -> Result<CertificateParams> {
+fn build_intermediate_params(
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
+) -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.use_authority_key_identifier_extension = true;
     params.serial_number = Some(random_serial()?);
     params.distinguished_name = distinguished_name("ExfilGuard Intermediate CA");
-    set_validity(&mut params, INTERMEDIATE_VALIDITY_YEARS);
+    params.not_before = not_before;
+    params.not_after = not_after;
     Ok(params)
 }
 
@@ -263,12 +329,6 @@ fn distinguished_name(common_name: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, common_name);
     dn
-}
-
-fn set_validity(params: &mut CertificateParams, years: i64) {
-    let now = OffsetDateTime::now_utc();
-    params.not_before = now - Duration::days(1);
-    params.not_after = now + Duration::days(years * 365);
 }
 
 fn random_serial() -> Result<SerialNumber> {
@@ -431,30 +491,16 @@ fn read_certificate_der(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .with_context(|| format!("failed to read certificate {}", path.display()))?;
-    let mut certs = CertificateDer::pem_slice_iter(&bytes);
-    match certs.next() {
-        Some(Ok(cert)) => {
-            match certs.next() {
-                Some(Ok(_)) => {
-                    bail!(
-                        "multiple certificates found in {}; expected a single PEM section",
-                        path.display()
-                    );
-                }
-                Some(Err(err)) => {
-                    return Err(err).with_context(|| {
-                        format!("failed to parse certificate at {}", path.display())
-                    });
-                }
-                None => {}
-            }
-            Ok(cert.as_ref().to_vec())
-        }
-        Some(Err(err)) => {
-            Err(err).with_context(|| format!("failed to parse certificate at {}", path.display()))
-        }
-        None => bail!("no certificate found in {}", path.display()),
-    }
+    let certificates = super::validation::parse_strict_certificate_pem_bundle(
+        &bytes,
+        &format!("certificate {}", path.display()),
+    )?;
+    ensure!(
+        certificates.len() == 1,
+        "multiple certificates found in {}; expected a single PEM section",
+        path.display()
+    );
+    Ok(certificates.into_iter().next().expect("length checked"))
 }
 
 fn read_private_key_pem(path: &Path) -> Result<Zeroizing<String>> {
@@ -463,16 +509,6 @@ fn read_private_key_pem(path: &Path) -> Result<Zeroizing<String>> {
     file.read_to_string(&mut pem)
         .with_context(|| format!("failed to read intermediate key from {}", path.display()))?;
     Ok(pem)
-}
-
-fn ensure_key_matches_cert(cert_der: &[u8], key: &KeyPair) -> Result<()> {
-    let provider = ring::default_provider();
-    let key_der = PrivateKeyDer::try_from(key.serialize_der())
-        .map_err(|err| anyhow!("failed to parse private key DER: {err}"))?;
-    let cert = CertificateDer::from(cert_der.to_vec());
-    CertifiedKey::from_der(vec![cert], key_der, &provider)
-        .map_err(|err| anyhow!("intermediate key does not match certificate: {err}"))?;
-    Ok(())
 }
 
 fn sign_certificate(
@@ -488,6 +524,7 @@ fn sign_certificate(
 fn build_leaf_params(
     names: &[&str],
     ttl: StdDuration,
+    issuer_not_after: OffsetDateTime,
 ) -> Result<(CertificateParams, OffsetDateTime)> {
     let subject_alt_names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
     let mut params = CertificateParams::new(subject_alt_names)
@@ -507,9 +544,15 @@ fn build_leaf_params(
     let now = OffsetDateTime::now_utc();
     params.not_before = now - Duration::minutes(5);
     let ttl_duration = std_duration_to_time(ttl)?;
-    params.not_after = now
+    let requested_not_after = now
         .checked_add(ttl_duration)
         .ok_or_else(|| anyhow!("leaf TTL exceeds supported range"))?;
+    let latest_not_after = issuer_not_after - LEAF_ISSUER_EXPIRY_MARGIN;
+    ensure!(
+        latest_not_after > now,
+        "CA intermediate is too close to expiry to mint a leaf certificate"
+    );
+    params.not_after = requested_not_after.min(latest_not_after);
     let expires_at = params.not_after;
 
     Ok((params, expires_at))
@@ -575,12 +618,17 @@ mod tests {
         Ok(dir)
     }
 
+    fn test_validity() -> (OffsetDateTime, OffsetDateTime) {
+        let now = OffsetDateTime::now_utc();
+        (now - Duration::days(1), now + Duration::days(365))
+    }
+
     #[test]
     fn generates_new_material_when_missing() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        let ca = CertificateAuthority::load_or_generate(dir.path())?;
+        let ca = CertificateAuthority::load_builtin(dir.path())?;
         assert!(dir.path().join(ROOT_CERT_FILE).exists());
-        assert!(dir.path().join(ROOT_KEY_FILE).exists());
+        assert!(!dir.path().join(ROOT_KEY_FILE).exists());
         assert!(dir.path().join(INTERMEDIATE_CERT_FILE).exists());
         assert!(dir.path().join(INTERMEDIATE_KEY_FILE).exists());
 
@@ -589,19 +637,22 @@ mod tests {
         assert!(!chain[0].as_ref().is_empty());
         assert!(!chain[1].as_ref().is_empty());
         assert!(!ca.signing_key().serialize_der().is_empty());
+        let remaining = ca.intermediate_not_after() - OffsetDateTime::now_utc();
+        assert!(remaining > Duration::days(9 * 365));
+        assert_eq!(ca.root_not_after(), ca.intermediate_not_after());
         Ok(())
     }
 
     #[test]
     fn reuses_existing_material() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        let ca_first = CertificateAuthority::load_or_generate(dir.path())?;
+        let ca_first = CertificateAuthority::load_builtin(dir.path())?;
         let root_first = ca_first.root_certificate_der().as_ref().to_vec();
         let intermediate_first = ca_first.intermediate_certificate_der().as_ref().to_vec();
         let key_first = ca_first.signing_key().serialize_der();
         drop(ca_first);
 
-        let ca_second = CertificateAuthority::load_or_generate(dir.path())?;
+        let ca_second = CertificateAuthority::load_builtin(dir.path())?;
         assert_eq!(
             root_first,
             ca_second.root_certificate_der().as_ref().to_vec()
@@ -619,14 +670,15 @@ mod tests {
         let dir = secure_ca_temp_dir()?;
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
-        let root_params = build_root_params()?;
+        let (not_before, not_after) = test_validity();
+        let root_params = build_root_params(not_before, not_after)?;
         let root_cert = root_params
             .self_signed(&root_key)
             .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
 
         let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
-        let mut intermediate_params = build_intermediate_params()?;
+        let mut intermediate_params = build_intermediate_params(not_before, not_after)?;
         intermediate_params.distinguished_name = distinguished_name("Corp Intermediate CA");
         let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let intermediate_cert =
@@ -644,7 +696,7 @@ mod tests {
             true,
         )?;
 
-        let ca = CertificateAuthority::load_or_generate(dir.path())?;
+        let ca = CertificateAuthority::load_builtin(dir.path())?;
         let minted = ca.mint_leaf(&["leaf.example"], StdDuration::from_secs(3600))?;
         let leaf_der = &minted.chain_der[0];
         let (_, leaf_cert) = parse_x509_certificate(leaf_der)
@@ -666,7 +718,7 @@ mod tests {
         let root_path = dir.path().join(ROOT_CERT_FILE);
         fs::write(&root_path, "dummy root cert")?;
         fs::set_permissions(&root_path, fs::Permissions::from_mode(0o644))?;
-        match CertificateAuthority::load_or_generate(dir.path()) {
+        match CertificateAuthority::load_builtin(dir.path()) {
             Ok(_) => panic!("expected error when CA material is incomplete"),
             Err(err) => assert!(
                 err.to_string().contains("incomplete CA material"),
@@ -677,18 +729,19 @@ mod tests {
     }
 
     #[test]
-    fn loads_with_missing_root_key() -> Result<()> {
+    fn files_source_loads_without_root_key() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
-        let root_params = build_root_params()?;
+        let (not_before, not_after) = test_validity();
+        let root_params = build_root_params(not_before, not_after)?;
         let root_cert = root_params
             .self_signed(&root_key)
             .map_err(|err| anyhow!("failed to self-sign root certificate: {err}"))?;
 
         let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate intermediate key: {err}"))?;
-        let intermediate_params = build_intermediate_params()?;
+        let intermediate_params = build_intermediate_params(not_before, not_after)?;
         let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let intermediate_cert =
             sign_certificate(&intermediate_params, &intermediate_key, &root_issuer)?;
@@ -705,8 +758,43 @@ mod tests {
             true,
         )?;
 
-        let ca = CertificateAuthority::load_or_generate(dir.path())?;
+        let ca = CertificateAuthority::load_files(dir.path())?;
         assert!(!ca.intermediate_certificate_der().as_ref().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn files_source_rejects_empty_directory() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        let err = CertificateAuthority::load_files(dir.path())
+            .err()
+            .expect("files source must not generate a CA");
+        assert!(
+            err.to_string().contains("files CA source requires"),
+            "{err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn files_source_does_not_create_a_missing_directory() -> Result<()> {
+        let parent = secure_ca_temp_dir()?;
+        let ca_dir = parent.path().join("missing");
+        assert!(CertificateAuthority::load_files(&ca_dir).is_err());
+        assert!(!ca_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_obsolete_root_key() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        CertificateAuthority::load_builtin(dir.path())?;
+        write_pem_file(&dir.path().join(ROOT_KEY_FILE), "obsolete", true)?;
+
+        let err = CertificateAuthority::load_builtin(dir.path())
+            .err()
+            .expect("root private key must be rejected");
+        assert!(err.to_string().contains("obsolete root.key"), "{err:?}");
         Ok(())
     }
 
@@ -714,11 +802,11 @@ mod tests {
     fn rejects_symlinked_ca_directory() -> Result<()> {
         let parent = TempDir::new()?;
         let real_dir = parent.path().join("real-ca");
-        CertificateAuthority::load_or_generate(&real_dir)?;
+        CertificateAuthority::load_builtin(&real_dir)?;
         let linked_dir = parent.path().join("linked-ca");
         symlink(&real_dir, &linked_dir)?;
 
-        let err = CertificateAuthority::load_or_generate(&linked_dir)
+        let err = CertificateAuthority::load_builtin(&linked_dir)
             .err()
             .expect("symlinked CA directory should be rejected");
         assert!(err.to_string().contains("must not be a symlink"), "{err:?}");
@@ -729,13 +817,17 @@ mod tests {
     fn rejects_symlinked_ca_keys() -> Result<()> {
         for key_name in [ROOT_KEY_FILE, INTERMEDIATE_KEY_FILE] {
             let dir = secure_ca_temp_dir()?;
-            CertificateAuthority::load_or_generate(dir.path())?;
+            CertificateAuthority::load_builtin(dir.path())?;
             let key_path = dir.path().join(key_name);
             let real_path = dir.path().join(format!("{key_name}.real"));
-            fs::rename(&key_path, &real_path)?;
+            if key_name == ROOT_KEY_FILE {
+                write_pem_file(&real_path, "obsolete", true)?;
+            } else {
+                fs::rename(&key_path, &real_path)?;
+            }
             symlink(&real_path, &key_path)?;
 
-            let err = CertificateAuthority::load_or_generate(dir.path())
+            let err = CertificateAuthority::load_builtin(dir.path())
                 .err()
                 .expect("symlinked CA key should be rejected");
             assert!(err.to_string().contains("must not be a symlink"), "{err:?}");
@@ -748,7 +840,7 @@ mod tests {
         let dir = TempDir::new()?;
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750))?;
 
-        let err = CertificateAuthority::load_or_generate(dir.path())
+        let err = CertificateAuthority::load_builtin(dir.path())
             .err()
             .expect("permissive CA directory should be rejected");
         assert!(err.to_string().contains("expected 0500 or 0700"), "{err:?}");
@@ -758,11 +850,11 @@ mod tests {
     #[test]
     fn rejects_permissive_ca_key() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        CertificateAuthority::load_or_generate(dir.path())?;
+        CertificateAuthority::load_builtin(dir.path())?;
         let key_path = dir.path().join(INTERMEDIATE_KEY_FILE);
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o640))?;
 
-        let err = CertificateAuthority::load_or_generate(dir.path())
+        let err = CertificateAuthority::load_builtin(dir.path())
             .err()
             .expect("group-readable CA key should be rejected");
         assert!(err.to_string().contains("expected 0400 or 0600"), "{err:?}");
@@ -772,10 +864,11 @@ mod tests {
     #[test]
     fn accepts_read_only_owner_ca_material() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        CertificateAuthority::load_or_generate(dir.path())?;
-        for key_name in [ROOT_KEY_FILE, INTERMEDIATE_KEY_FILE] {
-            fs::set_permissions(dir.path().join(key_name), fs::Permissions::from_mode(0o400))?;
-        }
+        CertificateAuthority::load_builtin(dir.path())?;
+        fs::set_permissions(
+            dir.path().join(INTERMEDIATE_KEY_FILE),
+            fs::Permissions::from_mode(0o400),
+        )?;
         for cert_name in [ROOT_CERT_FILE, INTERMEDIATE_CERT_FILE] {
             fs::set_permissions(
                 dir.path().join(cert_name),
@@ -784,7 +877,7 @@ mod tests {
         }
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500))?;
 
-        let result = CertificateAuthority::load_or_generate(dir.path());
+        let result = CertificateAuthority::load_builtin(dir.path());
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         result?;
         Ok(())
@@ -793,12 +886,12 @@ mod tests {
     #[test]
     fn rejects_non_regular_ca_key() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        CertificateAuthority::load_or_generate(dir.path())?;
+        CertificateAuthority::load_builtin(dir.path())?;
         let key_path = dir.path().join(INTERMEDIATE_KEY_FILE);
         fs::remove_file(&key_path)?;
         fs::create_dir(&key_path)?;
 
-        let err = CertificateAuthority::load_or_generate(dir.path())
+        let err = CertificateAuthority::load_builtin(dir.path())
             .err()
             .expect("non-regular CA key should be rejected");
         assert!(err.to_string().contains("not a regular file"), "{err:?}");
@@ -808,7 +901,7 @@ mod tests {
     #[test]
     fn rejects_ca_material_owned_by_another_uid() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        CertificateAuthority::load_or_generate(dir.path())?;
+        CertificateAuthority::load_builtin(dir.path())?;
         let key_path = dir.path().join(INTERMEDIATE_KEY_FILE);
         let metadata = fs::metadata(&key_path)?;
         let other_uid = if metadata.uid() == u32::MAX {
@@ -827,11 +920,11 @@ mod tests {
     #[test]
     fn rejects_group_writable_ca_certificate() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        CertificateAuthority::load_or_generate(dir.path())?;
+        CertificateAuthority::load_builtin(dir.path())?;
         let cert_path = dir.path().join(ROOT_CERT_FILE);
         fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o664))?;
 
-        let err = CertificateAuthority::load_or_generate(dir.path())
+        let err = CertificateAuthority::load_builtin(dir.path())
             .err()
             .expect("group-writable CA certificate should be rejected");
         assert!(err.to_string().contains("unsafe mode"), "{err:?}");
@@ -841,7 +934,7 @@ mod tests {
     #[test]
     fn mint_leaf_produces_certified_key() -> Result<()> {
         let dir = secure_ca_temp_dir()?;
-        let ca = CertificateAuthority::load_or_generate(dir.path())?;
+        let ca = CertificateAuthority::load_builtin(dir.path())?;
         let minted = ca.mint_leaf(&["leaf.example"], StdDuration::from_secs(3600))?;
         assert_eq!(minted.chain_der.len(), 3);
         assert!(!minted.certified_key.cert.is_empty());
@@ -854,7 +947,8 @@ mod tests {
     fn leaf_params_use_ip_san_for_literals() -> Result<()> {
         let ttl = StdDuration::from_secs(60);
         for literal in ["192.0.2.1", "2001:db8::1"] {
-            let (params, _) = build_leaf_params(&[literal], ttl)?;
+            let issuer_not_after = OffsetDateTime::now_utc() + Duration::days(1);
+            let (params, _) = build_leaf_params(&[literal], ttl, issuer_not_after)?;
             assert_eq!(params.subject_alt_names.len(), 1);
             match &params.subject_alt_names[0] {
                 SanType::IpAddress(ip) => {
@@ -863,6 +957,18 @@ mod tests {
                 other => panic!("expected IP SAN for {literal}, got {other:?}"),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn leaf_validity_is_capped_before_issuer_expiry() -> Result<()> {
+        let issuer_not_after = OffsetDateTime::now_utc() + Duration::minutes(30);
+        let (_, expires_at) = build_leaf_params(
+            &["leaf.example"],
+            StdDuration::from_secs(60 * 60),
+            issuer_not_after,
+        )?;
+        assert_eq!(expires_at, issuer_not_after - LEAF_ISSUER_EXPIRY_MARGIN);
         Ok(())
     }
 }

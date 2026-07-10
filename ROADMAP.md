@@ -12,8 +12,8 @@
 - Support for authenticating clients via proxy auth credentials or mTLS instead
   of just source IPs, so multi-tenant deployments can bind policies to
   people/services directly.
-- Optional integrations with secret managers (Vault, etc.) to fetch CA material
-  or policy variables at runtime, minimizing long-lived secrets on disk.
+- Additional secret-manager integrations for policy variables and providers
+  beyond the built-in Vault CA lifecycle.
 
 ## Body Inspection
 - Inspect request and response bodies for sensitive patterns (credit card numbers,

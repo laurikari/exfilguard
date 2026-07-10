@@ -3,7 +3,10 @@
 
 listen = "0.0.0.0:3128"
 
-ca_dir = "/var/lib/exfilguard/ca"
+# On first start, builtin mode creates a long-lived root and intermediate in
+# this owner-only directory. See the CA source documentation before changing
+# this to externally managed files or Vault.
+ca = { source = "builtin", dir = "/var/lib/exfilguard/ca" }
 
 clients = "clients.toml"
 clients_dir = "clients.d"

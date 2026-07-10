@@ -62,6 +62,10 @@ impl CertificateCache {
         key
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.inner.lock().cap().get()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().len()
@@ -82,7 +86,7 @@ mod tests {
     #[test]
     fn cache_hits_memory() -> Result<()> {
         let dir = TempDir::new()?;
-        let ca = CertificateAuthority::load_or_generate(dir.path().join("ca"))?;
+        let ca = CertificateAuthority::load_builtin(dir.path().join("ca"))?;
         let cache = CertificateCache::new(16)?;
         let name = "example.com";
 
@@ -96,7 +100,7 @@ mod tests {
     #[test]
     fn cache_evicts_least_recently_used_entry() -> Result<()> {
         let dir = TempDir::new()?;
-        let ca = CertificateAuthority::load_or_generate(dir.path().join("ca"))?;
+        let ca = CertificateAuthority::load_builtin(dir.path().join("ca"))?;
         let cache = CertificateCache::new(2)?;
 
         cache.insert("one.example".to_string(), mint(&ca, "one.example")?);
@@ -114,7 +118,7 @@ mod tests {
     #[test]
     fn cache_removes_expired_entry() -> Result<()> {
         let dir = TempDir::new()?;
-        let ca = CertificateAuthority::load_or_generate(dir.path().join("ca"))?;
+        let ca = CertificateAuthority::load_builtin(dir.path().join("ca"))?;
         let cache = CertificateCache::new(2)?;
         let mut minted = mint(&ca, "expired.example")?;
         minted.expires_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);

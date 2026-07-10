@@ -328,6 +328,96 @@ static POLICY_RELOAD_LAST_SUCCESS_UNIXTIME: Lazy<IntGauge> = Lazy::new(|| {
     gauge
 });
 
+static CA_CERTIFICATE_NOT_AFTER_TIMESTAMP_SECONDS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let vec = IntGaugeVec::new(
+        Opts::new(
+            "ca_certificate_not_after_timestamp_seconds",
+            "Unix timestamp when the active CA certificate expires",
+        ),
+        &["certificate"],
+    )
+    .expect("create ca_certificate_not_after_timestamp_seconds");
+    REGISTRY
+        .register(Box::new(vec.clone()))
+        .expect("register ca_certificate_not_after_timestamp_seconds");
+    vec
+});
+
+static CA_SOURCE_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let vec = IntGaugeVec::new(
+        Opts::new("ca_source_info", "Configured CA source"),
+        &["source"],
+    )
+    .expect("create ca_source_info");
+    REGISTRY
+        .register(Box::new(vec.clone()))
+        .expect("register ca_source_info");
+    vec
+});
+
+static CA_ISSUER_USABLE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "ca_issuer_usable",
+        "Whether the active CA issuer can mint a safely bounded leaf",
+    )
+    .expect("create ca_issuer_usable");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register ca_issuer_usable");
+    gauge
+});
+
+static CA_ISSUER_GENERATION: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "ca_issuer_generation",
+        "In-process active CA issuer generation",
+    )
+    .expect("create ca_issuer_generation");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register ca_issuer_generation");
+    gauge
+});
+
+static CA_VAULT_RENEWAL_ATTEMPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let vec = IntCounterVec::new(
+        Opts::new(
+            "ca_vault_renewal_attempts_total",
+            "Vault CA renewal attempts by result and bounded reason",
+        ),
+        &["result", "reason"],
+    )
+    .expect("create ca_vault_renewal_attempts_total");
+    REGISTRY
+        .register(Box::new(vec.clone()))
+        .expect("register ca_vault_renewal_attempts_total");
+    vec
+});
+
+static CA_VAULT_LAST_RENEWAL_ATTEMPT_TIMESTAMP_SECONDS: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "ca_vault_last_renewal_attempt_timestamp_seconds",
+        "Unix timestamp of the last Vault CA renewal attempt",
+    )
+    .expect("create ca_vault_last_renewal_attempt_timestamp_seconds");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register ca_vault_last_renewal_attempt_timestamp_seconds");
+    gauge
+});
+
+static CA_VAULT_LAST_RENEWAL_SUCCESS_TIMESTAMP_SECONDS: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "ca_vault_last_renewal_success_timestamp_seconds",
+        "Unix timestamp of the last successful Vault CA renewal",
+    )
+    .expect("create ca_vault_last_renewal_success_timestamp_seconds");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register ca_vault_last_renewal_success_timestamp_seconds");
+    gauge
+});
+
 static UPSTREAM_POOL_REUSE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let vec = IntCounterVec::new(
         Opts::new(
@@ -592,6 +682,47 @@ pub fn mark_policy_reload_success() {
         .as_secs()
         .min(i64::MAX as u64) as i64;
     POLICY_RELOAD_LAST_SUCCESS_UNIXTIME.set(now);
+}
+
+fn unix_timestamp_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+pub fn set_ca_state(
+    source: &str,
+    root_not_after: i64,
+    intermediate_not_after: i64,
+    usable: bool,
+    generation: u64,
+) {
+    CA_SOURCE_INFO.with_label_values(&[source]).set(1);
+    CA_CERTIFICATE_NOT_AFTER_TIMESTAMP_SECONDS
+        .with_label_values(&["root"])
+        .set(root_not_after);
+    CA_CERTIFICATE_NOT_AFTER_TIMESTAMP_SECONDS
+        .with_label_values(&["intermediate"])
+        .set(intermediate_not_after);
+    CA_ISSUER_USABLE.set(i64::from(usable));
+    CA_ISSUER_GENERATION.set(generation.min(i64::MAX as u64) as i64);
+}
+
+pub fn set_ca_issuer_usable(usable: bool) {
+    CA_ISSUER_USABLE.set(i64::from(usable));
+}
+
+pub fn record_ca_vault_renewal(result: &str, reason: &str) {
+    let now = unix_timestamp_now();
+    CA_VAULT_LAST_RENEWAL_ATTEMPT_TIMESTAMP_SECONDS.set(now);
+    CA_VAULT_RENEWAL_ATTEMPTS_TOTAL
+        .with_label_values(&[result, reason])
+        .inc();
+    if result == "success" {
+        CA_VAULT_LAST_RENEWAL_SUCCESS_TIMESTAMP_SECONDS.set(now);
+    }
 }
 
 pub fn record_pool_reuse(reused: bool) {
@@ -869,6 +1000,8 @@ mod tests {
             Duration::from_millis(10),
         );
         record_rule_hit("rule-1");
+        set_ca_state("files", 2_000_000_000, 1_900_000_000, true, 3);
+        record_ca_vault_renewal("failure", "signing");
         let text = String::from_utf8(gather()).expect("utf8");
         assert!(
             text.contains("requests_total"),
@@ -881,6 +1014,15 @@ mod tests {
         assert!(
             text.contains("rule_hits_total"),
             "expected rule_hits_total in metrics output"
+        );
+        assert!(text.contains("ca_source_info{source=\"files\"} 1"));
+        assert!(text.contains(
+            "ca_certificate_not_after_timestamp_seconds{certificate=\"intermediate\"} 1900000000"
+        ));
+        assert!(text.contains("ca_issuer_usable 1"));
+        assert!(text.contains("ca_issuer_generation 3"));
+        assert!(
+            text.contains("ca_vault_renewal_attempts_total{reason=\"signing\",result=\"failure\"}")
         );
     }
 

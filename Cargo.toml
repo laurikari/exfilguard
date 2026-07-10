@@ -36,10 +36,12 @@ time = { version = "0.3", features = ["std"] }
 zeroize = "1.8"
 blake3 = "1.8"
 rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 config = { version = "0.15", features = ["toml"] }
 async-trait = "0.1"
 httpdate = "1.0.3"
 uuid = { version = "1.23.1", features = ["v4"] }
+x509-parser = { version = "0.18", features = ["verify"] }
 
 [features]
 fuzzing = []
@@ -49,7 +51,6 @@ assert_matches = "1.5"
 nix = { version = "0.31", features = ["signal"] }
 tokio = { version = "1.52", features = ["rt", "macros", "test-util"] }
 tempfile = "3.27"
-x509-parser = "0.18"
 
 [package.metadata.deb]
 maintainer = "Ville Laurikari <ville@laurikari.net>"

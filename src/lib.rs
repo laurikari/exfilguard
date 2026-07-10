@@ -10,18 +10,24 @@ pub mod util;
 
 use std::sync::Arc;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rustls::crypto::ring;
 use rustls::{RootCertStore, client::ClientConfig};
 use rustls_native_certs as native_certs;
 use tokio::sync::watch;
+use tokio::time::{Duration, sleep};
 use tracing::warn;
 
 use crate::{
     policy::matcher::PolicySnapshot,
     proxy::{default_upstream_resolver, permissive_test_upstream_resolver},
-    settings::Settings,
-    tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
+    settings::{CaSettings, Settings, VaultAuth},
+    tls::{
+        ca::CertificateAuthority,
+        cache::CertificateCache,
+        issuer::TlsIssuer,
+        vault::{VaultAuthConfig, VaultCaSource, VaultConfig},
+    },
 };
 
 pub async fn run(settings: Settings) -> Result<()> {
@@ -50,7 +56,7 @@ async fn run_with_upstream_resolver(
         };
         (addr, path, tls)
     });
-    let ca = Arc::new(CertificateAuthority::load_or_generate(&settings.ca_dir)?);
+    let (ca, ca_source, vault_source) = load_ca(&settings.ca).await?;
     let cert_cache = Arc::new(CertificateCache::new(settings.leaf_cache_capacity)?);
     let tls_issuer = Arc::new(TlsIssuer::new(
         ca.clone(),
@@ -58,13 +64,24 @@ async fn run_with_upstream_resolver(
         settings.leaf_ttl(),
         settings.leaf_mint_concurrency,
     )?);
+    crate::metrics::set_ca_state(
+        ca_source,
+        ca.root_not_after().unix_timestamp(),
+        ca.intermediate_not_after().unix_timestamp(),
+        true,
+        tls_issuer.generation(),
+    );
+    if let Some(vault_source) = vault_source {
+        vault_source.spawn_renewal(tls_issuer.clone());
+    }
+    spawn_ca_usability_monitor(tls_issuer.clone());
     let TlsClientConfigs { http1, http2 } = build_tls_client_configs(&settings)?;
     let snapshot = build_runtime_policy_snapshot(&settings)?;
     crate::metrics::mark_policy_reload_success();
     let (policy_tx, policy_rx) = watch::channel(snapshot.clone());
     spawn_runtime_policy_reload_task(settings.clone(), policy_tx);
     let policy_store = proxy::PolicyStore::new(policy_rx);
-    let tls_context = Arc::new(proxy::TlsContext::new(ca, tls_issuer, http1, http2));
+    let tls_context = Arc::new(proxy::TlsContext::new(tls_issuer, http1, http2));
 
     let cache = if let Some(cache_dir) = &settings.cache_dir {
         Some(Arc::new(
@@ -93,6 +110,75 @@ async fn run_with_upstream_resolver(
         }
     } else {
         proxy::run(app).await
+    }
+}
+
+fn spawn_ca_usability_monitor(issuer: Arc<TlsIssuer>) {
+    tokio::spawn(async move {
+        loop {
+            let usable = issuer.current_ca().intermediate_not_after()
+                > time::OffsetDateTime::now_utc() + time::Duration::minutes(5);
+            crate::metrics::set_ca_issuer_usable(usable);
+            sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
+async fn load_ca(
+    settings: &CaSettings,
+) -> Result<(
+    Arc<CertificateAuthority>,
+    &'static str,
+    Option<Arc<VaultCaSource>>,
+)> {
+    match settings {
+        CaSettings::Builtin { dir } => Ok((
+            Arc::new(CertificateAuthority::load_builtin(dir)?),
+            "builtin",
+            None,
+        )),
+        CaSettings::Files { dir } => Ok((
+            Arc::new(CertificateAuthority::load_files(dir)?),
+            "files",
+            None,
+        )),
+        CaSettings::Vault(settings) => {
+            let auth = match &settings.auth {
+                VaultAuth::AppRole {
+                    mount,
+                    role_id,
+                    secret_id_file,
+                } => VaultAuthConfig::AppRole {
+                    mount: mount.clone(),
+                    role_id: role_id.clone(),
+                    secret_id_file: secret_id_file.clone(),
+                },
+                VaultAuth::TokenFile { token_file } => VaultAuthConfig::TokenFile {
+                    token_file: token_file.clone(),
+                },
+                VaultAuth::Proxy {} => VaultAuthConfig::Proxy,
+            };
+            let source = Arc::new(VaultCaSource::new(VaultConfig {
+                address: settings.address.clone(),
+                tls_ca_cert: settings.tls_ca_cert.clone(),
+                tls_server_name: settings.tls_server_name.clone(),
+                namespace: settings.namespace.clone(),
+                pki_mount: settings.pki_mount.clone(),
+                issuer: settings.issuer.clone(),
+                expected_root_certs: settings.expected_root_certs.clone(),
+                intermediate_ttl: settings.intermediate_ttl(),
+                renewal_threshold: settings.renewal_threshold(),
+                request_timeout: settings.request_timeout(),
+                tls_client_cert: settings.tls_client_cert.clone(),
+                tls_client_key: settings.tls_client_key.clone(),
+                auth,
+            })?);
+            let ca = source
+                .issue()
+                .await
+                .context("failed to initialize Vault-backed CA")?;
+            Ok((ca, "vault", Some(source)))
+        }
     }
 }
 

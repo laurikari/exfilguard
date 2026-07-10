@@ -238,7 +238,7 @@ impl BumpedTlsFixture {
         let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let upstream_addr = upstream_listener.local_addr()?;
 
-        let ca = Arc::new(CertificateAuthority::load_or_generate(&dirs.ca_dir)?);
+        let ca = Arc::new(CertificateAuthority::load_builtin(&dirs.ca_dir)?);
         let policy = policy.bind_host_port(upstream_host, upstream_addr.port());
         let (clients, policies) = TestConfigBuilder::new()
             .default_client(&[policy_name])
