@@ -52,6 +52,10 @@ general rules and know what will happen.
 ExfilGuard identifies a client from the downstream source address. It uses
 exact IP matches, CIDR ranges, and one fallback client.
 
+The fallback client has no address selector and is considered only after exact
+IP and CIDR matching finds nothing. Configurations that set `ip` or `cidr` on
+the fallback are rejected.
+
 By default, it trusts the immediate peer address. If you enable PROXY protocol
 and trust the sender, it may use the address from that header instead. It does
 not use `X-Forwarded-For` or similar HTTP headers for client identity.

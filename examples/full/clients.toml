@@ -27,7 +27,6 @@ policies = [
 # Fallback for anything not mapped above.
 [[client]]
 name = "fallback"
-cidr = "0.0.0.0/0"
 policies = [
   "fallback-egress-deny",
 ]

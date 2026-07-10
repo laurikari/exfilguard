@@ -277,8 +277,7 @@ fn validate_config(config: &Config) -> Result<()> {
     validate_clients(&config.clients)
 }
 
-/// Ensures that client selectors do not conflict (duplicate IPs or overlapping
-/// CIDRs except for the designated fallback).
+/// Ensures that client selectors do not conflict and exactly one fallback is defined.
 ///
 /// This remains the single semantic check used by loaded configs, runtime
 /// reloads, and programmatic configs so those paths keep identical guarantees.
@@ -286,12 +285,10 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
     struct CidrClaim<'a> {
         name: &'a str,
         net: IpNet,
-        fallback: bool,
     }
 
     struct IpClaim<'a> {
         name: &'a str,
-        fallback: bool,
     }
 
     let mut fallback_seen = false;
@@ -299,21 +296,19 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
     let mut cidr_claims: Vec<CidrClaim<'_>> = Vec::new();
 
     for client in clients {
-        if client.fallback {
-            ensure!(
-                !fallback_seen,
-                "multiple fallback clients defined; exactly one client must set fallback=true"
-            );
-            fallback_seen = true;
-        }
-
         match &client.selector {
+            ClientSelector::Fallback => {
+                ensure!(
+                    !fallback_seen,
+                    "multiple fallback clients defined; exactly one client must set fallback=true"
+                );
+                fallback_seen = true;
+            }
             ClientSelector::Ip(addr) => {
                 if let Some(existing) = ip_claims.insert(
                     *addr,
                     IpClaim {
                         name: client.name.as_ref(),
-                        fallback: client.fallback,
                     },
                 ) {
                     bail!(
@@ -324,9 +319,6 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                     );
                 }
                 for claim in &cidr_claims {
-                    if client.fallback || claim.fallback {
-                        continue;
-                    }
                     if claim.net.contains(addr) {
                         bail!(
                             "client '{}' IP {} overlaps with client '{}' CIDR {}",
@@ -340,9 +332,6 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
             }
             ClientSelector::Cidr(net) => {
                 for claim in &cidr_claims {
-                    if client.fallback || claim.fallback {
-                        continue;
-                    }
                     if cidrs_overlap(&claim.net, net) {
                         bail!(
                             "client '{}' CIDR {} overlaps with client '{}' CIDR {}",
@@ -354,9 +343,6 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                     }
                 }
                 for (addr, claim) in &ip_claims {
-                    if client.fallback || claim.fallback {
-                        continue;
-                    }
                     if net.contains(addr) {
                         bail!(
                             "client '{}' CIDR {} overlaps with client '{}' IP {}",
@@ -370,7 +356,6 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                 cidr_claims.push(CidrClaim {
                     name: client.name.as_ref(),
                     net: *net,
-                    fallback: client.fallback,
                 });
             }
         }
@@ -421,15 +406,13 @@ mod tests {
         UrlPattern, ValidatedConfig,
     };
     use http::{Method, StatusCode};
-    use ipnet::IpNet;
     use std::sync::Arc;
 
     fn fallback_client(policy_name: &str) -> Client {
         Client {
             name: Arc::from("default"),
-            selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+            selector: ClientSelector::Fallback,
             policies: Arc::from(vec![Arc::<str>::from(policy_name)].into_boxed_slice()),
-            fallback: true,
         }
     }
 

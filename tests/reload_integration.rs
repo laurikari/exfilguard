@@ -212,7 +212,7 @@ async fn reload_on_sighup_updates_clients() -> Result<()> {
     let upstream_task = tokio::spawn(run_upstream(upstream_listener));
 
     let (clients_deny, policies) = TestConfigBuilder::new()
-        .client_ip("loopback", "127.0.0.1", &["deny-policy"], false)
+        .client_ip("loopback", "127.0.0.1", &["deny-policy"])
         .default_client(&["allow-policy"])
         .policy(PolicySpec::new("deny-policy").rule(
             RuleSpec::deny(&["GET"], format!("http://127.0.0.1:{upstream_port}/**")).status(403),
@@ -224,7 +224,7 @@ async fn reload_on_sighup_updates_clients() -> Result<()> {
         .render();
 
     let clients_allow = TestConfigBuilder::new()
-        .client_ip("loopback", "127.0.0.1", &["allow-policy"], false)
+        .client_ip("loopback", "127.0.0.1", &["allow-policy"])
         .default_client(&["allow-policy"])
         .render()
         .0;

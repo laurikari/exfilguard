@@ -15,13 +15,13 @@ pub struct Client {
     pub name: Arc<str>,
     pub selector: ClientSelector,
     pub policies: Arc<[Arc<str>]>,
-    pub fallback: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum ClientSelector {
     Ip(IpAddr),
     Cidr(IpNet),
+    Fallback,
 }
 
 #[derive(Debug, Clone)]

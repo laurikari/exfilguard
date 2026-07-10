@@ -15,6 +15,5 @@ policies = ["allow-rfc4193"]
 
 [[client]]
 name = "fallback"
-cidr = "::/0"
 policies = ["deny-loopback"]
 fallback = true

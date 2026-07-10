@@ -55,18 +55,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             fallback,
         } = client;
 
-        let selector = match (ip, cidr) {
-            (Some(ip), None) => match parse_ip_or_cidr(&ip)? {
-                IpOrCidr::Ip(addr) => ClientSelector::Ip(addr),
-                IpOrCidr::Cidr(_) => bail!("client '{}' ip must not be a CIDR", name),
-            },
-            (None, Some(cidr)) => match parse_ip_or_cidr(&cidr)? {
-                IpOrCidr::Cidr(net) => ClientSelector::Cidr(net),
-                IpOrCidr::Ip(_) => bail!("client '{}' cidr must include slash notation", name),
-            },
-            (None, None) => bail!("client '{}' must specify either ip or cidr", name),
-            (Some(_), Some(_)) => bail!("client '{}' must not specify both ip and cidr", name),
-        };
+        let selector = parse_client_selector(&name, ip, cidr, fallback)?;
 
         let mut policy_refs = Vec::with_capacity(policy_names.len());
         for policy_name in policy_names {
@@ -78,11 +67,41 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             name: arc_name,
             selector,
             policies: Arc::from(policy_refs.into_boxed_slice()),
-            fallback,
         });
     }
 
     Ok(clients)
+}
+
+fn parse_client_selector(
+    name: &str,
+    ip: Option<String>,
+    cidr: Option<String>,
+    fallback: bool,
+) -> Result<ClientSelector> {
+    if fallback {
+        if ip.is_some() || cidr.is_some() {
+            bail!(
+                "fallback client '{}' must not specify either ip or cidr",
+                name
+            );
+        }
+        return Ok(ClientSelector::Fallback);
+    }
+
+    let selector = match (ip, cidr) {
+        (Some(ip), None) => match parse_ip_or_cidr(&ip)? {
+            IpOrCidr::Ip(addr) => Some(ClientSelector::Ip(addr)),
+            IpOrCidr::Cidr(_) => bail!("client '{}' ip must not be a CIDR", name),
+        },
+        (None, Some(cidr)) => match parse_ip_or_cidr(&cidr)? {
+            IpOrCidr::Cidr(net) => Some(ClientSelector::Cidr(net)),
+            IpOrCidr::Ip(_) => bail!("client '{}' cidr must include slash notation", name),
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => bail!("client '{}' must not specify both ip and cidr", name),
+    };
+    selector.ok_or_else(|| anyhow!("client '{}' must specify either ip or cidr", name))
 }
 
 fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
@@ -437,7 +456,6 @@ policies = ["allow"]
 
 [[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["deny"]
 fallback = true
 "#,
@@ -468,7 +486,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "test"
-ip = "127.0.0.1"
 policies = ["missing"]
 fallback = true
 "#,
@@ -491,7 +508,6 @@ name = "only"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["deny"]
 fallback = true
 "#,
@@ -523,12 +539,16 @@ name = "deny"
 name = "a"
 ip = "10.0.0.5"
 policies = ["allow"]
-fallback = true
 
 [[client]]
 name = "b"
 ip = "10.0.0.5"
 policies = ["allow"]
+
+[[client]]
+name = "default"
+policies = ["allow"]
+fallback = true
 "#,
         );
         let policies = write_temp(
@@ -558,7 +578,6 @@ policies = ["allow"]
 
 [[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -589,7 +608,6 @@ policies = ["allow"]
 
 [[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -606,11 +624,9 @@ name = "allow"
     }
 
     #[test]
-    fn fallback_overlap_is_allowed_regardless_of_order() {
-        let clients = write_temp(
-            r#"[[client]]
+    fn selectorless_fallback_is_order_independent() {
+        let fallback_first = r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 
@@ -618,8 +634,17 @@ fallback = true
 name = "finance"
 cidr = "10.10.1.0/24"
 policies = ["allow"]
-"#,
-        );
+"#;
+        let explicit_first = r#"[[client]]
+name = "finance"
+cidr = "10.10.1.0/24"
+policies = ["allow"]
+
+[[client]]
+name = "default"
+policies = ["allow"]
+fallback = true
+"#;
         let policies = write_temp(
             r#"[[policy]]
 name = "allow"
@@ -627,8 +652,55 @@ name = "allow"
   action = "ALLOW"
 "#,
         );
-        let config = load_config(clients.path(), policies.path()).expect("config should load");
-        assert_eq!(config.clients.len(), 2);
+        for input in [fallback_first, explicit_first] {
+            let clients = write_temp(input);
+            let config = load_config(clients.path(), policies.path()).expect("config should load");
+            assert_eq!(config.clients.len(), 2);
+            assert!(
+                config
+                    .clients
+                    .iter()
+                    .find(|client| client.name.as_ref() == "default")
+                    .is_some_and(|client| matches!(client.selector, ClientSelector::Fallback))
+            );
+
+            let compiled = Arc::new(
+                crate::policy::compile::compile_config(&config).expect("config should compile"),
+            );
+            let snapshot = crate::policy::matcher::PolicySnapshot::new(compiled);
+            let resolved = snapshot
+                .resolve_client("10.10.1.200".parse().expect("test IP"))
+                .expect("explicit client should resolve");
+            assert_eq!(resolved.name.as_ref(), "finance");
+        }
+    }
+
+    #[test]
+    fn reject_selector_on_fallback_client() {
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+"#,
+        );
+
+        for selector in [r#"ip = "10.10.1.200""#, r#"cidr = "10.10.1.0/24""#] {
+            let clients = write_temp(&format!(
+                r#"[[client]]
+name = "default"
+{selector}
+policies = ["allow"]
+fallback = true
+"#
+            ));
+            let err = load_config(clients.path(), policies.path()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("fallback client 'default' must not specify either ip or cidr"),
+                "unexpected error: {err:#}"
+            );
+        }
     }
 
     #[test]
@@ -636,7 +708,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["pass"]
 fallback = true
 "#,
@@ -663,7 +734,6 @@ name = "pass"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["pass"]
 fallback = true
 "#,
@@ -690,7 +760,6 @@ name = "pass"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -722,7 +791,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -747,7 +815,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -772,7 +839,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -797,7 +863,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -822,7 +887,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -848,7 +912,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,
@@ -885,7 +948,6 @@ name = "allow"
         let clients = write_temp(
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,

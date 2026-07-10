@@ -293,9 +293,8 @@ mod tests {
         }
         let clients = vec![Client {
             name: Arc::<str>::from("default"),
-            selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+            selector: ClientSelector::Fallback,
             policies: Arc::from(policy_refs.into_boxed_slice()),
-            fallback: true,
         }];
         ValidatedConfig::new(Config { clients, policies }).expect("validate config")
     }
@@ -411,9 +410,8 @@ mod tests {
         let config = ValidatedConfig::new(Config {
             clients: vec![Client {
                 name: Arc::<str>::from("default"),
-                selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+                selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
-                fallback: true,
             }],
             policies: vec![policy],
         })
@@ -465,9 +463,8 @@ mod tests {
         let config = ValidatedConfig::new(Config {
             clients: vec![Client {
                 name: Arc::<str>::from("default"),
-                selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+                selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
-                fallback: true,
             }],
             policies: vec![policy],
         })
@@ -504,25 +501,21 @@ mod tests {
                 name: Arc::<str>::from("exact"),
                 selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
-                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("cidr24"),
                 selector: ClientSelector::Cidr("10.0.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
-                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("cidr_other"),
                 selector: ClientSelector::Cidr("10.1.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
-                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("default"),
-                selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+                selector: ClientSelector::Fallback,
                 policies: policy_refs.clone(),
-                fallback: true,
             },
         ];
 
@@ -561,13 +554,11 @@ mod tests {
                 name: Arc::<str>::from("ipv4-client"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: policy_refs.clone(),
-                fallback: false,
             },
             Client {
                 name: Arc::<str>::from("default"),
-                selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+                selector: ClientSelector::Fallback,
                 policies: policy_refs,
-                fallback: true,
             },
         ];
 
@@ -630,9 +621,8 @@ mod tests {
         };
         let clients = vec![Client {
             name: Arc::<str>::from("default"),
-            selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+            selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
-            fallback: true,
         }];
         let config = ValidatedConfig::new(Config {
             clients,
@@ -679,9 +669,8 @@ mod tests {
         };
         let clients = vec![Client {
             name: Arc::<str>::from("default"),
-            selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+            selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
-            fallback: true,
         }];
         let config = ValidatedConfig::new(Config {
             clients,

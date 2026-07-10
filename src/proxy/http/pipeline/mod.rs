@@ -70,7 +70,6 @@ mod tests {
             &clients_path,
             r#"[[client]]
 name = "default"
-cidr = "0.0.0.0/0"
 policies = ["allow"]
 fallback = true
 "#,

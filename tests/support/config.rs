@@ -12,26 +12,22 @@ impl TestConfigBuilder {
     }
 
     pub fn default_client(mut self, policies: &[&str]) -> Self {
-        self.clients
-            .push(ClientSpec::cidr("default", "0.0.0.0/0", policies, true));
+        self.clients.push(ClientSpec::fallback("default", policies));
         self
     }
 
-    pub fn client_cidr(
-        mut self,
-        name: &str,
-        cidr: &str,
-        policies: &[&str],
-        fallback: bool,
-    ) -> Self {
-        self.clients
-            .push(ClientSpec::cidr(name, cidr, policies, fallback));
+    pub fn fallback_client(mut self, name: &str, policies: &[&str]) -> Self {
+        self.clients.push(ClientSpec::fallback(name, policies));
         self
     }
 
-    pub fn client_ip(mut self, name: &str, ip: &str, policies: &[&str], fallback: bool) -> Self {
-        self.clients
-            .push(ClientSpec::ip(name, ip, policies, fallback));
+    pub fn client_cidr(mut self, name: &str, cidr: &str, policies: &[&str]) -> Self {
+        self.clients.push(ClientSpec::cidr(name, cidr, policies));
+        self
+    }
+
+    pub fn client_ip(mut self, name: &str, ip: &str, policies: &[&str]) -> Self {
+        self.clients.push(ClientSpec::ip(name, ip, policies));
         self
     }
 
@@ -55,13 +51,14 @@ impl TestConfigBuilder {
                 ClientSelectorSpec::Cidr(cidr) => {
                     let _ = writeln!(clients_doc, "cidr = \"{}\"", toml_escape(cidr));
                 }
+                ClientSelectorSpec::Fallback => {}
             }
             let _ = writeln!(
                 clients_doc,
                 "policies = [{}]",
                 format_string_list(&client.policies)
             );
-            if client.fallback {
+            if matches!(client.selector, ClientSelectorSpec::Fallback) {
                 let _ = writeln!(clients_doc, "fallback = true");
             }
         }
@@ -124,11 +121,21 @@ pub struct ClientSpec {
     name: String,
     selector: ClientSelectorSpec,
     policies: Vec<String>,
-    fallback: bool,
 }
 
 impl ClientSpec {
-    pub fn cidr(name: &str, cidr: &str, policies: &[&str], fallback: bool) -> Self {
+    pub fn fallback(name: &str, policies: &[&str]) -> Self {
+        Self {
+            name: name.to_string(),
+            selector: ClientSelectorSpec::Fallback,
+            policies: policies
+                .iter()
+                .map(|policy| (*policy).to_string())
+                .collect(),
+        }
+    }
+
+    pub fn cidr(name: &str, cidr: &str, policies: &[&str]) -> Self {
         Self {
             name: name.to_string(),
             selector: ClientSelectorSpec::Cidr(cidr.to_string()),
@@ -136,11 +143,10 @@ impl ClientSpec {
                 .iter()
                 .map(|policy| (*policy).to_string())
                 .collect(),
-            fallback,
         }
     }
 
-    pub fn ip(name: &str, ip: &str, policies: &[&str], fallback: bool) -> Self {
+    pub fn ip(name: &str, ip: &str, policies: &[&str]) -> Self {
         Self {
             name: name.to_string(),
             selector: ClientSelectorSpec::Ip(ip.to_string()),
@@ -148,7 +154,6 @@ impl ClientSpec {
                 .iter()
                 .map(|policy| (*policy).to_string())
                 .collect(),
-            fallback,
         }
     }
 }
@@ -157,6 +162,7 @@ impl ClientSpec {
 pub enum ClientSelectorSpec {
     Ip(String),
     Cidr(String),
+    Fallback,
 }
 
 #[derive(Debug, Clone)]

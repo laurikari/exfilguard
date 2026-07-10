@@ -235,7 +235,7 @@ Config loading fails if the HTTPS mode and method set are inconsistent.
 
 Exactly one client must set `fallback = true`. That client handles requests that
 do not match any specific IP or CIDR. Config loading fails if zero or multiple
-fallback clients exist.
+fallback clients exist. The fallback must not set `ip` or `cidr`.
 
 ## Certificate storage and permissions
 

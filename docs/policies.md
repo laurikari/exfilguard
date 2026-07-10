@@ -14,8 +14,8 @@ files in `clients.d/`.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | String | Yes | Unique identifier for the client |
-| `ip` | String | One of ip/cidr | Single IP address (e.g., `"127.0.0.1"`, `"::1"`) |
-| `cidr` | String | One of ip/cidr | CIDR block (e.g., `"10.0.0.0/8"`, `"2001:db8::/32"`) |
+| `ip` | String | Non-fallback only: one of ip/cidr | Single IP address (e.g., `"127.0.0.1"`, `"::1"`) |
+| `cidr` | String | Non-fallback only: one of ip/cidr | CIDR block (e.g., `"10.0.0.0/8"`, `"2001:db8::/32"`) |
 | `policies` | Array | Yes | List of policy names to apply in order |
 | `fallback` | Boolean | No | Mark as fallback client (exactly one required) |
 
@@ -23,11 +23,14 @@ files in `clients.d/`.
 
 Client selectors must not overlap, so each source IP maps to at most one
 non-fallback client. If nothing matches, ExfilGuard uses the fallback client.
+The fallback has no selector and is never part of IP/CIDR matching. A fallback
+that sets `ip` or `cidr` is invalid.
 
 ### Validation Rules
 
 - Client names must be unique
-- Either `ip` or `cidr` must be specified, not both
+- Every non-fallback client must specify either `ip` or `cidr`, not both
+- The fallback client must not specify `ip` or `cidr`
 - Non-fallback selectors must not overlap (IP vs IP, IP vs CIDR, CIDR vs CIDR)
 - Exactly one client must have `fallback = true`
 - All referenced policies must exist
@@ -56,7 +59,6 @@ policies = ["local-allow"]
 # Fallback: deny everything else
 [[client]]
 name = "fallback"
-cidr = "0.0.0.0/0"
 policies = ["default-deny"]
 fallback = true
 ```

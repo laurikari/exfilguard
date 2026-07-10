@@ -368,7 +368,6 @@ mod tests {
     use crate::policy::compile::compile_config;
     use crate::policy::matcher::PolicySnapshot;
     use http::Method;
-    use ipnet::IpNet;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -395,9 +394,8 @@ mod tests {
         };
         let clients = vec![Client {
             name: Arc::<str>::from("default"),
-            selector: ClientSelector::Cidr("0.0.0.0/0".parse::<IpNet>().unwrap()),
+            selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
-            fallback: true,
         }];
         let config = Config {
             clients,
