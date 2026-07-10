@@ -307,14 +307,22 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | `dns_resolve_timeout` | u64 | 2 | Maximum time to resolve DNS for upstream hosts |
 | `upstream_connect_timeout` | u64 | 5 | Maximum time to establish upstream TCP connections |
 | `tls_handshake_timeout` | u64 | 10 | Maximum time for TLS handshakes (client or upstream) |
-| `request_header_timeout` | u64 | 10 | Maximum time to read an HTTP request line + headers |
+| `request_header_timeout` | u64 | 10 | Maximum time to read an HTTP/1 request line + headers or the downstream HTTP/2 connection preface |
 | `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |
 | `response_header_timeout` | u64 | 60 | Maximum time to receive upstream response headers |
 | `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
 | `request_total_timeout` | u64 | 0 | Maximum total time from request start until the response has been fully forwarded (0 disables) |
-| `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an idle client keep-alive connection |
+| `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an HTTP/1 keep-alive connection or an HTTP/2 connection with no active request streams |
 | `connect_tunnel_idle_timeout` | u64 | 60 | Maximum idle time for CONNECT tunnels |
 | `connect_tunnel_max_lifetime` | u64 | 0 | Maximum lifetime for CONNECT tunnels (0 disables) |
+
+For downstream HTTP/2, the connection is request-idle whenever it has no
+active stream task. The client must produce its next complete request within
+`client_keepalive_idle_timeout`; PING and other control traffic do not extend
+that period. This also bounds an incomplete HTTP/2 header block while no other
+stream is active. Active streams remain governed by the request-body,
+response, and optional total-request timeouts rather than the connection-idle
+timer.
 
 ---
 

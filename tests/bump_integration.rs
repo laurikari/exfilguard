@@ -1693,6 +1693,110 @@ async fn connect_bump_http2_encoded_unreserved_hits_ordered_deny() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_closes_request_idle_session() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-idle";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2)
+            .with_settings(|settings| settings.client_keepalive_idle_timeout = 1),
+    )
+    .await?;
+    let mut client = fixture.h2_client().await?;
+
+    client.wait_closed(StdDuration::from_secs(2)).await?;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_closes_incomplete_request_headers_when_idle() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-incomplete";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2)
+            .with_settings(|settings| settings.client_keepalive_idle_timeout = 1),
+    )
+    .await?;
+    let mut stream = fixture.take_tls_stream();
+
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await?;
+    stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+    stream.write_all(&[0, 0, 1, 1, 0, 0, 0, 0, 1, 0x82]).await?;
+    stream.flush().await?;
+
+    timeout(StdDuration::from_secs(2), async {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => return Ok::<(), std::io::Error>(()),
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+    })
+    .await
+    .context("incomplete HTTP/2 headers were not closed by idle timeout")??;
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_does_not_apply_connection_idle_timeout_to_active_stream() -> Result<()>
+{
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-active";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2NoResponse)
+            .with_settings(|settings| {
+                settings.client_keepalive_idle_timeout = 1;
+                settings.response_header_timeout = 3;
+            }),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/active")
+                .build()?,
+        )
+        .body(())?;
+    let response = client.start_request(request)?;
+
+    sleep(StdDuration::from_millis(1_500)).await;
+    assert!(
+        !client.is_closed(),
+        "active HTTP/2 stream was closed by connection-idle timeout"
+    );
+
+    drop(response);
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_closes_downstream_after_upstream_close() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-reconnect";

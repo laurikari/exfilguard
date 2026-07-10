@@ -184,6 +184,7 @@ impl Http2Upstream {
     }
 
     pub(super) async fn shutdown(&mut self) {
+        self.primed.take();
         if let Some(handle) = self.handle.take() {
             handle.connection_task.abort();
             let _ = handle.connection_task.await;
@@ -192,6 +193,7 @@ impl Http2Upstream {
 
     pub(super) async fn terminate_session(&mut self) {
         let _ = self.closed_tx.send(true);
+        self.primed.take();
         if let Some(handle) = self.handle.take() {
             handle.connection_task.abort();
             let _ = handle.connection_task.await;

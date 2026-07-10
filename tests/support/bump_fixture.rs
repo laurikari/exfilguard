@@ -131,6 +131,12 @@ pub struct BumpedH2Client {
 }
 
 impl BumpedH2Client {
+    pub fn is_closed(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     pub async fn request(
         &mut self,
         request: http::Request<()>,
@@ -142,6 +148,17 @@ impl BumpedH2Client {
         let response = response_fut
             .await
             .context("failed to receive HTTP/2 response")?;
+        Ok(response)
+    }
+
+    pub fn start_request(
+        &mut self,
+        request: http::Request<()>,
+    ) -> Result<h2::client::ResponseFuture> {
+        let (response, _) = self
+            .send_request
+            .send_request(request, true)
+            .context("failed to send HTTP/2 request")?;
         Ok(response)
     }
 

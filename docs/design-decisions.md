@@ -251,3 +251,19 @@ ExfilGuard does not currently support some protocol features, including
 HTTP/1.0 and upgrade-style flows such as WebSocket over HTTP/1.1.
 
 We leave them out because that keeps the code easier to reason about.
+
+## HTTP/2 uses request-idle connection timeouts
+
+The downstream HTTP/2 connection preface must arrive within
+`request_header_timeout`. After setup, `client_keepalive_idle_timeout` applies
+only while there are no active request streams. A client must produce its next
+complete request within that window; control traffic such as PING does not
+keep a request-idle connection alive. Active streams continue to use their
+phase-specific body, response, and optional total-request timeouts.
+
+The `h2` library does not expose when an individual HEADERS/CONTINUATION block
+starts. ExfilGuard therefore bounds an incomplete header block on an otherwise
+idle connection with the connection-idle timeout instead of maintaining a
+second partial HTTP/2 frame parser solely to apply a shorter header deadline.
+This keeps setup and idle retention bounded without imposing a lifetime on
+legitimate active or multiplexed sessions.

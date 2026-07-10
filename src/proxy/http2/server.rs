@@ -10,9 +10,11 @@ use futures::future::poll_fn;
 use h2::server::{self, SendResponse};
 use http;
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     sync::{Mutex, Semaphore, watch},
     task::JoinSet,
+    time::{sleep, timeout},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::warn;
@@ -78,14 +80,13 @@ impl Http2BumpService {
         primed_upstream: Option<PrimedHttp2Upstream>,
         flow_context: RequestFlowContext,
     ) -> Result<Self> {
-        let mut builder = server::Builder::new();
-        builder
-            .max_header_list_size(app.settings.max_request_header_size.min(u32::MAX as usize) as u32)
-            .max_concurrent_streams(app.settings.http2_max_concurrent_streams);
-        let connection = builder
-            .handshake(stream)
-            .await
-            .context("failed to handshake HTTP/2 with downstream client")?;
+        let connection = handshake_downstream(
+            stream,
+            app.settings.max_request_header_size,
+            app.settings.http2_max_concurrent_streams,
+            app.settings.request_header_timeout(),
+        )
+        .await?;
         let upstream = Http2Upstream::new(app.clone(), connect_binding, primed_upstream);
         let upstream_closed = upstream.closed_receiver();
         let request_slots = Arc::new(Semaphore::new(
@@ -104,6 +105,7 @@ impl Http2BumpService {
 
     async fn run(&mut self) -> Result<()> {
         let mut tasks = JoinSet::new();
+        let keepalive_timeout = self.app.settings.client_keepalive_idle_timeout();
         loop {
             tokio::select! {
                 biased;
@@ -180,6 +182,13 @@ impl Http2BumpService {
                         }
                     }
                 }
+                _ = sleep(keepalive_timeout), if tasks.is_empty() => {
+                    tracing::debug!(
+                        peer = %self.peer,
+                        "closing idle downstream HTTP/2 session"
+                    );
+                    break;
+                }
             }
         }
         while let Some(result) = tasks.join_next().await {
@@ -189,6 +198,25 @@ impl Http2BumpService {
         upstream.shutdown().await;
         Ok(())
     }
+}
+
+async fn handshake_downstream<T>(
+    stream: T,
+    max_header_size: usize,
+    max_concurrent_streams: u32,
+    setup_timeout: Duration,
+) -> Result<server::Connection<T, Bytes>>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut builder = server::Builder::new();
+    builder
+        .max_header_list_size(max_header_size.min(u32::MAX as usize) as u32)
+        .max_concurrent_streams(max_concurrent_streams);
+    timeout(setup_timeout, builder.handshake(stream))
+        .await
+        .context("timed out waiting for downstream HTTP/2 connection preface")?
+        .context("failed to handshake HTTP/2 with downstream client")
 }
 
 fn log_stream_task_completion(peer: SocketAddr, result: Result<(), tokio::task::JoinError>) {
@@ -530,7 +558,29 @@ impl RequestHandler for Http2RequestHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
     use tokio::sync::mpsc;
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_handshake_times_out_without_connection_preface() {
+        let (_client, server) = duplex(1024);
+        let task = tokio::spawn(handshake_downstream(
+            server,
+            32 * 1024,
+            100,
+            Duration::from_secs(1),
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for downstream HTTP/2 connection preface"),
+            "{error:#}"
+        );
+    }
 
     #[tokio::test]
     async fn completed_stream_tasks_are_reaped_while_accept_source_remains_open() {
