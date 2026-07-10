@@ -7,7 +7,6 @@ fi
 
 install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard
 install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/ca
-install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/cert-cache
 install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/cache
 install -d -o root -g exfilguard -m 0750 /etc/exfilguard
 install -d -o root -g exfilguard -m 0750 /etc/exfilguard/config.d

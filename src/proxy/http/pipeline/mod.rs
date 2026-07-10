@@ -93,9 +93,10 @@ name = "allow"
             clients_dir: None,
             policies: policies_path.clone(),
             policies_dir: None,
-            cert_cache_dir: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
+            leaf_cache_capacity: 4,
+            leaf_mint_concurrency: 2,
             log_queries: false,
             dns_resolve_timeout: 1,
             upstream_connect_timeout: 1,
@@ -125,8 +126,13 @@ name = "allow"
         };
 
         let ca = Arc::new(CertificateAuthority::load_or_generate(&ca_dir)?);
-        let cert_cache = Arc::new(CertificateCache::new(4, None)?);
-        let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
+        let cert_cache = Arc::new(CertificateCache::new(settings.leaf_cache_capacity)?);
+        let tls_issuer = Arc::new(TlsIssuer::new(
+            ca.clone(),
+            cert_cache,
+            settings.leaf_ttl(),
+            settings.leaf_mint_concurrency,
+        )?);
         let config_doc = config::load_config(&clients_path, &policies_path)?;
         let compiled = Arc::new(policy::compile::compile_config(&config_doc)?);
         let snapshot = PolicySnapshot::new(compiled);

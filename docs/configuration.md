@@ -77,8 +77,9 @@ These settings control TLS interception and leaf certificate generation.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `cert_cache_dir` | Path | None | Directory to cache dynamically generated TLS certificates |
 | `leaf_ttl` | u64 | 86400 | TLS certificate leaf TTL in seconds (must be > 0) |
+| `leaf_cache_capacity` | usize | 4096 | Maximum number of generated TLS leaves retained in memory (must be > 0) |
+| `leaf_mint_concurrency` | usize | 4 | Maximum concurrent blocking TLS leaf mint jobs (must be > 0) |
 
 ### CA Directory Structure
 
@@ -100,9 +101,8 @@ ca_dir/
 If `ca_dir` is empty, ExfilGuard generates all four files automatically on first startup.
 
 !!! note
-    If you change files under `ca_dir`, restart the server. If you replace the
-    signing CA and use `cert_cache_dir`, clear the cached leaf certificates
-    before restart if you need clients to see the new issuer right away.
+    If you change files under `ca_dir`, restart the server. Generated leaf
+    certificates are cached only in process memory and disappear on restart.
 
 ### Using Your Corporate CA
 
@@ -334,7 +334,6 @@ EXFILGUARD__UPSTREAM_CONNECT_TIMEOUT=120
 # Core settings
 listen = "127.0.0.1:3128"
 ca_dir = "./ca"
-cert_cache_dir = "./cert_cache"
 clients = "clients.toml"
 policies = "policies.toml"
 clients_dir = "clients.d"
@@ -346,6 +345,8 @@ log_queries = false
 
 # TLS
 leaf_ttl = 86400
+leaf_cache_capacity = 4096
+leaf_mint_concurrency = 4
 
 # Timeouts (seconds)
 dns_resolve_timeout = 2

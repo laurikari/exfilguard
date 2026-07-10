@@ -170,7 +170,7 @@ impl CertificateAuthority {
     }
 
     /// Mint a new leaf certificate for the provided subject names with the requested validity.
-    /// The returned value includes the full chain and private key bytes for persistence.
+    /// The returned value includes the in-memory rustls key plus raw material for test fixtures.
     pub fn mint_leaf(&self, names: &[&str], ttl: StdDuration) -> Result<MintedLeaf> {
         ensure!(!names.is_empty(), "at least one subject name is required");
         ensure!(ttl > StdDuration::from_secs(0), "leaf ttl must be positive");

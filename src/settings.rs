@@ -22,6 +22,14 @@ impl SettingsDefaults {
         86_400
     }
 
+    const fn leaf_cache_capacity() -> usize {
+        4096
+    }
+
+    const fn leaf_mint_concurrency() -> usize {
+        4
+    }
+
     const fn log_queries() -> bool {
         false
     }
@@ -174,6 +182,7 @@ where
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub listen: SocketAddr,
     #[serde(default, deserialize_with = "deserialize_proxy_protocol_mode")]
@@ -187,12 +196,14 @@ pub struct Settings {
     pub clients_dir: Option<PathBuf>,
     #[serde(default)]
     pub policies_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub cert_cache_dir: Option<PathBuf>,
     #[serde(default = "SettingsDefaults::log_format")]
     pub log: LogFormat,
     #[serde(default = "SettingsDefaults::leaf_ttl")]
     pub leaf_ttl: u64,
+    #[serde(default = "SettingsDefaults::leaf_cache_capacity")]
+    pub leaf_cache_capacity: usize,
+    #[serde(default = "SettingsDefaults::leaf_mint_concurrency")]
+    pub leaf_mint_concurrency: usize,
     #[serde(default = "SettingsDefaults::log_queries")]
     pub log_queries: bool,
     #[serde(default = "SettingsDefaults::dns_resolve_timeout")]
@@ -468,9 +479,6 @@ impl Settings {
             .unwrap_or_else(|| Path::new("."));
 
         self.ca_dir = absolutize(&self.ca_dir, base_dir);
-        if let Some(cache_dir) = self.cert_cache_dir.clone() {
-            self.cert_cache_dir = Some(absolutize(&cache_dir, base_dir));
-        }
         if let Some(cache_dir) = self.cache_dir.clone() {
             self.cache_dir = Some(absolutize(&cache_dir, base_dir));
         }
@@ -571,6 +579,16 @@ impl Settings {
             self.leaf_ttl > 0,
             "leaf_ttl must be greater than 0 seconds (got {})",
             self.leaf_ttl
+        );
+        ensure!(
+            self.leaf_cache_capacity > 0,
+            "leaf_cache_capacity must be greater than 0 (got {})",
+            self.leaf_cache_capacity
+        );
+        ensure!(
+            self.leaf_mint_concurrency > 0,
+            "leaf_mint_concurrency must be greater than 0 (got {})",
+            self.leaf_mint_concurrency
         );
         if self.cache_dir.is_some() {
             ensure!(
@@ -686,6 +704,33 @@ response_header_timeout = 30
     }
 
     #[test]
+    fn load_rejects_removed_persistent_leaf_cache_setting() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("exfilguard.toml");
+        fs::write(
+            &config_path,
+            r#"
+listen = "127.0.0.1:3128"
+ca_dir = "ca"
+clients = "clients.toml"
+policies = "policies.toml"
+cert_cache_dir = "leaf-cache"
+"#,
+        )
+        .unwrap();
+
+        let error = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("cert_cache_dir")
+                && error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_settings_validation_cache_enabled() {
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -696,9 +741,10 @@ response_header_timeout = 30
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
-            cert_cache_dir: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
+            leaf_cache_capacity: 4096,
+            leaf_mint_concurrency: 4,
             log_queries: false,
             dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,
@@ -732,6 +778,14 @@ response_header_timeout = 30
         let mut unlimited = settings.clone();
         unlimited.max_request_body_size = 0;
         assert!(unlimited.validate().is_ok());
+
+        let mut invalid_leaf_cache = settings.clone();
+        invalid_leaf_cache.leaf_cache_capacity = 0;
+        assert!(invalid_leaf_cache.validate().is_err());
+
+        let mut invalid_mint_concurrency = settings;
+        invalid_mint_concurrency.leaf_mint_concurrency = 0;
+        assert!(invalid_mint_concurrency.validate().is_err());
     }
 
     #[test]
@@ -745,9 +799,10 @@ response_header_timeout = 30
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
-            cert_cache_dir: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
+            leaf_cache_capacity: 4096,
+            leaf_mint_concurrency: 4,
             log_queries: false,
             dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,
@@ -794,9 +849,10 @@ response_header_timeout = 30
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
-            cert_cache_dir: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
+            leaf_cache_capacity: 4096,
+            leaf_mint_concurrency: 4,
             log_queries: false,
             dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,
@@ -840,9 +896,10 @@ response_header_timeout = 30
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
-            cert_cache_dir: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
+            leaf_cache_capacity: 4096,
+            leaf_mint_concurrency: 4,
             log_queries: false,
             dns_resolve_timeout: 2,
             upstream_connect_timeout: 5,

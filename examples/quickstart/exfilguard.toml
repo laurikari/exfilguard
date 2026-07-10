@@ -2,7 +2,6 @@ listen = "127.0.0.1:3128"
 proxy_protocol = "off"
 
 ca_dir = "/tmp/exfilguard/quickstart/ca"
-cert_cache_dir = "/tmp/exfilguard/quickstart/cache"
 
 clients = "clients.toml"
 policies = "policies.toml"

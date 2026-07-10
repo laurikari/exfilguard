@@ -879,9 +879,6 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
 async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
     let upstream_host = "localhost";
     let dirs = TestDirs::new()?;
-    let workspace = dirs.config_dir.parent().expect("temp workspace directory");
-    let cert_cache_dir = workspace.join("cert_cache");
-    std::fs::create_dir_all(&cert_cache_dir)?;
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_addr = upstream_listener.local_addr()?;
 
@@ -919,11 +916,7 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    let cert_cache_path = cert_cache_dir.clone();
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(move |settings| {
-            settings.cert_cache_dir = Some(cert_cache_path.clone());
-        })
         .spawn()
         .await?;
 
@@ -985,9 +978,6 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
 async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
     let upstream_host = "localhost";
     let dirs = TestDirs::new()?;
-    let workspace = dirs.config_dir.parent().expect("temp workspace directory");
-    let cert_cache_dir = workspace.join("cert_cache");
-    std::fs::create_dir_all(&cert_cache_dir)?;
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_addr = upstream_listener.local_addr()?;
 
@@ -1025,11 +1015,7 @@ async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    let cert_cache_path = cert_cache_dir.clone();
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(move |settings| {
-            settings.cert_cache_dir = Some(cert_cache_path.clone());
-        })
         .spawn()
         .await?;
 
@@ -1091,9 +1077,6 @@ async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
 async fn http_keepalive_does_not_retry_ambiguous_empty_post() -> Result<()> {
     let upstream_host = "localhost";
     let dirs = TestDirs::new()?;
-    let workspace = dirs.config_dir.parent().expect("temp workspace directory");
-    let cert_cache_dir = workspace.join("cert_cache");
-    std::fs::create_dir_all(&cert_cache_dir)?;
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_addr = upstream_listener.local_addr()?;
 
@@ -1139,11 +1122,7 @@ async fn http_keepalive_does_not_retry_ambiguous_empty_post() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    let cert_cache_path = cert_cache_dir.clone();
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
-        .with_settings(move |settings| {
-            settings.cert_cache_dir = Some(cert_cache_path.clone());
-        })
         .spawn()
         .await?;
 
@@ -2007,20 +1986,15 @@ async fn http_ipv6_loopback_denied() -> Result<()> {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
     let dirs = TestDirs::new()?;
-    let workspace = dirs.config_dir.parent().expect("temp workspace directory");
-    let cert_cache_dir = workspace.join("cert_cache");
-    std::fs::create_dir_all(&cert_cache_dir)?;
 
     let clients = std::fs::read_to_string("tests/data/clients/ipv6.toml")?;
     let policies = std::fs::read_to_string("tests/data/policies/ipv6.toml")?;
 
-    let cert_cache_path = cert_cache_dir.clone();
     let harness = ProxyHarnessBuilder::with_dirs(dirs, clients.as_str(), policies.as_str())
         .with_private_test_upstreams(false)
         .with_settings(move |settings| {
             let port = settings.listen.port();
             settings.listen = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
-            settings.cert_cache_dir = Some(cert_cache_path.clone());
             settings.log_queries = true;
         })
         .spawn()

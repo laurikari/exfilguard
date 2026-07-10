@@ -235,9 +235,6 @@ impl BumpedTlsFixture {
             settings_override,
         } = options;
         let dirs = super::TestDirs::new()?;
-        let workspace = dirs.config_dir.parent().expect("temp workspace directory");
-        let cert_cache_dir = workspace.join("cert_cache");
-        std::fs::create_dir_all(&cert_cache_dir)?;
         let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let upstream_addr = upstream_listener.local_addr()?;
 
@@ -252,12 +249,10 @@ impl BumpedTlsFixture {
         let (added_proxy, _) =
             proxy_root_store.add_parsable_certificates([ca.root_certificate_der()]);
         assert!(added_proxy > 0, "expected CA root to be trusted by proxy");
-        let cert_cache_path = cert_cache_dir.clone();
         let mut settings_override = settings_override;
         let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
             .with_proxy_root_store(proxy_root_store)
             .with_settings(move |settings| {
-                settings.cert_cache_dir = Some(cert_cache_path.clone());
                 if let Some(override_fn) = settings_override.take() {
                     override_fn(settings);
                 }

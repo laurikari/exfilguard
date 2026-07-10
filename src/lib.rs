@@ -24,8 +24,6 @@ use crate::{
     tls::{ca::CertificateAuthority, cache::CertificateCache, issuer::TlsIssuer},
 };
 
-const DEFAULT_CERT_CACHE_CAPACITY: usize = 512;
-
 pub async fn run(settings: Settings) -> Result<()> {
     run_with_upstream_resolver(settings, default_upstream_resolver()).await
 }
@@ -53,15 +51,12 @@ async fn run_with_upstream_resolver(
         (addr, path, tls)
     });
     let ca = Arc::new(CertificateAuthority::load_or_generate(&settings.ca_dir)?);
-    let cert_cache_dir = settings.cert_cache_dir.clone();
-    let cert_cache = Arc::new(CertificateCache::new(
-        DEFAULT_CERT_CACHE_CAPACITY,
-        cert_cache_dir,
-    )?);
+    let cert_cache = Arc::new(CertificateCache::new(settings.leaf_cache_capacity)?);
     let tls_issuer = Arc::new(TlsIssuer::new(
         ca.clone(),
         cert_cache.clone(),
         settings.leaf_ttl(),
+        settings.leaf_mint_concurrency,
     )?);
     let TlsClientConfigs { http1, http2 } = build_tls_client_configs(&settings)?;
     let snapshot = build_runtime_policy_snapshot(&settings)?;

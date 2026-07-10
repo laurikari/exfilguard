@@ -22,8 +22,6 @@ use super::dirs::{TestDirs, write_clients_and_policies};
 use super::net::{find_free_port, wait_for_listener};
 use super::tls::build_proxy_tls_configs;
 
-const CERT_CACHE_CAPACITY: usize = 512;
-
 fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
     Settings {
         listen,
@@ -34,9 +32,10 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         clients_dir: None,
         policies: dirs.policies_path.clone(),
         policies_dir: None,
-        cert_cache_dir: None,
         log: LogFormat::Text,
         leaf_ttl: 3_600,
+        leaf_cache_capacity: 512,
+        leaf_mint_concurrency: 4,
         log_queries: false,
         dns_resolve_timeout: 2,
         upstream_connect_timeout: 5,
@@ -164,11 +163,13 @@ impl ProxyHarnessBuilder {
         let proxy_addr = settings.listen;
         let settings = Arc::new(settings);
 
-        let cert_cache = Arc::new(CertificateCache::new(
-            CERT_CACHE_CAPACITY,
-            settings.cert_cache_dir.clone(),
+        let cert_cache = Arc::new(CertificateCache::new(settings.leaf_cache_capacity)?);
+        let tls_issuer = Arc::new(TlsIssuer::new(
+            ca.clone(),
+            cert_cache,
+            settings.leaf_ttl(),
+            settings.leaf_mint_concurrency,
         )?);
-        let tls_issuer = Arc::new(TlsIssuer::new(ca.clone(), cert_cache, settings.leaf_ttl())?);
 
         let (proxy_client_config, proxy_client_h2_config) =
             build_proxy_tls_configs(self.proxy_root_store)?;

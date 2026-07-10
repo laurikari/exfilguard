@@ -60,7 +60,12 @@ pub async fn handle_bump(
         UpstreamProbe::Http1 => (false, None),
     };
 
-    let server_config = build_server_config(app, &target.host, supports_h2)?;
+    let server_config = timeout(
+        app.settings.tls_handshake_timeout(),
+        build_server_config(app, &target.host, supports_h2),
+    )
+    .await
+    .map_err(|_| anyhow!("leaf certificate mint timed out"))??;
     let acceptor = TlsAcceptor::from(server_config);
     let tls_stream = timeout(
         app.settings.tls_handshake_timeout(),
@@ -111,8 +116,12 @@ pub async fn handle_bump(
     Ok(BumpStats { handshake_bytes })
 }
 
-fn build_server_config(app: &AppContext, host: &str, prefer_h2: bool) -> Result<Arc<ServerConfig>> {
-    let certified = app.tls.issuer.issue(&[host])?;
+async fn build_server_config(
+    app: &AppContext,
+    host: &str,
+    prefer_h2: bool,
+) -> Result<Arc<ServerConfig>> {
+    let certified = app.tls.issuer.issue(&[host]).await?;
     let provider = ring::default_provider();
     let builder = ServerConfig::builder_with_provider(provider.into());
     let builder = builder.with_safe_default_protocol_versions()?;

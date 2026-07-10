@@ -4,7 +4,6 @@
 listen = "0.0.0.0:3128"
 
 ca_dir = "/var/lib/exfilguard/ca"
-cert_cache_dir = "/var/lib/exfilguard/cert-cache"
 
 clients = "clients.toml"
 clients_dir = "clients.d"
@@ -19,6 +18,10 @@ log = "json"
 
 # Bumped downstream HTTP/2 concurrency per connection
 # http2_max_concurrent_streams = 100
+
+# In-memory TLS leaf cache and mint admission
+# leaf_cache_capacity = 4096
+# leaf_mint_concurrency = 4
 
 # Response cache storage (rules opt-in)
 cache_dir = "/var/lib/exfilguard/cache"

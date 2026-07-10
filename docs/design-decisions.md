@@ -61,6 +61,17 @@ The method restriction follows HTTP idempotency semantics when delivery to the
 origin is ambiguous. Non-idempotent methods and extension methods whose
 semantics ExfilGuard cannot establish are not retried automatically.
 
+## TLS leaf certificates are cached only in memory
+
+ExfilGuard does not persist generated TLS leaf certificates or their private
+keys. Leaf minting is cheap enough that reminting after a restart is preferable
+to maintaining an on-disk private-key cache with its own capacity, expiry, and
+filesystem-safety lifecycle.
+
+The in-memory cache is capacity-bounded. Concurrent requests for the same leaf
+are single-flighted, and globally limited mint jobs run on blocking workers so
+certificate generation cannot stall asynchronous I/O workers.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that

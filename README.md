@@ -241,11 +241,11 @@ fallback clients exist. The fallback must not set `ip` or `cidr`.
 
 ## Certificate storage and permissions
 
-`--ca-dir` and `cert_cache_dir` hold the root, intermediate, and leaf
-material. ExfilGuard writes files with `0o600`, but you must also secure the
-directories, for example with `chmod 700`. Anyone who can read them can mint
-certificates or impersonate the proxy, so run ExfilGuard as an unprivileged
-user and store the CA on trusted disks.
+`--ca-dir` holds the root and intermediate CA material. ExfilGuard writes keys
+with `0o600`, but you must also secure the directory, for example with
+`chmod 700`. Anyone who can read the signing key can mint certificates or
+impersonate the proxy, so run ExfilGuard as an unprivileged user and store the
+CA on trusted disks. Generated leaf keys are cached only in process memory.
 
 ## Testing
 
