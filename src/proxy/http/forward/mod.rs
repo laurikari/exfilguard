@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use http::Method;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tracing::debug;
 
@@ -126,7 +127,14 @@ where
     .await;
 
     match outcome {
-        Err(err) if should_retry_reused_connection(reused_existing, body_plan, &err) => {
+        Err(err)
+            if should_retry_reused_connection(
+                reused_existing,
+                &request.method,
+                body_plan,
+                &err,
+            ) =>
+        {
             debug!(
                 host = %connection.host,
                 port = connection.port,
@@ -240,10 +248,14 @@ async fn finalize_forward_attempt(
 
 fn should_retry_reused_connection(
     reused_existing: bool,
+    method: &Method,
     body_plan: BodyPlan,
     err: &anyhow::Error,
 ) -> bool {
-    if !reused_existing || !matches!(body_plan, BodyPlan::Empty) {
+    if !reused_existing
+        || !is_standard_idempotent_method(method)
+        || !matches!(body_plan, BodyPlan::Empty)
+    {
         return false;
     }
 
@@ -264,26 +276,69 @@ fn should_retry_reused_connection(
     })
 }
 
+fn is_standard_idempotent_method(method: &Method) -> bool {
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
+        || method == Method::TRACE
+        || method == Method::PUT
+        || method == Method::DELETE
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BodyPlan, should_retry_reused_connection};
     use crate::proxy::forward_error::UpstreamClosed;
+    use http::Method;
 
     #[test]
-    fn retry_only_on_reused_empty_body_stale_connection_errors() {
+    fn retry_standard_idempotent_methods_on_reused_empty_stale_connections() {
         let stale = anyhow::Error::new(UpstreamClosed);
-        assert!(should_retry_reused_connection(
-            true,
-            BodyPlan::Empty,
-            &stale
-        ));
+
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::PUT,
+            Method::DELETE,
+        ] {
+            assert!(
+                should_retry_reused_connection(true, &method, BodyPlan::Empty, &stale),
+                "expected {method} to be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn do_not_retry_non_idempotent_or_extension_methods() {
+        let stale = anyhow::Error::new(UpstreamClosed);
+
+        for method in [
+            Method::POST,
+            Method::PATCH,
+            Method::CONNECT,
+            Method::from_bytes(b"CUSTOM").unwrap(),
+        ] {
+            assert!(
+                !should_retry_reused_connection(true, &method, BodyPlan::Empty, &stale),
+                "expected {method} not to be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_requires_reuse_empty_body_and_stale_connection_error() {
+        let stale = anyhow::Error::new(UpstreamClosed);
         assert!(!should_retry_reused_connection(
             false,
+            &Method::GET,
             BodyPlan::Empty,
             &stale
         ));
         assert!(!should_retry_reused_connection(
             true,
+            &Method::GET,
             BodyPlan::Fixed(1),
             &stale,
         ));
@@ -291,6 +346,7 @@ mod tests {
         let unrelated = anyhow::anyhow!("some other upstream failure");
         assert!(!should_retry_reused_connection(
             true,
+            &Method::GET,
             BodyPlan::Empty,
             &unrelated,
         ));

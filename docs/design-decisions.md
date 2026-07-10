@@ -48,6 +48,18 @@ spellings, but it cannot reuse a representation selected using a missing,
 extra, or reordered value. Cache layout changes invalidate entries that lack
 this complete key.
 
+## Retry only replayable idempotent requests
+
+When reuse of a pooled HTTP/1 upstream connection fails with an error that
+indicates a stale socket, ExfilGuard retries once on a fresh connection only if
+the request is bodyless and uses a standard idempotent method: `GET`, `HEAD`,
+`OPTIONS`, `TRACE`, `PUT`, or `DELETE`.
+
+The bodyless restriction makes the request locally replayable without buffering.
+The method restriction follows HTTP idempotency semantics when delivery to the
+origin is ambiguous. Non-idempotent methods and extension methods whose
+semantics ExfilGuard cannot establish are not retried automatically.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that

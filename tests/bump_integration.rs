@@ -928,6 +928,115 @@ async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_keepalive_does_not_retry_ambiguous_empty_post() -> Result<()> {
+    let upstream_host = "localhost";
+    let dirs = TestDirs::new()?;
+    let workspace = dirs.config_dir.parent().expect("temp workspace directory");
+    let cert_cache_dir = workspace.join("cert_cache");
+    std::fs::create_dir_all(&cert_cache_dir)?;
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-http"])
+        .policy(
+            PolicySpec::new("allow-http")
+                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**")))
+                .bind_host_port(upstream_host, upstream_addr.port()),
+        )
+        .render();
+
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    let action_count = Arc::new(AtomicUsize::new(0));
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let accept_counter = accept_count.clone();
+    let action_counter = action_count.clone();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                accept = upstream_listener.accept() => {
+                    let (stream, peer) = match accept {
+                        Ok(pair) => pair,
+                        Err(err) => return Err(anyhow::anyhow!("upstream accept error: {err}")),
+                    };
+                    accept_counter.fetch_add(1, Ordering::SeqCst);
+                    let action_counter = action_counter.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            serve_http_ambiguous_empty_post(stream, peer, action_counter).await
+                        {
+                            tracing::warn!(
+                                error = %err,
+                                "ambiguous POST upstream handler error"
+                            );
+                        }
+                    });
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let cert_cache_path = cert_cache_dir.clone();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(move |settings| {
+            settings.cert_cache_dir = Some(cert_cache_path.clone());
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let warm_request = format!(
+        "GET http://{host}:{port}/warm HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port()
+    );
+    stream.write_all(warm_request.as_bytes()).await?;
+    stream.flush().await?;
+    let warm_response = read_http_response(&mut stream).await?;
+    assert!(
+        warm_response.starts_with("HTTP/1.1 200"),
+        "unexpected warm-up response: {warm_response}"
+    );
+
+    let post_request = format!(
+        "POST http://{host}:{port}/action HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: exfilguard-test\r\nContent-Length: 0\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port()
+    );
+    stream.write_all(post_request.as_bytes()).await?;
+    stream.flush().await?;
+    let post_response = read_http_response(&mut stream).await?;
+    assert!(
+        post_response.starts_with("HTTP/1.1 502"),
+        "expected ambiguous upstream failure, got: {post_response}"
+    );
+
+    assert_eq!(
+        action_count.load(Ordering::SeqCst),
+        1,
+        "the origin-side POST action must not be replayed"
+    );
+    assert_eq!(
+        accept_count.load(Ordering::SeqCst),
+        1,
+        "a non-idempotent request must not be retried on a fresh connection"
+    );
+
+    stream.shutdown().await.ok();
+    let _ = shutdown_tx.send(());
+    upstream_task
+        .await
+        .expect("upstream task join failed")
+        .expect("upstream task error");
+    harness.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_keepalive_reuses_upstream_connections() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
@@ -1842,6 +1951,50 @@ async fn serve_http_stale_keepalive(mut stream: TcpStream, _peer: SocketAddr) ->
         .shutdown()
         .await
         .context("failed to shutdown stale keepalive upstream stream")?;
+    Ok(())
+}
+
+async fn serve_http_ambiguous_empty_post(
+    mut stream: TcpStream,
+    _peer: SocketAddr,
+    action_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    loop {
+        let request_bytes = read_request(&mut stream).await?;
+        if request_bytes.is_empty() {
+            break;
+        }
+
+        let request = String::from_utf8(request_bytes)?;
+        if request.starts_with("POST ") && request_path(&request) == "/action" {
+            action_count.fetch_add(1, Ordering::SeqCst);
+            stream
+                .shutdown()
+                .await
+                .context("failed to close after processing ambiguous POST")?;
+            return Ok(());
+        }
+
+        let body = request_path(&request).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("failed to write ambiguous POST warm-up response")?;
+        stream
+            .flush()
+            .await
+            .context("failed to flush ambiguous POST warm-up response")?;
+    }
+
+    stream
+        .shutdown()
+        .await
+        .context("failed to shutdown ambiguous POST upstream stream")?;
     Ok(())
 }
 
