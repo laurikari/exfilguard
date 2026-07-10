@@ -4,7 +4,7 @@
 listen = "0.0.0.0:3128"
 
 ca_dir = "/var/lib/exfilguard/ca"
-cert_cache_dir = "/var/lib/exfilguard/cache"
+cert_cache_dir = "/var/lib/exfilguard/cert-cache"
 
 clients = "clients.toml"
 clients_dir = "clients.d"
