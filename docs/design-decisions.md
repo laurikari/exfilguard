@@ -40,6 +40,14 @@ body would leave request bytes in the downstream connection. Chunked requests
 also bypass the cache because their emptiness is unknown until framing is
 consumed.
 
+Fields named by `Vary` are matched using their complete ordered list of parsed
+field-value bytes. ExfilGuard does not generically comma-combine repeated fields
+because whether combination is valid depends on the field grammar. This
+conservative comparison can produce a cache miss for semantically equivalent
+spellings, but it cannot reuse a representation selected using a missing,
+extra, or reordered value. Cache layout changes invalidate entries that lack
+this complete key.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that

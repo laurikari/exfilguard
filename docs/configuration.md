@@ -273,7 +273,8 @@ Cache lifetime is chosen in this order:
 - **Methods**: Only `GET` and `HEAD` requests
 - **Status codes**: 200, 203, 204, 205, 301, 302
 - **Bypass**: Requests with `Authorization` or `Cookie` headers are never
-  served from cache and are not stored. Requests with `Range` are also bypassed.
+  served from cache and are not stored. Requests with fixed-length or chunked
+  bodies, or with `Range`, are also bypassed.
 - **Not cached**: Responses with `no-store`, `no-cache`, or `private`
   directives, or any `Set-Cookie` header
 
@@ -285,6 +286,10 @@ Request-side cache controls can force a bypass. If a request includes
 not be stored. Otherwise, caching follows the upstream response headers plus
 `force_cache_duration` from policy rules.
 
+For fields named by `Vary`, ExfilGuard stores and compares the complete ordered
+list of request field values. Requests with missing, extra, or reordered values
+do not share a representation.
+
 #### Eviction
 
 The cache uses LRU eviction when capacity is reached. Expired entries are
@@ -292,7 +297,7 @@ removed on lookup.
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`v2` under the cache root).
+Cache entries live under a versioned subdirectory (`v3` under the cache root).
 Metadata is keyed by request URI and points to an immutable body generation.
 When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up

@@ -11,7 +11,7 @@ use tracing::{trace, warn};
 
 use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 
-const CACHE_LAYOUT_VERSION: u32 = 2;
+const CACHE_LAYOUT_VERSION: u32 = 3;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
 

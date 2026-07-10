@@ -849,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn uses_versioned_cache_dir_and_cleans_old_versions() -> Result<()> {
         let dir = TempDir::new()?;
-        let old_dir = dir.path().join("v1");
+        let old_dir = dir.path().join("v2");
         fs::create_dir_all(&old_dir)?;
         fs::write(old_dir.join("old"), b"data")?;
 
@@ -863,6 +863,7 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
+        assert_eq!(active_name, "v3");
         let mut cleaned = false;
         for _ in 0..10 {
             let dirs = fs::read_dir(dir.path())?
@@ -968,6 +969,61 @@ mod tests {
 
         assert!(cache.lookup(&method, &uri, &req_headers_2).await.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_vary_preserves_complete_ordered_values() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/vary-persisted");
+        let name = http::header::HeaderName::from_static("x-variant");
+        let secret = http::HeaderValue::from_bytes(b"\x80secret")?;
+
+        let mut stored_headers = HeaderMap::new();
+        stored_headers.append(name.clone(), "common".parse()?);
+        stored_headers.append(name.clone(), secret.clone());
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(http::header::VARY, "X-Variant".parse()?);
+
+        let cache = build_cache(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        cache
+            .store(
+                &method,
+                &uri,
+                &stored_headers,
+                StatusCode::OK,
+                &response_headers,
+                b"secret representation",
+                Duration::from_secs(60),
+            )
+            .await?;
+        drop(cache);
+
+        let rebuilt = build_cache(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        assert!(
+            rebuilt
+                .lookup(&method, &uri, &stored_headers)
+                .await
+                .is_some(),
+            "exact repeated values should survive cache rebuild"
+        );
+
+        let mut first_only = HeaderMap::new();
+        first_only.append(name.clone(), "common".parse()?);
+        assert!(
+            rebuilt.lookup(&method, &uri, &first_only).await.is_none(),
+            "persisted key must not match only its first value"
+        );
+
+        let mut reversed = HeaderMap::new();
+        reversed.append(name.clone(), secret);
+        reversed.append(name, "common".parse()?);
+        assert!(
+            rebuilt.lookup(&method, &uri, &reversed).await.is_none(),
+            "persisted key must preserve value order"
+        );
         Ok(())
     }
 

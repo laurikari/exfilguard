@@ -271,7 +271,8 @@ The cache follows standard HTTP caching headers from upstream:
 
 - **Cache-Control**: `s-maxage`, `max-age`, `public`, `private`, `no-cache`, `no-store`
 - **Expires**: HTTP date for expiration
-- **Vary**: Responses vary by specified request headers
+- **Vary**: Responses vary by the complete ordered value list of each specified
+  request header
 
 `force_cache_duration` is a fallback only. It does not override upstream
 freshness. It applies when the upstream response omits `s-maxage`, `max-age`,

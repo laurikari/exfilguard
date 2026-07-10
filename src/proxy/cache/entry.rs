@@ -24,7 +24,7 @@ pub(super) struct PersistedEntry {
     pub body_id: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub vary_headers: Vec<(String, String)>,
+    pub vary_headers: Vec<(String, Vec<u8>)>,
     pub expires_at: u64,
     pub content_hash: String,
     pub content_length: u64,
@@ -37,7 +37,7 @@ impl CacheEntry {
             body_id: self.body_id.clone(),
             status: self.status.as_u16(),
             headers: headermap_to_vec(&self.headers),
-            vary_headers: headermap_to_vec(self.vary.headers()),
+            vary_headers: headermap_to_bytes_vec(self.vary.headers()),
             expires_at: self
                 .expires_at
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -55,7 +55,7 @@ impl CacheEntry {
         expires_at: SystemTime,
     ) -> Self {
         let headers = to_headermap(&persisted.headers);
-        let vary_headers = to_headermap(&persisted.vary_headers);
+        let vary_headers = bytes_vec_to_headermap(&persisted.vary_headers);
         let vary = VaryKey::new(vary_headers);
 
         Self {
@@ -93,4 +93,23 @@ fn headermap_to_vec(map: &HeaderMap) -> Vec<(String, String)> {
         }
     }
     items
+}
+
+fn bytes_vec_to_headermap(items: &[(String, Vec<u8>)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in items {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::try_from(name.as_str()),
+            http::HeaderValue::from_bytes(value),
+        ) {
+            map.append(name, value);
+        }
+    }
+    map
+}
+
+fn headermap_to_bytes_vec(map: &HeaderMap) -> Vec<(String, Vec<u8>)> {
+    map.iter()
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect()
 }

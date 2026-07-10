@@ -295,6 +295,71 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_vary_values_do_not_cross_cache_representations() -> Result<()> {
+    let upstream =
+        MockUpstream::new("Cache-Control: public, max-age=60\r\nVary: X-Variant").await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let repeated = format!(
+        "GET http://127.0.0.1:{upstream_port}/vary HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nX-Variant: common\r\nX-Variant: secret\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(repeated.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(response.contains("cached-response"));
+    assert_eq!(request_counter.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    let first_only = format!(
+        "GET http://127.0.0.1:{upstream_port}/vary HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nX-Variant: common\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(first_only.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(response.contains("cached-response"));
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        2,
+        "request sharing only the first Vary value must miss"
+    );
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(first_only.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(response.contains("cached-response"));
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        2,
+        "the exact single-value representation should now hit"
+    );
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fixed_body_requests_do_not_populate_cache_or_share_variants() -> Result<()> {
     let upstream = BodyEchoUpstream::new().await?;
     let upstream_port = upstream.port();
@@ -694,7 +759,7 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         .cache_dir
         .as_ref()
         .expect("cache dir enabled")
-        .join("v2");
+        .join("v3");
 
     let readonly_marker = Arc::new(AtomicUsize::new(0));
     let watcher_dir = cache_version_dir.clone();
