@@ -146,7 +146,9 @@ mod tests {
 
     fn issuer(capacity: usize, mint_concurrency: usize) -> Result<TlsIssuer> {
         let ca_dir = TempDir::new()?;
-        let ca = Arc::new(CertificateAuthority::load_or_generate(ca_dir.path())?);
+        let ca = Arc::new(CertificateAuthority::load_or_generate(
+            ca_dir.path().join("ca"),
+        )?);
         let cache = Arc::new(CertificateCache::new(capacity)?);
         TlsIssuer::new(ca, cache, StdDuration::from_secs(3600), mint_concurrency)
     }
@@ -254,7 +256,8 @@ mod tests {
     #[test]
     fn rejects_invalid_limits() {
         let ca_dir = TempDir::new().unwrap();
-        let ca = Arc::new(CertificateAuthority::load_or_generate(ca_dir.path()).unwrap());
+        let ca =
+            Arc::new(CertificateAuthority::load_or_generate(ca_dir.path().join("ca")).unwrap());
         let cache = Arc::new(CertificateCache::new(16).unwrap());
         let err = TlsIssuer::new(ca, cache, StdDuration::from_secs(3600), 0)
             .err()

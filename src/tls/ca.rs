@@ -1,14 +1,16 @@
 use std::convert::TryInto;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write;
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
+use std::io::{Read, Write};
 // ExfilGuard only targets Unix-like hosts, so we rely on the Unix-specific
 // OpenOptions extension traits to enforce filesystem permissions.
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use nix::libc::O_NOFOLLOW;
+use nix::unistd::geteuid;
 use rand::{TryRng, rngs::SysRng};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
@@ -47,11 +49,33 @@ impl CertificateAuthority {
             .create(ca_dir)
             .with_context(|| format!("failed to create CA directory {}", ca_dir.display()))?;
 
+        let expected_uid = geteuid().as_raw();
+        validate_ca_directory(ca_dir, expected_uid)?;
+
         let paths = CaPaths::new(ca_dir);
-        let has_root_cert = paths.root_cert.exists();
-        let has_root_key = paths.root_key.exists();
-        let has_intermediate_cert = paths.intermediate_cert.exists();
-        let has_intermediate_key = paths.intermediate_key.exists();
+        let has_root_cert = path_exists_no_follow(&paths.root_cert)?;
+        let has_root_key = path_exists_no_follow(&paths.root_key)?;
+        let has_intermediate_cert = path_exists_no_follow(&paths.intermediate_cert)?;
+        let has_intermediate_key = path_exists_no_follow(&paths.intermediate_key)?;
+
+        for (path, kind, present) in [
+            (&paths.root_cert, CaFileKind::Certificate, has_root_cert),
+            (&paths.root_key, CaFileKind::PrivateKey, has_root_key),
+            (
+                &paths.intermediate_cert,
+                CaFileKind::Certificate,
+                has_intermediate_cert,
+            ),
+            (
+                &paths.intermediate_key,
+                CaFileKind::PrivateKey,
+                has_intermediate_key,
+            ),
+        ] {
+            if present {
+                validate_ca_file(path, kind, expected_uid)?;
+            }
+        }
 
         match (
             has_root_cert,
@@ -97,6 +121,16 @@ impl CertificateAuthority {
         write_pem_file(&paths.intermediate_cert, &intermediate_cert_pem, false)?;
         write_pem_file(&paths.intermediate_key, intermediate_key_pem.as_str(), true)?;
 
+        let expected_uid = geteuid().as_raw();
+        for (path, kind) in [
+            (&paths.root_cert, CaFileKind::Certificate),
+            (&paths.root_key, CaFileKind::PrivateKey),
+            (&paths.intermediate_cert, CaFileKind::Certificate),
+            (&paths.intermediate_key, CaFileKind::PrivateKey),
+        ] {
+            validate_ca_file(path, kind, expected_uid)?;
+        }
+
         // Drop root key as soon as we've finished persisting it.
         drop(root_key);
 
@@ -112,14 +146,7 @@ impl CertificateAuthority {
     fn load_existing(paths: &CaPaths) -> Result<Self> {
         let root_der = read_certificate_der(&paths.root_cert)?;
         let intermediate_der = read_certificate_der(&paths.intermediate_cert)?;
-        let intermediate_key_pem = Zeroizing::new(
-            fs::read_to_string(&paths.intermediate_key).with_context(|| {
-                format!(
-                    "failed to read intermediate key from {}",
-                    paths.intermediate_key.display()
-                )
-            })?,
-        );
+        let intermediate_key_pem = read_private_key_pem(&paths.intermediate_key)?;
         let intermediate_key = KeyPair::from_pem(intermediate_key_pem.as_ref())
             .map_err(|err| anyhow!("failed to parse intermediate key: {err}"))?;
 
@@ -272,9 +299,138 @@ fn write_pem_file(path: &Path, contents: &str, private: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum CaFileKind {
+    Certificate,
+    PrivateKey,
+}
+
+fn path_exists_no_follow(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn validate_ca_directory(path: &Path, expected_uid: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect CA directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "CA directory {} must not be a symlink; replace it with a real directory owned by UID {}",
+            path.display(),
+            expected_uid
+        );
+    }
+    ensure!(
+        metadata.is_dir(),
+        "CA directory {} is not a directory",
+        path.display()
+    );
+    ensure!(
+        metadata.uid() == expected_uid,
+        "CA directory {} is owned by UID {}, but ExfilGuard runs as UID {}; run `chown {} {}`",
+        path.display(),
+        metadata.uid(),
+        expected_uid,
+        expected_uid,
+        path.display()
+    );
+
+    let mode = metadata.mode() & 0o7777;
+    ensure!(
+        matches!(mode, 0o500 | 0o700),
+        "CA directory {} has mode {:04o}; expected 0500 or 0700; run `chmod 0700 {}`",
+        path.display(),
+        mode,
+        path.display()
+    );
+    Ok(())
+}
+
+fn validate_ca_file(path: &Path, kind: CaFileKind, expected_uid: u32) -> Result<()> {
+    open_validated_ca_file(path, kind, expected_uid)?;
+    Ok(())
+}
+
+fn open_validated_ca_file(path: &Path, kind: CaFileKind, expected_uid: u32) -> Result<File> {
+    let link_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect CA file {}", path.display()))?;
+    if link_metadata.file_type().is_symlink() {
+        bail!(
+            "CA file {} must not be a symlink; install a regular file owned by UID {}",
+            path.display(),
+            expected_uid
+        );
+    }
+    validate_ca_file_metadata(path, &link_metadata, kind, expected_uid)?;
+
+    // O_NOFOLLOW closes the race where the final path is replaced with a symlink
+    // between the metadata check and open. The owner-only CA directory prevents
+    // other users from replacing entries after its validation.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to securely open CA file {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect open CA file {}", path.display()))?;
+    validate_ca_file_metadata(path, &opened_metadata, kind, expected_uid)?;
+    Ok(file)
+}
+
+fn validate_ca_file_metadata(
+    path: &Path,
+    metadata: &Metadata,
+    kind: CaFileKind,
+    expected_uid: u32,
+) -> Result<()> {
+    ensure!(
+        metadata.file_type().is_file(),
+        "CA file {} is not a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.uid() == expected_uid,
+        "CA file {} is owned by UID {}, but ExfilGuard runs as UID {}; run `chown {} {}`",
+        path.display(),
+        metadata.uid(),
+        expected_uid,
+        expected_uid,
+        path.display()
+    );
+
+    let mode = metadata.mode() & 0o7777;
+    match kind {
+        CaFileKind::PrivateKey => ensure!(
+            matches!(mode, 0o400 | 0o600),
+            "CA private key {} has mode {:04o}; expected 0400 or 0600; run `chmod 0600 {}`",
+            path.display(),
+            mode,
+            path.display()
+        ),
+        CaFileKind::Certificate => ensure!(
+            mode & 0o400 != 0 && mode & 0o7133 == 0,
+            "CA certificate {} has unsafe mode {:04o}; it must be owner-readable, non-executable, and not group/world-writable; run `chmod 0644 {}`",
+            path.display(),
+            mode,
+            path.display()
+        ),
+    }
+    Ok(())
+}
+
+fn open_ca_file(path: &Path, kind: CaFileKind) -> Result<File> {
+    open_validated_ca_file(path, kind, geteuid().as_raw())
+}
+
 fn read_certificate_der(path: &Path) -> Result<Vec<u8>> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read certificate {}", path.display()))?;
+    let mut file = open_ca_file(path, CaFileKind::Certificate)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read certificate {}", path.display()))?;
     let mut certs = CertificateDer::pem_slice_iter(&bytes);
     match certs.next() {
         Some(Ok(cert)) => {
@@ -299,6 +455,14 @@ fn read_certificate_der(path: &Path) -> Result<Vec<u8>> {
         }
         None => bail!("no certificate found in {}", path.display()),
     }
+}
+
+fn read_private_key_pem(path: &Path) -> Result<Zeroizing<String>> {
+    let mut file = open_ca_file(path, CaFileKind::PrivateKey)?;
+    let mut pem = Zeroizing::new(String::new());
+    file.read_to_string(&mut pem)
+        .with_context(|| format!("failed to read intermediate key from {}", path.display()))?;
+    Ok(pem)
 }
 
 fn ensure_key_matches_cert(cert_der: &[u8], key: &KeyPair) -> Result<()> {
@@ -400,13 +564,20 @@ mod tests {
     use rcgen::SanType;
     use std::fs;
     use std::net::IpAddr;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
     use x509_parser::parse_x509_certificate;
 
+    fn secure_ca_temp_dir() -> Result<TempDir> {
+        let dir = TempDir::new()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        Ok(dir)
+    }
+
     #[test]
     fn generates_new_material_when_missing() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = secure_ca_temp_dir()?;
         let ca = CertificateAuthority::load_or_generate(dir.path())?;
         assert!(dir.path().join(ROOT_CERT_FILE).exists());
         assert!(dir.path().join(ROOT_KEY_FILE).exists());
@@ -423,7 +594,7 @@ mod tests {
 
     #[test]
     fn reuses_existing_material() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = secure_ca_temp_dir()?;
         let ca_first = CertificateAuthority::load_or_generate(dir.path())?;
         let root_first = ca_first.root_certificate_der().as_ref().to_vec();
         let intermediate_first = ca_first.intermediate_certificate_der().as_ref().to_vec();
@@ -445,7 +616,7 @@ mod tests {
 
     #[test]
     fn leaf_issuer_matches_loaded_intermediate_subject() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = secure_ca_temp_dir()?;
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
         let root_params = build_root_params()?;
@@ -491,9 +662,10 @@ mod tests {
 
     #[test]
     fn errors_on_partial_material() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = secure_ca_temp_dir()?;
         let root_path = dir.path().join(ROOT_CERT_FILE);
         fs::write(&root_path, "dummy root cert")?;
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o644))?;
         match CertificateAuthority::load_or_generate(dir.path()) {
             Ok(_) => panic!("expected error when CA material is incomplete"),
             Err(err) => assert!(
@@ -506,7 +678,7 @@ mod tests {
 
     #[test]
     fn loads_with_missing_root_key() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = secure_ca_temp_dir()?;
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
         let root_params = build_root_params()?;
@@ -539,8 +711,136 @@ mod tests {
     }
 
     #[test]
-    fn mint_leaf_produces_certified_key() -> Result<()> {
+    fn rejects_symlinked_ca_directory() -> Result<()> {
+        let parent = TempDir::new()?;
+        let real_dir = parent.path().join("real-ca");
+        CertificateAuthority::load_or_generate(&real_dir)?;
+        let linked_dir = parent.path().join("linked-ca");
+        symlink(&real_dir, &linked_dir)?;
+
+        let err = CertificateAuthority::load_or_generate(&linked_dir)
+            .err()
+            .expect("symlinked CA directory should be rejected");
+        assert!(err.to_string().contains("must not be a symlink"), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_symlinked_ca_keys() -> Result<()> {
+        for key_name in [ROOT_KEY_FILE, INTERMEDIATE_KEY_FILE] {
+            let dir = secure_ca_temp_dir()?;
+            CertificateAuthority::load_or_generate(dir.path())?;
+            let key_path = dir.path().join(key_name);
+            let real_path = dir.path().join(format!("{key_name}.real"));
+            fs::rename(&key_path, &real_path)?;
+            symlink(&real_path, &key_path)?;
+
+            let err = CertificateAuthority::load_or_generate(dir.path())
+                .err()
+                .expect("symlinked CA key should be rejected");
+            assert!(err.to_string().contains("must not be a symlink"), "{err:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_permissive_ca_directory() -> Result<()> {
         let dir = TempDir::new()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750))?;
+
+        let err = CertificateAuthority::load_or_generate(dir.path())
+            .err()
+            .expect("permissive CA directory should be rejected");
+        assert!(err.to_string().contains("expected 0500 or 0700"), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_permissive_ca_key() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        CertificateAuthority::load_or_generate(dir.path())?;
+        let key_path = dir.path().join(INTERMEDIATE_KEY_FILE);
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o640))?;
+
+        let err = CertificateAuthority::load_or_generate(dir.path())
+            .err()
+            .expect("group-readable CA key should be rejected");
+        assert!(err.to_string().contains("expected 0400 or 0600"), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_read_only_owner_ca_material() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        CertificateAuthority::load_or_generate(dir.path())?;
+        for key_name in [ROOT_KEY_FILE, INTERMEDIATE_KEY_FILE] {
+            fs::set_permissions(dir.path().join(key_name), fs::Permissions::from_mode(0o400))?;
+        }
+        for cert_name in [ROOT_CERT_FILE, INTERMEDIATE_CERT_FILE] {
+            fs::set_permissions(
+                dir.path().join(cert_name),
+                fs::Permissions::from_mode(0o444),
+            )?;
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500))?;
+
+        let result = CertificateAuthority::load_or_generate(dir.path());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        result?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_regular_ca_key() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        CertificateAuthority::load_or_generate(dir.path())?;
+        let key_path = dir.path().join(INTERMEDIATE_KEY_FILE);
+        fs::remove_file(&key_path)?;
+        fs::create_dir(&key_path)?;
+
+        let err = CertificateAuthority::load_or_generate(dir.path())
+            .err()
+            .expect("non-regular CA key should be rejected");
+        assert!(err.to_string().contains("not a regular file"), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_ca_material_owned_by_another_uid() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        CertificateAuthority::load_or_generate(dir.path())?;
+        let key_path = dir.path().join(INTERMEDIATE_KEY_FILE);
+        let metadata = fs::metadata(&key_path)?;
+        let other_uid = if metadata.uid() == u32::MAX {
+            metadata.uid() - 1
+        } else {
+            metadata.uid() + 1
+        };
+
+        let err =
+            validate_ca_file_metadata(&key_path, &metadata, CaFileKind::PrivateKey, other_uid)
+                .expect_err("foreign-owned CA key should be rejected");
+        assert!(err.to_string().contains("is owned by UID"), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_group_writable_ca_certificate() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        CertificateAuthority::load_or_generate(dir.path())?;
+        let cert_path = dir.path().join(ROOT_CERT_FILE);
+        fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o664))?;
+
+        let err = CertificateAuthority::load_or_generate(dir.path())
+            .err()
+            .expect("group-writable CA certificate should be rejected");
+        assert!(err.to_string().contains("unsafe mode"), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn mint_leaf_produces_certified_key() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
         let ca = CertificateAuthority::load_or_generate(dir.path())?;
         let minted = ca.mint_leaf(&["leaf.example"], StdDuration::from_secs(3600))?;
         assert_eq!(minted.chain_der.len(), 3);

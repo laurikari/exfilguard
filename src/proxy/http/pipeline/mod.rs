@@ -60,7 +60,6 @@ mod tests {
         let workspace = temp.path();
         let ca_dir = workspace.join("ca");
         let config_dir = workspace.join("config");
-        std::fs::create_dir_all(&ca_dir)?;
         std::fs::create_dir_all(&config_dir)?;
 
         let clients_path = config_dir.join("clients.toml");

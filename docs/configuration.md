@@ -100,6 +100,40 @@ ca_dir/
 
 If `ca_dir` is empty, ExfilGuard generates all four files automatically on first startup.
 
+ExfilGuard enforces owner-only control of this material at every startup:
+
+- `ca_dir` must be a real directory, not a symlink, owned by the process UID,
+  with mode `0700` or read-only mode `0500`.
+- Every CA file must be a regular, non-symlink file owned by the process UID.
+- `root.key` and `intermediate.key` must have mode `0600` or read-only mode
+  `0400`.
+- Certificates must be owner-readable, non-executable, and not writable by
+  group or other users. Generated certificates request mode `0644`; the Debian
+  service's `UMask=0077` reduces that to `0600`. Read-only modes such as `0444`
+  are also suitable.
+
+Startup fails with a remediation command when these requirements are not met;
+ExfilGuard does not change the ownership or permissions of provisioned files.
+For the packaged service, a typical repair is:
+
+```bash
+sudo chown -R exfilguard:exfilguard /var/lib/exfilguard/ca
+sudo chmod 0700 /var/lib/exfilguard/ca
+sudo chmod 0600 /var/lib/exfilguard/ca/root.key \
+  /var/lib/exfilguard/ca/intermediate.key
+sudo chmod 0644 /var/lib/exfilguard/ca/root.crt \
+  /var/lib/exfilguard/ca/intermediate.crt
+```
+
+If `root.key` is intentionally absent, omit it from the command.
+
+The Debian package creates `/var/lib/exfilguard/ca` as
+`exfilguard:exfilguard` mode `0700` and runs the service with `UMask=0077`, so
+a clean installation satisfies these rules on its first start. Package
+upgrades restore the directory ownership and mode but deliberately do not
+change existing CA files; operator-provisioned material must already satisfy
+the file rules above.
+
 !!! note
     If you change files under `ca_dir`, restart the server. Generated leaf
     certificates are cached only in process memory and disappear on restart.
@@ -142,6 +176,9 @@ PKI:
    # Keep the original intermediate.key - it matches the CSR
    # root.key is no longer needed (can be removed or kept)
    ```
+
+   Ensure the copied files are owned by the same UID that runs ExfilGuard and
+   restore the directory, key, and certificate modes documented above.
 
 5. **Restart ExfilGuard**.
    Clients that trust your corporate CA will then trust intercepted

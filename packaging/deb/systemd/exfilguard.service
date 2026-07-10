@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 User=exfilguard
 Group=exfilguard
+UMask=0077
 ExecStart=/usr/sbin/exfilguard --config /etc/exfilguard/exfilguard.toml
 Restart=on-failure
 RestartSec=2s

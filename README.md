@@ -155,8 +155,9 @@ strict, and policy checks run before any upstream connection is made.
   sane defaults.
 - Run as a non-root user and only listen on the interfaces you need. Put a
   firewall in front.
-- Lock down `ca_dir` with strict file permissions. Back up and rotate the CA
-  files regularly.
+- Keep `ca_dir` and its keys owned by the ExfilGuard process UID. Startup
+  enforces owner-only directory/key modes and rejects symlinks. Back up and
+  rotate the CA files regularly.
 - Review timeout and size limits for your setup (see `docs/configuration.md`).
 - Set `max_request_body_size`, `max_request_header_size`, and
   `max_response_header_size` to reasonable values.
@@ -242,8 +243,12 @@ fallback clients exist. The fallback must not set `ip` or `cidr`.
 ## Certificate storage and permissions
 
 `--ca-dir` holds the root and intermediate CA material. ExfilGuard writes keys
-with `0o600`, but you must also secure the directory, for example with
-`chmod 700`. Anyone who can read the signing key can mint certificates or
+with `0o600` and the directory with `0o700`. At startup it requires the final
+directory and every CA file to be owned by its process UID, rejects symlinks
+and non-regular files, and rejects group/world access to private keys. Read-only
+owner modes (`0o500` for the directory and `0o400` for keys) are supported.
+See `docs/configuration.md` for the exact certificate modes and remediation
+commands. Anyone who can read the signing key can mint certificates or
 impersonate the proxy, so run ExfilGuard as an unprivileged user and store the
 CA on trusted disks. Generated leaf keys are cached only in process memory.
 

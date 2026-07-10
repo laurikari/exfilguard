@@ -72,6 +72,19 @@ The in-memory cache is capacity-bounded. Concurrent requests for the same leaf
 are single-flighted, and globally limited mint jobs run on blocking workers so
 certificate generation cannot stall asynchronous I/O workers.
 
+## CA material is controlled by the process owner
+
+ExfilGuard loads CA material only from a real owner-controlled directory. The
+directory and all CA files must belong to the process UID; private keys must be
+regular, non-symlink files with owner-only modes. Read-only owner modes are
+supported, but shared ownership and permissive modes are rejected at startup
+instead of being repaired automatically.
+
+This intentionally excludes shared-volume and sidecar ownership models. A CA
+signing key can impersonate every inspected origin, so deployment convenience
+does not justify accepting material another local principal can replace or
+read.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that
