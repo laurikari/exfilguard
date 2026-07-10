@@ -3,7 +3,7 @@ mod support;
 use std::{
     net::Ipv4Addr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration as StdDuration,
@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Result;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 
@@ -112,6 +112,125 @@ impl MockUpstream {
     }
 }
 
+struct BodyEchoUpstream {
+    listener: TcpListener,
+    requests: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl BodyEchoUpstream {
+    async fn new() -> Result<Self> {
+        Ok(Self {
+            listener: TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+            requests: Arc::new(AtomicUsize::new(0)),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.listener.local_addr().unwrap().port()
+    }
+
+    async fn run(self) -> Result<()> {
+        loop {
+            let (socket, _) = self.listener.accept().await?;
+            let requests = self.requests.clone();
+            let bodies = self.bodies.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(socket);
+                loop {
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+
+                    let mut content_length = 0usize;
+                    let mut connection_close = false;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let Some((name, value)) = line.split_once(':') else {
+                            return;
+                        };
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        } else if name.eq_ignore_ascii_case("connection")
+                            && value.trim().eq_ignore_ascii_case("close")
+                        {
+                            connection_close = true;
+                        }
+                    }
+
+                    let mut body = vec![0u8; content_length];
+                    reader.read_exact(&mut body).await.unwrap();
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body.clone());
+
+                    let response_body = format!("origin:{}", String::from_utf8_lossy(&body));
+                    let connection = if connection_close {
+                        "close"
+                    } else {
+                        "keep-alive"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: public, max-age=60\r\nConnection: {connection}\r\n\r\n{response_body}",
+                        response_body.len()
+                    );
+                    reader
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .unwrap();
+                    reader.get_mut().flush().await.unwrap();
+
+                    if connection_close {
+                        reader.get_mut().shutdown().await.ok();
+                        return;
+                    }
+                }
+            });
+        }
+    }
+}
+
+async fn spawn_body_cache_harness(upstream_port: u16) -> Result<ProxyHarness> {
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await
+}
+
+fn fixed_body_request(upstream_port: u16, path: &str, body: &str, close: bool) -> String {
+    let connection = if close { "close" } else { "keep-alive" };
+    format!(
+        "GET http://127.0.0.1:{upstream_port}{path} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn bodyless_request(upstream_port: u16, path: &str, close: bool) -> String {
+    let connection = if close { "close" } else { "keep-alive" };
+    format!(
+        "GET http://127.0.0.1:{upstream_port}{path} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: {connection}\r\n\r\n"
+    )
+}
+
 async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) -> Result<()> {
     let upstream = MockUpstream::new(upstream_headers).await?;
     let upstream_port = upstream.port();
@@ -172,6 +291,150 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
     upstream_task.abort();
     let _ = upstream_task.await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_body_requests_do_not_populate_cache_or_share_variants() -> Result<()> {
+    let upstream = BodyEchoUpstream::new().await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let received_bodies = upstream.bodies.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+    let harness = spawn_body_cache_harness(upstream_port).await?;
+
+    for body in ["alpha", "bravo"] {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream
+            .write_all(fixed_body_request(upstream_port, "/variant", body, true).as_bytes())
+            .await?;
+        let response = read_http_response(&mut stream).await?;
+        assert!(
+            response.contains(&format!("origin:{body}")),
+            "body variant was not forwarded independently: {response}"
+        );
+    }
+
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        2,
+        "each body-bearing request must reach the origin"
+    );
+
+    // A later bodyless request should populate a fresh entry, proving neither
+    // body-bearing response was stored under the bodyless cache key.
+    let bodyless = bodyless_request(upstream_port, "/variant", true);
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(bodyless.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(response.contains("origin:"));
+    assert_eq!(request_counter.load(Ordering::SeqCst), 3);
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(bodyless.as_bytes()).await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(response.contains("origin:"));
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        3,
+        "the bodyless response should be cacheable"
+    );
+    assert_eq!(
+        *received_bodies.lock().unwrap(),
+        vec![b"alpha".to_vec(), b"bravo".to_vec(), Vec::new()]
+    );
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_body_bypasses_existing_hit_and_preserves_pipeline() -> Result<()> {
+    let upstream = BodyEchoUpstream::new().await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+    let harness = spawn_body_cache_harness(upstream_port).await?;
+
+    let bodyless_close = bodyless_request(upstream_port, "/pipelined", true);
+    let mut warm_stream = TcpStream::connect(harness.addr).await?;
+    warm_stream.write_all(bodyless_close.as_bytes()).await?;
+    let warm_response = read_http_response(&mut warm_stream).await?;
+    assert!(warm_response.contains("origin:"));
+    assert_eq!(request_counter.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    let body_request = fixed_body_request(upstream_port, "/pipelined", "BODY", false);
+    let following_request = bodyless_request(upstream_port, "/pipelined", true);
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream
+        .write_all(format!("{body_request}{following_request}").as_bytes())
+        .await?;
+
+    let first = read_http_response_with_length(&mut stream).await?;
+    assert!(
+        first.contains("origin:BODY"),
+        "body-bearing request incorrectly used the existing cache hit: {first}"
+    );
+    let second = read_http_response_with_length(&mut stream).await?;
+    assert!(
+        second.contains("origin:"),
+        "following pipelined request was not parsed cleanly: {second}"
+    );
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        2,
+        "only the warmup and body-bearing request should reach the origin"
+    );
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expect_continue_body_request_bypasses_existing_hit() -> Result<()> {
+    let upstream = BodyEchoUpstream::new().await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+    let harness = spawn_body_cache_harness(upstream_port).await?;
+
+    let bodyless = bodyless_request(upstream_port, "/expect", true);
+    let mut warm_stream = TcpStream::connect(harness.addr).await?;
+    warm_stream.write_all(bodyless.as_bytes()).await?;
+    let warm_response = read_http_response(&mut warm_stream).await?;
+    assert!(warm_response.contains("origin:"));
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request_head = format!(
+        "GET http://127.0.0.1:{upstream_port}/expect HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: 4\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request_head.as_bytes()).await?;
+    let interim = read_until_double_crlf(&mut stream).await?;
+    assert!(
+        interim.starts_with("HTTP/1.1 100 Continue"),
+        "cache hit incorrectly replaced the continue handshake: {interim}"
+    );
+
+    stream.write_all(b"BODY").await?;
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.contains("origin:BODY"),
+        "body was not forwarded after 100 Continue: {response}"
+    );
+    assert_eq!(request_counter.load(Ordering::SeqCst), 2);
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
     Ok(())
 }
 

@@ -40,7 +40,7 @@ pub(super) async fn prepare_cache_write(
     head: &Http1ResponseHead,
     peer: SocketAddr,
 ) -> CacheWriteState {
-    if matches!(request_body_plan, BodyPlan::Chunked) {
+    if !request_body_plan.is_definitely_empty() {
         return CacheWriteState::Bypass;
     }
 

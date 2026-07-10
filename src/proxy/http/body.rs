@@ -33,6 +33,16 @@ pub enum BodyPlan {
     Chunked,
 }
 
+impl BodyPlan {
+    /// Whether parsing proved that the request has no body bytes.
+    ///
+    /// A chunked request is not definitely empty until its framing is consumed,
+    /// so it deliberately returns false here.
+    pub const fn is_definitely_empty(self) -> bool {
+        matches!(self, Self::Empty | Self::Fixed(0))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkedRelayStats {
     pub bytes_read: u64,

@@ -12,7 +12,6 @@ use super::ClientDisposition;
 use super::handler::Http1RequestHandler;
 use super::respond::shutdown_stream;
 
-use super::super::body::BodyPlan;
 use super::super::codec::{ConnectionOverride, encode_cached_http1_response};
 use super::super::forward::{ResponseBodyPlan, determine_response_body_plan};
 
@@ -30,7 +29,7 @@ pub(super) async fn evaluate_cache<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if matches!(handler.body_plan, BodyPlan::Chunked) {
+    if !handler.body_plan.is_definitely_empty() {
         return Ok(CacheEvaluation::Bypass);
     }
 

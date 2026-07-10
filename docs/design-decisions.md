@@ -31,6 +31,15 @@ That includes cases such as:
 This is a security choice. ExfilGuard should not quietly “fix” a request into
 a different request.
 
+## Cache only bodyless requests
+
+Shared-cache lookup and storage are limited to requests proven to have no body.
+Body-bearing `GET` and `HEAD` requests are forwarded normally without using the
+cache. Cache keys do not include bodies, and serving a hit before consuming a
+body would leave request bytes in the downstream connection. Chunked requests
+also bypass the cache because their emptiness is unknown until framing is
+consumed.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that
