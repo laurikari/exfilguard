@@ -128,6 +128,11 @@ impl Http2BumpService {
                         Err(_) => break,
                     }
                 }
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(result) = result {
+                        log_stream_task_completion(self.peer, result);
+                    }
+                }
                 result = self.connection.accept() => {
                     let Some(result) = result else {
                         break;
@@ -177,10 +182,22 @@ impl Http2BumpService {
                 }
             }
         }
-        while tasks.join_next().await.is_some() {}
+        while let Some(result) = tasks.join_next().await {
+            log_stream_task_completion(self.peer, result);
+        }
         let mut upstream = self.upstream.lock().await;
         upstream.shutdown().await;
         Ok(())
+    }
+}
+
+fn log_stream_task_completion(peer: SocketAddr, result: Result<(), tokio::task::JoinError>) {
+    if let Err(err) = result {
+        warn!(
+            peer = %peer,
+            error = %err,
+            "HTTP/2 downstream request task failed"
+        );
     }
 }
 
@@ -507,5 +524,39 @@ impl RequestHandler for Http2RequestHandler {
         outcome: policy_eval::DefaultDenyOutcome<'_>,
     ) -> Result<Self::Output> {
         self.ctx.handle_default_deny(outcome).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn completed_stream_tasks_are_reaped_while_accept_source_remains_open() {
+        let mut tasks = JoinSet::new();
+        for _ in 0..256 {
+            tasks.spawn(async {});
+        }
+        assert_eq!(tasks.len(), 256);
+
+        let (accept_source, mut accepted) = mpsc::unbounded_channel::<()>();
+        let peer = "127.0.0.1:3128".parse().unwrap();
+        while !tasks.is_empty() {
+            tokio::select! {
+                biased;
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(result) = result {
+                        log_stream_task_completion(peer, result);
+                    }
+                }
+                value = accepted.recv() => {
+                    panic!("open idle accept source unexpectedly completed: {value:?}");
+                }
+            }
+        }
+
+        assert_eq!(tasks.len(), 0);
+        assert!(!accept_source.is_closed());
     }
 }
