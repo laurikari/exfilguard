@@ -7,6 +7,51 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::util::timeout_with_context;
 
+pub struct CountingWriter<W> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W> AsyncWrite for CountingWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                self.bytes_written = self.bytes_written.saturating_add(written as u64);
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 pub struct TeeWriter<W1, W2> {
     writer1: W1,
     writer2: W2,

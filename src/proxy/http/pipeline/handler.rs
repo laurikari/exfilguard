@@ -7,8 +7,13 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use async_trait::async_trait;
 
 use crate::proxy::{
-    AppContext, allow_log::log_allow_success, connect::ResolvedTarget,
-    forward_limits::AllowLogTracker, policy_eval, policy_response, request::ParsedRequest,
+    AppContext,
+    allow_log::log_allow_success,
+    connect::ResolvedTarget,
+    forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
+    forward_limits::AllowLogTracker,
+    policy_eval, policy_response,
+    request::ParsedRequest,
     request_pipeline::RequestHandler,
 };
 
@@ -17,6 +22,7 @@ use super::cache::{CacheEvaluation, evaluate_cache};
 use super::forward::{
     build_allow_log_stats, forward_request, handle_forward_success, respond_forward_error,
 };
+use super::respond::shutdown_stream;
 
 use super::super::body::BodyPlan;
 use super::super::codec::Http1HeaderAccumulator;
@@ -60,6 +66,29 @@ where
         };
 
         let forward_result = forward_request(self, &decision).await;
+        if let Err(err) = forward_result.as_ref() {
+            let kind = classify_forward_error(err);
+            if let ForwardErrorKind::ResponseAlreadyStarted(started) = &kind {
+                crate::metrics::record_upstream_error(kind.as_metric_label());
+                log_forward_error(&kind, &log, err);
+                let spec = policy_response::forward_error_spec(&kind);
+                let error_detail = err.to_string();
+                let shutdown_result =
+                    shutdown_stream(self.reader.get_mut(), self.response_body_timeout).await;
+                policy_response::forward_error_log_builder(
+                    log.access_log_builder(),
+                    &decision,
+                    &spec,
+                    &error_detail,
+                )
+                .status(started.status)
+                .bytes(self.log_tracker.current_bytes(), started.bytes_to_client)
+                .elapsed(self.log_tracker.elapsed())
+                .log();
+                shutdown_result?;
+                return Ok(ClientDisposition::Close);
+            }
+        }
         let handled =
             policy_response::handle_forward_result(&decision, log.clone(), forward_result).await?;
         match handled {

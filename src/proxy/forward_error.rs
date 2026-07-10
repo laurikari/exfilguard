@@ -1,14 +1,36 @@
 use anyhow::Error;
+use http::StatusCode;
 use thiserror::Error;
 use tracing::warn;
 
 use crate::proxy::{
-    http::BodyTooLarge, policy_eval::RequestLogContext, resolver::PrivateAddressError,
+    http::{BodyTooLarge, InvalidRequestBody},
+    policy_eval::RequestLogContext,
+    resolver::PrivateAddressError,
 };
 
 #[derive(Debug, Error)]
 #[error("request timed out")]
 pub struct RequestTimeout;
+
+#[derive(Debug, Error)]
+#[error("response forwarding failed after downstream response started: {source}")]
+pub struct ResponseAlreadyStarted {
+    pub status: StatusCode,
+    pub bytes_to_client: u64,
+    #[source]
+    pub source: Error,
+}
+
+impl ResponseAlreadyStarted {
+    pub fn new(status: StatusCode, bytes_to_client: u64, source: Error) -> Self {
+        Self {
+            status,
+            bytes_to_client,
+            source,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 #[error(
@@ -39,7 +61,9 @@ impl MisdirectedRequest {
 
 /// Normalized classification of forwarding failures so HTTP/1.1 and HTTP/2 can react consistently.
 pub enum ForwardErrorKind<'a> {
+    ResponseAlreadyStarted(&'a ResponseAlreadyStarted),
     RequestTimeout,
+    InvalidRequestBody(&'a InvalidRequestBody),
     BodyTooLarge(&'a BodyTooLarge),
     PrivateAddress(&'a PrivateAddressError),
     MisdirectedRequest(&'a MisdirectedRequest),
@@ -50,7 +74,9 @@ pub enum ForwardErrorKind<'a> {
 impl ForwardErrorKind<'_> {
     pub fn as_metric_label(&self) -> &'static str {
         match self {
+            Self::ResponseAlreadyStarted(_) => "response_body_failed",
             Self::RequestTimeout => "request_timeout",
+            Self::InvalidRequestBody(_) => "invalid_request_body",
             Self::BodyTooLarge(_) => "body_too_large",
             Self::PrivateAddress(_) => "private_address",
             Self::MisdirectedRequest(_) => "misdirected_request",
@@ -61,8 +87,12 @@ impl ForwardErrorKind<'_> {
 }
 
 pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
-    if err.downcast_ref::<RequestTimeout>().is_some() {
+    if let Some(started) = err.downcast_ref::<ResponseAlreadyStarted>() {
+        ForwardErrorKind::ResponseAlreadyStarted(started)
+    } else if err.downcast_ref::<RequestTimeout>().is_some() {
         ForwardErrorKind::RequestTimeout
+    } else if let Some(invalid) = err.downcast_ref::<InvalidRequestBody>() {
+        ForwardErrorKind::InvalidRequestBody(invalid)
     } else if let Some(body) = err.downcast_ref::<BodyTooLarge>() {
         ForwardErrorKind::BodyTooLarge(body)
     } else if let Some(private) = err.downcast_ref::<PrivateAddressError>() {
@@ -88,6 +118,19 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
     let effective_mode = log.effective_mode();
 
     match kind {
+        ForwardErrorKind::ResponseAlreadyStarted(_) => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            error = %err,
+            "response forwarding failed after downstream response started"
+        ),
         ForwardErrorKind::RequestTimeout => warn!(
             peer = %peer,
             request_id = request_id,
@@ -99,6 +142,19 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             inner_method = inner_method,
             effective_mode = effective_mode,
             "request timed out while forwarding"
+        ),
+        ForwardErrorKind::InvalidRequestBody(_) => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            error = %err,
+            "invalid request body"
         ),
         ForwardErrorKind::PrivateAddress(private_err) => warn!(
             peer = %peer,
@@ -165,12 +221,16 @@ pub struct UpstreamClosed;
 
 #[cfg(test)]
 mod tests {
-    use super::{ForwardErrorKind, MisdirectedRequest};
-    use crate::{proxy::http::BodyTooLarge, proxy::resolver::PrivateAddressError};
+    use super::{ForwardErrorKind, MisdirectedRequest, ResponseAlreadyStarted};
+    use crate::{
+        proxy::http::{BodyTooLarge, InvalidRequestBody},
+        proxy::resolver::PrivateAddressError,
+    };
 
     #[test]
     fn metric_labels_cover_all_forward_error_kinds() {
         let body = BodyTooLarge { bytes_read: 42 };
+        let invalid = InvalidRequestBody::new(4, "bad chunk");
         let private = PrivateAddressError::new("example.com", 443, "connect target");
         let misdirected = MisdirectedRequest::new(
             "upstream.test".to_string(),
@@ -180,8 +240,21 @@ mod tests {
         );
 
         assert_eq!(
+            ForwardErrorKind::ResponseAlreadyStarted(&ResponseAlreadyStarted::new(
+                http::StatusCode::OK,
+                10,
+                anyhow::anyhow!("bad body"),
+            ))
+            .as_metric_label(),
+            "response_body_failed"
+        );
+        assert_eq!(
             ForwardErrorKind::RequestTimeout.as_metric_label(),
             "request_timeout"
+        );
+        assert_eq!(
+            ForwardErrorKind::InvalidRequestBody(&invalid).as_metric_label(),
+            "invalid_request_body"
         );
         assert_eq!(
             ForwardErrorKind::BodyTooLarge(&body).as_metric_label(),

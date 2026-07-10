@@ -6,7 +6,7 @@ mod pipeline;
 mod server;
 pub mod upstream;
 
-pub use body::BodyTooLarge;
+pub use body::{BodyTooLarge, InvalidRequestBody};
 pub(crate) use codec::{Http1HeaderAccumulator, Http1ResponseHead};
 pub use pipeline::{respond_with_access_log, send_response, shutdown_stream};
 pub use server::{handle_decrypted_https, handle_http};

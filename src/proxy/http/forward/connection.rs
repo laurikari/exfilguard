@@ -10,9 +10,9 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
-use crate::io_util::write_all_with_timeout;
+use crate::io_util::{CountingWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
-use crate::proxy::forward_error::RequestTimeout;
+use crate::proxy::forward_error::{RequestTimeout, ResponseAlreadyStarted};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
@@ -198,27 +198,45 @@ where
     }
     let mut bytes_to_client = informational_bytes.saturating_add(encoded_head.len() as u64);
 
-    let (body_bytes, cache_store) = cache_state
-        .relay_body(
-            &mut upstream_reader,
-            client_reader.get_mut(),
-            response_body_plan,
-            timeouts,
-            connection.peer,
-            request_deadline,
-            max_response_header_bytes,
-            peer,
-            request,
-        )
-        .await?;
+    let (relay_result, relayed_bytes) = {
+        let mut response_body_writer = CountingWriter::new(client_reader.get_mut());
+        let result = cache_state
+            .relay_body(
+                &mut upstream_reader,
+                &mut response_body_writer,
+                response_body_plan,
+                timeouts,
+                connection.peer,
+                request_deadline,
+                max_response_header_bytes,
+                peer,
+                request,
+            )
+            .await;
+        (result, response_body_writer.bytes_written())
+    };
+    let (body_bytes, cache_store) = match relay_result {
+        Ok(result) => result,
+        Err(source) => {
+            return Err(ResponseAlreadyStarted::new(
+                head.status,
+                bytes_to_client.saturating_add(relayed_bytes),
+                source,
+            )
+            .into());
+        }
+    };
     bytes_to_client = bytes_to_client.saturating_add(body_bytes);
 
-    timeout_with_context(
+    if let Err(source) = timeout_with_context(
         timeouts.response_io,
         client_reader.get_mut().flush(),
         "flushing client stream",
     )
-    .await?;
+    .await
+    {
+        return Err(ResponseAlreadyStarted::new(head.status, bytes_to_client, source).into());
+    }
 
     drop(upstream_reader);
 

@@ -274,6 +274,13 @@ Run a target:
 cargo fuzz run http1_request_head
 ```
 
+Stable regression seeds live under `fuzz/seeds/`. For example, run the chunked
+body target from its signed-extension and malformed-framing seeds with:
+
+```shell
+cargo fuzz run http1_chunked_body fuzz/seeds/http1_chunked_body
+```
+
 Parallel workers example:
 
 ```shell

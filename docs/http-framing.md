@@ -12,6 +12,18 @@ treats it as having no body. Any bytes after the header terminator belong to
 the next request on the same connection. ExfilGuard does not read until EOF,
 because EOF is only a valid delimiter when the connection is being closed.
 
+Chunked bodies use hexadecimal size lines terminated by CRLF. ExfilGuard
+validates the complete RFC 9112 chunk-extension grammar, including token and
+quoted-string values, and forwards valid size lines unchanged. This preserves
+signed chunk extensions. Bare-LF lines, extra or embedded carriage returns,
+controls, malformed quoting, and trailing syntax are rejected. Invalid request
+framing receives a `400 Bad Request` response and closes the connection.
+
+The same validation applies to chunked origin responses. If malformed framing
+is found after the origin response headers have already been sent downstream,
+ExfilGuard closes the downstream connection instead of appending a second HTTP
+response.
+
 ## Legacy or Lenient Upstreams
 
 Some legacy servers treat a missing length as "read until close". On keep-alive

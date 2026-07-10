@@ -380,7 +380,8 @@ impl Http2RequestHandler {
     fn should_disconnect_on_forward_error(kind: &ForwardErrorKind<'_>) -> bool {
         !matches!(
             kind,
-            ForwardErrorKind::BodyTooLarge(_)
+            ForwardErrorKind::InvalidRequestBody(_)
+                | ForwardErrorKind::BodyTooLarge(_)
                 | ForwardErrorKind::PrivateAddress(_)
                 | ForwardErrorKind::MisdirectedRequest(_)
         )
@@ -389,7 +390,9 @@ impl Http2RequestHandler {
     fn forward_error_decision(kind: &ForwardErrorKind<'_>) -> &'static str {
         match kind {
             ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
-            ForwardErrorKind::RequestTimeout
+            ForwardErrorKind::ResponseAlreadyStarted(_)
+            | ForwardErrorKind::RequestTimeout
+            | ForwardErrorKind::InvalidRequestBody(_)
             | ForwardErrorKind::MisdirectedRequest(_)
             | ForwardErrorKind::UpstreamClosed
             | ForwardErrorKind::Other => "ERROR",

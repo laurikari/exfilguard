@@ -19,6 +19,14 @@ pub struct ForwardErrorSpec {
 
 pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
     match kind {
+        ForwardErrorKind::ResponseAlreadyStarted(_) => ForwardErrorSpec {
+            status: StatusCode::BAD_GATEWAY,
+            body_http1: b"response forwarding failed\r\n",
+            body_http2: "response forwarding failed",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "response_body_failed",
+        },
         ForwardErrorKind::RequestTimeout => ForwardErrorSpec {
             status: StatusCode::GATEWAY_TIMEOUT,
             body_http1: b"request timed out\r\n",
@@ -26,6 +34,14 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             decision: "ERROR",
             extra_client_bytes: 0,
             log_reason: "request_timeout",
+        },
+        ForwardErrorKind::InvalidRequestBody(body) => ForwardErrorSpec {
+            status: StatusCode::BAD_REQUEST,
+            body_http1: b"invalid request body\r\n",
+            body_http2: "invalid request body",
+            decision: "ERROR",
+            extra_client_bytes: body.bytes_read,
+            log_reason: "invalid_request_body",
         },
         ForwardErrorKind::BodyTooLarge(body) => ForwardErrorSpec {
             status: StatusCode::PAYLOAD_TOO_LARGE,

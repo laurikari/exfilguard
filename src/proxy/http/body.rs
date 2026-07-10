@@ -2,7 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::time::timeout;
@@ -13,7 +13,7 @@ use crate::{
         forward_error::RequestTimeout,
         forward_limits::BodySizeTracker,
         headers::{sanitize_request_trailer_lines, sanitize_response_trailer_lines},
-        http::codec::read_line_with_timeout,
+        http::codec::read_line_bytes_with_timeout,
     },
     util::timeout_with_context,
 };
@@ -24,6 +24,29 @@ const MAX_CHUNK_LINE_LENGTH: usize = 8192;
 #[error("request body exceeds configured limit")]
 pub struct BodyTooLarge {
     pub bytes_read: u64,
+}
+
+#[derive(Debug, Error)]
+#[error("invalid request body: {detail}")]
+pub struct InvalidRequestBody {
+    pub bytes_read: u64,
+    detail: String,
+}
+
+impl InvalidRequestBody {
+    pub(crate) fn new(bytes_read: u64, detail: impl Into<String>) -> Self {
+        Self {
+            bytes_read,
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("invalid chunked body: {detail}")]
+struct InvalidChunkedBody {
+    bytes_read: u64,
+    detail: String,
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +74,168 @@ pub struct ChunkedRelayStats {
 }
 
 type TrailerSanitizer = fn(&[String]) -> Result<Vec<Vec<u8>>>;
+
+fn exact_crlf_content<'a>(line: &'a [u8], element: &str) -> Result<&'a [u8]> {
+    let content = line
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| anyhow!("{element} line must end with CRLF"))?;
+    if content.contains(&b'\r') || content.contains(&b'\n') {
+        bail!("{element} line contains an embedded CR or LF");
+    }
+    Ok(content)
+}
+
+fn hex_value(byte: u8) -> Option<usize> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as usize),
+        b'a'..=b'f' => Some((byte - b'a' + 10) as usize),
+        b'A'..=b'F' => Some((byte - b'A' + 10) as usize),
+        _ => None,
+    }
+}
+
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_bws(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn is_qdtext(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' ' | b'!' | b'#'..=b'[' | b']'..=b'~') || byte >= 0x80
+}
+
+fn is_quoted_pair_value(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' ' | b'!'..=b'~') || byte >= 0x80
+}
+
+fn skip_bws(bytes: &[u8], index: &mut usize) {
+    while bytes.get(*index).is_some_and(|byte| is_bws(*byte)) {
+        *index += 1;
+    }
+}
+
+fn parse_quoted_extension_value(bytes: &[u8], index: &mut usize) -> Result<()> {
+    debug_assert_eq!(bytes.get(*index), Some(&b'"'));
+    *index += 1;
+
+    loop {
+        let Some(byte) = bytes.get(*index).copied() else {
+            bail!("unterminated quoted chunk extension value");
+        };
+        match byte {
+            b'"' => {
+                *index += 1;
+                return Ok(());
+            }
+            b'\\' => {
+                *index += 1;
+                let Some(escaped) = bytes.get(*index).copied() else {
+                    bail!("unterminated quoted-pair in chunk extension value");
+                };
+                if !is_quoted_pair_value(escaped) {
+                    bail!("invalid quoted-pair in chunk extension value");
+                }
+                *index += 1;
+            }
+            byte if is_qdtext(byte) => *index += 1,
+            _ => bail!("invalid byte in quoted chunk extension value"),
+        }
+    }
+}
+
+fn parse_chunk_extensions(bytes: &[u8]) -> Result<()> {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        skip_bws(bytes, &mut index);
+        if index == bytes.len() {
+            bail!("chunk size must not end with whitespace");
+        }
+        if bytes[index] != b';' {
+            bail!("invalid data after chunk size");
+        }
+        index += 1;
+        skip_bws(bytes, &mut index);
+
+        let name_start = index;
+        while bytes.get(index).is_some_and(|byte| is_tchar(*byte)) {
+            index += 1;
+        }
+        if index == name_start {
+            bail!("chunk extension name must be a nonempty token");
+        }
+
+        let name_end = index;
+        skip_bws(bytes, &mut index);
+        if bytes.get(index) != Some(&b'=') {
+            if index == bytes.len() && index > name_end {
+                bail!("chunk size must not end with whitespace");
+            }
+            continue;
+        }
+        index += 1;
+        skip_bws(bytes, &mut index);
+
+        if bytes.get(index) == Some(&b'"') {
+            parse_quoted_extension_value(bytes, &mut index)?;
+        } else {
+            let value_start = index;
+            while bytes.get(index).is_some_and(|byte| is_tchar(*byte)) {
+                index += 1;
+            }
+            if index == value_start {
+                bail!("chunk extension value must be a token or quoted string");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_chunk_size_line(line: &[u8]) -> Result<usize> {
+    let content = exact_crlf_content(line, "chunk size")?;
+    let mut size_end = 0usize;
+    let mut chunk_size = 0usize;
+
+    while let Some(value) = content.get(size_end).and_then(|byte| hex_value(*byte)) {
+        chunk_size = chunk_size
+            .checked_mul(16)
+            .and_then(|size| size.checked_add(value))
+            .ok_or_else(|| anyhow!("chunk size exceeds platform limit"))?;
+        size_end += 1;
+    }
+    if size_end == 0 {
+        bail!("chunk size must contain at least one hexadecimal digit");
+    }
+
+    parse_chunk_extensions(&content[size_end..])?;
+    Ok(chunk_size)
+}
+
+fn invalid_chunked_body(stats: &ChunkedRelayStats, detail: impl Into<String>) -> anyhow::Error {
+    InvalidChunkedBody {
+        bytes_read: stats.bytes_read,
+        detail: detail.into(),
+    }
+    .into()
+}
 
 async fn with_total_deadline<F, T>(total_deadline: Option<Instant>, future: F) -> Result<T>
 where
@@ -147,26 +332,30 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut stats = ChunkedRelayStats::default();
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
         let size_bytes = with_total_deadline(
             total_deadline,
-            read_line_with_timeout(reader, &mut line, read_timeout, peer, MAX_CHUNK_LINE_LENGTH),
+            read_line_bytes_with_timeout(
+                reader,
+                &mut line,
+                read_timeout,
+                peer,
+                MAX_CHUNK_LINE_LENGTH,
+            ),
         )
         .await?;
         if size_bytes == 0 {
-            bail!("unexpected EOF while reading chunk size from {peer}");
+            return Err(invalid_chunked_body(
+                &stats,
+                format!("unexpected EOF while reading chunk size from {peer}"),
+            ));
         }
         stats.bytes_read = stats.bytes_read.saturating_add(size_bytes as u64);
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let size_str = trimmed
-            .split_once(';')
-            .map(|(size, _)| size)
-            .unwrap_or(trimmed);
-        let chunk_size = usize::from_str_radix(size_str, 16)
-            .with_context(|| format!("invalid chunk size '{size_str}'"))?;
+        let chunk_size = parse_chunk_size_line(&line)
+            .map_err(|err| invalid_chunked_body(&stats, err.to_string()))?;
 
         if let Some(limit_tracker) = limit.as_deref_mut() {
             limit_tracker.record(chunk_size)?;
@@ -176,7 +365,7 @@ where
             total_deadline,
             write_all_with_timeout(
                 writer,
-                line.as_bytes(),
+                &line,
                 write_timeout,
                 format!("forwarding chunk size {write_target}"),
             ),
@@ -191,7 +380,7 @@ where
                 line.clear();
                 let trailer_line_bytes = with_total_deadline(
                     total_deadline,
-                    read_line_with_timeout(
+                    read_line_bytes_with_timeout(
                         reader,
                         &mut line,
                         read_timeout,
@@ -201,24 +390,33 @@ where
                 )
                 .await?;
                 if trailer_line_bytes == 0 {
-                    bail!("unexpected EOF while reading chunk trailer from {peer}");
+                    return Err(invalid_chunked_body(
+                        &stats,
+                        format!("unexpected EOF while reading chunk trailer from {peer}"),
+                    ));
                 }
                 stats.bytes_read = stats.bytes_read.saturating_add(trailer_line_bytes as u64);
-                let trimmed = line.trim_end_matches(['\r', '\n']);
-                if trimmed.is_empty() {
+                let trailer = exact_crlf_content(&line, "chunk trailer")
+                    .map_err(|err| invalid_chunked_body(&stats, err.to_string()))?;
+                if trailer.is_empty() {
                     break;
                 }
                 trailer_bytes_total = trailer_bytes_total
                     .checked_add(line.len())
-                    .ok_or_else(|| anyhow!("{trailer_limit_error}"))?;
+                    .ok_or_else(|| invalid_chunked_body(&stats, trailer_limit_error))?;
                 if trailer_bytes_total > max_trailer_bytes {
-                    bail!("{trailer_limit_error}");
+                    return Err(invalid_chunked_body(&stats, trailer_limit_error));
                 }
-                trailer_lines.push(trimmed.to_string());
+                let trailer = std::str::from_utf8(trailer).map_err(|_| {
+                    invalid_chunked_body(&stats, "chunk trailer contained invalid bytes")
+                })?;
+                trailer_lines.push(trailer.to_string());
             }
 
             stats.had_trailers = !trailer_lines.is_empty();
-            for trailer_line in sanitize_trailers(&trailer_lines)? {
+            let sanitized_trailers = sanitize_trailers(&trailer_lines)
+                .map_err(|err| invalid_chunked_body(&stats, err.to_string()))?;
+            for trailer_line in sanitized_trailers {
                 with_total_deadline(
                     total_deadline,
                     write_all_with_timeout(
@@ -259,7 +457,10 @@ where
             )
             .await?;
             if read == 0 {
-                bail!("unexpected EOF while reading chunk data from {peer}");
+                return Err(invalid_chunked_body(
+                    &stats,
+                    format!("unexpected EOF while reading chunk data from {peer}"),
+                ));
             }
             remaining -= read;
             with_total_deadline(
@@ -277,15 +478,31 @@ where
         }
 
         let mut crlf = [0u8; 2];
-        with_idle_and_total(
+        let terminator_result = with_idle_and_total(
             read_timeout,
             total_deadline,
             reader.read_exact(&mut crlf),
             format!("reading chunk terminator from {peer}"),
         )
-        .await?;
+        .await;
+        if let Err(err) = terminator_result {
+            if err
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .any(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
+            {
+                return Err(invalid_chunked_body(
+                    &stats,
+                    format!("unexpected EOF while reading chunk terminator from {peer}"),
+                ));
+            }
+            return Err(err);
+        }
         if &crlf != b"\r\n" {
-            bail!("invalid chunk terminator when reading from {peer}");
+            return Err(invalid_chunked_body(
+                &stats,
+                format!("invalid chunk terminator when reading from {peer}"),
+            ));
         }
         with_total_deadline(
             total_deadline,
@@ -320,7 +537,7 @@ where
     U: AsyncWrite + Unpin,
 {
     let mut tracker = BodySizeTracker::new(max_request_body_size);
-    relay_chunked_body_generic(
+    let result = relay_chunked_body_generic(
         reader,
         upstream,
         read_timeout,
@@ -333,8 +550,19 @@ where
         "request trailer section exceeds configured limit",
         sanitize_request_trailer_lines,
     )
-    .await
-    .map(|stats| stats.bytes_read)
+    .await;
+
+    match result {
+        Ok(stats) => Ok(stats.bytes_read),
+        Err(err) => {
+            if let Some(invalid) = err.downcast_ref::<InvalidChunkedBody>() {
+                return Err(
+                    InvalidRequestBody::new(invalid.bytes_read, invalid.detail.clone()).into(),
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 pub async fn relay_fixed_body<S, C>(
@@ -455,7 +683,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{relay_chunked_body, stream_chunked_body};
+    use super::{
+        InvalidRequestBody, parse_chunk_size_line, relay_chunked_body, stream_chunked_body,
+    };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
@@ -464,10 +694,64 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443))
     }
 
+    async fn stream_request_body(body: &[u8]) -> anyhow::Result<u64> {
+        let (client_stream, mut client_writer) = duplex(body.len().max(1) * 2);
+        client_writer.write_all(body).await?;
+        drop(client_writer);
+
+        let mut reader = BufReader::new(client_stream);
+        stream_chunked_body(
+            &mut reader,
+            &mut tokio::io::sink(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            peer(),
+            4096,
+            1024,
+        )
+        .await
+    }
+
+    #[test]
+    fn chunk_size_parser_accepts_complete_rfc_extension_grammar() {
+        assert_eq!(parse_chunk_size_line(b"A\r\n").unwrap(), 10);
+        assert_eq!(
+            parse_chunk_size_line(b"5 \t; chunk-signature = abc123; quoted=\"a\\\"b\"; flag\r\n")
+                .unwrap(),
+            5
+        );
+
+        let with_obs_text = b"1; opaque=\"\x80\"\r\n";
+        assert_eq!(parse_chunk_size_line(with_obs_text).unwrap(), 1);
+    }
+
+    #[test]
+    fn chunk_size_parser_rejects_ambiguous_or_malformed_lines() {
+        for line in [
+            b"1\n".as_slice(),
+            b"1\r\r\n",
+            b"1;\x01=x\r\n",
+            b"1;foo=\"unterminated\r\n",
+            b"1;foo=bar junk\r\n",
+            b"1;\r\n",
+            b"1;foo=\r\n",
+            b"1 \r\n",
+        ] {
+            assert!(
+                parse_chunk_size_line(line).is_err(),
+                "unexpectedly accepted {line:?}"
+            );
+        }
+
+        let overflow = format!("{}\r\n", "F".repeat(usize::BITS as usize / 4 + 1));
+        assert!(parse_chunk_size_line(overflow.as_bytes()).is_err());
+    }
+
     #[tokio::test]
     async fn stream_chunked_body_strips_forwarding_request_trailers() {
-        let body = b"5\r\nhello\r\n0\r\nX-Forwarded-For: 1.2.3.4\r\nDigest: sha-256=abc\r\n\r\n";
-        let expected = b"5\r\nhello\r\n0\r\nDigest: sha-256=abc\r\n\r\n";
+        let body = b"5;chunk-signature=abc123\r\nhello\r\n0\r\nX-Forwarded-For: 1.2.3.4\r\nDigest: sha-256=abc\r\n\r\n";
+        let expected = b"5;chunk-signature=abc123\r\nhello\r\n0\r\nDigest: sha-256=abc\r\n\r\n";
 
         let (client_stream, mut client_writer) = duplex(1024);
         let (mut upstream_source, mut upstream_sink) = duplex(1024);
@@ -500,6 +784,48 @@ mod tests {
             .await
             .expect("read forwarded body");
         assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn stream_chunked_body_rejects_invalid_size_and_trailer_line_endings() {
+        for body in [
+            b"".as_slice(),
+            b"1\nx\r\n0\r\n\r\n".as_slice(),
+            b"1\r\r\nx\r\n0\r\n\r\n",
+            b"1\r\nx",
+            b"0\r\nDigest: value\n\n",
+            b"0\r\nDigest: value\r\r\n\r\n",
+        ] {
+            let err = stream_request_body(body)
+                .await
+                .expect_err("ambiguous chunk framing should be rejected");
+            assert!(
+                err.downcast_ref::<InvalidRequestBody>().is_some(),
+                "unexpected error for {body:?}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_body_rejects_ambiguous_upstream_size_line() {
+        let body = b"1\nx\r\n0\r\n\r\n";
+        let (upstream_stream, mut upstream_writer) = duplex(128);
+        upstream_writer.write_all(body).await.unwrap();
+        drop(upstream_writer);
+
+        let mut upstream = BufReader::new(upstream_stream);
+        let err = relay_chunked_body(
+            &mut upstream,
+            &mut tokio::io::sink(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            peer(),
+            None,
+            1024,
+        )
+        .await
+        .expect_err("ambiguous upstream chunk framing should be rejected");
+        assert!(err.to_string().contains("must end with CRLF"));
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ ExfilGuard rejects malformed or ambiguous request syntax.
 That includes cases such as:
 
 - both `Content-Length` and `Transfer-Encoding`
+- malformed or ambiguously terminated chunk framing
 - malformed CONNECT authorities
 - encoded path separators
 - encoded dot-segment tricks

@@ -285,6 +285,166 @@ async fn http_invalid_upstream_header_value_returns_502() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_invalid_chunk_size_line_returns_400() -> Result<()> {
+    let upstream = TestUpstream::http_ok("unexpected").await?;
+    let upstream_port = upstream.port();
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["POST"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "POST http://127.0.0.1:{upstream_port}/upload HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\nx\r\n0\r\n\r\n"
+    );
+    client.send(request.as_bytes()).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("invalid request body"),
+        "expected invalid request body response, got: {response}"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    drop(upstream);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_valid_signed_chunk_extension_is_forwarded_unchanged() -> Result<()> {
+    let chunked_body = b"5;chunk-signature=abc123\r\nhello\r\n0\r\n\r\n".to_vec();
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    let expected_body_len = chunked_body.len();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await?;
+        let request_head = read_request(&mut stream).await?;
+        let request_head = String::from_utf8(request_head)?;
+        anyhow::ensure!(
+            request_head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "upstream request did not retain chunked framing: {request_head}"
+        );
+
+        let mut body = vec![0u8; expected_body_len];
+        stream.read_exact(&mut body).await?;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+            .await?;
+        stream.flush().await?;
+        stream.shutdown().await.ok();
+        Ok::<Vec<u8>, anyhow::Error>(body)
+    });
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["POST"],
+            format!("http://127.0.0.1:{}/**", upstream_addr.port()),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request_head = format!(
+        "POST http://127.0.0.1:{port}/upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        port = upstream_addr.port()
+    );
+    let mut request = request_head.into_bytes();
+    request.extend_from_slice(&chunked_body);
+    client.send(&request).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected response: {response}"
+    );
+    let forwarded_body = upstream_task.await.expect("upstream task join failed")?;
+    assert_eq!(forwarded_body, chunked_body);
+
+    client.shutdown().await;
+    harness.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_invalid_upstream_chunk_closes_started_response_without_502() -> Result<()> {
+    let log_capture = LogCapture::new("info").await;
+    let upstream = TestUpstream::http_response(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\nx\r\n0\r\n\r\n"
+            .to_vec(),
+    )
+    .await?;
+    let upstream_port = upstream.port();
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/bad-body HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(request.as_bytes()).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "origin response head should have been forwarded: {response}"
+    );
+    assert_eq!(
+        response.matches("HTTP/1.1 ").count(),
+        1,
+        "proxy must not append a second response after forwarding the origin status: {response}"
+    );
+    assert!(
+        !response.contains("502 Bad Gateway"),
+        "proxy appended a 502 to an already-started response: {response}"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    drop(upstream);
+
+    let logs = log_capture.text();
+    assert!(
+        logs.contains("error_reason=\"response_body_failed\"")
+            || logs.contains("error_reason=response_body_failed"),
+        "expected response-body failure access log, got: {logs}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_splice_stays_open_past_timeout() -> Result<()> {
     let upstream = TestUpstream::echo().await?;
     let upstream_port = upstream.port();
