@@ -167,6 +167,28 @@ Clients are expected to know they are talking to a proxy.
 This keeps request meaning, client intent, and logging straightforward.
 Transparent proxying may come later.
 
+## Availability isolation belongs at the deployment boundary
+
+ExfilGuard assumes its proxy and metrics listeners are reachable only by the
+authorized clients and monitoring systems an operator intends to serve. It
+enforces egress policy, but it is not a denial-of-service isolation or
+multi-tenant fairness boundary.
+
+The process therefore does not impose a default global or per-IP connection
+ceiling. Connection cost varies substantially between idle HTTP, TLS
+handshakes, multiplexed HTTP/2, and long-lived tunnels, while node capacity
+varies by orders of magnitude. A generic ceiling can strand most of a capable
+node and indiscriminately reject healthy clients without identifying the
+source of pressure.
+
+Deployments that need availability isolation should restrict listener access
+and apply coarse connection or rate controls at the firewall, load balancer,
+or equivalent network edge. ExfilGuard's client metrics and policy reload help
+identify and deny abusive traffic after attribution. A future in-process
+overload controller would need real resource-pressure signals, client-aware
+accounting, and hysteresis; it is a separate feature rather than a fixed
+connection-count safeguard.
+
 ## Request body limits are opt-in
 
 By default, ExfilGuard does not cap inspected request body size.

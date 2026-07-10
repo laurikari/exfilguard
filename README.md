@@ -155,6 +155,10 @@ strict, and policy checks run before any upstream connection is made.
   sane defaults.
 - Run as a non-root user and only listen on the interfaces you need. Put a
   firewall in front.
+- Expose the proxy only to authorized clients. ExfilGuard enforces egress
+  policy; it is not a denial-of-service isolation or per-client fairness
+  boundary. Apply connection or rate controls at the network edge if clients
+  must be isolated from one another for availability.
 - Choose an explicit `builtin`, `files`, or `vault` CA source. For file-backed
   sources, startup enforces owner-only directory/key modes and rejects
   symlinks. Vault mode keeps CA and leaf private keys in memory.
@@ -171,6 +175,9 @@ strict, and policy checks run before any upstream connection is made.
 
 - Use ExfilGuard as an explicit proxy. Transparent interception is not
   documented or supported for deployment.
+- ExfilGuard does not impose arbitrary global or per-IP connection ceilings.
+  Operators are responsible for preventing abusive clients from exhausting a
+  shared node or cluster.
 - ExfilGuard does not support WebSocket or HTTP/1.1 Upgrade flows. It rejects
   upstream `101 Switching Protocols` responses instead of tunneling them.
 - ExfilGuard rejects HTTP/1.0 requests and upstream HTTP/1.0 responses. It
