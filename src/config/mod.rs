@@ -305,6 +305,16 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                 fallback_seen = true;
             }
             ClientSelector::Ip(addr) => {
+                if let IpAddr::V6(v6) = addr
+                    && let Some(v4) = v6.to_ipv4_mapped()
+                {
+                    bail!(
+                        "client '{}' IP {} is an IPv4-mapped IPv6 address; use IPv4 selector '{}'",
+                        client.name,
+                        addr,
+                        v4
+                    );
+                }
                 if let Some(existing) = ip_claims.insert(
                     *addr,
                     IpClaim {
@@ -331,6 +341,18 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                 }
             }
             ClientSelector::Cidr(net) => {
+                if let IpNet::V6(v6) = net
+                    && v6.prefix_len() >= 96
+                    && let Some(v4) = v6.network().to_ipv4_mapped()
+                {
+                    bail!(
+                        "client '{}' CIDR {} is an IPv4-mapped IPv6 range; use IPv4 CIDR '{}/{}'",
+                        client.name,
+                        net,
+                        v4,
+                        v6.prefix_len() - 96
+                    );
+                }
                 for claim in &cidr_claims {
                     if cidrs_overlap(&claim.net, net) {
                         bail!(
@@ -403,7 +425,7 @@ impl Deref for ValidatedConfig {
 mod tests {
     use super::{
         Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
-        UrlPattern, ValidatedConfig,
+        UrlPattern, ValidatedConfig, validate_clients,
     };
     use http::{Method, StatusCode};
     use std::sync::Arc;
@@ -445,6 +467,50 @@ mod tests {
 
         let err = ValidatedConfig::new(config).unwrap_err();
         assert!(err.to_string().contains("references unknown policy"));
+    }
+
+    #[test]
+    fn reject_ipv4_mapped_ipv6_client_selectors() {
+        let cases = [
+            (
+                ClientSelector::Ip("::ffff:10.0.0.5".parse().unwrap()),
+                "use IPv4 selector '10.0.0.5'",
+            ),
+            (
+                ClientSelector::Cidr("::ffff:10.0.0.0/120".parse().unwrap()),
+                "use IPv4 CIDR '10.0.0.0/24'",
+            ),
+        ];
+
+        for (selector, expected) in cases {
+            let clients = [
+                Client {
+                    name: Arc::from("mapped"),
+                    selector,
+                    policies: Arc::from([]),
+                },
+                fallback_client("deny"),
+            ];
+            let err = validate_clients(&clients).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_native_ipv6_client_selector() {
+        let clients = [
+            Client {
+                name: Arc::from("native-v6"),
+                selector: ClientSelector::Cidr("2001:db8::/32".parse().unwrap()),
+                policies: Arc::from([]),
+            },
+            fallback_client("deny"),
+        ];
+
+        validate_clients(&clients).unwrap();
     }
 
     #[test]

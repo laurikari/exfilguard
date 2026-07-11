@@ -32,6 +32,8 @@ that sets `ip` or `cidr` is invalid.
 - Every non-fallback client must specify either `ip` or `cidr`, not both
 - The fallback client must not specify `ip` or `cidr`
 - Non-fallback selectors must not overlap (IP vs IP, IP vs CIDR, CIDR vs CIDR)
+- IPv4-mapped IPv6 selectors such as `::ffff:10.0.0.5` are rejected; use the
+  ordinary IPv4 address or CIDR because mapped peers have IPv4 client identity
 - Exactly one client must have `fallback = true`
 - All referenced policies must exist
 

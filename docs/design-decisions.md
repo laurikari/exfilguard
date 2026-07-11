@@ -134,6 +134,10 @@ general rules and know what will happen.
 ExfilGuard identifies a client from the downstream source address. It uses
 exact IP matches, CIDR ranges, and one fallback client.
 
+IPv4-mapped IPv6 peer addresses are treated as their underlying IPv4 address.
+Configuration must therefore use the ordinary IPv4 address or CIDR; mapped-only
+selectors are rejected rather than accepted as rules that can never match.
+
 The fallback client has no address selector and is considered only after exact
 IP and CIDR matching finds nothing. Configurations that set `ip` or `cidr` on
 the fallback are rejected.
