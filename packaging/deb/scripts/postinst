@@ -23,8 +23,24 @@ for file in /etc/exfilguard/*.toml; do
     chmod 0640 "$file"
 done
 
-if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
+
+    # Keep an active service running while dpkg replaces package files, then
+    # restart it onto the new binary. An administratively stopped service stays
+    # stopped, and policy-rc.d remains authoritative through deb-systemd-invoke.
+    if [ "$1" = "configure" ] && [ -n "${2:-}" ]; then
+        # Packages before 0.9 stopped the service from their old prerm, so its
+        # previous active state is no longer observable here. Restore the normal
+        # enabled deployment during that one transition. Fixed-to-fixed upgrades
+        # use try-restart and therefore preserve an intentional stopped state.
+        if dpkg --compare-versions "$2" lt 0.9.0 \
+            && systemctl --system is-enabled --quiet exfilguard.service; then
+            deb-systemd-invoke start exfilguard.service >/dev/null 2>&1 || true
+        else
+            deb-systemd-invoke try-restart exfilguard.service >/dev/null 2>&1 || true
+        fi
+    fi
 fi
 
 exit 0

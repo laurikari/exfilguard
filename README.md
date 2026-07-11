@@ -325,7 +325,11 @@ The package installs `/usr/sbin/exfilguard`, sample configs in `/etc/exfilguard/
 a writable CA/cache directory under `/var/lib/exfilguard/`, and a
 `systemd` unit (`exfilguard.service`). The binary reads
 `/etc/exfilguard/exfilguard.toml` by default, and logs go to journald unless you
-override the config or set `EXFILGUARD__*` environment variables.
+override the config or set `EXFILGUARD__*` environment variables. Package
+upgrades restart the service when it was already active; they do not start a
+service that an administrator left stopped. During the one-time upgrade from a
+pre-0.9 package whose removal script already stopped the process, an enabled
+service is started because its previous active state cannot be recovered.
 
 ## Metrics
 
