@@ -2073,6 +2073,7 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
         .rule(
             RuleSpec::deny(&["GET"], format!("https://{upstream_host}/blocked/**"))
                 .status(451)
+                .reason("Policy Blocked")
                 .body("blocked by policy"),
         )
         .rule(RuleSpec::allow(

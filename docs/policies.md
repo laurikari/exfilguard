@@ -97,8 +97,8 @@ Rules run in order. The first matching rule decides the action.
 | `url_pattern` | String | None | URL pattern to match (see syntax below) |
 | `https_mode` | String | `"inspect"` | HTTPS handling mode: `"inspect"` or `"tunnel"` |
 | `cache` | Table | None | Cache configuration (see below) |
-| `status` | u16 | Required for DENY | HTTP status code for denial response |
-| `reason` | String | None | HTTP reason phrase (DENY only) |
+| `status` | u16 | Required for DENY | Final error status from 400 through 599 |
+| `reason` | String | None | HTTP/1 reason phrase (DENY only; ignored by HTTP/2) |
 | `body` | String | None | Response body (DENY only) |
 
 ### ALLOW vs DENY
@@ -112,8 +112,10 @@ Rules run in order. The first matching rule decides the action.
 #### DENY Rules
 
 - Block the request with specified response
-- Must set `status` (HTTP status code)
-- Optional: `reason` and `body`
+- Must set `status` to a final error code from 400 through 599; unregistered
+  codes within that range, such as 470, are supported
+- Optional: `reason` and `body`. The reason phrase is used only for HTTP/1 and
+  may not contain status-line control bytes; HTTP/2 carries no reason phrase
 
 ---
 

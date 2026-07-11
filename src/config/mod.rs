@@ -107,8 +107,11 @@ fn validate_reason(reason: &str) -> Result<()> {
     if reason.trim().is_empty() {
         bail!("reason must not be empty");
     }
-    if reason.contains('\r') || reason.contains('\n') {
-        bail!("reason must not contain CR or LF");
+    if let Some(byte) = reason
+        .bytes()
+        .find(|byte| !matches!(byte, b'\t' | 0x20..=0x7e | 0x80..=0xff))
+    {
+        bail!("reason contains invalid HTTP status-line byte 0x{byte:02x}");
     }
     Ok(())
 }
@@ -219,17 +222,22 @@ fn validate_policy_rules(policy: &Policy) -> Result<()> {
             }
         }
 
-        if let RuleAction::Deny {
-            reason: Some(reason),
-            ..
-        } = &rule.action
-        {
-            validate_reason(reason).with_context(|| {
-                format!(
-                    "policy '{}' DENY rule has invalid reason phrase '{}'",
-                    policy.name, reason
-                )
-            })?;
+        if let RuleAction::Deny { status, reason, .. } = &rule.action {
+            ensure!(
+                (400..=599).contains(&status.as_u16()),
+                "policy '{}' DENY rule {} status must be between 400 and 599 (got {})",
+                policy.name,
+                idx,
+                status
+            );
+            if let Some(reason) = reason {
+                validate_reason(reason).with_context(|| {
+                    format!(
+                        "policy '{}' DENY rule has invalid reason phrase '{}'",
+                        policy.name, reason
+                    )
+                })?;
+            }
         }
 
         validate_rule_constraints(
@@ -431,7 +439,7 @@ impl Deref for ValidatedConfig {
 mod tests {
     use super::{
         Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
-        UrlPattern, ValidatedConfig, validate_clients, validate_path_pattern,
+        UrlPattern, ValidatedConfig, validate_clients, validate_path_pattern, validate_reason,
     };
     use http::{Method, StatusCode};
     use std::sync::Arc;
@@ -456,6 +464,30 @@ mod tests {
             url_pattern,
             https_mode,
             cache: None,
+        }
+    }
+
+    fn config_with_deny(status: u16, reason: Option<&str>) -> Config {
+        Config {
+            clients: vec![fallback_client("deny")],
+            policies: vec![Policy {
+                name: Arc::from("deny"),
+                rules: Arc::from(
+                    vec![Rule {
+                        id: Arc::from("deny#0"),
+                        action: RuleAction::Deny {
+                            status: StatusCode::from_u16(status).unwrap(),
+                            reason: reason.map(Arc::from),
+                            body: None,
+                        },
+                        methods: MethodMatch::Any,
+                        url_pattern: None,
+                        https_mode: HttpsMode::Inspect,
+                        cache: None,
+                    }]
+                    .into_boxed_slice(),
+                ),
+            }],
         }
     }
 
@@ -636,5 +668,35 @@ mod tests {
 
         let err = ValidatedConfig::new(config).unwrap_err();
         assert!(err.to_string().contains("invalid reason phrase"));
+    }
+
+    #[test]
+    fn deny_status_must_be_a_final_error() {
+        for status in [400, 470, 499, 500, 599] {
+            ValidatedConfig::new(config_with_deny(status, None)).unwrap();
+        }
+
+        for status in [100, 199, 399, 600, 999] {
+            let err = ValidatedConfig::new(config_with_deny(status, None)).unwrap_err();
+            assert!(
+                err.to_string().contains("must be between 400 and 599"),
+                "unexpected error for {status}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_reason_uses_http_status_line_grammar() {
+        for reason in ["Policy Blocked", "Policy\tBlocked", "Estetty – pääsy"] {
+            validate_reason(reason).unwrap();
+        }
+
+        for reason in ["bad\0reason", "bad\u{000b}reason", "bad\u{007f}reason"] {
+            let err = validate_reason(reason).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid HTTP status-line byte"),
+                "unexpected error: {err:#}"
+            );
+        }
     }
 }
