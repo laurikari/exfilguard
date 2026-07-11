@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::{Result, anyhow};
 use blake3::Hasher;
@@ -11,7 +11,7 @@ use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{trace, warn};
 
-use super::{CacheEntry, CacheKey, CacheState, VaryKey};
+use super::{CacheEntry, CacheKey, CacheState, CacheTiming, VaryKey};
 
 enum CacheWriterFile {
     File(AsyncFile),
@@ -173,7 +173,7 @@ impl CacheWriter {
         mut self,
         status: StatusCode,
         headers: HeaderMap,
-        ttl: Duration,
+        timing: CacheTiming,
     ) -> Result<CacheFinishOutcome> {
         self.file.flush().await?;
 
@@ -190,12 +190,17 @@ impl CacheWriter {
             return Ok(CacheFinishOutcome::Skipped);
         }
 
-        let Some(expires_at) = SystemTime::now().checked_add(ttl) else {
+        let Some(expires_at) = timing.expires_at() else {
             warn!("skipping cache entry with unrepresentable expiration time");
             async_fs::remove_file(&self.temp_path).await.ok();
             self.finished = true;
             return Ok(CacheFinishOutcome::Skipped);
         };
+        if SystemTime::now() >= expires_at {
+            async_fs::remove_file(&self.temp_path).await.ok();
+            self.finished = true;
+            return Ok(CacheFinishOutcome::Skipped);
+        }
 
         let hash = self.hasher.finalize();
         let content_hash = hash.to_hex().to_string();
@@ -222,6 +227,8 @@ impl CacheWriter {
             status,
             headers,
             vary: self.vary.clone(),
+            response_time: timing.response_time,
+            corrected_initial_age: timing.corrected_initial_age,
             expires_at,
             content_hash,
             content_length: self.current_size,
@@ -320,7 +327,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::num::NonZeroUsize;
     use std::sync::atomic::AtomicU64;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
     fn build_state(dir: &TempDir) -> Arc<CacheState> {
@@ -369,8 +376,17 @@ mod tests {
 
         let body = b"partial write cache payload";
         writer.write_all(body).await?;
+        let response_time = SystemTime::now();
         writer
-            .finish(StatusCode::OK, HeaderMap::new(), Duration::from_secs(30))
+            .finish(
+                StatusCode::OK,
+                HeaderMap::new(),
+                CacheTiming {
+                    response_time,
+                    corrected_initial_age: Duration::ZERO,
+                    freshness_lifetime: Duration::from_secs(30),
+                },
+            )
             .await?;
 
         let meta_path = state.meta_path(key.entry_id());
@@ -409,9 +425,53 @@ mod tests {
         );
         writer.write_all(b"body").await?;
         writer
-            .finish(StatusCode::OK, HeaderMap::new(), Duration::MAX)
+            .finish(
+                StatusCode::OK,
+                HeaderMap::new(),
+                CacheTiming {
+                    response_time: SystemTime::now(),
+                    corrected_initial_age: Duration::ZERO,
+                    freshness_lifetime: Duration::MAX,
+                },
+            )
             .await?;
 
+        assert!(!temp_path.exists());
+        assert!(!state.meta_path(key.entry_id()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_writer_discards_entry_that_expired_while_streaming() -> Result<()> {
+        let dir = TempDir::new()?;
+        let state = build_state(&dir);
+        let key = CacheKey::new(&Method::GET, &build_uri());
+        let temp_path = state.store.temp_path("tmp_expired_while_streaming");
+
+        let mut options = async_fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        let file = options.open(&temp_path).await?;
+        let mut writer = CacheWriter::new(
+            file,
+            temp_path.clone(),
+            state.clone(),
+            key.clone(),
+            VaryKey::new(HeaderMap::new()),
+        );
+        writer.write_all(b"body").await?;
+        let outcome = writer
+            .finish(
+                StatusCode::OK,
+                HeaderMap::new(),
+                CacheTiming {
+                    response_time: SystemTime::now() - Duration::from_secs(31),
+                    corrected_initial_age: Duration::ZERO,
+                    freshness_lifetime: Duration::from_secs(30),
+                },
+            )
+            .await?;
+
+        assert_eq!(outcome, CacheFinishOutcome::Skipped);
         assert!(!temp_path.exists());
         assert!(!state.meta_path(key.entry_id()).exists());
         Ok(())

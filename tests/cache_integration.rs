@@ -17,6 +17,17 @@ use tokio::{
 
 use support::*;
 
+fn response_header_values<'a>(response: &'a str, name: &str) -> Vec<&'a str> {
+    response
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+        .collect()
+}
+
 // Minimal HTTP upstream that counts requests
 struct MockUpstream {
     listener: TcpListener,
@@ -347,8 +358,94 @@ async fn run_forced_freshness_test(upstream_headers: &str, expect_cache_hit: boo
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forced_freshness_is_only_an_absent_metadata_fallback() -> Result<()> {
     run_forced_freshness_test("", true).await?;
+    run_forced_freshness_test("Age: 61", false).await?;
     run_forced_freshness_test("Cache-Control: max-age=0", false).await?;
     run_forced_freshness_test("Cache-Control: public, max-age=invalid", false).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn existing_age_can_exhaust_origin_freshness() -> Result<()> {
+    let upstream = MockUpstream::new("Cache-Control: public, max-age=60\r\nAge: 59").await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let request = bodyless_request(upstream_port, "/aged", true);
+
+    for _ in 0..2 {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+        assert!(
+            read_http_response(&mut stream)
+                .await?
+                .contains("cached-response")
+        );
+        tokio::time::sleep(StdDuration::from_millis(1_100)).await;
+    }
+    assert_eq!(request_counter.load(Ordering::SeqCst), 2);
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_transfer_time_consumes_freshness() -> Result<()> {
+    let upstream = MockUpstream::new_with_delay(
+        "Cache-Control: public, max-age=1",
+        Some(StdDuration::from_millis(1_100)),
+    )
+    .await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let request = bodyless_request(upstream_port, "/slow", true);
+
+    for _ in 0..2 {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+        assert!(
+            read_http_response(&mut stream)
+                .await?
+                .contains("cached-response")
+        );
+    }
+    assert_eq!(request_counter.load(Ordering::SeqCst), 2);
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
     Ok(())
 }
 
@@ -763,10 +860,14 @@ async fn test_cache_hit_keeps_connection_open() -> Result<()> {
     stream.write_all(keepalive_request.as_bytes()).await?;
     let response_one = read_http_response_with_length(&mut stream).await?;
     assert!(response_one.contains("cached-response"));
+    let ages = response_header_values(&response_one, "Age");
+    assert_eq!(ages.len(), 1);
+    assert!(ages[0].parse::<u64>()? >= 2);
 
     stream.write_all(keepalive_request.as_bytes()).await?;
     let response_two = read_http_response_with_length(&mut stream).await?;
     assert!(response_two.contains("cached-response"));
+    assert_eq!(response_header_values(&response_two, "Age").len(), 1);
 
     assert_eq!(
         request_counter.load(Ordering::SeqCst),
@@ -817,7 +918,7 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         .cache_dir
         .as_ref()
         .expect("cache dir enabled")
-        .join("v3");
+        .join("v4");
 
     let readonly_marker = Arc::new(AtomicUsize::new(0));
     let watcher_dir = cache_version_dir.clone();

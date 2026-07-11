@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use http::Method;
@@ -17,7 +17,7 @@ use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
 
-use super::cache::prepare_cache_write;
+use super::cache::{CacheResponse, prepare_cache_write};
 use super::request::{build_upstream_request, send_continue_if_needed};
 use super::response::{ResponseBodyPlan, determine_response_body_plan, read_final_response_head};
 use super::{ForwardStats, ForwardTimeouts};
@@ -96,6 +96,7 @@ where
     let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
     let request_bytes =
         build_upstream_request(request, headers, request_close, &body_plan, expect_continue);
+    let upstream_request_instant = Instant::now();
     write_all_with_timeout(
         &mut connection.stream,
         &request_bytes,
@@ -156,7 +157,7 @@ where
         connection.peer,
         max_response_header_bytes,
     );
-    let (head, informational_bytes) = if let Some(deadline) = request_deadline {
+    let (mut head, informational_bytes) = if let Some(deadline) = request_deadline {
         let now = Instant::now();
         if now >= deadline {
             return Err(RequestTimeout.into());
@@ -169,6 +170,10 @@ where
     } else {
         head_fut.await?
     };
+    let response_instant = Instant::now();
+    let response_time = SystemTime::now();
+    head.normalize_date(response_time);
+    let response_delay = response_instant.saturating_duration_since(upstream_request_instant);
     let response_body_plan = determine_response_body_plan(&request.method, head.status, &head);
 
     let mut client_close = request_close || head.connection_close;
@@ -176,8 +181,22 @@ where
         client_close = true;
     }
 
-    let cache_state =
-        prepare_cache_write(decision, app, request, headers, body_plan, &head, peer).await;
+    let cache_state = prepare_cache_write(
+        decision,
+        app,
+        request,
+        headers,
+        body_plan,
+        CacheResponse {
+            head: &head,
+            timing: crate::proxy::cache::CacheResponseTiming {
+                response_time,
+                response_delay,
+            },
+        },
+        peer,
+    )
+    .await;
 
     let override_connection = if client_close {
         Some(ConnectionOverride::Close)

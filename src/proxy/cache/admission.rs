@@ -1,9 +1,10 @@
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, Method, StatusCode};
 
-use crate::proxy::http::cache_control::{OriginFreshness, get_origin_freshness, is_cacheable};
+use crate::proxy::http::cache_control::{
+    OriginFreshness, corrected_initial_age, get_origin_freshness, is_cacheable,
+};
 
 use super::CacheRequestContext;
 
@@ -28,7 +29,32 @@ pub(crate) enum CacheWritePlan {
 pub(crate) struct CacheStorePlan {
     pub request: CacheRequestContext,
     pub response_headers: HeaderMap,
-    pub ttl: Duration,
+    pub timing: CacheTiming,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheTiming {
+    pub response_time: SystemTime,
+    pub corrected_initial_age: Duration,
+    pub freshness_lifetime: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheResponseTiming {
+    pub response_time: SystemTime,
+    pub response_delay: Duration,
+}
+
+impl CacheTiming {
+    pub fn expires_at(self) -> Option<SystemTime> {
+        let remaining = self
+            .freshness_lifetime
+            .checked_sub(self.corrected_initial_age)?;
+        if remaining.is_zero() {
+            return None;
+        }
+        self.response_time.checked_add(remaining)
+    }
 }
 
 pub(crate) fn plan_cache_write(
@@ -38,7 +64,12 @@ pub(crate) fn plan_cache_write(
     response_headers: HeaderMap,
     forced_cache_duration: Option<Duration>,
     has_sensitive_headers: bool,
+    response_timing: CacheResponseTiming,
 ) -> CacheWritePlan {
+    let CacheResponseTiming {
+        response_time,
+        response_delay,
+    } = response_timing;
     if has_sensitive_headers {
         return CacheWritePlan::Skip(CacheSkipReason::SensitiveRequestHeaders);
     }
@@ -62,21 +93,36 @@ pub(crate) fn plan_cache_write(
         return CacheWritePlan::Skip(CacheSkipReason::NotCacheable);
     }
 
-    let ttl = select_cache_ttl(
-        get_origin_freshness(&response_headers),
+    let freshness_lifetime = select_cache_ttl(
+        get_origin_freshness(&response_headers, response_time),
         forced_cache_duration,
     );
-    if ttl <= Duration::ZERO {
+    if freshness_lifetime <= Duration::ZERO {
         return CacheWritePlan::Skip(CacheSkipReason::ZeroTtl);
     }
-    if SystemTime::now().checked_add(ttl).is_none() {
+    let timing = CacheTiming {
+        response_time,
+        corrected_initial_age: corrected_initial_age(
+            &response_headers,
+            response_time,
+            response_delay,
+        ),
+        freshness_lifetime,
+    };
+    if timing.corrected_initial_age >= timing.freshness_lifetime {
+        return CacheWritePlan::Skip(CacheSkipReason::ZeroTtl);
+    }
+    let Some(expires_at) = timing.expires_at() else {
         return CacheWritePlan::Skip(CacheSkipReason::UnrepresentableTtl);
+    };
+    if SystemTime::now() >= expires_at {
+        return CacheWritePlan::Skip(CacheSkipReason::ZeroTtl);
     }
 
     CacheWritePlan::Store(Box::new(CacheStorePlan {
         request: cache_request,
         response_headers,
-        ttl,
+        timing,
     }))
 }
 
@@ -90,17 +136,26 @@ fn select_cache_ttl(origin: OriginFreshness, forced: Option<Duration>) -> Durati
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheSkipReason, CacheWritePlan, plan_cache_write, select_cache_ttl};
+    use super::{
+        CacheResponseTiming, CacheSkipReason, CacheWritePlan, plan_cache_write, select_cache_ttl,
+    };
     use crate::proxy::cache::CacheRequestContext;
     use crate::proxy::http::cache_control::{MAX_CACHE_TTL, OriginFreshness};
     use http::{HeaderMap, HeaderValue, Method, StatusCode};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     fn request_context() -> CacheRequestContext {
         CacheRequestContext {
             uri: "http://example.com/resource".parse().unwrap(),
             headers: HeaderMap::new(),
             bypass: false,
+        }
+    }
+
+    fn response_timing(response_delay: Duration) -> CacheResponseTiming {
+        CacheResponseTiming {
+            response_time: SystemTime::now(),
+            response_delay,
         }
     }
 
@@ -151,11 +206,12 @@ mod tests {
             HeaderMap::new(),
             Some(Duration::from_secs(30)),
             false,
+            response_timing(Duration::ZERO),
         );
         let CacheWritePlan::Store(plan) = plan else {
             panic!("headerless response should use forced TTL");
         };
-        assert_eq!(plan.ttl, Duration::from_secs(30));
+        assert_eq!(plan.timing.freshness_lifetime, Duration::from_secs(30));
     }
 
     #[test]
@@ -174,6 +230,7 @@ mod tests {
                 headers,
                 Some(Duration::from_secs(30)),
                 false,
+                response_timing(Duration::ZERO),
             );
             assert!(matches!(
                 plan,
@@ -196,6 +253,7 @@ mod tests {
             headers,
             Some(Duration::from_secs(30)),
             false,
+            response_timing(Duration::ZERO),
         );
         assert!(matches!(
             plan,
@@ -217,10 +275,56 @@ mod tests {
             headers,
             None,
             false,
+            response_timing(Duration::ZERO),
         );
         let CacheWritePlan::Store(plan) = plan else {
             panic!("overflowing HTTP delta-seconds should use the standard cache maximum");
         };
-        assert_eq!(plan.ttl, MAX_CACHE_TTL);
+        assert_eq!(plan.timing.freshness_lifetime, MAX_CACHE_TTL);
+    }
+
+    #[test]
+    fn existing_age_reduces_forced_freshness() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AGE, HeaderValue::from_static("31"));
+
+        let plan = plan_cache_write(
+            &Method::GET,
+            Some(request_context()),
+            StatusCode::OK,
+            headers,
+            Some(Duration::from_secs(30)),
+            false,
+            response_timing(Duration::ZERO),
+        );
+
+        assert!(matches!(
+            plan,
+            CacheWritePlan::Skip(CacheSkipReason::ZeroTtl)
+        ));
+    }
+
+    #[test]
+    fn response_delay_can_consume_all_freshness() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=30"),
+        );
+
+        let plan = plan_cache_write(
+            &Method::GET,
+            Some(request_context()),
+            StatusCode::OK,
+            headers,
+            None,
+            false,
+            response_timing(Duration::from_secs(30)),
+        );
+
+        assert!(matches!(
+            plan,
+            CacheWritePlan::Skip(CacheSkipReason::ZeroTtl)
+        ));
     }
 }

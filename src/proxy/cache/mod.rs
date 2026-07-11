@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow};
 use http::{HeaderMap, Method, StatusCode, Uri};
@@ -26,7 +26,10 @@ mod request;
 mod store;
 mod writer;
 
-pub(crate) use admission::{CacheSkipReason, CacheStorePlan, CacheWritePlan, plan_cache_write};
+pub(crate) use admission::{
+    CacheResponseTiming, CacheSkipReason, CacheStorePlan, CacheTiming, CacheWritePlan,
+    plan_cache_write,
+};
 use entry::{CacheEntry, PersistedEntry};
 use index::CacheIndex;
 use key::{CacheKey, VaryKey};
@@ -166,9 +169,15 @@ impl HttpCache {
         body: &[u8],
         ttl: Duration,
     ) -> Result<()> {
+        let response_time = SystemTime::now();
         if let Some(mut stream) = self.open_stream(method, uri, req_headers, headers).await? {
             stream.write_all(body).await?;
-            if stream.finish(status, headers.clone(), ttl).await? == CacheFinishOutcome::Stored {
+            let timing = CacheTiming {
+                response_time,
+                corrected_initial_age: Duration::ZERO,
+                freshness_lifetime: ttl,
+            };
+            if stream.finish(status, headers.clone(), timing).await? == CacheFinishOutcome::Stored {
                 crate::metrics::record_cache_store();
             }
         }
@@ -225,7 +234,7 @@ impl CacheState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::SystemTime;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     fn build_uri(host: &str, port: u16, path: &str) -> Uri {
@@ -239,6 +248,13 @@ mod tests {
 
     const TEST_SWEEPER_INTERVAL: Duration = Duration::from_secs(3600);
     const TEST_SWEEPER_BATCH_SIZE: usize = 128;
+
+    fn now_unix_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time is after the Unix epoch")
+            .as_millis() as u64
+    }
 
     async fn build_cache(
         capacity: usize,
@@ -301,6 +317,7 @@ mod tests {
         assert!(hit.is_some());
         let hit = hit.unwrap();
         assert_eq!(hit.content_length, body.len() as u64);
+        assert_eq!(hit.headers.get(http::header::AGE).unwrap(), "0");
 
         // Verify body on disk
         let disk_body = fs::read(hit.body_path)?;
@@ -399,7 +416,7 @@ mod tests {
                 StatusCode::OK,
                 &resp_headers,
                 body,
-                Duration::from_secs(0),
+                Duration::from_secs(1),
             )
             .await?;
 
@@ -408,7 +425,7 @@ mod tests {
         assert!(body_path.exists(), "expected cached body to exist");
         assert!(meta_path.exists(), "expected cached metadata to exist");
 
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         let miss = cache.lookup(&method, &uri, &req_headers).await;
         assert!(miss.is_none());
 
@@ -522,6 +539,49 @@ mod tests {
             .expect("entry should be restored from disk");
         let body = fs::read(hit.body_path)?;
         assert_eq!(body, b"persisted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_age_timeline_and_hits_replace_origin_age() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let cache = build_cache(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/persisted-age");
+        let req_headers = HeaderMap::new();
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.append(http::header::AGE, "2".parse()?);
+        resp_headers.append(http::header::AGE, "3".parse()?);
+
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"persisted",
+                Duration::from_secs(60),
+            )
+            .await?;
+        let (_, meta_path) = cache_entry_paths(&cache, &method, &uri)?;
+        drop(cache);
+
+        let mut persisted: PersistedEntry = serde_json::from_slice(&fs::read(&meta_path)?)?;
+        persisted.corrected_initial_age_millis = 7_000;
+        persisted.expires_at_unix_millis = persisted.response_time_unix_millis + 53_000;
+        fs::write(&meta_path, serde_json::to_vec(&persisted)?)?;
+
+        let rebuilt = build_cache(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        let hit = rebuilt
+            .lookup(&method, &uri, &req_headers)
+            .await
+            .expect("entry should be restored from disk");
+        let ages = hit.headers.get_all(http::header::AGE);
+        assert_eq!(ages.iter().count(), 1);
+        let age: u64 = ages.iter().next().unwrap().to_str()?.parse()?;
+        assert!((7..10).contains(&age), "unexpected restored age {age}");
         Ok(())
     }
 
@@ -783,10 +843,9 @@ mod tests {
             status: 200,
             headers: Vec::new(),
             vary_headers: Vec::new(),
-            expires_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs()
-                + 60,
+            response_time_unix_millis: now_unix_millis(),
+            corrected_initial_age_millis: 0,
+            expires_at_unix_millis: now_unix_millis() + 60_000,
             content_hash: "abc".to_string(),
             content_length: 0,
         };
@@ -802,7 +861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_drops_unrepresentable_expiration_metadata() -> Result<()> {
+    async fn rebuild_drops_invalid_timing_metadata() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
         let key_base = "GET::http://example.com:80/unrepresentable".to_string();
@@ -817,7 +876,9 @@ mod tests {
             status: 200,
             headers: Vec::new(),
             vary_headers: Vec::new(),
-            expires_at: u64::MAX,
+            response_time_unix_millis: now_unix_millis(),
+            corrected_initial_age_millis: 0,
+            expires_at_unix_millis: u64::MAX,
             content_hash: "0".repeat(64),
             content_length: 0,
         };
@@ -848,11 +909,11 @@ mod tests {
                 StatusCode::OK,
                 &resp_headers,
                 b"expired",
-                Duration::from_secs(0),
+                Duration::from_secs(1),
             )
             .await?;
 
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         drop(cache);
 
         let rebuilt = build_cache(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
@@ -880,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn uses_versioned_cache_dir_and_cleans_old_versions() -> Result<()> {
         let dir = TempDir::new()?;
-        let old_dir = dir.path().join("v2");
+        let old_dir = dir.path().join("v3");
         fs::create_dir_all(&old_dir)?;
         fs::write(old_dir.join("old"), b"data")?;
 
@@ -894,7 +955,7 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
-        assert_eq!(active_name, "v3");
+        assert_eq!(active_name, "v4");
         let mut cleaned = false;
         for _ in 0..10 {
             let dirs = fs::read_dir(dir.path())?
@@ -931,11 +992,11 @@ mod tests {
                 StatusCode::OK,
                 &resp_headers,
                 b"sweep",
-                Duration::from_secs(0),
+                Duration::from_secs(1),
             )
             .await?;
 
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         let (body_path, _) = cache_entry_paths(&cache, &method, &uri)?;
         assert!(body_path.exists(), "expected cached body to exist");
 
@@ -956,7 +1017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweeper_removes_unrepresentable_expiration_metadata() -> Result<()> {
+    async fn sweeper_removes_invalid_timing_metadata() -> Result<()> {
         let dir = TempDir::new()?;
         let cache =
             build_cache(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
@@ -973,7 +1034,9 @@ mod tests {
             status: 200,
             headers: Vec::new(),
             vary_headers: Vec::new(),
-            expires_at: u64::MAX,
+            response_time_unix_millis: now_unix_millis(),
+            corrected_initial_age_millis: 0,
+            expires_at_unix_millis: u64::MAX,
             content_hash: blake3::hash(b"body").to_hex().to_string(),
             content_length: 4,
         };

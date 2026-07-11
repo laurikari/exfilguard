@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ pub(super) struct CacheEntry {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub vary: VaryKey,
+    pub response_time: SystemTime,
+    pub corrected_initial_age: Duration,
     pub expires_at: SystemTime,
     pub content_hash: String,
     pub content_length: u64,
@@ -25,7 +27,9 @@ pub(super) struct PersistedEntry {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub vary_headers: Vec<(String, Vec<u8>)>,
-    pub expires_at: u64,
+    pub response_time_unix_millis: u64,
+    pub corrected_initial_age_millis: u64,
+    pub expires_at_unix_millis: u64,
     pub content_hash: String,
     pub content_length: u64,
 }
@@ -38,11 +42,9 @@ impl CacheEntry {
             status: self.status.as_u16(),
             headers: headermap_to_vec(&self.headers),
             vary_headers: headermap_to_bytes_vec(self.vary.headers()),
-            expires_at: self
-                .expires_at
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            response_time_unix_millis: system_time_unix_millis(self.response_time),
+            corrected_initial_age_millis: duration_millis(self.corrected_initial_age),
+            expires_at_unix_millis: system_time_unix_millis(self.expires_at),
             content_hash: self.content_hash.clone(),
             content_length: self.content_length,
         }
@@ -52,6 +54,8 @@ impl CacheEntry {
         persisted: &PersistedEntry,
         key_id: &str,
         id: u64,
+        response_time: SystemTime,
+        corrected_initial_age: Duration,
         expires_at: SystemTime,
     ) -> Self {
         let headers = to_headermap(&persisted.headers);
@@ -63,6 +67,8 @@ impl CacheEntry {
             status: StatusCode::from_u16(persisted.status).unwrap_or(StatusCode::OK),
             headers,
             vary,
+            response_time,
+            corrected_initial_age,
             expires_at,
             key_id: key_id.to_string(),
             body_id: persisted.body_id.clone(),
@@ -70,6 +76,23 @@ impl CacheEntry {
             content_length: persisted.content_length,
         }
     }
+
+    pub(super) fn current_age(&self, now: SystemTime) -> Duration {
+        self.corrected_initial_age
+            .saturating_add(now.duration_since(self.response_time).unwrap_or_default())
+    }
+}
+
+fn system_time_unix_millis(value: SystemTime) -> u64 {
+    value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_millis(value: Duration) -> u64 {
+    value.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn to_headermap(items: &[(String, String)]) -> HeaderMap {

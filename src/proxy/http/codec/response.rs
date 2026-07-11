@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use http::{HeaderMap, StatusCode, Version};
@@ -37,6 +37,29 @@ pub(crate) struct Http1ResponseHead {
 }
 
 impl Http1ResponseHead {
+    /// Ensure the forwarded/stored response has one valid Date field and
+    /// return the value used for cache age calculations.
+    pub fn normalize_date(&mut self, response_time: SystemTime) -> SystemTime {
+        let mut dates = self
+            .headers
+            .iter()
+            .filter(|header| header.lower_name() == "date");
+        let valid_date = dates
+            .next()
+            .and_then(|header| httpdate::parse_http_date(header.value_text()).ok())
+            .filter(|_| dates.next().is_none());
+        if let Some(date) = valid_date {
+            return date;
+        }
+
+        self.headers.retain(|header| header.lower_name() != "date");
+        self.headers.push(
+            Http1HeaderLine::new("Date", httpdate::fmt_http_date(response_time))
+                .expect("generated Date header is valid"),
+        );
+        response_time
+    }
+
     pub fn encode(
         &self,
         body_plan: ResponseBodyPlan,
@@ -475,12 +498,80 @@ mod tests {
     };
     use crate::proxy::http::forward::ResponseBodyPlan;
     use http::{StatusCode, Version};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+
+    fn empty_response_head(headers: Vec<Http1HeaderLine>) -> Http1ResponseHead {
+        Http1ResponseHead {
+            status_line: "HTTP/1.1 200 OK".to_string(),
+            status: StatusCode::OK,
+            headers,
+            content_length: Some(0),
+            chunked: false,
+            transfer_encoding_present: false,
+            connection_close: false,
+        }
+    }
+
+    #[test]
+    fn normalize_date_adds_missing_date() {
+        let response_time = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut head = empty_response_head(Vec::new());
+
+        head.normalize_date(response_time);
+
+        assert_eq!(
+            head.header_map()
+                .get(http::header::DATE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            httpdate::fmt_http_date(response_time).as_str()
+        );
+    }
+
+    #[test]
+    fn normalize_date_preserves_one_valid_date() {
+        let response_time = UNIX_EPOCH + Duration::from_secs(1_000);
+        let origin_date = response_time - Duration::from_secs(60);
+        let mut head = empty_response_head(vec![
+            Http1HeaderLine::new("Date", httpdate::fmt_http_date(origin_date)).unwrap(),
+        ]);
+
+        let normalized = head.normalize_date(response_time);
+
+        assert_eq!(normalized, origin_date);
+        assert_eq!(
+            head.header_map()
+                .get(http::header::DATE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            httpdate::fmt_http_date(origin_date).as_str()
+        );
+    }
+
+    #[test]
+    fn normalize_date_replaces_invalid_or_multiple_values() {
+        let response_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut head = empty_response_head(vec![
+            Http1HeaderLine::new("Date", "invalid").unwrap(),
+            Http1HeaderLine::new("Date", "Thu, 01 Jan 1970 00:00:01 GMT").unwrap(),
+        ]);
+
+        head.normalize_date(response_time);
+
+        let headers = head.header_map();
+        assert_eq!(headers.get_all(http::header::DATE).iter().count(), 1);
+        assert_eq!(
+            headers.get(http::header::DATE).unwrap().to_str().unwrap(),
+            httpdate::fmt_http_date(response_time).as_str()
+        );
     }
 
     #[test]

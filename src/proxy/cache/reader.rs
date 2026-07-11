@@ -47,7 +47,8 @@ impl CacheReader {
             }
         };
 
-        if SystemTime::now() > entry.expires_at {
+        let now = SystemTime::now();
+        if now >= entry.expires_at {
             trace!("cache entry expired");
             self.invalidate_entry(cache_key.key_base(), &entry).await;
             crate::metrics::record_cache_lookup(false);
@@ -101,10 +102,18 @@ impl CacheReader {
             }
         };
 
+        let mut headers = entry.headers.clone();
+        headers.remove(http::header::AGE);
+        let age = entry.current_age(now).as_secs();
+        headers.insert(
+            http::header::AGE,
+            http::HeaderValue::from_str(&age.to_string()).expect("generated Age header is valid"),
+        );
+
         crate::metrics::record_cache_lookup(true);
         Some(CachedResponse {
             status: entry.status,
-            headers: entry.headers.clone(),
+            headers,
             body_path,
             body,
             content_length: entry.content_length,

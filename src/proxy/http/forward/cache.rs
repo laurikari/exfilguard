@@ -8,8 +8,8 @@ use tracing::{debug, warn};
 use crate::io_util::{BestEffortWriter, TeeWriter};
 use crate::proxy::AppContext;
 use crate::proxy::cache::{
-    CacheFinishOutcome, CacheSkipReason, CacheStorePlan, CacheWritePlan, CacheWriter,
-    build_cache_request_context, plan_cache_write,
+    CacheFinishOutcome, CacheResponseTiming, CacheSkipReason, CacheStorePlan, CacheWritePlan,
+    CacheWriter, build_cache_request_context, plan_cache_write,
 };
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
@@ -31,15 +31,21 @@ pub(super) struct CacheStoreContext {
     status: http::StatusCode,
 }
 
+pub(super) struct CacheResponse<'a> {
+    pub head: &'a Http1ResponseHead,
+    pub timing: CacheResponseTiming,
+}
+
 pub(super) async fn prepare_cache_write(
     decision: &AllowDecision,
     app: &AppContext,
     request: &ParsedRequest,
     headers: &Http1HeaderAccumulator,
     request_body_plan: BodyPlan,
-    head: &Http1ResponseHead,
+    response: CacheResponse<'_>,
     peer: SocketAddr,
 ) -> CacheWriteState {
+    let CacheResponse { head, timing } = response;
     if !request_body_plan.is_definitely_empty() {
         return CacheWriteState::Bypass;
     }
@@ -72,6 +78,7 @@ pub(super) async fn prepare_cache_write(
         response_headers,
         cache_config.force_cache_duration,
         headers.has_sensitive_cache_headers(),
+        timing,
     );
 
     match plan {
@@ -209,10 +216,10 @@ impl CacheWriteState {
 
                 let CacheStorePlan {
                     response_headers,
-                    ttl,
+                    timing,
                     ..
                 } = plan;
-                let finish_result = writer.finish(status, response_headers, ttl).await;
+                let finish_result = writer.finish(status, response_headers, timing).await;
 
                 let cache_store = match finish_result {
                     Ok(outcome) => {

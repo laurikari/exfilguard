@@ -110,7 +110,10 @@ pub enum OriginFreshness {
 }
 
 /// Parse origin freshness without treating malformed metadata as absent.
-pub fn get_origin_freshness(headers: &HeaderMap) -> OriginFreshness {
+pub fn get_origin_freshness(
+    headers: &HeaderMap,
+    response_time: std::time::SystemTime,
+) -> OriginFreshness {
     let mut s_maxage = None;
     let mut max_age = None;
     for value in headers.get_all(http::header::CACHE_CONTROL) {
@@ -152,11 +155,56 @@ pub fn get_origin_freshness(headers: &HeaderMap) -> OriginFreshness {
     let Ok(expires) = httpdate::parse_http_date(expires) else {
         return OriginFreshness::Invalid;
     };
+    let date = single_http_date(headers, http::header::DATE).unwrap_or(response_time);
     let duration = expires
-        .duration_since(std::time::SystemTime::now())
+        .duration_since(date)
         .unwrap_or(Duration::ZERO)
         .min(MAX_CACHE_TTL);
     OriginFreshness::Explicit(duration)
+}
+
+fn single_http_date(
+    headers: &HeaderMap,
+    name: http::header::HeaderName,
+) -> Option<std::time::SystemTime> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+}
+
+fn age_value(headers: &HeaderMap) -> Duration {
+    let Some(value) = headers.get_all(http::header::AGE).iter().next() else {
+        return Duration::ZERO;
+    };
+    let Some(first) = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(',').next())
+    else {
+        return Duration::ZERO;
+    };
+    parse_delta_seconds(first.trim()).unwrap_or(Duration::ZERO)
+}
+
+pub fn corrected_initial_age(
+    headers: &HeaderMap,
+    response_time: std::time::SystemTime,
+    response_delay: Duration,
+) -> Duration {
+    let apparent_age = single_http_date(headers, http::header::DATE)
+        .and_then(|date| response_time.duration_since(date).ok())
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_CACHE_TTL);
+    let corrected_age_value = age_value(headers)
+        .saturating_add(response_delay)
+        .min(MAX_CACHE_TTL);
+    apparent_age.max(corrected_age_value)
 }
 
 pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
@@ -218,6 +266,11 @@ fn normalize_cc_value(value: &str) -> &str {
 mod tests {
     use super::*;
     use http::HeaderValue;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn response_time() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_000)
+    }
 
     #[test]
     fn test_parse_cache_control() {
@@ -270,14 +323,20 @@ mod tests {
             http::header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=invalid"),
         );
-        assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+        assert_eq!(
+            get_origin_freshness(&headers, response_time()),
+            OriginFreshness::Invalid
+        );
 
         headers = HeaderMap::new();
         headers.insert(
             http::header::EXPIRES,
             HeaderValue::from_static("not-a-date"),
         );
-        assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+        assert_eq!(
+            get_origin_freshness(&headers, response_time()),
+            OriginFreshness::Invalid
+        );
     }
 
     #[test]
@@ -292,7 +351,10 @@ mod tests {
                 http::header::CACHE_CONTROL,
                 HeaderValue::from_str(value).unwrap(),
             );
-            assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+            assert_eq!(
+                get_origin_freshness(&headers, response_time()),
+                OriginFreshness::Invalid
+            );
         }
     }
 
@@ -308,7 +370,7 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
             assert_eq!(
-                get_origin_freshness(&headers),
+                get_origin_freshness(&headers, response_time()),
                 OriginFreshness::Explicit(MAX_CACHE_TTL)
             );
         }
@@ -390,8 +452,68 @@ mod tests {
             HeaderValue::from_static("max-age=120"),
         );
         assert_eq!(
-            get_origin_freshness(&headers),
+            get_origin_freshness(&headers, response_time()),
             OriginFreshness::Explicit(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn expires_lifetime_is_measured_from_date() {
+        let date = UNIX_EPOCH + Duration::from_secs(100);
+        let expires = date + Duration::from_secs(60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::DATE,
+            HeaderValue::from_str(&httpdate::fmt_http_date(date)).unwrap(),
+        );
+        headers.insert(
+            http::header::EXPIRES,
+            HeaderValue::from_str(&httpdate::fmt_http_date(expires)).unwrap(),
+        );
+
+        assert_eq!(
+            get_origin_freshness(&headers, response_time()),
+            OriginFreshness::Explicit(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn expires_without_date_uses_response_time() {
+        let expires = response_time() + Duration::from_secs(60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::EXPIRES,
+            HeaderValue::from_str(&httpdate::fmt_http_date(expires)).unwrap(),
+        );
+
+        assert_eq!(
+            get_origin_freshness(&headers, response_time()),
+            OriginFreshness::Explicit(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn corrected_age_uses_the_larger_of_date_and_age_paths() {
+        let date = response_time() - Duration::from_secs(100);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::DATE,
+            HeaderValue::from_str(&httpdate::fmt_http_date(date)).unwrap(),
+        );
+        headers.insert(http::header::AGE, HeaderValue::from_static("59"));
+
+        assert_eq!(
+            corrected_initial_age(&headers, response_time(), Duration::from_secs(2)),
+            Duration::from_secs(100)
+        );
+
+        headers.insert(
+            http::header::DATE,
+            HeaderValue::from_str(&httpdate::fmt_http_date(response_time())).unwrap(),
+        );
+        assert_eq!(
+            corrected_initial_age(&headers, response_time(), Duration::from_secs(2)),
+            Duration::from_secs(61)
         );
     }
 

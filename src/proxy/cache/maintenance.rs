@@ -11,9 +11,25 @@ use tracing::{trace, warn};
 
 use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 
-const CACHE_LAYOUT_VERSION: u32 = 3;
+const CACHE_LAYOUT_VERSION: u32 = 4;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
+
+fn unix_millis_to_system_time(value: u64) -> Option<SystemTime> {
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(value))
+}
+
+fn persisted_timing(persisted: &PersistedEntry) -> Option<(SystemTime, Duration, SystemTime)> {
+    let response_time = unix_millis_to_system_time(persisted.response_time_unix_millis)?;
+    let expires_at = unix_millis_to_system_time(persisted.expires_at_unix_millis)?;
+    let corrected_initial_age = Duration::from_millis(persisted.corrected_initial_age_millis);
+    let remaining = expires_at.duration_since(response_time).ok()?;
+    let freshness_lifetime = corrected_initial_age.checked_add(remaining)?;
+    if freshness_lifetime > crate::proxy::http::cache_control::MAX_CACHE_TTL {
+        return None;
+    }
+    Some((response_time, corrected_initial_age, expires_at))
+}
 
 pub(super) fn cache_version_dir(root: &Path) -> PathBuf {
     root.join(format!("{CACHE_VERSION_PREFIX}{CACHE_LAYOUT_VERSION}"))
@@ -254,17 +270,16 @@ impl CacheState {
         }
 
         // Basic validation
-        let Some(expires_at) =
-            SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(persisted.expires_at))
+        let Some((response_time, corrected_initial_age, expires_at)) = persisted_timing(&persisted)
         else {
             warn!(
-                "cache metadata {} has an unrepresentable expiration; removing entry",
+                "cache metadata {} has invalid timing; removing entry",
                 meta_path.display()
             );
             self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         };
-        if SystemTime::now() > expires_at {
+        if SystemTime::now() >= expires_at {
             self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
         }
@@ -296,8 +311,14 @@ impl CacheState {
             return Ok(None);
         }
 
-        let entry =
-            CacheEntry::from_persisted(&persisted, entry_id, self.next_entry_id(), expires_at);
+        let entry = CacheEntry::from_persisted(
+            &persisted,
+            entry_id,
+            self.next_entry_id(),
+            response_time,
+            corrected_initial_age,
+            expires_at,
+        );
 
         let evicted = self.insert_entry(key.key_base().to_string(), entry);
         self.remove_evicted_files(evicted);
@@ -384,9 +405,9 @@ impl CacheState {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
-                    let expires_at = SystemTime::UNIX_EPOCH
-                        .checked_add(Duration::from_secs(persisted.expires_at));
-                    if expires_at.is_some_and(|expires_at| now <= expires_at) {
+                    if persisted_timing(&persisted)
+                        .is_some_and(|(_, _, expires_at)| now < expires_at)
+                    {
                         continue;
                     }
                     self.remove_entry_by_key_base(&persisted.key_base);

@@ -418,6 +418,7 @@ environment.
 
 - **Cache-Control**: `max-age`, `s-maxage`, `public`, `private`, `no-cache`, `no-store`
 - **Expires**: HTTP date for cache expiration
+- **Date and Age**: Used to account for a response's age before and while it is cached
 - **Vary**: Cache keys include request headers specified by Vary
 
 #### TTL Priority
@@ -428,6 +429,11 @@ Cache lifetime is chosen in this order:
 2. `max-age`
 3. `Expires` header
 4. `force_cache_duration` from policy rule (fallback only)
+
+The response's corrected age is subtracted from that lifetime, including when
+`force_cache_duration` supplies the lifetime. Time spent receiving the response
+body also consumes freshness. Cache hits replace any upstream `Age` field with
+the response's current age.
 
 #### What Gets Cached
 
@@ -458,7 +464,7 @@ removed on lookup.
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`v3` under the cache root).
+Cache entries live under a versioned subdirectory (`v4` under the cache root).
 Metadata is keyed by request URI and points to an immutable body generation.
 When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up
