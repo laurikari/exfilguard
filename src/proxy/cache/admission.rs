@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::time::SystemTime;
 
 use http::{HeaderMap, Method, StatusCode};
 
@@ -13,6 +14,7 @@ pub(crate) enum CacheSkipReason {
     ResponseSetCookie,
     NotCacheable,
     ZeroTtl,
+    UnrepresentableTtl,
 }
 
 #[derive(Debug)]
@@ -67,6 +69,9 @@ pub(crate) fn plan_cache_write(
     if ttl <= Duration::ZERO {
         return CacheWritePlan::Skip(CacheSkipReason::ZeroTtl);
     }
+    if SystemTime::now().checked_add(ttl).is_none() {
+        return CacheWritePlan::Skip(CacheSkipReason::UnrepresentableTtl);
+    }
 
     CacheWritePlan::Store(Box::new(CacheStorePlan {
         request: cache_request,
@@ -87,7 +92,7 @@ fn select_cache_ttl(origin: OriginFreshness, forced: Option<Duration>) -> Durati
 mod tests {
     use super::{CacheSkipReason, CacheWritePlan, plan_cache_write, select_cache_ttl};
     use crate::proxy::cache::CacheRequestContext;
-    use crate::proxy::http::cache_control::OriginFreshness;
+    use crate::proxy::http::cache_control::{MAX_CACHE_TTL, OriginFreshness};
     use http::{HeaderMap, HeaderValue, Method, StatusCode};
     use std::time::Duration;
 
@@ -196,5 +201,26 @@ mod tests {
             plan,
             CacheWritePlan::Skip(CacheSkipReason::NotCacheable)
         ));
+    }
+
+    #[test]
+    fn overflowing_origin_ttl_is_capped_and_cached() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=18446744073709551615"),
+        );
+        let plan = plan_cache_write(
+            &Method::GET,
+            Some(request_context()),
+            StatusCode::OK,
+            headers,
+            None,
+            false,
+        );
+        let CacheWritePlan::Store(plan) = plan else {
+            panic!("overflowing HTTP delta-seconds should use the standard cache maximum");
+        };
+        assert_eq!(plan.ttl, MAX_CACHE_TTL);
     }
 }

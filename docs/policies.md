@@ -274,7 +274,7 @@ url_pattern = "https://cdn.example.com/**"
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `force_cache_duration` | u64 | Fallback cache lifetime in seconds (used only when upstream sends no cache headers) |
+| `force_cache_duration` | u64 | Fallback cache lifetime in seconds, at most 2147483648 (used only when upstream sends no cache headers) |
 
 ### How Caching Works
 
@@ -290,6 +290,8 @@ freshness. It applies when the upstream response omits `s-maxage`, `max-age`,
 and `Expires`, including cases where only `public` is set.
 Zero, expired, malformed, or duplicated freshness metadata makes the response
 stale; it is not treated as omitted metadata and does not activate the fallback.
+Oversized origin `max-age` and `s-maxage` values use HTTP's standard
+2147483648-second overflow value.
 
 !!! note
     Only bodyless `GET` and `HEAD` responses with status 200, 203, 204, 205,

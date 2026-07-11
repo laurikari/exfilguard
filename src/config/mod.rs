@@ -17,6 +17,8 @@ pub use model::{
 
 use crate::util::cidrs_overlap;
 
+pub(crate) const MAX_CACHE_TTL_SECONDS: u64 = 1 << 31;
+
 fn methods_include_connect(methods: &MethodMatch) -> bool {
     match methods {
         MethodMatch::Any => false,
@@ -240,6 +242,21 @@ fn validate_policy_rules(policy: &Policy) -> Result<()> {
             }
         }
 
+        if let Some(force_cache_duration) = rule
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.force_cache_duration)
+        {
+            ensure!(
+                force_cache_duration <= MAX_CACHE_TTL_SECONDS,
+                "policy '{}' rule {} force_cache_duration must not exceed {} seconds (got {})",
+                policy.name,
+                idx,
+                MAX_CACHE_TTL_SECONDS,
+                force_cache_duration
+            );
+        }
+
         validate_rule_constraints(
             policy.name.as_ref(),
             idx,
@@ -437,9 +454,11 @@ impl Deref for ValidatedConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::model::CacheConfig;
     use super::{
-        Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
-        UrlPattern, ValidatedConfig, validate_clients, validate_path_pattern, validate_reason,
+        Client, ClientSelector, Config, HttpsMode, MAX_CACHE_TTL_SECONDS, MethodMatch, Policy,
+        Rule, RuleAction, Scheme, UrlPattern, ValidatedConfig, validate_clients,
+        validate_path_pattern, validate_reason,
     };
     use http::{Method, StatusCode};
     use std::sync::Arc;
@@ -696,6 +715,42 @@ mod tests {
             assert!(
                 err.to_string().contains("invalid HTTP status-line byte"),
                 "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unrepresentable_forced_cache_duration() {
+        let mut valid = allow_rule(MethodMatch::Any, HttpsMode::Inspect, None);
+        valid.cache = Some(CacheConfig {
+            force_cache_duration: Some(MAX_CACHE_TTL_SECONDS),
+        });
+        let valid_config = Config {
+            clients: vec![fallback_client("cache")],
+            policies: vec![Policy {
+                name: Arc::from("cache"),
+                rules: Arc::from(vec![valid].into_boxed_slice()),
+            }],
+        };
+        ValidatedConfig::new(valid_config).unwrap();
+
+        for duration in [MAX_CACHE_TTL_SECONDS + 1, u64::MAX] {
+            let mut invalid = allow_rule(MethodMatch::Any, HttpsMode::Inspect, None);
+            invalid.cache = Some(CacheConfig {
+                force_cache_duration: Some(duration),
+            });
+            let invalid_config = Config {
+                clients: vec![fallback_client("cache")],
+                policies: vec![Policy {
+                    name: Arc::from("cache"),
+                    rules: Arc::from(vec![invalid].into_boxed_slice()),
+                }],
+            };
+            let err = ValidatedConfig::new(invalid_config).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("force_cache_duration must not exceed"),
+                "unexpected error for {duration}: {err:#}"
             );
         }
     }

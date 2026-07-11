@@ -254,7 +254,16 @@ impl CacheState {
         }
 
         // Basic validation
-        let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.expires_at);
+        let Some(expires_at) =
+            SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(persisted.expires_at))
+        else {
+            warn!(
+                "cache metadata {} has an unrepresentable expiration; removing entry",
+                meta_path.display()
+            );
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
+            return Ok(None);
+        };
         if SystemTime::now() > expires_at {
             self.store.remove_entry_files(entry_id, &persisted.body_id);
             return Ok(None);
@@ -375,9 +384,9 @@ impl CacheState {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
-                    let expires_at =
-                        SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.expires_at);
-                    if now <= expires_at {
+                    let expires_at = SystemTime::UNIX_EPOCH
+                        .checked_add(Duration::from_secs(persisted.expires_at));
+                    if expires_at.is_some_and(|expires_at| now <= expires_at) {
                         continue;
                     }
                     self.remove_entry_by_key_base(&persisted.key_base);

@@ -1,6 +1,22 @@
 use http::{HeaderMap, Method, StatusCode};
 use std::time::Duration;
 
+use crate::config::MAX_CACHE_TTL_SECONDS;
+
+pub const MAX_CACHE_TTL: Duration = Duration::from_secs(MAX_CACHE_TTL_SECONDS);
+
+fn parse_delta_seconds(value: &str) -> Result<Duration, ()> {
+    let value = normalize_cc_value(value);
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    let seconds = value
+        .parse::<u64>()
+        .unwrap_or(MAX_CACHE_TTL_SECONDS)
+        .min(MAX_CACHE_TTL_SECONDS);
+    Ok(Duration::from_secs(seconds))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CacheControl {
     pub public: bool,
@@ -32,16 +48,16 @@ pub fn parse_cache_control(headers: &HeaderMap) -> CacheControl {
                     "must-revalidate" => cc.must_revalidate = true,
                     "max-age" => {
                         if let Some(value) = value
-                            && let Ok(secs) = normalize_cc_value(value).parse::<u64>()
+                            && let Ok(duration) = parse_delta_seconds(value)
                         {
-                            cc.max_age = Some(Duration::from_secs(secs));
+                            cc.max_age = Some(duration);
                         }
                     }
                     "s-maxage" => {
                         if let Some(value) = value
-                            && let Ok(secs) = normalize_cc_value(value).parse::<u64>()
+                            && let Ok(duration) = parse_delta_seconds(value)
                         {
-                            cc.s_maxage = Some(Duration::from_secs(secs));
+                            cc.s_maxage = Some(duration);
                         }
                     }
                     _ => {}
@@ -112,12 +128,7 @@ pub fn get_origin_freshness(headers: &HeaderMap) -> OriginFreshness {
                 *destination = Some(Err(()));
                 continue;
             }
-            *destination = Some(
-                value
-                    .and_then(|value| normalize_cc_value(value).parse::<u64>().ok())
-                    .map(Duration::from_secs)
-                    .ok_or(()),
-            );
+            *destination = Some(value.ok_or(()).and_then(parse_delta_seconds));
         }
     }
 
@@ -143,7 +154,8 @@ pub fn get_origin_freshness(headers: &HeaderMap) -> OriginFreshness {
     };
     let duration = expires
         .duration_since(std::time::SystemTime::now())
-        .unwrap_or(Duration::ZERO);
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_CACHE_TTL);
     OriginFreshness::Explicit(duration)
 }
 
@@ -281,6 +293,24 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
             assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+        }
+    }
+
+    #[test]
+    fn overflowing_origin_delta_seconds_uses_standard_cache_maximum() {
+        for value in [
+            "max-age=18446744073709551615",
+            "max-age=184467440737095516150000",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert_eq!(
+                get_origin_freshness(&headers),
+                OriginFreshness::Explicit(MAX_CACHE_TTL)
+            );
         }
     }
 

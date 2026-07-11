@@ -12,6 +12,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::{fs as async_fs, task};
 use tracing::trace;
 
+#[cfg(test)]
+use crate::config::MAX_CACHE_TTL_SECONDS;
+
 mod admission;
 mod entry;
 mod index;
@@ -34,7 +37,7 @@ use maintenance::{prepare_versioned_cache_dir, spawn_cache_dir_cleanup, spawn_ca
 use reader::CacheReader;
 pub(crate) use request::{CacheRequestContext, build_cache_request_context};
 use store::CacheStore;
-pub(crate) use writer::CacheWriter;
+pub(crate) use writer::{CacheFinishOutcome, CacheWriter};
 
 #[derive(Debug)]
 pub struct CachedResponse {
@@ -165,8 +168,9 @@ impl HttpCache {
     ) -> Result<()> {
         if let Some(mut stream) = self.open_stream(method, uri, req_headers, headers).await? {
             stream.write_all(body).await?;
-            stream.finish(status, headers.clone(), ttl).await?;
-            crate::metrics::record_cache_store();
+            if stream.finish(status, headers.clone(), ttl).await? == CacheFinishOutcome::Stored {
+                crate::metrics::record_cache_store();
+            }
         }
         Ok(())
     }
@@ -798,6 +802,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_drops_unrepresentable_expiration_metadata() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let key_base = "GET::http://example.com:80/unrepresentable".to_string();
+        let entry_id = CacheKey::entry_id_for_key(&key_base);
+        let versioned_dir = cache_version_dir(&disk_dir);
+        let shard_dir = versioned_dir.join(&entry_id[0..2]).join(&entry_id[2..4]);
+        fs::create_dir_all(&shard_dir)?;
+        let meta_path = shard_dir.join(format!("{entry_id}.meta"));
+        let persisted = PersistedEntry {
+            key_base,
+            body_id: format!("{}{}", &entry_id[..4], "0".repeat(60)),
+            status: 200,
+            headers: Vec::new(),
+            vary_headers: Vec::new(),
+            expires_at: u64::MAX,
+            content_hash: "0".repeat(64),
+            content_length: 0,
+        };
+        fs::write(&meta_path, serde_json::to_vec(&persisted)?)?;
+
+        let _rebuilt = build_cache(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        assert!(!meta_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_prunes_expired_entries() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
@@ -925,6 +956,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweeper_removes_unrepresentable_expiration_metadata() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache =
+            build_cache(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        let key_base = "GET::http://example.com:80/sweep-invalid-expiry".to_string();
+        let entry_id = CacheKey::entry_id_for_key(&key_base);
+        let body_id = format!("{}{}", &entry_id[..4], "0".repeat(60));
+        let body_path = cache.state.body_path(&body_id);
+        fs::create_dir_all(body_path.parent().expect("body shard"))?;
+        fs::write(&body_path, b"body")?;
+        let meta_path = cache.state.meta_path(&entry_id);
+        let persisted = PersistedEntry {
+            key_base,
+            body_id,
+            status: 200,
+            headers: Vec::new(),
+            vary_headers: Vec::new(),
+            expires_at: u64::MAX,
+            content_hash: blake3::hash(b"body").to_hex().to_string(),
+            content_length: 4,
+        };
+        fs::write(&meta_path, serde_json::to_vec(&persisted)?)?;
+
+        let stats = cache.state.sweep_expired_entries(10).await?;
+        assert_eq!(stats.removed, 1);
+        assert!(!meta_path.exists());
+        assert!(!body_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_vary_mismatch() -> Result<()> {
         let dir = TempDir::new()?;
 
@@ -996,7 +1058,7 @@ mod tests {
                 StatusCode::OK,
                 &response_headers,
                 b"secret representation",
-                Duration::from_secs(60),
+                Duration::from_secs(MAX_CACHE_TTL_SECONDS),
             )
             .await?;
         drop(cache);

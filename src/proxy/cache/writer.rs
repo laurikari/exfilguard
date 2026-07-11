@@ -116,6 +116,12 @@ pub(crate) struct CacheWriter {
     finished: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheFinishOutcome {
+    Stored,
+    Skipped,
+}
+
 impl CacheWriter {
     pub(super) fn new(
         file: AsyncFile,
@@ -168,21 +174,28 @@ impl CacheWriter {
         status: StatusCode,
         headers: HeaderMap,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<CacheFinishOutcome> {
         self.file.flush().await?;
 
         if self.discard {
             // Delete temp file
             async_fs::remove_file(&self.temp_path).await.ok();
             self.finished = true;
-            return Ok(());
+            return Ok(CacheFinishOutcome::Skipped);
         }
 
         if self.current_size > self.state.max_bytes {
             async_fs::remove_file(&self.temp_path).await.ok();
             self.finished = true;
-            return Ok(());
+            return Ok(CacheFinishOutcome::Skipped);
         }
+
+        let Some(expires_at) = SystemTime::now().checked_add(ttl) else {
+            warn!("skipping cache entry with unrepresentable expiration time");
+            async_fs::remove_file(&self.temp_path).await.ok();
+            self.finished = true;
+            return Ok(CacheFinishOutcome::Skipped);
+        };
 
         let hash = self.hasher.finalize();
         let content_hash = hash.to_hex().to_string();
@@ -209,7 +222,7 @@ impl CacheWriter {
             status,
             headers,
             vary: self.vary.clone(),
-            expires_at: SystemTime::now() + ttl,
+            expires_at,
             content_hash,
             content_length: self.current_size,
         };
@@ -222,7 +235,7 @@ impl CacheWriter {
                 .await
                 .ok();
             self.finished = true;
-            return Ok(());
+            return Ok(CacheFinishOutcome::Skipped);
         }
 
         let evicted = self
@@ -235,7 +248,7 @@ impl CacheWriter {
             .await;
 
         self.finished = true;
-        Ok(())
+        Ok(CacheFinishOutcome::Stored)
     }
 }
 
@@ -374,6 +387,33 @@ mod tests {
         let stored = async_fs::read(&body_path).await?;
         assert_eq!(stored, body);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_writer_discards_unrepresentable_expiration() -> Result<()> {
+        let dir = TempDir::new()?;
+        let state = build_state(&dir);
+        let key = CacheKey::new(&Method::GET, &build_uri());
+        let temp_path = state.store.temp_path("tmp_unrepresentable_ttl");
+
+        let mut options = async_fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        let file = options.open(&temp_path).await?;
+        let mut writer = CacheWriter::new(
+            file,
+            temp_path.clone(),
+            state.clone(),
+            key.clone(),
+            VaryKey::new(HeaderMap::new()),
+        );
+        writer.write_all(b"body").await?;
+        writer
+            .finish(StatusCode::OK, HeaderMap::new(), Duration::MAX)
+            .await?;
+
+        assert!(!temp_path.exists());
+        assert!(!state.meta_path(key.entry_id()).exists());
         Ok(())
     }
 }

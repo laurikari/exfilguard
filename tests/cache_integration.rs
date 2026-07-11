@@ -562,8 +562,8 @@ async fn expect_continue_body_request_bypasses_existing_hit() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_cache_hit_avoids_upstream() -> Result<()> {
-    let upstream = MockUpstream::new("Cache-Control: public, max-age=60").await?;
+async fn oversized_origin_ttl_is_capped_and_cache_hits() -> Result<()> {
+    let upstream = MockUpstream::new("Cache-Control: public, max-age=18446744073709551615").await?;
     let upstream_port = upstream.port();
     let request_counter = upstream.requests.clone();
 

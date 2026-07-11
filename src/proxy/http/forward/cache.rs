@@ -8,8 +8,8 @@ use tracing::{debug, warn};
 use crate::io_util::{BestEffortWriter, TeeWriter};
 use crate::proxy::AppContext;
 use crate::proxy::cache::{
-    CacheSkipReason, CacheStorePlan, CacheWritePlan, CacheWriter, build_cache_request_context,
-    plan_cache_write,
+    CacheFinishOutcome, CacheSkipReason, CacheStorePlan, CacheWritePlan, CacheWriter,
+    build_cache_request_context, plan_cache_write,
 };
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
@@ -82,6 +82,12 @@ pub(super) async fn prepare_cache_write(
                     peer = %peer,
                     host = %request.host,
                     "skipping cache store due to Set-Cookie response header"
+                );
+            } else if matches!(reason, CacheSkipReason::UnrepresentableTtl) {
+                warn!(
+                    peer = %peer,
+                    host = %request.host,
+                    "skipping cache store because expiration time is not representable"
                 );
             }
             CacheWriteState::Skip
@@ -209,8 +215,11 @@ impl CacheWriteState {
                 let finish_result = writer.finish(status, response_headers, ttl).await;
 
                 let cache_store = match finish_result {
-                    Ok(()) => {
-                        if !cache_failed && !discarded_for_trailers {
+                    Ok(outcome) => {
+                        if outcome == CacheFinishOutcome::Stored
+                            && !cache_failed
+                            && !discarded_for_trailers
+                        {
                             crate::metrics::record_cache_store();
                             CacheStoreResult::Stored
                         } else {
