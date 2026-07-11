@@ -74,9 +74,15 @@ fn validate_path_pattern(path: &str) -> Result<()> {
     if !path.starts_with('/') {
         bail!("path pattern must start with '/'");
     }
+    if path.contains("//") {
+        bail!("path pattern must not contain repeated '/' separators");
+    }
     for segment in path.split('/').skip(1) {
         if segment.is_empty() {
             continue;
+        }
+        if segment == "." || segment == ".." {
+            bail!("path pattern must not contain '.' or '..' segments");
         }
         if segment == "*" || segment == "**" {
             continue;
@@ -425,7 +431,7 @@ impl Deref for ValidatedConfig {
 mod tests {
     use super::{
         Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
-        UrlPattern, ValidatedConfig, validate_clients,
+        UrlPattern, ValidatedConfig, validate_clients, validate_path_pattern,
     };
     use http::{Method, StatusCode};
     use std::sync::Arc;
@@ -511,6 +517,67 @@ mod tests {
         ];
 
         validate_clients(&clients).unwrap();
+    }
+
+    #[test]
+    fn reject_noncanonical_policy_path_patterns() {
+        for path in [
+            "/./admin/**",
+            "/public/../admin/**",
+            "//admin/**",
+            "/admin//**",
+        ] {
+            let err = validate_path_pattern(path).unwrap_err();
+            assert!(
+                err.to_string().contains("path pattern must not contain"),
+                "unexpected error for {path}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_config_rejects_noncanonical_policy_path_pattern() {
+        let config = Config {
+            clients: vec![fallback_client("allow")],
+            policies: vec![Policy {
+                name: Arc::from("allow"),
+                rules: Arc::from(
+                    vec![allow_rule(
+                        MethodMatch::Any,
+                        HttpsMode::Inspect,
+                        Some(UrlPattern {
+                            scheme: Scheme::Https,
+                            host: Arc::from("example.com"),
+                            port: None,
+                            path: Some(Arc::from("/admin//**")),
+                            original: Arc::from("https://example.com/admin//**"),
+                        }),
+                    )]
+                    .into_boxed_slice(),
+                ),
+            }],
+        };
+
+        let err = ValidatedConfig::new(config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("policy 'allow' has invalid url_pattern"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn accept_canonical_policy_path_patterns() {
+        for path in [
+            "/",
+            "/admin/",
+            "/.well-known/**",
+            "/v1..beta/*",
+            "/files/.*",
+            "/users/*/objects/**",
+        ] {
+            validate_path_pattern(path).unwrap();
+        }
     }
 
     #[test]

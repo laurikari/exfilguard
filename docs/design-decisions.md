@@ -19,6 +19,11 @@ parsed and serialized to one numeric spelling before comparison. The original
 request target remains unchanged for forwarding, logging, cache keys, and
 signature-sensitive traffic.
 
+Policy path patterns must already be canonical: configurations containing dot
+segments or repeated slash separators are rejected. Rewriting a pattern could
+silently change operator intent, especially when the removed segment contains
+a wildcard.
+
 ## Reject ambiguous syntax
 
 ExfilGuard rejects malformed or ambiguous request syntax.

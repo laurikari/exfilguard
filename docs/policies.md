@@ -200,6 +200,10 @@ url_pattern = "https://example.com:8443/api/**"
     preserves the raw request target for upstream forwarding, so signed
     requests keep their original path bytes.
 
+    Patterns themselves must already use that canonical shape. A pattern with
+    a `.` or `..` segment or repeated `/` separators is rejected instead of
+    being accepted as a rule that requests cannot match.
+
 !!! note
     Requests are rejected if the path contains invalid escapes, backslashes,
     encoded path separators, or encoded dot-segments such as `%2e%2e`.
