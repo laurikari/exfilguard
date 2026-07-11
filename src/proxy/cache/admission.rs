@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode};
 
-use crate::proxy::http::cache_control::{get_freshness_lifetime, is_cacheable};
+use crate::proxy::http::cache_control::{OriginFreshness, get_origin_freshness, is_cacheable};
 
 use super::CacheRequestContext;
 
@@ -61,7 +61,7 @@ pub(crate) fn plan_cache_write(
     }
 
     let ttl = select_cache_ttl(
-        get_freshness_lifetime(&response_headers),
+        get_origin_freshness(&response_headers),
         forced_cache_duration,
     );
     if ttl <= Duration::ZERO {
@@ -75,40 +75,126 @@ pub(crate) fn plan_cache_write(
     }))
 }
 
-fn select_cache_ttl(origin_ttl: Option<Duration>, forced: Option<Duration>) -> Duration {
-    if let Some(ttl) = origin_ttl
-        && ttl > Duration::ZERO
-    {
-        return ttl;
+fn select_cache_ttl(origin: OriginFreshness, forced: Option<Duration>) -> Duration {
+    match origin {
+        OriginFreshness::Explicit(ttl) => ttl,
+        OriginFreshness::Invalid => Duration::ZERO,
+        OriginFreshness::Absent => forced.unwrap_or(Duration::ZERO),
     }
-    forced.unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::select_cache_ttl;
+    use super::{CacheSkipReason, CacheWritePlan, plan_cache_write, select_cache_ttl};
+    use crate::proxy::cache::CacheRequestContext;
+    use crate::proxy::http::cache_control::OriginFreshness;
+    use http::{HeaderMap, HeaderValue, Method, StatusCode};
     use std::time::Duration;
 
-    #[test]
-    fn prefers_origin_ttl_when_present() {
-        let origin = Some(Duration::from_secs(30));
-        let forced = Some(Duration::from_secs(5));
-        assert_eq!(select_cache_ttl(origin, forced), Duration::from_secs(30));
+    fn request_context() -> CacheRequestContext {
+        CacheRequestContext {
+            uri: "http://example.com/resource".parse().unwrap(),
+            headers: HeaderMap::new(),
+            bypass: false,
+        }
     }
 
     #[test]
-    fn falls_back_to_forced_when_origin_is_zero_or_missing() {
+    fn prefers_origin_ttl_when_present() {
         let forced = Some(Duration::from_secs(5));
         assert_eq!(
-            select_cache_ttl(Some(Duration::ZERO), forced),
+            select_cache_ttl(OriginFreshness::Explicit(Duration::from_secs(30)), forced),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_forced_only_when_origin_freshness_is_absent() {
+        let forced = Some(Duration::from_secs(5));
+        assert_eq!(
+            select_cache_ttl(OriginFreshness::Explicit(Duration::ZERO), forced),
+            Duration::ZERO
+        );
+        assert_eq!(
+            select_cache_ttl(OriginFreshness::Invalid, forced),
+            Duration::ZERO
+        );
+        assert_eq!(
+            select_cache_ttl(OriginFreshness::Absent, forced),
             Duration::from_secs(5)
         );
-        assert_eq!(select_cache_ttl(None, forced), Duration::from_secs(5));
     }
 
     #[test]
     fn returns_zero_without_origin_or_forced() {
-        assert_eq!(select_cache_ttl(None, None), Duration::ZERO);
-        assert_eq!(select_cache_ttl(Some(Duration::ZERO), None), Duration::ZERO);
+        assert_eq!(
+            select_cache_ttl(OriginFreshness::Absent, None),
+            Duration::ZERO
+        );
+        assert_eq!(
+            select_cache_ttl(OriginFreshness::Explicit(Duration::ZERO), None),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn forced_ttl_stores_headerless_eligible_response() {
+        let plan = plan_cache_write(
+            &Method::GET,
+            Some(request_context()),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Some(Duration::from_secs(30)),
+            false,
+        );
+        let CacheWritePlan::Store(plan) = plan else {
+            panic!("headerless response should use forced TTL");
+        };
+        assert_eq!(plan.ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn forced_ttl_does_not_override_explicit_zero_or_invalid_freshness() {
+        for (name, value) in [
+            (http::header::CACHE_CONTROL, "max-age=0"),
+            (http::header::CACHE_CONTROL, "s-maxage=invalid"),
+            (http::header::EXPIRES, "not-a-date"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static(value));
+            let plan = plan_cache_write(
+                &Method::GET,
+                Some(request_context()),
+                StatusCode::OK,
+                headers,
+                Some(Duration::from_secs(30)),
+                false,
+            );
+            assert!(matches!(
+                plan,
+                CacheWritePlan::Skip(CacheSkipReason::ZeroTtl)
+            ));
+        }
+    }
+
+    #[test]
+    fn forced_ttl_does_not_override_storage_prohibitions() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        let plan = plan_cache_write(
+            &Method::GET,
+            Some(request_context()),
+            StatusCode::OK,
+            headers,
+            Some(Duration::from_secs(30)),
+            false,
+        );
+        assert!(matches!(
+            plan,
+            CacheWritePlan::Skip(CacheSkipReason::NotCacheable)
+        ));
     }
 }

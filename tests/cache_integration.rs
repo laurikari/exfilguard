@@ -96,10 +96,14 @@ impl MockUpstream {
                     return;
                 }
 
+                let additional_headers = if headers.is_empty() {
+                    String::new()
+                } else {
+                    format!("{headers}\r\n")
+                };
                 let response_head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n\r\n",
-                    body.len(),
-                    headers
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{additional_headers}\r\n",
+                    body.len()
                 );
                 socket.write_all(response_head.as_bytes()).await.unwrap();
                 if let Some(delay) = delay {
@@ -291,6 +295,60 @@ async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) ->
     upstream_task.abort();
     let _ = upstream_task.await;
 
+    Ok(())
+}
+
+async fn run_forced_freshness_test(upstream_headers: &str, expect_cache_hit: bool) -> Result<()> {
+    let upstream = MockUpstream::new(upstream_headers).await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_force_duration(60),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let request = bodyless_request(upstream_port, "/forced", true);
+    for _ in 0..2 {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let response = read_http_response(&mut stream).await?;
+        assert!(
+            response.contains("cached-response"),
+            "unexpected response for {upstream_headers:?}: {response:?}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+    }
+
+    let expected_requests = if expect_cache_hit { 1 } else { 2 };
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        expected_requests,
+        "unexpected forced-cache behavior for upstream headers {upstream_headers:?}"
+    );
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forced_freshness_is_only_an_absent_metadata_fallback() -> Result<()> {
+    run_forced_freshness_test("", true).await?;
+    run_forced_freshness_test("Cache-Control: max-age=0", false).await?;
+    run_forced_freshness_test("Cache-Control: public, max-age=invalid", false).await?;
     Ok(())
 }
 

@@ -83,48 +83,68 @@ pub fn is_cacheable(method: &Method, status: StatusCode, headers: &HeaderMap) ->
         return false;
     }
 
-    // Requires explicit freshness info (max-age, s-maxage, or Expires)
-    // or explicit 'public' (though public usually implies some default cacheability,
-    // we want to be safe and require explicit lifetime or public indication).
-    // For now, let's require either max-age/s-maxage OR Expires.
-    // If 'public' is set but no freshness, browsers might cache, but we should be careful.
-    // Let's stick to: Must have freshness info OR be 'public'.
-
-    if cc.max_age.is_some() || cc.s_maxage.is_some() || cc.public {
-        return true;
-    }
-
-    if headers.contains_key(http::header::EXPIRES) {
-        return true;
-    }
-
-    false
+    true
 }
 
-pub fn get_freshness_lifetime(headers: &HeaderMap) -> Option<Duration> {
-    let cc = parse_cache_control(headers);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginFreshness {
+    Absent,
+    Explicit(Duration),
+    Invalid,
+}
 
-    if let Some(s_maxage) = cc.s_maxage {
-        return Some(s_maxage);
-    }
-    if let Some(max_age) = cc.max_age {
-        return Some(max_age);
-    }
-
-    if let Some(expires) = headers.get(http::header::EXPIRES)
-        && let Ok(expires_str) = expires.to_str()
-        && let Ok(expires_time) = httpdate::parse_http_date(expires_str)
-    {
-        // Determine time delta
-        let now = std::time::SystemTime::now();
-        if let Ok(duration) = expires_time.duration_since(now) {
-            return Some(duration);
+/// Parse origin freshness without treating malformed metadata as absent.
+pub fn get_origin_freshness(headers: &HeaderMap) -> OriginFreshness {
+    let mut s_maxage = None;
+    let mut max_age = None;
+    for value in headers.get_all(http::header::CACHE_CONTROL) {
+        let Ok(value) = value.to_str() else {
+            return OriginFreshness::Invalid;
+        };
+        for part in value.split(',') {
+            let (name, value) = split_directive(part.trim());
+            let destination = match name.as_str() {
+                "s-maxage" => &mut s_maxage,
+                "max-age" => &mut max_age,
+                _ => continue,
+            };
+            if destination.is_some() {
+                *destination = Some(Err(()));
+                continue;
+            }
+            *destination = Some(
+                value
+                    .and_then(|value| normalize_cc_value(value).parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .ok_or(()),
+            );
         }
-        // If expires is in the past, duration is 0
-        return Some(Duration::ZERO);
     }
 
-    None
+    if let Some(directive) = s_maxage.or(max_age) {
+        return match directive {
+            Ok(duration) => OriginFreshness::Explicit(duration),
+            Err(()) => OriginFreshness::Invalid,
+        };
+    }
+
+    let mut expires_values = headers.get_all(http::header::EXPIRES).iter();
+    let Some(expires) = expires_values.next() else {
+        return OriginFreshness::Absent;
+    };
+    if expires_values.next().is_some() {
+        return OriginFreshness::Invalid;
+    }
+    let Ok(expires) = expires.to_str() else {
+        return OriginFreshness::Invalid;
+    };
+    let Ok(expires) = httpdate::parse_http_date(expires) else {
+        return OriginFreshness::Invalid;
+    };
+    let duration = expires
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    OriginFreshness::Explicit(duration)
 }
 
 pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
@@ -223,6 +243,48 @@ mod tests {
     }
 
     #[test]
+    fn response_without_freshness_is_storage_eligible() {
+        assert!(is_cacheable(
+            &Method::GET,
+            StatusCode::OK,
+            &HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn explicit_freshness_detects_invalid_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=invalid"),
+        );
+        assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+
+        headers = HeaderMap::new();
+        headers.insert(
+            http::header::EXPIRES,
+            HeaderValue::from_static("not-a-date"),
+        );
+        assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+    }
+
+    #[test]
+    fn invalid_higher_priority_or_duplicate_freshness_is_not_ignored() {
+        for value in [
+            "s-maxage=invalid, max-age=60",
+            "s-maxage=60, s-maxage=30",
+            "max-age=60, max-age=30",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert_eq!(get_origin_freshness(&headers), OriginFreshness::Invalid);
+        }
+    }
+
+    #[test]
     fn test_not_cacheable_private() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -298,8 +360,8 @@ mod tests {
             HeaderValue::from_static("max-age=120"),
         );
         assert_eq!(
-            get_freshness_lifetime(&headers),
-            Some(Duration::from_secs(120))
+            get_origin_freshness(&headers),
+            OriginFreshness::Explicit(Duration::from_secs(120))
         );
     }
 

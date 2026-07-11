@@ -288,6 +288,8 @@ The cache follows standard HTTP caching headers from upstream:
 `force_cache_duration` is a fallback only. It does not override upstream
 freshness. It applies when the upstream response omits `s-maxage`, `max-age`,
 and `Expires`, including cases where only `public` is set.
+Zero, expired, malformed, or duplicated freshness metadata makes the response
+stale; it is not treated as omitted metadata and does not activate the fallback.
 
 !!! note
     Only bodyless `GET` and `HEAD` responses with status 200, 203, 204, 205,
