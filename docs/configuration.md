@@ -450,8 +450,10 @@ the response's current age.
 Request-side cache controls can force a bypass. If a request includes
 `Cache-Control: no-cache`, `Cache-Control: no-store`, `Cache-Control: max-age=0`,
 `Pragma: no-cache`, or `Range`, the cache will not be used and the response will
-not be stored. Otherwise, caching follows the upstream response headers plus
-`force_cache_duration` from policy rules.
+not be stored. ExfilGuard does not evaluate conditional validators locally;
+requests with `If-None-Match` or `If-Modified-Since` are likewise forwarded
+without cache lookup or storage. Otherwise, caching follows the upstream
+response headers plus `force_cache_duration` from policy rules.
 
 For fields named by `Vary`, ExfilGuard stores and compares the complete ordered
 list of request field values. Requests with missing, extra, or reordered values

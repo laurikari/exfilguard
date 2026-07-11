@@ -246,6 +246,131 @@ fn bodyless_request(upstream_port: u16, path: &str, close: bool) -> String {
     )
 }
 
+async fn run_conditional_cache_bypass_test(
+    conditional_name: &str,
+    matching_value: &str,
+    nonmatching_value: &str,
+    response_validator: &str,
+) -> Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = listener.local_addr()?.port();
+    let request_counter = Arc::new(AtomicUsize::new(0));
+    let counter = request_counter.clone();
+    let conditional_name_owned = conditional_name.to_ascii_lowercase();
+    let matching_value_owned = matching_value.to_string();
+    let response_validator_owned = response_validator.to_string();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let counter = counter.clone();
+            let conditional_name = conditional_name_owned.clone();
+            let matching_value = matching_value_owned.clone();
+            let response_validator = response_validator_owned.clone();
+            tokio::spawn(async move {
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    data.extend_from_slice(&buf[..read]);
+                    if data.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                counter.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&data);
+                let condition = request.lines().skip(1).find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case(&conditional_name)
+                        .then(|| value.trim().to_string())
+                });
+                let response = if condition.as_deref() == Some(matching_value.as_str()) {
+                    format!(
+                        "HTTP/1.1 304 Not Modified\r\n{response_validator}\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    let body = if condition.is_some() {
+                        "conditional-full"
+                    } else {
+                        "initial"
+                    };
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: public, max-age=60\r\n{response_validator}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.ok();
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let request = |conditional: Option<&str>| {
+        let conditional = conditional
+            .map(|value| format!("{conditional_name}: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "GET http://127.0.0.1:{upstream_port}/conditional HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n{conditional}Connection: close\r\n\r\n"
+        )
+    };
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(request(None).as_bytes()).await?;
+    let warm = read_http_response(&mut stream).await?;
+    assert!(warm.contains("initial"));
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream
+        .write_all(request(Some(matching_value)).as_bytes())
+        .await?;
+    let not_modified = read_http_response(&mut stream).await?;
+    assert!(
+        not_modified.starts_with("HTTP/1.1 304"),
+        "conditional request should reach the origin: {not_modified:?}"
+    );
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream
+        .write_all(request(Some(nonmatching_value)).as_bytes())
+        .await?;
+    let full = read_http_response(&mut stream).await?;
+    assert!(full.contains("conditional-full"));
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    stream.write_all(request(None).as_bytes()).await?;
+    let cached = read_http_response(&mut stream).await?;
+    assert!(
+        cached.contains("initial"),
+        "conditional full response must not replace cached entry: {cached:?}"
+    );
+    assert_eq!(request_counter.load(Ordering::SeqCst), 3);
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
 async fn run_cache_bypass_test(upstream_headers: &str, request_headers: &str) -> Result<()> {
     let upstream = MockUpstream::new(upstream_headers).await?;
     let upstream_port = upstream.port();
@@ -362,6 +487,22 @@ async fn forced_freshness_is_only_an_absent_metadata_fallback() -> Result<()> {
     run_forced_freshness_test("Cache-Control: max-age=0", false).await?;
     run_forced_freshness_test("Cache-Control: public, max-age=invalid", false).await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn if_none_match_bypasses_cache_lookup_and_storage() -> Result<()> {
+    run_conditional_cache_bypass_test("If-None-Match", "\"v1\"", "\"other\"", "ETag: \"v1\"").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn if_modified_since_bypasses_cache_lookup_and_storage() -> Result<()> {
+    run_conditional_cache_bypass_test(
+        "If-Modified-Since",
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Sun, 06 Nov 1994 08:49:36 GMT",
+        "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT",
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

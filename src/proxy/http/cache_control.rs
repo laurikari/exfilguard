@@ -208,7 +208,10 @@ pub fn corrected_initial_age(
 }
 
 pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
-    if headers.contains_key(http::header::RANGE) {
+    if headers.contains_key(http::header::RANGE)
+        || headers.contains_key(http::header::IF_NONE_MATCH)
+        || headers.contains_key(http::header::IF_MODIFIED_SINCE)
+    {
         return true;
     }
 
@@ -559,6 +562,36 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=0-99"));
         assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_cache_applicable_conditionals() {
+        for (name, values) in [
+            (http::header::IF_NONE_MATCH, vec!["*", "W/\"v1\""]),
+            (
+                http::header::IF_MODIFIED_SINCE,
+                vec!["not-a-date", "Sun, 06 Nov 1994 08:49:37 GMT"],
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(name.clone(), HeaderValue::from_str(value).unwrap());
+            }
+            assert!(request_cache_bypass(&headers));
+        }
+    }
+
+    #[test]
+    fn origin_only_or_standalone_range_conditionals_do_not_bypass() {
+        for name in [
+            http::header::IF_MATCH,
+            http::header::IF_UNMODIFIED_SINCE,
+            http::header::IF_RANGE,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("ignored-by-cache"));
+            assert!(!request_cache_bypass(&headers));
+        }
     }
 
     #[test]
