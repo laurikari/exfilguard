@@ -26,6 +26,9 @@ non-fallback client. If nothing matches, ExfilGuard uses the fallback client.
 The fallback has no selector and is never part of IP/CIDR matching. A fallback
 that sets `ip` or `cidr` is invalid.
 
+IP literals in URL patterns are compared by address value, so equivalent
+compressed and expanded IPv6 spellings match the same rule.
+
 ### Validation Rules
 
 - Client names must be unique

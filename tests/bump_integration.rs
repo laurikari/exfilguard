@@ -678,6 +678,44 @@ async fn connect_default_deny_returns_403() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_equivalent_ipv6_spelling_hits_ordered_deny() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["ipv6"])
+        .policy(
+            PolicySpec::new("ipv6")
+                .rule(
+                    RuleSpec::deny(&["CONNECT"], "https://[2001:0DB8:0:0:0:0:0:10]:443/**")
+                        .https_mode("tunnel")
+                        .status(451)
+                        .body("IPv6 target denied"),
+                )
+                .rule(RuleSpec::allow(&["CONNECT"], "https://*/**").https_mode("tunnel")),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = b"CONNECT [2001:db8::10]:443 HTTP/1.1\r\nHost: [2001:db8::10]:443\r\nConnection: close\r\n\r\n";
+    stream.write_all(request).await?;
+    stream.flush().await?;
+
+    let response = read_http_response(&mut stream).await?;
+    assert!(
+        response.starts_with("HTTP/1.1 451"),
+        "equivalent IPv6 spelling bypassed ordered deny: {response}"
+    );
+    assert!(response.contains("IPv6 target denied"));
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
     let dirs = TestDirs::new()?;
     let target_port = find_free_port()?;
@@ -2105,7 +2143,7 @@ async fn http_ipv6_loopback_denied() -> Result<()> {
         .await?;
 
     let mut stream = TcpStream::connect(harness.addr).await?;
-    let request = b"GET http://[::1]/secret HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n";
+    let request = b"GET http://[0:0:0:0:0:0:0:1]/secret HTTP/1.1\r\nHost: [0:0:0:0:0:0:0:1]\r\nConnection: close\r\n\r\n";
     stream.write_all(request).await?;
     stream.flush().await?;
 

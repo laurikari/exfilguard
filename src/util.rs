@@ -35,6 +35,11 @@ pub fn parse_ip_or_cidr(value: &str) -> Result<IpOrCidr> {
     }
 }
 
+/// Return the canonical textual representation when `value` is an IP literal.
+pub fn canonicalize_ip_literal(value: &str) -> Option<String> {
+    value.parse::<IpAddr>().ok().map(|addr| addr.to_string())
+}
+
 /// Returns true if the provided IP address should be treated as non-public for upstream filtering.
 ///
 /// Historical note: despite the name, this is intentionally broader than RFC1918/RFC4193 private
@@ -187,6 +192,15 @@ mod tests {
             parsed,
             IpOrCidr::Ip(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
         );
+    }
+
+    #[test]
+    fn canonicalizes_equivalent_ipv6_literals() {
+        assert_eq!(
+            canonicalize_ip_literal("2001:0DB8:0:0:0:0:0:10").as_deref(),
+            Some("2001:db8::10")
+        );
+        assert_eq!(canonicalize_ip_literal("api.example.com"), None);
     }
 
     #[test]

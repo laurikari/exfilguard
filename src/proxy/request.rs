@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,6 +7,7 @@ use http::{Method, Uri};
 use crate::config::Scheme;
 use crate::logging::AccessLogBuilder;
 use crate::policy::matcher::Request as PolicyRequest;
+use crate::util::canonicalize_ip_literal;
 
 /// Common representation of an HTTP request after parsing the start line / pseudo headers.
 ///
@@ -203,11 +204,11 @@ pub fn parse_host_header(value: &str) -> Result<(String, Option<u16>)> {
 }
 
 fn canonicalize_policy_host(host: &str) -> Result<String> {
-    let host = host.to_ascii_lowercase();
-    if host.parse::<IpAddr>().is_ok() {
+    if let Some(host) = canonicalize_ip_literal(host) {
         return Ok(host);
     }
 
+    let host = host.to_ascii_lowercase();
     let host = host.strip_suffix('.').unwrap_or(&host);
     if host.is_empty() {
         bail!("Host header missing hostname");
@@ -552,11 +553,15 @@ mod tests {
 
     #[test]
     fn parse_uri_request_normalizes_ipv6_host() -> Result<()> {
-        let uri: Uri = "https://[2001:db8::10]/".parse()?;
+        let uri: Uri = "https://[2001:0DB8:0:0:0:0:0:10]/".parse()?;
         let parsed = parse_uri_request(Method::GET, &uri, Scheme::Https)?;
         assert_eq!(parsed.host, "2001:db8::10");
         assert_eq!(parsed.port, Some(443));
-        assert_eq!(parsed.authority_host(), "[2001:db8::10]");
+        assert_eq!(
+            parsed.authority_host(),
+            "[2001:0DB8:0:0:0:0:0:10]",
+            "forwarded authority must retain the original spelling"
+        );
         Ok(())
     }
 

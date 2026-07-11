@@ -656,7 +656,7 @@ mod tests {
                     methods: MethodMatch::Any,
                     url_pattern: Some(UrlPattern {
                         scheme: Scheme::Https,
-                        host: Arc::<str>::from("2001:db8::10"),
+                        host: Arc::<str>::from("2001:0DB8:0:0:0:0:0:10"),
                         port: Some(443),
                         path: Some(Arc::<str>::from("/")),
                         original: Arc::<str>::from("https://[2001:db8::10]:443/"),

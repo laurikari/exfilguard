@@ -19,7 +19,7 @@ use super::model::{
 ///
 /// Compilation involves:
 /// 1. Building a `CidrTrie` for O(log N) client lookups by source IP.
-/// 2. Converting URL patterns into specialized `HostMatcher` (Glob/Exact)
+/// 2. Converting URL patterns into specialized `HostMatcher` values
 ///    and `PathMatcher` (Regex) structures for fast evaluation.
 /// 3. Resolving policy name references into direct indices to avoid string lookups at runtime.
 pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
@@ -155,6 +155,10 @@ fn compile_host_pattern(host: &str) -> Result<HostMatcher> {
         return Ok(HostMatcher::Any);
     }
 
+    if let Ok(addr) = host.parse() {
+        return Ok(HostMatcher::Ip(addr));
+    }
+
     if !host.contains('*') {
         return Ok(HostMatcher::Exact(host.to_ascii_lowercase()));
     }
@@ -226,6 +230,8 @@ fn compile_path_pattern(pattern: &Arc<str>) -> Result<PathMatcher> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
+
     use crate::config::{
         Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
         ValidatedConfig,
@@ -278,6 +284,15 @@ mod tests {
         };
         let compiled = compile_policy(&policy).expect("compile policy");
         assert_eq!(compiled.rules.len(), 1);
+    }
+
+    #[test]
+    fn compile_exact_ipv6_host_canonically() {
+        let matcher = compile_host_pattern("2001:0DB8:0:0:0:0:0:10").unwrap();
+        assert!(matches!(
+            matcher,
+            HostMatcher::Ip(addr) if addr == "2001:db8::10".parse::<IpAddr>().unwrap()
+        ));
     }
 
     #[test]

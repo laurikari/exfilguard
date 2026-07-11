@@ -14,8 +14,10 @@ that already have one clear meaning.
 
 For policy matching, percent-encoded RFC-unreserved characters are decoded and
 the hex digits of retained escapes are uppercased. Dot-segment processing runs
-on that canonical policy path. The original request target remains unchanged
-for forwarding, logging, cache keys, and signature-sensitive traffic.
+on that canonical policy path. IP-literal hosts in rules and requests are
+parsed and serialized to one numeric spelling before comparison. The original
+request target remains unchanged for forwarding, logging, cache keys, and
+signature-sensitive traffic.
 
 ## Reject ambiguous syntax
 

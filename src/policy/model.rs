@@ -264,6 +264,7 @@ impl UrlMatcher {
 #[derive(Debug, Clone)]
 pub enum HostMatcher {
     Any,
+    Ip(IpAddr),
     Exact(String),
     Pattern(HostPattern),
 }
@@ -272,6 +273,7 @@ impl HostMatcher {
     pub fn matches(&self, host: &str) -> bool {
         match self {
             HostMatcher::Any => true,
+            HostMatcher::Ip(expected) => host.parse::<IpAddr>().is_ok_and(|host| host == *expected),
             HostMatcher::Exact(expected) => expected == &host.to_ascii_lowercase(),
             HostMatcher::Pattern(pattern) => pattern.matches(host),
         }

@@ -15,7 +15,7 @@ use super::{
         RuleAction, Scheme, UrlPattern,
     },
 };
-use crate::util::{IpOrCidr, parse_ip_or_cidr};
+use crate::util::{IpOrCidr, canonicalize_ip_literal, parse_ip_or_cidr};
 
 pub fn load_config<P: AsRef<Path>, Q: AsRef<Path>>(
     clients_path: P,
@@ -297,8 +297,9 @@ fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
         .next()
         .ok_or_else(|| anyhow!("pattern missing host"))?;
 
-    let (host, port) = parse_host_and_port(host_port)?;
-    super::validate_host_pattern(host)?;
+    let (raw_host, port) = parse_host_and_port(host_port)?;
+    super::validate_host_pattern(raw_host)?;
+    let host = canonicalize_ip_literal(raw_host).unwrap_or_else(|| raw_host.to_string());
 
     let path = host_and_path.next().map(|path| format!("/{}", path));
     if let Some(path_ref) = path.as_ref() {
@@ -307,7 +308,7 @@ fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
 
     Ok(UrlPattern {
         scheme,
-        host: Arc::<str>::from(host.to_string()),
+        host: Arc::<str>::from(host),
         port,
         path: path.map(Arc::<str>::from),
         original: Arc::<str>::from(raw.to_string()),
