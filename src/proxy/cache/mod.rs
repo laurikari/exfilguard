@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
@@ -63,6 +63,7 @@ struct CacheState {
     store: CacheStore,
     max_entry_size: u64,
     max_bytes: u64,
+    in_flight_bytes: AtomicU64,
     next_id: AtomicU64,
 }
 
@@ -82,6 +83,10 @@ impl HttpCache {
         sweeper_interval: Duration,
         sweeper_batch_size: usize,
     ) -> Result<Self> {
+        ensure!(
+            max_entry_size <= max_bytes,
+            "cache max entry size ({max_entry_size}) must not exceed total capacity ({max_bytes})"
+        );
         let cache_root = disk_dir;
         let (disk_dir, cleanup_dirs) = prepare_versioned_cache_dir(&cache_root).await?;
 
@@ -95,6 +100,7 @@ impl HttpCache {
             store,
             max_entry_size,
             max_bytes,
+            in_flight_bytes: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
         });
         spawn_cache_dir_cleanup(cleanup_dirs);
@@ -200,6 +206,36 @@ impl CacheState {
 
     fn next_entry_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn try_reserve_in_flight(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        self.in_flight_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|total| *total <= self.max_entry_size)
+            })
+            .is_ok()
+    }
+
+    fn release_in_flight(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let released =
+            self.in_flight_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_sub(bytes)
+                });
+        debug_assert!(released.is_ok(), "cache in-flight accounting underflow");
+    }
+
+    #[cfg(test)]
+    fn in_flight_bytes(&self) -> u64 {
+        self.in_flight_bytes.load(Ordering::Acquire)
     }
 
     fn remove_entry_if_id_matches(&self, key_base: &str, entry_id: u64) -> Option<CacheEntry> {
@@ -323,6 +359,14 @@ mod tests {
         let disk_body = fs::read(hit.body_path)?;
         assert_eq!(disk_body, body);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_entry_limit_above_total_capacity() -> Result<()> {
+        let dir = TempDir::new()?;
+        let result = build_cache(10, dir.path().to_path_buf(), 1025, 1024).await;
+        assert!(result.is_err());
         Ok(())
     }
 
@@ -1265,8 +1309,8 @@ mod tests {
     #[tokio::test]
     async fn enforces_total_capacity_and_evicts_lru() -> Result<()> {
         let dir = TempDir::new()?;
-        // Total cap of 6 bytes, entry cap large enough to not trigger first.
-        let cache = build_cache(4, dir.path().to_path_buf(), 1024, 6).await?;
+        // Total and per-entry caps are 6 bytes; each individual entry fits.
+        let cache = build_cache(4, dir.path().to_path_buf(), 6, 6).await?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;
@@ -1311,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn skips_entry_bigger_than_total_capacity() -> Result<()> {
         let dir = TempDir::new()?;
-        let cache = build_cache(2, dir.path().to_path_buf(), 1024, 2).await?;
+        let cache = build_cache(2, dir.path().to_path_buf(), 2, 2).await?;
         let req_headers = HeaderMap::new();
         let resp_headers = HeaderMap::new();
         let method = Method::GET;

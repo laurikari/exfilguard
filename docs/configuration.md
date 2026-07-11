@@ -397,9 +397,9 @@ cache storage.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `cache_dir` | Path | None | Directory for response cache storage |
-| `cache_max_entry_size` | u64 | 104857600 (100 MiB) | Maximum size of individual cache entries |
+| `cache_max_entry_size` | u64 | 104857600 (100 MiB) | Maximum size of an entry and aggregate in-progress response bodies |
 | `cache_max_entries` | usize | 10000 | Maximum number of cached responses (LRU) |
-| `cache_total_capacity` | u64 | 1073741824 (1 GiB) | Total cache capacity |
+| `cache_total_capacity` | u64 | 1073741824 (1 GiB) | Capacity of completed cache entries |
 | `cache_sweeper_interval` | u64 | 300 | Interval in seconds between cache sweeper runs |
 | `cache_sweeper_batch_size` | usize | 1000 | Maximum metadata entries inspected per sweep |
 
@@ -472,6 +472,14 @@ When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up
 to `cache_sweeper_batch_size` entries, removing expired entries and pruning
 empty shard directories.
+
+`cache_total_capacity` is an advisory bound for completed response bodies, not
+a filesystem quota. In-progress cache fills share an additional
+`cache_max_entry_size` staging allowance; when it is exhausted, those fills
+skip caching without slowing or rejecting the forwarded responses. Operators
+should therefore reserve at least the sum of both settings, plus space for
+metadata and normal filesystem overhead. Partial staging files are removed as
+soon as their fill is discarded.
 
 !!! note
     The cache does not support conditional revalidation (ETag/If-None-Match, Last-Modified/If-Modified-Since). Stale entries are discarded and fetched fresh from upstream.

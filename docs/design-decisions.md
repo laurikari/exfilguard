@@ -224,6 +224,19 @@ allow rule enables caching.
 ExfilGuard does not cache allowed traffic by default. That keeps response
 storage and freshness changes under explicit operator control.
 
+## Cache disk limits do not throttle forwarding
+
+`cache_total_capacity` bounds completed response bodies, while all in-progress
+cache fills share one additional `cache_max_entry_size` staging allowance.
+These are advisory cache-storage bounds rather than a filesystem quota; normal
+metadata and filesystem overhead still require headroom.
+
+When the staging allowance is exhausted, ExfilGuard abandons only the cache
+copy and continues forwarding the response. It does not slow or reject client
+traffic to protect cache population. Same-key fills are not coalesced: that is
+an upstream-load optimization with response-variant complexity, not necessary
+for bounding temporary disk use.
+
 ## `SIGHUP` reloads policy data only
 
 `SIGHUP` reloads clients and policies. It does not reload listener settings,

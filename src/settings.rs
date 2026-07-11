@@ -795,6 +795,12 @@ impl Settings {
                 self.cache_total_capacity
             );
             ensure!(
+                self.cache_max_entry_size <= self.cache_total_capacity,
+                "cache_max_entry_size ({}) must not exceed cache_total_capacity ({})",
+                self.cache_max_entry_size,
+                self.cache_total_capacity
+            );
+            ensure!(
                 self.cache_sweeper_interval > 0,
                 "cache_sweeper_interval must be greater than 0 seconds (got {})",
                 self.cache_sweeper_interval
@@ -1299,6 +1305,10 @@ policies = "policies.toml"
 
         settings.cache_max_entry_size = 1024;
         settings.cache_total_capacity = 0;
+        assert!(settings.validate().is_err());
+
+        settings.cache_total_capacity = 1024;
+        settings.cache_max_entry_size = 1025;
         assert!(settings.validate().is_err());
     }
 

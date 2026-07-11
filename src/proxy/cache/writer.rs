@@ -105,14 +105,17 @@ where
 impl<W: Unpin> Unpin for PartialWrite<W> {}
 
 pub(crate) struct CacheWriter {
-    file: CacheWriterFile,
+    file: Option<CacheWriterFile>,
     hasher: Hasher,
     temp_path: std::path::PathBuf,
     state: Arc<CacheState>,
     current_size: u64,
     key: CacheKey,
     vary: VaryKey,
+    reserved_bytes: u64,
+    pending_reservation: u64,
     discard: bool,
+    committed: bool,
     finished: bool,
 }
 
@@ -131,14 +134,17 @@ impl CacheWriter {
         vary: VaryKey,
     ) -> Self {
         Self {
-            file: CacheWriterFile::new(file),
+            file: Some(CacheWriterFile::new(file)),
             hasher: Hasher::new(),
             temp_path,
             state,
             current_size: 0,
             key,
             vary,
+            reserved_bytes: 0,
+            pending_reservation: 0,
             discard: false,
+            committed: false,
             finished: false,
         }
     }
@@ -153,20 +159,35 @@ impl CacheWriter {
         max_write: usize,
     ) -> Self {
         Self {
-            file: CacheWriterFile::new_partial(file, max_write),
+            file: Some(CacheWriterFile::new_partial(file, max_write)),
             hasher: Hasher::new(),
             temp_path,
             state,
             current_size: 0,
             key,
             vary,
+            reserved_bytes: 0,
+            pending_reservation: 0,
             discard: false,
+            committed: false,
             finished: false,
         }
     }
 
     pub(crate) fn discard(&mut self) {
+        if self.discard {
+            return;
+        }
         self.discard = true;
+        self.file.take();
+        let _ = std::fs::remove_file(&self.temp_path);
+        self.release_reserved_bytes();
+    }
+
+    fn release_reserved_bytes(&mut self) {
+        self.state.release_in_flight(self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.pending_reservation = 0;
     }
 
     pub(crate) async fn finish(
@@ -175,29 +196,29 @@ impl CacheWriter {
         headers: HeaderMap,
         timing: CacheTiming,
     ) -> Result<CacheFinishOutcome> {
-        self.file.flush().await?;
+        if let Some(file) = self.file.as_mut() {
+            file.flush().await?;
+        }
 
         if self.discard {
-            // Delete temp file
-            async_fs::remove_file(&self.temp_path).await.ok();
             self.finished = true;
             return Ok(CacheFinishOutcome::Skipped);
         }
 
         if self.current_size > self.state.max_bytes {
-            async_fs::remove_file(&self.temp_path).await.ok();
+            self.discard();
             self.finished = true;
             return Ok(CacheFinishOutcome::Skipped);
         }
 
         let Some(expires_at) = timing.expires_at() else {
             warn!("skipping cache entry with unrepresentable expiration time");
-            async_fs::remove_file(&self.temp_path).await.ok();
+            self.discard();
             self.finished = true;
             return Ok(CacheFinishOutcome::Skipped);
         };
         if SystemTime::now() >= expires_at {
-            async_fs::remove_file(&self.temp_path).await.ok();
+            self.discard();
             self.finished = true;
             return Ok(CacheFinishOutcome::Skipped);
         }
@@ -209,7 +230,8 @@ impl CacheWriter {
             .to_hex()
             .to_string();
         let body_id = format!("{}{}", &key_id[..4], &random_id[4..]);
-        let _publish_guard = self.state.publish_lock().lock().await;
+        let state = self.state.clone();
+        let _publish_guard = state.publish_lock().lock().await;
         let final_path = self.state.body_path(&body_id);
         let shard_dir = final_path
             .parent()
@@ -219,6 +241,7 @@ impl CacheWriter {
         // Move temp file to final path
         async_fs::create_dir_all(&shard_dir).await?;
         async_fs::rename(&self.temp_path, &final_path).await?;
+        self.temp_path = final_path.clone();
 
         let entry = CacheEntry {
             id: self.state.next_entry_id(),
@@ -241,6 +264,7 @@ impl CacheWriter {
             async_fs::remove_file(self.state.body_path(&body_id))
                 .await
                 .ok();
+            self.release_reserved_bytes();
             self.finished = true;
             return Ok(CacheFinishOutcome::Skipped);
         }
@@ -248,12 +272,14 @@ impl CacheWriter {
         let evicted = self
             .state
             .insert_entry(self.key.key_base().to_string(), entry);
+        self.committed = true;
         trace!("stored cache entry for {}", self.key.key_base());
 
         self.state
             .remove_evicted_files_async(evicted, &key_id)
             .await;
 
+        self.release_reserved_bytes();
         self.finished = true;
         Ok(CacheFinishOutcome::Stored)
     }
@@ -270,51 +296,86 @@ impl AsyncWrite for CacheWriter {
         }
 
         // Check size limit before writing to avoid partial cache entries.
-        if self.current_size + buf.len() as u64 > self.state.max_entry_size {
-            self.discard = true;
+        let requested = buf.len() as u64;
+        if self
+            .current_size
+            .checked_add(requested)
+            .is_none_or(|size| size > self.state.max_entry_size)
+        {
+            self.discard();
+            return Poll::Ready(Ok(buf.len()));
+        }
+        if self.pending_reservation == 0 {
+            if !self.state.try_reserve_in_flight(requested) {
+                self.discard();
+                return Poll::Ready(Ok(buf.len()));
+            }
+            self.reserved_bytes = self.reserved_bytes.saturating_add(requested);
+            self.pending_reservation = requested;
+        } else if self.pending_reservation != requested {
+            // The previous asynchronous file operation was abandoned by its
+            // caller. Drop this cache fill rather than attribute its result to
+            // a different buffer.
+            self.discard();
             return Poll::Ready(Ok(buf.len()));
         }
 
         // Write to file, then update hash/size with bytes actually written.
-        match Pin::new(&mut self.file).poll_write(cx, buf) {
+        let result = Pin::new(self.file.as_mut().expect("active cache writer has a file"))
+            .poll_write(cx, buf);
+        match result {
             Poll::Ready(Ok(written)) => {
+                let written = written as u64;
+                let unwritten = self.pending_reservation - written;
+                self.state.release_in_flight(unwritten);
+                self.reserved_bytes -= unwritten;
+                self.pending_reservation = 0;
                 if written > 0 {
-                    self.hasher.update(&buf[..written]);
-                    self.current_size = self.current_size.saturating_add(written as u64);
+                    self.hasher.update(&buf[..written as usize]);
+                    self.current_size = self.current_size.saturating_add(written);
                 }
-                Poll::Ready(Ok(written))
+                Poll::Ready(Ok(written as usize))
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                self.state.release_in_flight(self.pending_reservation);
+                self.reserved_bytes -= self.pending_reservation;
+                self.pending_reservation = 0;
+                Poll::Ready(Err(err))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_flush(cx)
+        match self.file.as_mut() {
+            Some(file) => Pin::new(file).poll_flush(cx),
+            None => Poll::Ready(Ok(())),
+        }
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_shutdown(cx)
+        match self.file.as_mut() {
+            Some(file) => Pin::new(file).poll_shutdown(cx),
+            None => Poll::Ready(Ok(())),
+        }
     }
 }
 
 impl Drop for CacheWriter {
     fn drop(&mut self) {
         if self.finished {
+            self.release_reserved_bytes();
             return;
         }
 
-        let temp_path = self.temp_path.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = async_fs::remove_file(temp_path).await;
-            });
-        } else {
-            let _ = std::fs::remove_file(&temp_path);
+        self.file.take();
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.temp_path);
         }
+        self.release_reserved_bytes();
     }
 }
 
@@ -331,6 +392,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn build_state(dir: &TempDir) -> Arc<CacheState> {
+        build_state_with_max_entry_size(dir, 1024 * 1024)
+    }
+
+    fn build_state_with_max_entry_size(dir: &TempDir, max_entry_size: u64) -> Arc<CacheState> {
         let capacity = NonZeroUsize::new(8).expect("nonzero capacity");
         let index = CacheIndex::new(capacity, 1024 * 1024);
         let store = CacheStore::new(dir.path().to_path_buf());
@@ -338,8 +403,9 @@ mod tests {
             index: Mutex::new(index),
             publish_lock: tokio::sync::Mutex::new(()),
             store,
-            max_entry_size: 1024 * 1024,
+            max_entry_size,
             max_bytes: 1024 * 1024,
+            in_flight_bytes: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
         })
     }
@@ -474,6 +540,82 @@ mod tests {
         assert_eq!(outcome, CacheFinishOutcome::Skipped);
         assert!(!temp_path.exists());
         assert!(!state.meta_path(key.entry_id()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_in_flight_budget_discards_only_competing_fill() -> Result<()> {
+        let dir = TempDir::new()?;
+        let state = build_state_with_max_entry_size(&dir, 8);
+        let key_a = CacheKey::new(&Method::GET, &build_uri());
+        let key_b = CacheKey::new(&Method::GET, &"http://example.com:80/other".parse::<Uri>()?);
+        let path_a = state.store.temp_path("tmp_budget_a");
+        let path_b = state.store.temp_path("tmp_budget_b");
+        let mut writer_a = CacheWriter::new(
+            async_fs::File::create(&path_a).await?,
+            path_a.clone(),
+            state.clone(),
+            key_a,
+            VaryKey::new(HeaderMap::new()),
+        );
+        let mut writer_b = CacheWriter::new(
+            async_fs::File::create(&path_b).await?,
+            path_b.clone(),
+            state.clone(),
+            key_b,
+            VaryKey::new(HeaderMap::new()),
+        );
+
+        writer_a.write_all(b"aaaaaa").await?;
+        assert_eq!(state.in_flight_bytes(), 6);
+        writer_b.write_all(b"bbbb").await?;
+
+        assert_eq!(state.in_flight_bytes(), 6);
+        assert!(path_a.exists());
+        assert!(!path_b.exists());
+        assert_eq!(
+            writer_b
+                .finish(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    CacheTiming {
+                        response_time: SystemTime::now(),
+                        corrected_initial_age: Duration::ZERO,
+                        freshness_lifetime: Duration::from_secs(30),
+                    },
+                )
+                .await?,
+            CacheFinishOutcome::Skipped
+        );
+
+        drop(writer_a);
+        assert_eq!(state.in_flight_bytes(), 0);
+        assert!(!path_a.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crossing_entry_limit_removes_partial_file_immediately() -> Result<()> {
+        let dir = TempDir::new()?;
+        let state = build_state_with_max_entry_size(&dir, 8);
+        let key = CacheKey::new(&Method::GET, &build_uri());
+        let temp_path = state.store.temp_path("tmp_entry_limit");
+        let mut writer = CacheWriter::new(
+            async_fs::File::create(&temp_path).await?,
+            temp_path.clone(),
+            state.clone(),
+            key,
+            VaryKey::new(HeaderMap::new()),
+        );
+
+        writer.write_all(b"aaaaaa").await?;
+        assert_eq!(state.in_flight_bytes(), 6);
+        writer.flush().await?;
+        assert_eq!(std::fs::metadata(&temp_path)?.len(), 6);
+
+        writer.write_all(b"bbbb").await?;
+        assert_eq!(state.in_flight_bytes(), 0);
+        assert!(!temp_path.exists());
         Ok(())
     }
 }
