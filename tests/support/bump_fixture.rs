@@ -26,7 +26,8 @@ use exfilguard::tls::ca::CertificateAuthority;
 use super::{
     PolicySpec, ProxyHarness, ProxyHarnessBuilder, RuleSpec, TestConfigBuilder, build_client_tls,
     build_client_tls_h2, build_upstream_h2_tls_config, build_upstream_tls_config,
-    read_http_response, read_http_response_with_length, read_until_double_crlf,
+    build_upstream_tls_config_with_alpn, read_http_response, read_http_response_with_length,
+    read_until_double_crlf,
 };
 
 #[derive(Clone, Copy)]
@@ -50,6 +51,8 @@ pub enum UpstreamMode {
     Http1Inspect,
     Http1Redirect,
     Http2,
+    Http2CacheInspect,
+    DualProtocolCacheInspect,
     Http2CloseBeforeResponse,
     Http2HeadersThenStallBody,
     Http2NoResponse,
@@ -63,6 +66,7 @@ pub struct BumpedTlsOptions<'a> {
     policy: PolicySpec,
     client_protocols: ClientProtocols,
     upstream_mode: UpstreamMode,
+    cache_enabled: bool,
     settings_override: Option<Box<dyn FnOnce(&mut Settings) + Send>>,
 }
 
@@ -74,6 +78,7 @@ impl<'a> BumpedTlsOptions<'a> {
             policy,
             client_protocols: ClientProtocols::Http1,
             upstream_mode: UpstreamMode::Http1Keepalive,
+            cache_enabled: false,
             settings_override: None,
         }
     }
@@ -85,6 +90,11 @@ impl<'a> BumpedTlsOptions<'a> {
 
     pub fn upstream_mode(mut self, mode: UpstreamMode) -> Self {
         self.upstream_mode = mode;
+        self
+    }
+
+    pub fn with_cache(mut self) -> Self {
+        self.cache_enabled = true;
         self
     }
 
@@ -234,11 +244,14 @@ impl Drop for BumpedH2Client {
 
 pub struct BumpedTlsFixture {
     upstream_addr: SocketAddr,
+    upstream_host: String,
+    client_root_store: RootCertStore,
     tls_stream: Option<tokio_rustls::client::TlsStream<TcpStream>>,
     shutdown_tx: oneshot::Sender<()>,
     upstream_task: tokio::task::JoinHandle<Result<()>>,
     harness: ProxyHarness,
     accept_count: Arc<AtomicUsize>,
+    request_count: Arc<AtomicUsize>,
 }
 
 impl BumpedTlsFixture {
@@ -249,9 +262,13 @@ impl BumpedTlsFixture {
             policy,
             client_protocols,
             upstream_mode,
+            cache_enabled,
             settings_override,
         } = options;
-        let dirs = super::TestDirs::new()?;
+        let mut dirs = super::TestDirs::new()?;
+        if cache_enabled {
+            dirs.enable_cache_dir()?;
+        }
         let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let upstream_addr = upstream_listener.local_addr()?;
 
@@ -282,16 +299,24 @@ impl BumpedTlsFixture {
             | UpstreamMode::Http1Inspect
             | UpstreamMode::Http1Redirect => build_upstream_tls_config(&ca, upstream_host)?,
             UpstreamMode::Http2
+            | UpstreamMode::Http2CacheInspect
             | UpstreamMode::Http2CloseBeforeResponse
             | UpstreamMode::Http2HeadersThenStallBody
             | UpstreamMode::Http2NoResponse
             | UpstreamMode::Http2SingleUse
             | UpstreamMode::Http2Inspect => build_upstream_h2_tls_config(&ca, upstream_host)?,
+            UpstreamMode::DualProtocolCacheInspect => build_upstream_tls_config_with_alpn(
+                &ca,
+                upstream_host,
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            )?,
         };
 
         let accept_count = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::new(AtomicUsize::new(0));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let accept_counter = accept_count.clone();
+        let request_counter = request_count.clone();
         let upstream_task = {
             let upstream_config = upstream_config.clone();
             tokio::spawn(async move {
@@ -308,6 +333,7 @@ impl BumpedTlsFixture {
                             };
                             accept_counter.fetch_add(1, Ordering::SeqCst);
                             let acceptor = TlsAcceptor::from(upstream_config.clone());
+                            let request_counter = request_counter.clone();
                             tokio::spawn(async move {
                                 let result = match upstream_mode {
                                     UpstreamMode::Http1Keepalive => {
@@ -321,6 +347,22 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http2 => {
                                         serve_tls_h2(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2CacheInspect => {
+                                        serve_tls_h2_cache_inspect(
+                                            stream,
+                                            acceptor,
+                                            peer,
+                                            request_counter,
+                                        ).await
+                                    }
+                                    UpstreamMode::DualProtocolCacheInspect => {
+                                        serve_tls_dual_protocol_cache_inspect(
+                                            stream,
+                                            acceptor,
+                                            peer,
+                                            request_counter,
+                                        ).await
                                     }
                                     UpstreamMode::Http2CloseBeforeResponse => {
                                         serve_tls_h2_close_before_response(stream, acceptor, peer).await
@@ -353,34 +395,25 @@ impl BumpedTlsFixture {
         let (added_client, _) =
             client_root_store.add_parsable_certificates([ca.root_certificate_der()]);
         assert!(added_client > 0, "expected CA root to be trusted by client");
-        let client_tls_config = client_protocols.build(client_root_store)?;
-
-        let mut stream = TcpStream::connect(harness.addr).await?;
-        let connect_request = format!(
-            "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Connection: keep-alive\r\n\r\n",
-            host = upstream_host,
-            port = upstream_addr.port()
-        );
-        stream.write_all(connect_request.as_bytes()).await?;
-        stream.flush().await?;
-
-        let connect_response = read_until_double_crlf(&mut stream).await?;
-        assert!(
-            connect_response.starts_with("HTTP/1.1 200"),
-            "unexpected CONNECT response: {connect_response}"
-        );
-
-        let connector = tokio_rustls::TlsConnector::from(client_tls_config);
-        let server_name = ServerName::try_from(upstream_host.to_string()).unwrap();
-        let tls_stream = connector.connect(server_name, stream).await?;
+        let tls_stream = connect_bumped_tls(
+            harness.addr,
+            upstream_host,
+            upstream_addr.port(),
+            &client_root_store,
+            client_protocols,
+        )
+        .await?;
 
         Ok(Self {
             upstream_addr,
+            upstream_host: upstream_host.to_string(),
+            client_root_store,
             tls_stream: Some(tls_stream),
             shutdown_tx,
             upstream_task,
             harness,
             accept_count,
+            request_count,
         })
     }
 
@@ -418,6 +451,21 @@ impl BumpedTlsFixture {
         })
     }
 
+    pub async fn reconnect(&mut self, protocols: ClientProtocols) -> Result<()> {
+        self.tls_stream.take();
+        self.tls_stream = Some(
+            connect_bumped_tls(
+                self.harness.addr,
+                &self.upstream_host,
+                self.upstream_addr.port(),
+                &self.client_root_store,
+                protocols,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
     pub fn upstream_addr(&self) -> SocketAddr {
         self.upstream_addr
     }
@@ -426,11 +474,41 @@ impl BumpedTlsFixture {
         self.accept_count.load(Ordering::SeqCst)
     }
 
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::SeqCst)
+    }
+
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
         let _ = self.upstream_task.await;
         self.harness.shutdown().await;
     }
+}
+
+async fn connect_bumped_tls(
+    proxy_addr: SocketAddr,
+    upstream_host: &str,
+    upstream_port: u16,
+    client_root_store: &RootCertStore,
+    protocols: ClientProtocols,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let client_tls_config = protocols.build(client_root_store.clone())?;
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let connect_request = format!(
+        "CONNECT {upstream_host}:{upstream_port} HTTP/1.1\r\nHost: {upstream_host}:{upstream_port}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(connect_request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let connect_response = read_until_double_crlf(&mut stream).await?;
+    assert!(
+        connect_response.starts_with("HTTP/1.1 200"),
+        "unexpected CONNECT response: {connect_response}"
+    );
+
+    let connector = tokio_rustls::TlsConnector::from(client_tls_config);
+    let server_name = ServerName::try_from(upstream_host.to_string()).unwrap();
+    Ok(connector.connect(server_name, stream).await?)
 }
 
 async fn serve_tls_keepalive(
@@ -565,6 +643,152 @@ async fn serve_tls_h2(stream: TcpStream, acceptor: TlsAcceptor, _peer: SocketAdd
         }
     }
 
+    Ok(())
+}
+
+async fn serve_tls_h2_cache_inspect(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    while let Some(result) = connection.accept().await {
+        let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
+        let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let path = request.uri().path().to_string();
+        let mut stream = request.into_body();
+        let mut request_body = Vec::new();
+        while let Some(frame) = stream.data().await {
+            let chunk = frame.context("failed to read HTTP/2 request body")?;
+            let chunk_len = chunk.len();
+            request_body.extend_from_slice(&chunk);
+            stream
+                .flow_control()
+                .release_capacity(chunk_len)
+                .context("failed to release HTTP/2 request body capacity")?;
+        }
+
+        let response_body = format!(
+            "request={sequence}\npath={path}\nbody={}",
+            String::from_utf8_lossy(&request_body)
+        );
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(())
+            .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+        let mut send = respond
+            .send_response(response, false)
+            .context("failed to send HTTP/2 response headers")?;
+        send.send_data(Bytes::from(response_body), true)
+            .context("failed to send HTTP/2 response body")?;
+    }
+
+    Ok(())
+}
+
+async fn serve_tls_dual_protocol_cache_inspect(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("TLS handshake with proxy failed")?;
+    match tls.get_ref().1.alpn_protocol() {
+        Some(b"h2") => serve_dual_cache_h2(tls, request_count).await,
+        Some(b"http/1.1") => serve_dual_cache_http1(tls, request_count).await,
+        negotiated => Err(anyhow!(
+            "unexpected negotiated protocol for dual cache upstream: {negotiated:?}"
+        )),
+    }
+}
+
+async fn serve_dual_cache_h2(
+    tls: tokio_rustls::server::TlsStream<TcpStream>,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+
+    while let Some(result) = connection.accept().await {
+        let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
+        let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let path = request.uri().path().to_string();
+        let mut request_body = request.into_body();
+        while let Some(frame) = request_body.data().await {
+            let chunk = frame.context("failed to read HTTP/2 request body")?;
+            request_body
+                .flow_control()
+                .release_capacity(chunk.len())
+                .context("failed to release HTTP/2 request body capacity")?;
+        }
+
+        let response_body = format!("request={sequence}\npath={path}\nprotocol=h2");
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(())
+            .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+        let mut send = respond
+            .send_response(response, false)
+            .context("failed to send HTTP/2 response headers")?;
+        send.send_data(Bytes::from(response_body), true)
+            .context("failed to send HTTP/2 response body")?;
+    }
+
+    Ok(())
+}
+
+async fn serve_dual_cache_http1(
+    mut tls: tokio_rustls::server::TlsStream<TcpStream>,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    loop {
+        let request_bytes = read_request(&mut tls).await?;
+        if request_bytes.is_empty() {
+            break;
+        }
+        let request = String::from_utf8(request_bytes)?;
+        let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let path = request_path(&request);
+        let close = request.to_ascii_lowercase().contains("connection: close");
+        let response_body = format!("request={sequence}\npath={path}\nprotocol=http/1.1");
+        let split = response_body.len().div_ceil(2);
+        let chunks = [
+            &response_body.as_bytes()[..split],
+            &response_body.as_bytes()[split..],
+        ];
+        let response_head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: {}\r\n\r\n",
+            if close { "close" } else { "keep-alive" }
+        );
+        tls.write_all(response_head.as_bytes()).await?;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let extension = if index == 0 { "; test=first" } else { "" };
+            tls.write_all(format!("{:X}{extension}\r\n", chunk.len()).as_bytes())
+                .await?;
+            tls.write_all(chunk).await?;
+            tls.write_all(b"\r\n").await?;
+        }
+        tls.write_all(b"0\r\n\r\n").await?;
+        tls.flush().await?;
+        if close {
+            break;
+        }
+    }
+    tls.shutdown().await.ok();
     Ok(())
 }
 

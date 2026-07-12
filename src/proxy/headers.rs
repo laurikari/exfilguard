@@ -311,6 +311,7 @@ pub(crate) fn response_header_should_skip(
         || name_lower == "proxy-connection"
         || name_lower == "proxy-authenticate"
         || name_lower == "proxy-authorization"
+        || name_lower == "te"
         || name_lower == "upgrade"
         || name_lower == "transfer-encoding"
         || name_lower == "trailer"
@@ -569,6 +570,7 @@ mod tests {
     fn response_header_skip_keeps_content_length() {
         let tokens = HashSet::new();
         assert!(!response_header_should_skip("content-length", &tokens));
+        assert!(response_header_should_skip("te", &tokens));
     }
 
     #[test]

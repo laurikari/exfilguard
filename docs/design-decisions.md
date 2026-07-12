@@ -224,6 +224,17 @@ allow rule enables caching.
 ExfilGuard does not cache allowed traffic by default. That keeps response
 storage and freshness changes under explicit operator control.
 
+## Response cache entries are protocol-neutral
+
+Inspected HTTP/1.1 and HTTP/2 traffic uses one shared response cache. Entries
+store canonical response headers and decoded payload bytes, not HTTP/1 chunk
+framing or HTTP/2 frames. A hit is framed for the downstream protocol.
+
+This keeps cache policy independent of ALPN and allows an entry populated over
+one HTTP version to serve the other. Responses with trailers are forwarded but
+not stored, and HTTP/1 responses with transfer-coding chains other than a sole
+`chunked` coding are not representable and therefore skip storage.
+
 ## Cache disk limits do not throttle forwarding
 
 `cache_total_capacity` bounds completed response bodies, while all in-progress

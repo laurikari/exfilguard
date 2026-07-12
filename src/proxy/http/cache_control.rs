@@ -1,9 +1,30 @@
-use http::{HeaderMap, Method, StatusCode};
-use std::time::Duration;
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use std::time::{Duration, SystemTime};
 
 use crate::config::MAX_CACHE_TTL_SECONDS;
 
 pub const MAX_CACHE_TTL: Duration = Duration::from_secs(MAX_CACHE_TTL_SECONDS);
+
+/// Ensure a protocol-neutral response has exactly one valid Date field.
+pub fn normalize_response_date(headers: &mut HeaderMap, response_time: SystemTime) {
+    let mut values = headers.get_all(http::header::DATE).iter();
+    let valid = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .is_some()
+        && values.next().is_none();
+    if valid {
+        return;
+    }
+
+    headers.remove(http::header::DATE);
+    headers.insert(
+        http::header::DATE,
+        HeaderValue::from_str(&httpdate::fmt_http_date(response_time))
+            .expect("generated Date header is valid"),
+    );
+}
 
 fn parse_delta_seconds(value: &str) -> Result<Duration, ()> {
     let value = normalize_cc_value(value);
@@ -273,6 +294,43 @@ mod tests {
 
     fn response_time() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_000)
+    }
+
+    #[test]
+    fn response_date_normalization_preserves_one_valid_value_and_replaces_other_forms() {
+        let expected = httpdate::fmt_http_date(response_time());
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            http::header::DATE,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        normalize_response_date(&mut valid, response_time());
+        assert_eq!(
+            valid.get(http::header::DATE).unwrap(),
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        );
+
+        for mut headers in [
+            HeaderMap::new(),
+            HeaderMap::from_iter([(http::header::DATE, HeaderValue::from_static("not a date"))]),
+        ] {
+            normalize_response_date(&mut headers, response_time());
+            assert_eq!(headers.get(http::header::DATE).unwrap(), expected.as_str());
+        }
+
+        let mut repeated = HeaderMap::new();
+        repeated.append(
+            http::header::DATE,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        repeated.append(
+            http::header::DATE,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:38 GMT"),
+        );
+        normalize_response_date(&mut repeated, response_time());
+        assert_eq!(repeated.get_all(http::header::DATE).iter().count(), 1);
+        assert_eq!(repeated.get(http::header::DATE).unwrap(), expected.as_str());
     }
 
     #[test]

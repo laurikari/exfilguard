@@ -5,7 +5,7 @@ use crate::proxy::http::Http1HeaderAccumulator;
 use crate::proxy::http::cache_control::request_cache_bypass;
 use crate::proxy::request::ParsedRequest;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CacheRequestContext {
     pub uri: Uri,
     pub headers: HeaderMap,
@@ -14,14 +14,20 @@ pub(crate) struct CacheRequestContext {
 
 pub(crate) fn build_cache_request_context(
     request: &ParsedRequest,
-    headers: &Http1HeaderAccumulator,
+    headers: &HeaderMap,
 ) -> Result<CacheRequestContext> {
     let uri = request.cache_uri()?;
-    let headers = headers.forward_header_map();
-    let bypass = request_cache_bypass(&headers);
+    let bypass = request_cache_bypass(headers);
     Ok(CacheRequestContext {
         uri,
-        headers,
+        headers: headers.clone(),
         bypass,
     })
+}
+
+pub(crate) fn build_http1_cache_request_context(
+    request: &ParsedRequest,
+    headers: &Http1HeaderAccumulator,
+) -> Result<CacheRequestContext> {
+    build_cache_request_context(request, &headers.forward_header_map())
 }

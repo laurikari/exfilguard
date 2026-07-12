@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     future::Future,
     net::SocketAddr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -23,13 +23,17 @@ use crate::{
 };
 
 use super::{
+    cache::{CacheMiss, CacheWriteState},
     request::{SanitizedRequest, build_upstream_uri},
     upstream::UpstreamCheckout,
 };
 
 const HEADER_PADDING: usize = 4;
 
-async fn with_total_deadline<F, T>(total_deadline: Option<Instant>, future: F) -> Result<T>
+pub(super) async fn with_total_deadline<F, T>(
+    total_deadline: Option<Instant>,
+    future: F,
+) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
@@ -48,7 +52,7 @@ where
     }
 }
 
-async fn send_data_with_backpressure(
+pub(super) async fn send_data_with_backpressure(
     stream: &mut SendStream<Bytes>,
     mut data: Bytes,
     idle_timeout: Duration,
@@ -105,6 +109,10 @@ impl ForwardOutcome {
     pub fn upstream_reused(&self) -> bool {
         self.log.upstream_reused
     }
+
+    pub fn cache_store(&self) -> &'static str {
+        self.log.cache_store
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -121,6 +129,7 @@ pub(super) async fn forward_request_to_upstream(
     max_request_body_size: usize,
     max_request_header_bytes: usize,
     max_response_header_bytes: usize,
+    cache_miss: Option<Box<CacheMiss>>,
 ) -> Result<ForwardOutcome> {
     let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
     let mut sender = checkout.sender;
@@ -154,6 +163,7 @@ pub(super) async fn forward_request_to_upstream(
         .map_err(|err| anyhow!("failed to build upstream HTTP/2 request: {err}"))?;
 
     let end_of_stream = body.is_end_stream();
+    let upstream_request_instant = Instant::now();
     let (response_fut, mut send_stream) = sender
         .send_request(request, end_of_stream)
         .context("failed to send headers to upstream over HTTP/2")?;
@@ -227,6 +237,9 @@ pub(super) async fn forward_request_to_upstream(
         ),
     )
     .await?;
+    let response_instant = Instant::now();
+    let response_time = SystemTime::now();
+    let response_delay = response_instant.saturating_duration_since(upstream_request_instant);
     let client_body_bytes = body_tracker.total();
 
     let status = response.status();
@@ -256,7 +269,30 @@ pub(super) async fn forward_request_to_upstream(
         header_budget.record(name_str.len() + value.as_bytes().len() + HEADER_PADDING)?;
         response_headers.append(name.clone(), value.clone());
     }
-    let response_header_bytes = header_budget.used();
+    crate::proxy::http::cache_control::normalize_response_date(
+        &mut response_headers,
+        response_time,
+    );
+    let mut normalized_header_budget = HeaderBudget::new(
+        max_response_header_bytes,
+        "upstream response headers exceed configured limit",
+    )?;
+    for (name, value) in &response_headers {
+        normalized_header_budget
+            .record(name.as_str().len() + value.as_bytes().len() + HEADER_PADDING)?;
+    }
+    let response_header_bytes = normalized_header_budget.used();
+
+    let mut cache_write = CacheWriteState::prepare(
+        cache_miss,
+        &meta.parsed.method,
+        status,
+        response_headers.clone(),
+        response_time,
+        response_delay,
+        upstream_peer,
+    )
+    .await;
 
     let mut response_builder = http::Response::builder().status(status);
     {
@@ -292,6 +328,7 @@ pub(super) async fn forward_request_to_upstream(
             upstream_body_bytes = upstream_body_bytes
                 .checked_add(chunk_len as u64)
                 .ok_or_else(|| anyhow!("response body size overflow"))?;
+            cache_write.write(&chunk, upstream_peer).await;
             send_data_with_backpressure(
                 &mut send_body,
                 chunk,
@@ -317,6 +354,7 @@ pub(super) async fn forward_request_to_upstream(
         .await?
         {
             Some(trailers) => {
+                cache_write.discard_for_trailers();
                 let sanitized = sanitize_response_trailer_map(&trailers, max_response_header_bytes)
                     .context("invalid HTTP/2 response trailers from upstream")?;
                 if sanitized.is_empty() {
@@ -337,6 +375,8 @@ pub(super) async fn forward_request_to_upstream(
         }
     }
 
+    let cache_store = cache_write.finish(upstream_peer).await;
+
     Ok(ForwardOutcome {
         log: ForwardLog {
             status,
@@ -345,6 +385,7 @@ pub(super) async fn forward_request_to_upstream(
             response_header_bytes,
             upstream_addr: upstream_peer,
             upstream_reused: reused_existing,
+            cache_store,
         },
     })
 }
@@ -390,4 +431,5 @@ struct ForwardLog {
     response_header_bytes: usize,
     upstream_addr: SocketAddr,
     upstream_reused: bool,
+    cache_store: &'static str,
 }

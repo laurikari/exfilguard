@@ -9,12 +9,12 @@ use crate::io_util::{BestEffortWriter, TeeWriter};
 use crate::proxy::AppContext;
 use crate::proxy::cache::{
     CacheFinishOutcome, CacheResponseTiming, CacheSkipReason, CacheStorePlan, CacheWritePlan,
-    CacheWriter, build_cache_request_context, plan_cache_write,
+    CacheWriter, build_http1_cache_request_context, plan_cache_write,
 };
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 
-use super::super::body::BodyPlan;
+use super::super::body::{BodyPlan, relay_chunked_body_with_payload_copy};
 use super::super::codec::{Http1HeaderAccumulator, Http1ResponseHead};
 use super::response::{ResponseBodyPlan, relay_body};
 use super::{CacheStoreResult, ForwardTimeouts};
@@ -59,7 +59,7 @@ pub(super) async fn prepare_cache_write(
         None => return CacheWriteState::Bypass,
     };
 
-    let cache_request = match build_cache_request_context(request, headers) {
+    let cache_request = match build_http1_cache_request_context(request, headers) {
         Ok(context) => Some(context),
         Err(err) => {
             debug!(
@@ -71,6 +71,9 @@ pub(super) async fn prepare_cache_write(
         }
     };
     let response_headers = head.header_map();
+    if head.transfer_encoding_present && !has_exact_chunked_transfer_encoding(&response_headers) {
+        return CacheWriteState::Skip;
+    }
     let plan = plan_cache_write(
         &request.method,
         cache_request,
@@ -130,6 +133,46 @@ pub(super) async fn prepare_cache_write(
     }
 }
 
+fn has_exact_chunked_transfer_encoding(headers: &http::HeaderMap) -> bool {
+    let mut codings = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim);
+    matches!(codings.next(), Some(coding) if coding.eq_ignore_ascii_case("chunked"))
+        && codings.next().is_none()
+}
+
+fn strip_hop_by_hop_response_headers(headers: &mut http::HeaderMap) {
+    let connection_tokens = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| http::header::HeaderName::from_bytes(token.as_bytes()).ok())
+        .collect::<Vec<_>>();
+
+    for token in connection_tokens {
+        headers.remove(token);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "proxy-connection",
+    ] {
+        headers.remove(name);
+    }
+}
+
 impl CacheWriteState {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn relay_body<S, C>(
@@ -183,17 +226,35 @@ impl CacheWriteState {
                 } = *ctx;
                 let mut best_effort = BestEffortWriter::new(&mut writer);
                 let bytes = {
-                    let mut tee = TeeWriter::new(client, &mut best_effort);
-                    relay_body(
-                        upstream_reader,
-                        &mut tee,
-                        response_body_plan,
-                        timeouts,
-                        upstream_peer,
-                        total_deadline,
-                        max_response_trailer_bytes,
-                    )
-                    .await?
+                    if matches!(response_body_plan, ResponseBodyPlan::Chunked) {
+                        let stats = relay_chunked_body_with_payload_copy(
+                            upstream_reader,
+                            client,
+                            &mut best_effort,
+                            timeouts.response_io,
+                            timeouts.response_io,
+                            upstream_peer,
+                            total_deadline,
+                            max_response_trailer_bytes,
+                        )
+                        .await?;
+                        super::response::ResponseRelayStats {
+                            bytes: stats.bytes_written,
+                            had_trailers: stats.had_trailers,
+                        }
+                    } else {
+                        let mut tee = TeeWriter::new(client, &mut best_effort);
+                        relay_body(
+                            upstream_reader,
+                            &mut tee,
+                            response_body_plan,
+                            timeouts,
+                            upstream_peer,
+                            total_deadline,
+                            max_response_trailer_bytes,
+                        )
+                        .await?
+                    }
                 };
 
                 let cache_error = best_effort.take_error();
@@ -215,10 +276,14 @@ impl CacheWriteState {
                 }
 
                 let CacheStorePlan {
-                    response_headers,
+                    mut response_headers,
                     timing,
                     ..
                 } = plan;
+                strip_hop_by_hop_response_headers(&mut response_headers);
+                if matches!(response_body_plan, ResponseBodyPlan::Chunked) {
+                    response_headers.remove(http::header::CONTENT_LENGTH);
+                }
                 let finish_result = writer.finish(status, response_headers, timing).await;
 
                 let cache_store = match finish_result {
@@ -248,5 +313,47 @@ impl CacheWriteState {
                 Ok((bytes.bytes, cache_store))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::{HeaderMap, HeaderValue};
+
+    use super::{has_exact_chunked_transfer_encoding, strip_hop_by_hop_response_headers};
+
+    #[test]
+    fn canonical_chunk_storage_requires_only_chunked_transfer_coding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        assert!(has_exact_chunked_transfer_encoding(&headers));
+
+        headers.insert(
+            http::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("gzip, chunked"),
+        );
+        assert!(!has_exact_chunked_transfer_encoding(&headers));
+    }
+
+    #[test]
+    fn canonical_metadata_drops_connection_scoped_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Keep-Alive, X-Private"),
+        );
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("x-private", HeaderValue::from_static("secret"));
+        headers.insert("x-end-to-end", HeaderValue::from_static("preserved"));
+
+        strip_hop_by_hop_response_headers(&mut headers);
+
+        assert!(!headers.contains_key(http::header::CONNECTION));
+        assert!(!headers.contains_key("keep-alive"));
+        assert!(!headers.contains_key("x-private"));
+        assert_eq!(headers["x-end-to-end"], "preserved");
     }
 }

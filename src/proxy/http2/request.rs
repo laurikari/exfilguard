@@ -21,6 +21,16 @@ pub(super) struct SanitizedRequest {
     pub request_line_bytes: u64,
 }
 
+impl SanitizedRequest {
+    pub fn forward_header_map(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in &self.forward_headers {
+            headers.append(name.clone(), value.clone());
+        }
+        headers
+    }
+}
+
 pub(super) fn sanitize_request(
     request: http::Request<RecvStream>,
     max_header_bytes: usize,

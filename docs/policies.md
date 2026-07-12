@@ -261,7 +261,8 @@ url_pattern = "https://example.com:8443/api/**"
 ## Response Caching
 
 Rules can enable caching for matched responses when the shared cache is
-configured globally.
+configured globally. The same rule behavior and cache entries apply to
+inspected HTTP/1.1 and HTTP/2 traffic.
 
 ```toml
 [[policy.rule]]

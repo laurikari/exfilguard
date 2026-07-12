@@ -409,10 +409,10 @@ The cache follows standard HTTP cache headers from upstream servers.
 
 #### Scope
 
-The cache is shared across all clients. Responses are keyed by method and
-absolute URI. `Vary` headers decide which request headers are part of the cache
-key. Enable caching only if cross-client sharing is acceptable in your
-environment.
+The cache is shared across all clients and across inspected HTTP/1.1 and
+HTTP/2 traffic. Responses are keyed by method and absolute URI. `Vary` headers
+decide which request headers are part of the cache key. Enable caching only if
+cross-client sharing is acceptable in your environment.
 
 #### Supported Headers
 
@@ -443,7 +443,9 @@ the response's current age.
   served from cache and are not stored. Requests with fixed-length or chunked
   bodies, or with `Range`, are also bypassed.
 - **Not cached**: Responses with `no-store`, `no-cache`, or `private`
-  directives, or any `Set-Cookie` header
+  directives, any `Set-Cookie` header, or response trailers. HTTP/1 responses
+  with transfer codings other than a sole `chunked` coding are also forwarded
+  without being stored.
 
 #### Request Cache Directives
 
@@ -466,7 +468,7 @@ removed on lookup.
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`v4` under the cache root).
+Cache entries live under a versioned subdirectory (`v5` under the cache root).
 Metadata is keyed by request URI and points to an immutable body generation.
 When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up

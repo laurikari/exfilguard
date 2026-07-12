@@ -33,12 +33,14 @@ pub(crate) use admission::{
 use entry::{CacheEntry, PersistedEntry};
 use index::CacheIndex;
 use key::{CacheKey, VaryKey};
-pub(crate) use lookup::CacheLookupOutcome;
+pub(crate) use lookup::{CacheLookupOutcome, Http1CacheLookupOutcome};
 #[cfg(test)]
 use maintenance::cache_version_dir;
 use maintenance::{prepare_versioned_cache_dir, spawn_cache_dir_cleanup, spawn_cache_sweeper};
 use reader::CacheReader;
-pub(crate) use request::{CacheRequestContext, build_cache_request_context};
+pub(crate) use request::{
+    CacheRequestContext, build_cache_request_context, build_http1_cache_request_context,
+};
 use store::CacheStore;
 pub(crate) use writer::{CacheFinishOutcome, CacheWriter};
 
@@ -985,7 +987,7 @@ mod tests {
     #[tokio::test]
     async fn uses_versioned_cache_dir_and_cleans_old_versions() -> Result<()> {
         let dir = TempDir::new()?;
-        let old_dir = dir.path().join("v3");
+        let old_dir = dir.path().join("v4");
         fs::create_dir_all(&old_dir)?;
         fs::write(old_dir.join("old"), b"data")?;
 
@@ -999,7 +1001,7 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
-        assert_eq!(active_name, "v4");
+        assert_eq!(active_name, "v5");
         let mut cleaned = false;
         for _ in 0..10 {
             let dirs = fs::read_dir(dir.path())?

@@ -24,6 +24,7 @@ use crate::{
     proxy::{
         AppContext,
         allow_log::{AllowLogStats, log_allow_success},
+        cache::HttpCache,
         connect::ResolvedTarget,
         forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
         forward_limits::AllowLogTracker,
@@ -36,6 +37,7 @@ use crate::{
 use async_trait::async_trait;
 
 use super::{
+    cache::{CacheEvaluation, CacheMiss, evaluate_cache, send_cached_response},
     forward::{forward_request_to_upstream, send_error_response},
     request::{SanitizedRequest, reject_expect_header, sanitize_request},
     upstream::{Http2Upstream, PrimedHttp2Upstream},
@@ -295,6 +297,7 @@ struct DownstreamRequestCtx {
     max_request_header_bytes: usize,
     max_response_header_bytes: usize,
     log_queries: bool,
+    cache: Option<Arc<HttpCache>>,
     log_tracker: AllowLogTracker,
 }
 
@@ -325,6 +328,7 @@ impl DownstreamRequestCtx {
             max_request_header_bytes: app.settings.max_request_header_size,
             max_response_header_bytes: app.settings.max_response_header_size,
             log_queries,
+            cache: app.cache.clone(),
             log_tracker: AllowLogTracker::new(request_base, start),
         }
     }
@@ -444,7 +448,10 @@ impl Http2RequestHandler {
         }
     }
 
-    async fn forward_request(&mut self) -> Result<super::forward::ForwardOutcome> {
+    async fn forward_request(
+        &mut self,
+        cache_miss: Option<Box<CacheMiss>>,
+    ) -> Result<super::forward::ForwardOutcome> {
         let forward_meta = self.ctx.meta.clone();
         let checkout = {
             let mut upstream = self.upstream.lock().await;
@@ -463,6 +470,7 @@ impl Http2RequestHandler {
             self.ctx.max_request_body_size,
             self.ctx.max_request_header_bytes,
             self.ctx.max_response_header_bytes,
+            cache_miss,
         )
         .await
     }
@@ -533,10 +541,53 @@ impl RequestHandler for Http2RequestHandler {
 
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
         let policy_eval::AllowOutcome { decision, log } = outcome;
-        match self.forward_request().await {
+        let cache_evaluation = evaluate_cache(
+            &self.ctx.meta,
+            self.ctx.body.is_end_stream(),
+            &decision,
+            self.ctx.cache.as_ref(),
+            self.ctx.peer,
+        )
+        .await;
+        let (cache_lookup, cache_miss) = match cache_evaluation {
+            CacheEvaluation::Hit(cached) => {
+                let (status, bytes_out) = send_cached_response(
+                    &mut self.ctx.respond,
+                    &self.ctx.meta.parsed.method,
+                    *cached,
+                    self.ctx.response_body_timeout,
+                    self.ctx.request_start,
+                    self.ctx.request_total_timeout,
+                    self.ctx.max_response_header_bytes,
+                )
+                .await?;
+                log.access_log_builder()
+                    .decision("CACHE_HIT")
+                    .client(decision.client.as_ref())
+                    .policy(decision.policy.as_ref())
+                    .rule(decision.rule.as_ref())
+                    .status(status)
+                    .bytes(self.ctx.log_tracker.base_bytes(), bytes_out)
+                    .elapsed(self.ctx.log_tracker.elapsed())
+                    .cache_lookup("hit")
+                    .cache_store("bypassed")
+                    .log();
+                return Ok(());
+            }
+            CacheEvaluation::Miss(miss) => ("miss", Some(miss)),
+            CacheEvaluation::Bypass => ("bypass", None),
+        };
+
+        match self.forward_request(cache_miss).await {
             Ok(success) => {
                 let stats = self.build_allow_log_stats(&success);
-                log_allow_success(log, &decision, stats, None, None);
+                log_allow_success(
+                    log,
+                    &decision,
+                    stats,
+                    Some(cache_lookup),
+                    Some(success.cache_store()),
+                );
                 Ok(())
             }
             Err(err) => self.handle_forward_error(&decision, log, err).await,

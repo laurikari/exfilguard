@@ -4,7 +4,7 @@ use tracing::debug;
 
 use crate::io_util::{copy_n_with_write_timeout, write_all_with_timeout};
 use crate::proxy::{
-    cache::CacheLookupOutcome,
+    cache::Http1CacheLookupOutcome,
     policy_eval::{AllowDecision, RequestLogContext},
 };
 
@@ -42,7 +42,7 @@ where
         .lookup_for_request(handler.parsed, &handler.headers)
         .await
     {
-        Ok(CacheLookupOutcome::Hit(hit)) => {
+        Ok(Http1CacheLookupOutcome::Hit(hit)) => {
             let client_stream = handler.reader.get_mut();
             let hit = *hit;
             let cached = hit.cached;
@@ -110,8 +110,8 @@ where
                 ClientDisposition::Continue
             }))
         }
-        Ok(CacheLookupOutcome::Miss) => Ok(CacheEvaluation::Miss),
-        Ok(CacheLookupOutcome::Bypass) => Ok(CacheEvaluation::Bypass),
+        Ok(Http1CacheLookupOutcome::Miss) => Ok(CacheEvaluation::Miss),
+        Ok(Http1CacheLookupOutcome::Bypass) => Ok(CacheEvaluation::Bypass),
         Err(err) => {
             debug!(
                 peer = %handler.peer,

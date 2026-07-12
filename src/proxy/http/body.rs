@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 use crate::{
@@ -326,6 +326,7 @@ async fn relay_chunked_body_generic<R, W>(
     max_trailer_bytes: usize,
     trailer_limit_error: &'static str,
     sanitize_trailers: TrailerSanitizer,
+    mut payload_copy: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
 ) -> Result<ChunkedRelayStats>
 where
     R: AsyncRead + Unpin,
@@ -473,6 +474,17 @@ where
                 ),
             )
             .await?;
+            if let Some(payload_copy) = payload_copy.as_deref_mut() {
+                with_total_deadline(
+                    total_deadline,
+                    timeout_with_context(
+                        write_timeout,
+                        payload_copy.write_all(&buffer[..read]),
+                        "writing decoded chunk payload copy",
+                    ),
+                )
+                .await?;
+            }
             stats.bytes_read = stats.bytes_read.saturating_add(read as u64);
             stats.bytes_written = stats.bytes_written.saturating_add(read as u64);
         }
@@ -549,6 +561,7 @@ where
         max_request_trailer_bytes,
         "request trailer section exceeds configured limit",
         sanitize_request_trailer_lines,
+        None,
     )
     .await;
 
@@ -635,6 +648,40 @@ where
         max_response_trailer_bytes,
         "response trailer section exceeds configured limit",
         sanitize_response_trailer_lines,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn relay_chunked_body_with_payload_copy<S, C, P>(
+    upstream: &mut BufReader<S>,
+    client: &mut C,
+    payload_copy: &mut P,
+    read_timeout: Duration,
+    write_timeout: Duration,
+    peer: SocketAddr,
+    total_deadline: Option<Instant>,
+    max_response_trailer_bytes: usize,
+) -> Result<ChunkedRelayStats>
+where
+    S: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+    P: AsyncWrite + Unpin + Send,
+{
+    relay_chunked_body_generic(
+        upstream,
+        client,
+        read_timeout,
+        write_timeout,
+        total_deadline,
+        peer,
+        "to client",
+        None,
+        max_response_trailer_bytes,
+        "response trailer section exceeds configured limit",
+        sanitize_response_trailer_lines,
+        Some(payload_copy),
     )
     .await
 }
@@ -684,7 +731,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        InvalidRequestBody, parse_chunk_size_line, relay_chunked_body, stream_chunked_body,
+        InvalidRequestBody, parse_chunk_size_line, relay_chunked_body,
+        relay_chunked_body_with_payload_copy, stream_chunked_body,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
@@ -826,6 +874,40 @@ mod tests {
         .await
         .expect_err("ambiguous upstream chunk framing should be rejected");
         assert!(err.to_string().contains("must end with CRLF"));
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_body_copies_only_decoded_payload() {
+        let body = b"5;extension=yes\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let (upstream_stream, mut upstream_writer) = duplex(256);
+        let (mut client_source, mut client_sink) = duplex(256);
+        let (mut payload_source, mut payload_sink) = duplex(256);
+        upstream_writer.write_all(body).await.unwrap();
+        drop(upstream_writer);
+
+        let stats = relay_chunked_body_with_payload_copy(
+            &mut BufReader::new(upstream_stream),
+            &mut client_sink,
+            &mut payload_sink,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            peer(),
+            None,
+            1024,
+        )
+        .await
+        .expect("relay chunked body");
+        drop(client_sink);
+        drop(payload_sink);
+
+        let mut forwarded = Vec::new();
+        client_source.read_to_end(&mut forwarded).await.unwrap();
+        let mut payload = Vec::new();
+        payload_source.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(forwarded, body);
+        assert_eq!(payload, b"hello world");
+        assert_eq!(stats.bytes_written, body.len() as u64);
+        assert!(!stats.had_trailers);
     }
 
     #[tokio::test]

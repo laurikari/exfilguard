@@ -1,3 +1,4 @@
+mod cache;
 mod forward;
 mod request;
 mod server;

@@ -948,6 +948,68 @@ async fn test_chunked_response_with_trailers_is_not_cached() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_response_cache_hit_uses_canonical_payload() -> Result<()> {
+    let raw_response = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Cache-Control: public, max-age=60\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "6;extension=yes\r\n",
+        "cached\r\n",
+        "9\r\n",
+        "-response\r\n",
+        "0\r\n",
+        "\r\n",
+    );
+    let upstream = MockUpstream::new_raw(raw_response).await?;
+    let upstream_port = upstream.port();
+    let request_counter = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/resource HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+
+    let mut first_stream = TcpStream::connect(harness.addr).await?;
+    first_stream.write_all(request.as_bytes()).await?;
+    let first = read_http_response(&mut first_stream).await?;
+    assert_eq!(
+        response_header_values(&first, "transfer-encoding"),
+        ["chunked"]
+    );
+    assert!(first.ends_with("6;extension=yes\r\ncached\r\n9\r\n-response\r\n0\r\n\r\n"));
+
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+    let mut second_stream = TcpStream::connect(harness.addr).await?;
+    second_stream.write_all(request.as_bytes()).await?;
+    let second = read_http_response(&mut second_stream).await?;
+    assert!(response_header_values(&second, "transfer-encoding").is_empty());
+    assert_eq!(response_header_values(&second, "content-length"), ["15"]);
+    assert!(second.ends_with("\r\n\r\ncached-response"), "{second:?}");
+    assert_eq!(request_counter.load(Ordering::SeqCst), 1);
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_hit_keeps_connection_open() -> Result<()> {
     let upstream = MockUpstream::new("Cache-Control: public, max-age=60").await?;
     let upstream_port = upstream.port();
@@ -1059,7 +1121,7 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         .cache_dir
         .as_ref()
         .expect("cache dir enabled")
-        .join("v4");
+        .join("v5");
 
     let readonly_marker = Arc::new(AtomicUsize::new(0));
     let watcher_dir = cache_version_dir.clone();

@@ -1651,6 +1651,248 @@ async fn connect_bump_supports_http2() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_cache_miss_then_hit() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "cache-h2";
+    let policy = PolicySpec::new(policy_name).rule(
+        RuleSpec::allow(&["GET"], format!("https://{upstream_host}/**")).cache_force_duration(60),
+    );
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2CacheInspect)
+            .with_cache(),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let uri = Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query("/h2/cached")
+        .build()?;
+    let first = http::Request::builder()
+        .method(Method::GET)
+        .uri(uri.clone())
+        .body(())?;
+    let (first_status, first_body) = client.request_text(first).await?;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_body, "request=1\npath=/h2/cached\nbody=");
+
+    sleep(StdDuration::from_millis(50)).await;
+    let second = http::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(())?;
+    let (second_status, second_body) = client.request_text(second).await?;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_body, first_body);
+    assert_eq!(
+        fixture.request_count(),
+        1,
+        "the second request should be served without an upstream HTTP/2 stream"
+    );
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bumped_cache_reuses_http1_chunk_payload_for_http2() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "cache-cross-protocol-h1-h2";
+    let policy = PolicySpec::new(policy_name).rule(
+        RuleSpec::allow(&["GET"], format!("https://{upstream_host}/**")).cache_force_duration(60),
+    );
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http1)
+            .upstream_mode(UpstreamMode::DualProtocolCacheInspect)
+            .with_cache(),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let expected_body = "request=1\npath=/cross/h1-to-h2\nprotocol=http/1.1";
+
+    {
+        let mut client = fixture.http1_client();
+        let request = format!(
+            "GET /cross/h1-to-h2 HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        client.send(request).await?;
+        let response = client.read_response().await?;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "origin response was not relayed with chunk framing: {response}"
+        );
+    }
+    assert_eq!(fixture.request_count(), 1);
+
+    sleep(StdDuration::from_millis(50)).await;
+    fixture.reconnect(ClientProtocols::Http2).await?;
+    let mut client = fixture.h2_client().await?;
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/cross/h1-to-h2")
+                .build()?,
+        )
+        .body(())?;
+    let (status, body) = client.request_text(request).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, expected_body,
+        "cached body retained HTTP/1 chunk framing"
+    );
+    assert_eq!(
+        fixture.request_count(),
+        1,
+        "HTTP/2 request should reuse the HTTP/1-populated cache entry"
+    );
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "cache-cross-protocol-h2-h1";
+    let policy = PolicySpec::new(policy_name).rule(
+        RuleSpec::allow(&["GET"], format!("https://{upstream_host}/**")).cache_force_duration(60),
+    );
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::DualProtocolCacheInspect)
+            .with_cache(),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let expected_body = "request=1\npath=/cross/h2-to-h1\nprotocol=h2";
+    let uri = Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query("/cross/h2-to-h1")
+        .build()?;
+
+    let mut h2_client = fixture.h2_client().await?;
+    let first = http::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(())?;
+    let (status, body) = h2_client.request_text(first).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, expected_body);
+    assert_eq!(fixture.request_count(), 1);
+    h2_client.shutdown().await;
+
+    sleep(StdDuration::from_millis(50)).await;
+    fixture.reconnect(ClientProtocols::Http1).await?;
+    let mut client = fixture.http1_client();
+    let request =
+        format!("GET /cross/h2-to-h1 HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    client.send(request).await?;
+    let response = client.read_response_with_length().await?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .context("cached HTTP/1 response missing head terminator")?;
+    assert!(head.starts_with("HTTP/1.1 200"));
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding"),
+        "cached H2 payload should use fixed HTTP/1 framing: {head}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("content-length: {}", expected_body.len())),
+        "cached HTTP/1 response has wrong content length: {head}"
+    );
+    assert_eq!(body, expected_body);
+    assert_eq!(
+        fixture.request_count(),
+        1,
+        "HTTP/1 request should reuse the HTTP/2-populated cache entry"
+    );
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_body_requests_bypass_cache() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "cache-h2-bodyless-only";
+    let policy = PolicySpec::new(policy_name).rule(
+        RuleSpec::allow(&["GET"], format!("https://{upstream_host}/**")).cache_force_duration(60),
+    );
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2CacheInspect)
+            .with_cache(),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let uri = Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query("/h2/body")
+        .build()?;
+    let mut client = fixture.h2_client().await?;
+
+    for (sequence, body) in [(1, "first"), (2, "second")] {
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(uri.clone())
+            .header(http::header::CONTENT_LENGTH, body.len())
+            .body(())?;
+        let (status, response_body) = client
+            .request_text_with_body(request, Bytes::copy_from_slice(body.as_bytes()))
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response_body,
+            format!("request={sequence}\npath=/h2/body\nbody={body}")
+        );
+    }
+
+    let first_bodyless = http::Request::builder()
+        .method(Method::GET)
+        .uri(uri.clone())
+        .body(())?;
+    let (status, cached_body) = client.request_text(first_bodyless).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached_body, "request=3\npath=/h2/body\nbody=");
+
+    sleep(StdDuration::from_millis(50)).await;
+    let second_bodyless = http::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(())?;
+    let (status, second_bodyless_body) = client.request_text(second_bodyless).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second_bodyless_body, cached_body);
+    assert_eq!(
+        fixture.request_count(),
+        3,
+        "body-bearing requests should bypass lookup and storage"
+    );
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_invalid_request_path_returns_400() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-invalid";
