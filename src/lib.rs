@@ -44,6 +44,10 @@ async fn run_with_upstream_resolver(
     upstream_resolver: Arc<dyn proxy::UpstreamResolver>,
 ) -> Result<()> {
     settings.validate()?;
+    let StartupPreflight {
+        policy_snapshot,
+        tls_client_configs,
+    } = build_startup_preflight(&settings)?;
     let settings = Arc::new(settings);
     let metrics = settings.metrics_listen.map(|addr| {
         let path = "/metrics".to_string();
@@ -75,10 +79,9 @@ async fn run_with_upstream_resolver(
         vault_source.spawn_renewal(tls_issuer.clone());
     }
     spawn_ca_usability_monitor(tls_issuer.clone());
-    let TlsClientConfigs { http1, http2 } = build_tls_client_configs(&settings)?;
-    let snapshot = build_runtime_policy_snapshot(&settings)?;
+    let TlsClientConfigs { http1, http2 } = tls_client_configs;
     crate::metrics::mark_policy_reload_success();
-    let (policy_tx, policy_rx) = watch::channel(snapshot.clone());
+    let (policy_tx, policy_rx) = watch::channel(policy_snapshot);
     spawn_runtime_policy_reload_task(settings.clone(), policy_tx);
     let policy_store = proxy::PolicyStore::new(policy_rx);
     let tls_context = Arc::new(proxy::TlsContext::new(tls_issuer, http1, http2));
@@ -111,6 +114,18 @@ async fn run_with_upstream_resolver(
     } else {
         proxy::run(app).await
     }
+}
+
+struct StartupPreflight {
+    policy_snapshot: PolicySnapshot,
+    tls_client_configs: TlsClientConfigs,
+}
+
+fn build_startup_preflight(settings: &Settings) -> Result<StartupPreflight> {
+    Ok(StartupPreflight {
+        policy_snapshot: build_runtime_policy_snapshot(settings)?,
+        tls_client_configs: build_tls_client_configs(settings)?,
+    })
 }
 
 fn spawn_ca_usability_monitor(issuer: Arc<TlsIssuer>) {
@@ -286,3 +301,59 @@ fn spawn_runtime_policy_reload_task(
     tracing::info!("SIGHUP runtime policy reload is not supported on this platform");
 }
 pub mod io_util;
+
+#[cfg(test)]
+mod startup_tests {
+    use std::fs;
+
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn invalid_policy_does_not_create_builtin_ca_material() -> Result<()> {
+        let directory = TempDir::new()?;
+        let ca_dir = directory.path().join("ca");
+        let clients_path = directory.path().join("clients.toml");
+        let policies_path = directory.path().join("policies.toml");
+        fs::write(
+            &clients_path,
+            r#"
+[[client]]
+name = "fallback"
+policies = ["present-policy"]
+fallback = true
+"#,
+        )?;
+        fs::write(
+            &policies_path,
+            r#"
+[[policy]]
+name = "present-policy"
+  [[policy.rule]]
+  action = "DENY"
+"#,
+        )?;
+
+        let settings: Settings = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+clients = {clients_path:?}
+policies = {policies_path:?}
+ca = {{ source = "builtin", dir = {ca_dir:?} }}
+"#,
+            clients_path = clients_path.to_string_lossy(),
+            policies_path = policies_path.to_string_lossy(),
+            ca_dir = ca_dir.to_string_lossy(),
+        ))?;
+
+        let err = run_for_tests(settings)
+            .await
+            .expect_err("invalid policy must fail startup");
+        assert!(err.to_string().contains("must set status"), "{err:?}");
+        assert!(
+            !ca_dir.exists(),
+            "policy preflight failure created CA material"
+        );
+        Ok(())
+    }
+}
