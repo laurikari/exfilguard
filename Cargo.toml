@@ -56,7 +56,7 @@ tempfile = "3.27"
 maintainer = "Ville Laurikari <ville@laurikari.net>"
 copyright = "2025 Ville Laurikari"
 extended-description = "ExfilGuard is a Rust egress proxy that enforces outbound policies with TLS interception support."
-depends = "adduser, ca-certificates, systemd"
+depends = "ca-certificates, systemd"
 section = "net"
 priority = "optional"
 conf-files = [
@@ -74,6 +74,16 @@ mode = "0755"
 [[package.metadata.deb.assets]]
 source = "packaging/deb/systemd/exfilguard.service"
 dest = "lib/systemd/system/exfilguard.service"
+mode = "0644"
+
+[[package.metadata.deb.assets]]
+source = "packaging/deb/sysusers/exfilguard.conf"
+dest = "usr/lib/sysusers.d/exfilguard.conf"
+mode = "0644"
+
+[[package.metadata.deb.assets]]
+source = "packaging/deb/tmpfiles/exfilguard.conf"
+dest = "usr/lib/tmpfiles.d/exfilguard.conf"
 mode = "0644"
 
 [[package.metadata.deb.assets]]

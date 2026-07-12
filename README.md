@@ -335,6 +335,10 @@ upgrades restart the service when it was already active; they do not start a
 service that an administrator left stopped. During the one-time upgrade from a
 pre-0.9 package whose removal script already stopped the process, an enabled
 service is started because its previous active state cannot be recovered.
+The package provisions its service account and directories through
+`systemd-sysusers` and `systemd-tmpfiles`, including when dpkg runs maintainer
+scripts chrootless against `DPKG_ROOT`. Purging removes ExfilGuard state under
+`/var/lib/exfilguard` but retains the system account to avoid unsafe UID reuse.
 
 ## Metrics
 

@@ -259,6 +259,17 @@ If the system trust store is empty, startup fails.
 That rule is strict on purpose. If a host has no trust anchors, the fix is to
 install them.
 
+## Debian package provisioning is root-aware and declarative
+
+The Debian package provisions the `exfilguard` system account with
+`systemd-sysusers` and its owned directories with `systemd-tmpfiles`. Both tools
+operate against `DPKG_ROOT` when dpkg explicitly runs maintainer scripts without
+a chroot, so image construction cannot mutate the build host.
+
+Purge removes ExfilGuard's state directory but retains the system account. This
+avoids reassigning its numeric UID to unrelated files that might remain outside
+the package-owned state tree.
+
 ## Caching is opt-in
 
 Response caching works only when global cache storage is configured and the

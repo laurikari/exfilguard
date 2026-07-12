@@ -1,27 +1,11 @@
 #!/bin/sh
 set -e
 
-if ! id -u exfilguard >/dev/null 2>&1; then
-    adduser --system --group --home /var/lib/exfilguard --no-create-home --shell /usr/sbin/nologin exfilguard >/dev/null 2>&1 || true
-fi
-
-# These owner/mode guarantees must stay aligned with the CA loader. Existing
-# CA files are deliberately left untouched; the service creates them as the
-# exfilguard user on first startup; provisioned files remain operator-managed
-# material that startup validates with actionable errors.
-install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard
-install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/ca
-install -d -o exfilguard -g exfilguard -m 0700 /var/lib/exfilguard/cache
-install -d -o root -g exfilguard -m 0750 /etc/exfilguard
-install -d -o root -g exfilguard -m 0750 /etc/exfilguard/config.d
-install -d -o root -g exfilguard -m 0750 /etc/exfilguard/clients.d
-install -d -o root -g exfilguard -m 0750 /etc/exfilguard/policies.d
-
-for file in /etc/exfilguard/*.toml; do
-    [ -f "$file" ] || continue
-    chown root:exfilguard "$file"
-    chmod 0640 "$file"
-done
+# Keep account and directory provisioning declarative and alternate-root safe.
+# Existing CA files are deliberately untouched; tmpfiles applies ownership and
+# modes only to the known directories and packaged configuration files.
+systemd-sysusers ${DPKG_ROOT:+--root="$DPKG_ROOT"} exfilguard.conf
+systemd-tmpfiles ${DPKG_ROOT:+--root="$DPKG_ROOT"} --create exfilguard.conf
 
 if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
     systemctl --system daemon-reload >/dev/null 2>&1 || true
