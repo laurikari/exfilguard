@@ -11,7 +11,7 @@ use crate::{
         matcher::{EvaluationResult, PolicySnapshot},
         model::CompiledCacheConfig,
     },
-    proxy::request::{ParsedRequest, redacted_path, scheme_name},
+    proxy::request::{ParsedRequest, request_target_for_log, scheme_name},
 };
 
 #[derive(Clone, Copy)]
@@ -78,11 +78,7 @@ pub struct RequestLogContext<'a> {
 
 impl<'a> RequestLogContext<'a> {
     pub fn new(peer: SocketAddr, parsed: &'a ParsedRequest, log_queries: bool) -> Self {
-        let logged_path = if log_queries {
-            parsed.path.clone()
-        } else {
-            redacted_path(&parsed.path)
-        };
+        let logged_path = request_target_for_log(&parsed.path, log_queries);
         Self {
             peer,
             parsed,

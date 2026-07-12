@@ -11,7 +11,8 @@ use crate::proxy::{
     forward_limits::AllowLogTracker,
     policy_eval::PolicyLogConfig,
     request::{
-        RequestFlowContext, parse_http1_request, parse_http1_request_origin_form, scheme_name,
+        RequestFlowContext, parse_http1_request, parse_http1_request_origin_form,
+        request_target_for_log, scheme_name,
     },
     request_pipeline,
 };
@@ -52,30 +53,8 @@ where
         start,
         app.settings.request_total_timeout(),
     );
-    let content_length = match headers.content_length() {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(peer = %peer, error = %err, "invalid content-length header");
-            let stream = reader.get_mut();
-            respond_with_access_log(
-                stream,
-                StatusCode::BAD_REQUEST,
-                None,
-                b"invalid Content-Length header\r\n",
-                response_body_timeout,
-                total_request_bytes,
-                start.elapsed(),
-                AccessLogBuilder::new(peer)
-                    .method(method.as_str())
-                    .scheme(scheme_name(fallback_scheme))
-                    .host(headers.host().unwrap_or(""))
-                    .path(target.clone())
-                    .decision("ERROR"),
-            )
-            .await?;
-            return Ok(ClientDisposition::Close);
-        }
-    };
+    let logged_target = request_target_for_log(&target, app.settings.log_queries);
+    let content_length = headers.content_length();
 
     let expect_continue = match headers.expect_continue() {
         Ok(value) => value,
@@ -93,7 +72,7 @@ where
                     .method(method.as_str())
                     .scheme(scheme_name(fallback_scheme))
                     .host(headers.host().unwrap_or(""))
-                    .path(target.clone())
+                    .path(logged_target.clone())
                     .decision("ERROR"),
             )
             .await?;
@@ -124,7 +103,7 @@ where
                 .method(method.as_str())
                 .scheme(scheme_name(fallback_scheme))
                 .host(headers.host().unwrap_or(""))
-                .path(target.clone())
+                .path(logged_target.clone())
                 .decision("DENY"),
         )
         .await?;
@@ -146,7 +125,12 @@ where
     } {
         Ok(parsed) => parsed,
         Err(err) => {
-            warn!(peer = %peer, error = ?err, "failed to parse HTTP request target");
+            warn!(
+                peer = %peer,
+                target = %logged_target,
+                error = ?err,
+                "failed to parse HTTP request target"
+            );
             respond_with_access_log(
                 reader.get_mut(),
                 StatusCode::BAD_REQUEST,
@@ -159,7 +143,7 @@ where
                     .method(method.as_str())
                     .scheme(scheme_name(fallback_scheme))
                     .host(headers.host().unwrap_or(""))
-                    .path(target)
+                    .path(logged_target)
                     .decision("ERROR"),
             )
             .await?;

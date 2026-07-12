@@ -318,6 +318,103 @@ async fn request_total_timeout_starts_after_complete_request_head() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_http1_errors_redact_queries_when_logging_is_disabled() -> Result<()> {
+    const SECRET: &str = "m16-query-secret-sentinel";
+
+    let log_capture = LogCapture::new("info").await;
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow"])
+        .policy(PolicySpec::new("allow").rule(RuleSpec::allow_any("http://example.com/**")))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.log_queries = false;
+            settings.max_request_body_size = 1;
+        })
+        .spawn()
+        .await?;
+
+    let cases = [
+        (
+            format!(
+                "POST http://example.com/expect?secret={SECRET} HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nExpect: custom\r\nConnection: close\r\n\r\n"
+            ),
+            "HTTP/1.1 417",
+        ),
+        (
+            format!(
+                "POST http://example.com/oversized?secret={SECRET} HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+            ),
+            "HTTP/1.1 413",
+        ),
+        (
+            format!(
+                "GET http://[malformed?secret={SECRET} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+            ),
+            "HTTP/1.1 400",
+        ),
+    ];
+
+    for (request, expected_status) in cases {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let response = read_http_response_with_length(&mut stream).await?;
+        assert!(
+            response.starts_with(expected_status),
+            "unexpected response: {response}"
+        );
+    }
+
+    harness.shutdown().await;
+    let logs = log_capture.text();
+    assert!(!logs.contains(SECRET), "query leaked into logs: {logs}");
+    for redacted in [
+        "http://example.com/expect",
+        "http://example.com/oversized",
+        "http://[malformed",
+    ] {
+        assert!(
+            logs.contains(redacted),
+            "missing redacted target {redacted:?}: {logs}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_http1_errors_log_queries_only_when_enabled() -> Result<()> {
+    const SECRET: &str = "m16-opt-in-query-sentinel";
+
+    let log_capture = LogCapture::new("info").await;
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow"])
+        .policy(PolicySpec::new("allow").rule(RuleSpec::allow_any("http://example.com/**")))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.log_queries = true)
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "POST http://example.com/invalid?secret={SECRET} HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nExpect: custom\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_response_with_length(&mut stream).await?;
+    assert!(response.starts_with("HTTP/1.1 417"));
+
+    harness.shutdown().await;
+    let logs = log_capture.text();
+    assert!(
+        logs.contains(SECRET),
+        "explicit query logging omitted query: {logs}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
     let dirs = TestDirs::new()?;
 

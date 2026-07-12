@@ -96,9 +96,7 @@ fn parse_http1_request_with_mode(
     fallback_scheme: Scheme,
     mode: Http1TargetMode,
 ) -> Result<ParsedRequest> {
-    let uri: Uri = target
-        .parse()
-        .with_context(|| format!("invalid request target '{target}'"))?;
+    let uri: Uri = target.parse().context("invalid request target")?;
 
     if uri.scheme().is_some() {
         match mode {
@@ -161,6 +159,22 @@ pub fn parse_uri_request(
 /// Return a path with query parameters removed for logging purposes.
 pub fn redacted_path(path: &str) -> String {
     path.split('?').next().unwrap_or("/").to_string()
+}
+
+/// Return a request target suitable for logs under the configured query policy.
+///
+/// This is intentionally lexical so malformed targets are redacted before parsing.
+pub fn request_target_for_log(target: &str, log_queries: bool) -> String {
+    if log_queries {
+        target.to_string()
+    } else {
+        let redacted = redacted_path(target);
+        if redacted.is_empty() {
+            "/".to_string()
+        } else {
+            redacted
+        }
+    }
 }
 
 /// Parse the HTTP scheme into the internal enum.
@@ -512,6 +526,32 @@ fn remove_last_path_segment(output: &mut String) {
 mod tests {
     use super::*;
     use http::Method;
+
+    #[test]
+    fn request_target_logging_redacts_queries_lexically() {
+        let cases = [
+            ("/resource?secret=one", "/resource"),
+            (
+                "http://example.com/resource?secret=two",
+                "http://example.com/resource",
+            ),
+            ("/resource%3Fvalue?secret=three", "/resource%3Fvalue"),
+            ("http://[malformed?secret=four", "http://[malformed"),
+            ("?secret=five", "/"),
+        ];
+
+        for (target, expected) in cases {
+            assert_eq!(request_target_for_log(target, false), expected);
+            assert_eq!(request_target_for_log(target, true), target);
+        }
+    }
+
+    #[test]
+    fn invalid_target_error_does_not_embed_the_raw_target() {
+        let target = "http://[malformed?query-secret-sentinel";
+        let err = parse_http1_request(Method::GET, target, None, Scheme::Http).unwrap_err();
+        assert!(!format!("{err:?}").contains("query-secret-sentinel"));
+    }
 
     #[test]
     fn parse_http1_request_fills_default_port() -> Result<()> {

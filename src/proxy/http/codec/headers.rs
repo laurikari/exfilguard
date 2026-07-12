@@ -109,8 +109,8 @@ impl Http1HeaderAccumulator {
         self.sanitizer.host()
     }
 
-    pub fn content_length(&self) -> Result<Option<usize>> {
-        Ok(self.sanitizer.content_length())
+    pub fn content_length(&self) -> Option<usize> {
+        self.sanitizer.content_length()
     }
 
     pub fn is_chunked(&self) -> bool {
