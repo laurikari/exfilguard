@@ -8,10 +8,10 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::future::poll_fn;
-use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
+use h2::{client, server::SendResponse};
 use http::{HeaderMap, HeaderValue, StatusCode};
-use tokio::time::timeout;
+use tokio::{sync::Mutex, time::timeout};
 
 use crate::{
     proxy::forward_error::RequestTimeout,
@@ -84,6 +84,26 @@ pub(super) async fn send_data_with_backpressure(
     Ok(())
 }
 
+async fn open_upstream_stream(
+    sender: &Mutex<client::SendRequest<Bytes>>,
+    request: http::Request<()>,
+    end_of_stream: bool,
+    request_deadline: Option<Instant>,
+) -> Result<(client::ResponseFuture, SendStream<Bytes>, Instant)> {
+    with_total_deadline(request_deadline, async {
+        let mut sender = sender.lock().await;
+        poll_fn(|cx| sender.poll_ready(cx))
+            .await
+            .context("upstream HTTP/2 sender not ready")?;
+        let upstream_request_instant = Instant::now();
+        let (response_fut, send_stream) = sender
+            .send_request(request, end_of_stream)
+            .context("failed to send headers to upstream over HTTP/2")?;
+        Ok((response_fut, send_stream, upstream_request_instant))
+    })
+    .await
+}
+
 #[derive(Clone)]
 pub(super) struct ForwardOutcome {
     log: ForwardLog,
@@ -132,7 +152,7 @@ pub(super) async fn forward_request_to_upstream(
     cache_miss: Option<Box<CacheMiss>>,
 ) -> Result<ForwardOutcome> {
     let request_deadline = request_deadline.instant();
-    let mut sender = checkout.sender;
+    let sender = checkout.sender;
     let upstream_peer = checkout.peer;
     let reused_existing = checkout.reused_existing;
 
@@ -163,10 +183,8 @@ pub(super) async fn forward_request_to_upstream(
         .map_err(|err| anyhow!("failed to build upstream HTTP/2 request: {err}"))?;
 
     let end_of_stream = body.is_end_stream();
-    let upstream_request_instant = Instant::now();
-    let (response_fut, mut send_stream) = sender
-        .send_request(request, end_of_stream)
-        .context("failed to send headers to upstream over HTTP/2")?;
+    let (response_fut, mut send_stream, upstream_request_instant) =
+        open_upstream_stream(sender.as_ref(), request, end_of_stream, request_deadline).await?;
 
     let mut body_tracker = BodySizeTracker::new(max_request_body_size);
 
@@ -436,4 +454,146 @@ struct ForwardLog {
     upstream_addr: SocketAddr,
     upstream_reused: bool,
     cache_store: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use bytes::Bytes;
+    use h2::{client, server};
+    use http::StatusCode;
+    use tokio::{
+        io::duplex,
+        sync::{Mutex, mpsc},
+        time::timeout,
+    };
+
+    use crate::proxy::forward_error::RequestTimeout;
+
+    use super::open_upstream_stream;
+
+    fn request(path: &str) -> http::Request<()> {
+        http::Request::builder()
+            .method("GET")
+            .uri(format!("https://example.test{path}"))
+            .version(http::Version::HTTP_2)
+            .body(())
+            .unwrap()
+    }
+
+    fn send_empty_response(mut respond: server::SendResponse<Bytes>) {
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .unwrap();
+        respond.send_response(response, true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_admission_uses_one_authoritative_sender() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(4);
+
+        let server_task = tokio::spawn(async move {
+            let mut builder = server::Builder::new();
+            builder.max_concurrent_streams(1);
+            let mut connection = builder.handshake(server_io).await.unwrap();
+            while let Some(result) = connection.accept().await {
+                let (request, respond) = result.unwrap();
+                accepted_tx
+                    .send((request.uri().path().to_owned(), respond))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut builder = client::Builder::new();
+        builder.initial_max_send_streams(1);
+        let (sender, connection) = builder.handshake(client_io).await.unwrap();
+        let connection_task = tokio::spawn(connection);
+        let sender = Arc::new(Mutex::new(sender));
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if sender.lock().await.current_max_send_streams() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server concurrency setting was not received");
+
+        let (first_response, _first_body, _) =
+            open_upstream_stream(sender.as_ref(), request("/one"), true, None)
+                .await
+                .unwrap();
+        let (first_path, first_respond) = timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_path, "/one");
+
+        // h2 permits the authoritative handle to hold one pending-open stream. Keeping that
+        // state on the shared handle is what makes the following request wait for readiness.
+        let (second_response, _second_body, _) =
+            open_upstream_stream(sender.as_ref(), request("/two"), true, None)
+                .await
+                .unwrap();
+        assert!(accepted_rx.try_recv().is_err());
+
+        let third_deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let third = open_upstream_stream(
+            sender.as_ref(),
+            request("/three"),
+            true,
+            Some(third_deadline),
+        );
+        tokio::pin!(third);
+        assert!(matches!(
+            futures::poll!(third.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let error = match third.await {
+            Ok(_) => panic!("third stream bypassed upstream admission"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<RequestTimeout>().is_some());
+
+        send_empty_response(first_respond);
+        timeout(Duration::from_secs(1), first_response)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (second_path, second_respond) = timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_path, "/two");
+        send_empty_response(second_respond);
+        timeout(Duration::from_secs(1), second_response)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (fourth_response, _fourth_body, _) =
+            open_upstream_stream(sender.as_ref(), request("/four"), true, None)
+                .await
+                .unwrap();
+        let (fourth_path, fourth_respond) = timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fourth_path, "/four");
+        send_empty_response(fourth_respond);
+        timeout(Duration::from_secs(1), fourth_response)
+            .await
+            .unwrap()
+            .unwrap();
+
+        connection_task.abort();
+        server_task.abort();
+    }
 }

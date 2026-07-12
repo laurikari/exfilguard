@@ -351,6 +351,19 @@ second partial HTTP/2 frame parser solely to apply a shorter header deadline.
 This keeps setup and idle retention bounded without imposing a lifetime on
 legitimate active or multiplexed sessions.
 
+## HTTP/2 stream admission follows the origin's limit
+
+Each upstream HTTP/2 connection keeps one authoritative request sender.
+ExfilGuard waits for that sender to become ready and opens the stream while
+holding the same admission lock, so concurrent downstream requests cannot
+bypass the origin's advertised `MAX_CONCURRENT_STREAMS` state by using cloned
+senders. Only readiness and stream creation are serialized; request bodies and
+responses remain multiplexed independently after their streams are open.
+
+Waiting for upstream stream capacity is part of the optional end-to-end
+`request_total_timeout`. Without that timeout, downstream HTTP/2 stream
+admission still bounds the number of waiting requests on the connection.
+
 ## The total request timeout is an end-to-end inner-request budget
 
 When enabled, `request_total_timeout` starts after ExfilGuard accepts a complete

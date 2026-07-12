@@ -1,9 +1,14 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use h2::client;
-use tokio::{net::TcpStream, sync::watch, task::JoinHandle, time::timeout};
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex, watch},
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use tracing::debug;
 
@@ -36,7 +41,7 @@ pub(super) struct Http2Upstream {
 }
 
 pub(super) struct UpstreamHandle {
-    pub sender: client::SendRequest<Bytes>,
+    pub sender: Arc<Mutex<client::SendRequest<Bytes>>>,
     pub peer: SocketAddr,
     pub host: String,
     pub port: u16,
@@ -47,7 +52,7 @@ pub(super) struct UpstreamHandle {
 }
 
 pub(super) struct UpstreamCheckout {
-    pub sender: client::SendRequest<Bytes>,
+    pub sender: Arc<Mutex<client::SendRequest<Bytes>>>,
     pub peer: SocketAddr,
     pub reused_existing: bool,
 }
@@ -239,7 +244,7 @@ async fn make_handle_from_stream(
     });
 
     Ok(UpstreamHandle {
-        sender,
+        sender: Arc::new(Mutex::new(sender)),
         connection_task: task,
         peer,
         host,
