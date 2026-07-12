@@ -364,6 +364,22 @@ Waiting for upstream stream capacity is part of the optional end-to-end
 `request_total_timeout`. Without that timeout, downstream HTTP/2 stream
 admission still bounds the number of waiting requests on the connection.
 
+## HTTP/2 request and response bodies remain full duplex
+
+After opening an upstream HTTP/2 stream, ExfilGuard polls request upload and
+the origin response concurrently. An origin may send a final response before
+the request body is complete, so ExfilGuard forwards that response immediately
+and continues driving both directions while they remain active. If the
+response completes first, the unfinished upload is canceled on that stream;
+other streams and the shared HTTP/2 connection remain usable.
+
+The response-header phase timeout starts after request upload completes, as it
+does for ordinary request/response exchanges, but an early response is still
+observed during upload. The optional total-request deadline continues to cover
+both directions throughout. A standards-defined `RST_STREAM(NO_ERROR)` after a
+complete early response terminates only the unused request side and does not
+discard the response.
+
 ## The total request timeout is an end-to-end inner-request budget
 
 When enabled, `request_total_timeout` starts after ExfilGuard accepts a complete

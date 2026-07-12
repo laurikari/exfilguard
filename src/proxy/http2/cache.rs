@@ -180,7 +180,7 @@ impl CacheWriteState {
         }
     }
 
-    pub fn discard_for_trailers(&mut self) {
+    pub fn discard(&mut self) {
         if let CacheWriteKind::Store(context) = &mut self.state {
             context.writer.discard();
         }

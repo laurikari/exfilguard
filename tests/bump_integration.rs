@@ -2276,6 +2276,118 @@ async fn connect_bump_http2_body_requests_bypass_cache() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_forwards_early_response_while_upload_is_active() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-full-duplex";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET", "PUT"],
+        format!("https://{upstream_host}/**"),
+    ));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2EarlyResponse)
+            .with_settings(|settings| {
+                settings.request_body_idle_timeout = 1;
+                settings.response_header_timeout = 2;
+            }),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let duplex_body = Bytes::from(vec![b'd'; 256 * 1024]);
+    let duplex_request = http::Request::builder()
+        .method(Method::PUT)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/duplex")
+                .build()?,
+        )
+        .header(http::header::CONTENT_LENGTH, duplex_body.len())
+        .body(())?;
+    let (status, response_body) = timeout(
+        StdDuration::from_secs(3),
+        client.request_text_with_body(duplex_request, duplex_body.clone()),
+    )
+    .await
+    .context("duplex HTTP/2 exchange timed out")?
+    .context("duplex HTTP/2 exchange failed")?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response_body, format!("received={}", duplex_body.len()));
+
+    let rejected_body = Bytes::from(vec![b'r'; 512 * 1024]);
+    let rejected_request = http::Request::builder()
+        .method(Method::PUT)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/early")
+                .build()?,
+        )
+        .header(http::header::CONTENT_LENGTH, rejected_body.len())
+        .body(())?;
+    let (status, response_body) = timeout(
+        StdDuration::from_secs(3),
+        client.request_text_with_body(rejected_request, rejected_body),
+    )
+    .await
+    .context("early HTTP/2 response timed out")?
+    .context("early HTTP/2 response failed")?;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(response_body, "rejected");
+
+    let after_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/after")
+                .build()?,
+        )
+        .body(())?;
+    let (status, response_body) = timeout(
+        StdDuration::from_secs(3),
+        client.request_text(after_request),
+    )
+    .await
+    .context("follow-up HTTP/2 request timed out")?
+    .context("follow-up HTTP/2 request failed")?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response_body, "/after");
+    assert_eq!(fixture.accept_count(), 1, "upstream H2 connection was lost");
+
+    let truncated_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/truncated")
+                .build()?,
+        )
+        .body(())?;
+    let truncated = timeout(
+        StdDuration::from_secs(3),
+        client.request_text(truncated_request),
+    )
+    .await
+    .context("truncated HTTP/2 response timed out")?;
+    assert!(
+        truncated.is_err(),
+        "NO_ERROR reset completed an ordinary truncated response"
+    );
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_invalid_request_path_returns_400() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-invalid";

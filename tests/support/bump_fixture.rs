@@ -58,6 +58,7 @@ pub enum UpstreamMode {
     DualProtocolCacheInspect,
     Http2CloseBeforeResponse,
     Http2HeadersThenStallBody,
+    Http2EarlyResponse,
     Http2NoResponse,
     Http2SingleUse,
     Http2Inspect,
@@ -305,6 +306,7 @@ impl BumpedTlsFixture {
             | UpstreamMode::Http2CacheInspect
             | UpstreamMode::Http2CloseBeforeResponse
             | UpstreamMode::Http2HeadersThenStallBody
+            | UpstreamMode::Http2EarlyResponse
             | UpstreamMode::Http2NoResponse
             | UpstreamMode::Http2SingleUse
             | UpstreamMode::Http2Inspect => build_upstream_h2_tls_config(&ca, upstream_host)?,
@@ -372,6 +374,9 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http2HeadersThenStallBody => {
                                         serve_tls_h2_headers_then_stall_body(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2EarlyResponse => {
+                                        serve_tls_h2_early_response(stream, acceptor, peer).await
                                     }
                                     UpstreamMode::Http2NoResponse => {
                                         serve_tls_h2_no_response(stream, acceptor, peer).await
@@ -857,6 +862,108 @@ async fn serve_tls_h2_headers_then_stall_body(
             result.context("HTTP/2 connection failed while stalling response body")?;
         }
     }
+    Ok(())
+}
+
+async fn serve_tls_h2_early_response(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+    let mut handlers = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) = result.context("failed to accept HTTP/2 request")?;
+                    handlers.spawn(serve_h2_early_response_request(request, respond));
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 handler available")
+                    .context("HTTP/2 early-response handler task failed")??;
+            }
+        }
+    }
+    while let Some(result) = handlers.join_next().await {
+        result.context("HTTP/2 early-response handler task failed")??;
+    }
+
+    Ok(())
+}
+
+async fn serve_h2_early_response_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2_server::SendResponse<Bytes>,
+) -> Result<()> {
+    match request.uri().path() {
+        "/early" => {
+            let response = http::Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(())
+                .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+            let mut send = respond
+                .send_response(response, false)
+                .context("failed to send early HTTP/2 response headers")?;
+            send.send_data(Bytes::from_static(b"rejected"), true)
+                .context("failed to send early HTTP/2 response body")?;
+        }
+        "/duplex" => {
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .body(())
+                .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+            let mut send = respond
+                .send_response(response, false)
+                .context("failed to send duplex HTTP/2 response headers")?;
+
+            let mut body = request.into_body();
+            let mut body_len = 0usize;
+            while let Some(frame) = body.data().await {
+                let chunk = frame.context("failed to read duplex HTTP/2 request body")?;
+                body_len += chunk.len();
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .context("failed to release duplex HTTP/2 request capacity")?;
+            }
+            send.send_data(Bytes::from(format!("received={body_len}")), true)
+                .context("failed to send duplex HTTP/2 response body")?;
+        }
+        "/truncated" => {
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .body(())
+                .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+            let mut send = respond
+                .send_response(response, false)
+                .context("failed to send truncated HTTP/2 response headers")?;
+            send.send_data(Bytes::from_static(b"partial"), false)
+                .context("failed to send truncated HTTP/2 response data")?;
+            send.send_reset(h2::Reason::NO_ERROR);
+        }
+        path => {
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .body(())
+                .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+            let mut send = respond
+                .send_response(response, false)
+                .context("failed to send HTTP/2 response headers")?;
+            send.send_data(Bytes::copy_from_slice(path.as_bytes()), true)
+                .context("failed to send HTTP/2 response body")?;
+        }
+    }
+
     Ok(())
 }
 
