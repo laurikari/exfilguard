@@ -337,7 +337,7 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
 | `request_total_timeout` | u64 | 0 | Maximum total time from accepting a complete request head through policy/cache work, upstream setup, and full response delivery (0 disables) |
 | `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an HTTP/1 keep-alive connection or an HTTP/2 connection with no active request streams |
-| `connect_tunnel_idle_timeout` | u64 | 60 | Maximum idle time for CONNECT tunnels |
+| `connect_tunnel_idle_timeout` | u64 | 60 | Maximum time with no successful relay progress in either direction of a raw CONNECT tunnel; also bounds individual tunnel writes and setup/shutdown operations |
 | `connect_tunnel_max_lifetime` | u64 | 0 | Maximum lifetime for CONNECT tunnels (0 disables) |
 
 For downstream HTTP/2, the connection is request-idle whenever it has no

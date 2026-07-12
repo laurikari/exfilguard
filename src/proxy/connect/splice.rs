@@ -5,6 +5,8 @@ use anyhow::{Context, Error, Result};
 use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
+use tokio::time::{Instant, sleep_until};
 
 use crate::{
     io_util::write_all_with_timeout,
@@ -25,6 +27,10 @@ pub struct SpliceStats {
 #[derive(Debug, Error)]
 #[error("CONNECT tunnel max lifetime exceeded")]
 pub struct ConnectTunnelTimeout;
+
+#[derive(Debug, Error)]
+#[error("CONNECT tunnel idle timeout exceeded")]
+struct ConnectTunnelIdleTimeout;
 
 #[derive(Debug, Error)]
 #[error("CONNECT tunnel failed after the downstream response was committed: {source}")]
@@ -91,7 +97,7 @@ pub async fn handle_splice(
         })?;
     }
 
-    let relay = relay_with_idle_timeouts(client_stream, &mut upstream_stream, tunnel_idle_timeout);
+    let relay = relay_with_idle_timeout(client_stream, &mut upstream_stream, tunnel_idle_timeout);
     let relay_result = if let Some(limit) = tunnel_max_lifetime {
         match tokio::time::timeout(limit, relay).await {
             Ok(result) => result,
@@ -164,42 +170,84 @@ where
     Ok(established.len() as u64)
 }
 
-async fn relay_with_idle_timeouts(
-    client_stream: &mut TcpStream,
-    upstream_stream: &mut TcpStream,
+async fn relay_with_idle_timeout<C, U>(
+    client_stream: &mut C,
+    upstream_stream: &mut U,
     idle_timeout: Duration,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut client_reader, mut client_writer) = io::split(client_stream);
     let (mut upstream_reader, mut upstream_writer) = io::split(upstream_stream);
+    let (activity_tx, activity_rx) = watch::channel(Instant::now());
 
     let client_to_upstream = transfer_half(
         &mut client_reader,
         &mut upstream_writer,
         idle_timeout,
-        idle_timeout,
         "CONNECT client",
         "upstream server",
+        &activity_tx,
     );
     let upstream_to_client = transfer_half(
         &mut upstream_reader,
         &mut client_writer,
         idle_timeout,
-        idle_timeout,
         "upstream server",
         "CONNECT client",
+        &activity_tx,
     );
 
-    let (client_bytes, upstream_bytes) = tokio::try_join!(client_to_upstream, upstream_to_client)?;
-    Ok((client_bytes, upstream_bytes))
+    let relay = async {
+        let (client_bytes, upstream_bytes) =
+            tokio::try_join!(client_to_upstream, upstream_to_client)?;
+        Ok((client_bytes, upstream_bytes))
+    };
+    tokio::pin!(relay);
+    tokio::select! {
+        biased;
+        result = &mut relay => result,
+        result = wait_for_tunnel_idle(activity_rx, idle_timeout) => {
+            result?;
+            unreachable!("tunnel idle watchdog only returns errors")
+        }
+    }
+}
+
+async fn wait_for_tunnel_idle(
+    mut activity: watch::Receiver<Instant>,
+    idle_timeout: Duration,
+) -> Result<()> {
+    loop {
+        let last_activity = *activity.borrow_and_update();
+        let deadline = last_activity
+            .checked_add(idle_timeout)
+            .ok_or_else(|| anyhow::anyhow!("CONNECT tunnel idle timeout is too large"))?;
+        tokio::select! {
+            biased;
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            _ = sleep_until(deadline) => {
+                if *activity.borrow() <= last_activity {
+                    return Err(ConnectTunnelIdleTimeout.into());
+                }
+            }
+        }
+    }
 }
 
 async fn transfer_half<R, W>(
     reader: &mut R,
     writer: &mut W,
-    read_timeout: Duration,
     write_timeout: Duration,
     read_label: &str,
     write_label: &str,
+    activity: &watch::Sender<Instant>,
 ) -> Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -208,12 +256,10 @@ where
     let mut transferred = 0u64;
     let mut buffer = [0u8; 8192];
     loop {
-        let read = timeout_with_context(
-            read_timeout,
-            reader.read(&mut buffer),
-            format!("reading from {read_label} during CONNECT splice"),
-        )
-        .await?;
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("reading from {read_label} during CONNECT splice"))?;
         if read == 0 {
             timeout_with_context(
                 write_timeout,
@@ -221,6 +267,7 @@ where
                 format!("shutting down {write_label} during CONNECT splice"),
             )
             .await?;
+            activity.send_replace(Instant::now());
             break;
         }
 
@@ -232,6 +279,7 @@ where
         )
         .await?;
         transferred = transferred.saturating_add(read as u64);
+        activity.send_replace(Instant::now());
     }
 
     timeout_with_context(
@@ -248,10 +296,11 @@ where
 mod tests {
     use super::*;
     use anyhow::Result;
+    use tokio::io::duplex;
     use tokio::net::TcpListener;
 
     #[tokio::test(start_paused = true)]
-    async fn idle_timeout_applies_to_upstream_read() -> Result<()> {
+    async fn idle_timeout_applies_to_the_whole_tunnel() -> Result<()> {
         let client_listener = TcpListener::bind("127.0.0.1:0").await?;
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
 
@@ -270,24 +319,120 @@ mod tests {
         let idle_timeout = Duration::from_secs(1);
 
         let handle = tokio::spawn(async move {
-            relay_with_idle_timeouts(&mut client_stream, &mut upstream_stream, idle_timeout).await
+            relay_with_idle_timeout(&mut client_stream, &mut upstream_stream, idle_timeout).await
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::advance(idle_timeout - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished(), "tunnel expired before idle timeout");
+
+        tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
 
-        assert!(handle.is_finished(), "expected client timeout to trigger");
+        assert!(
+            handle.is_finished(),
+            "expected tunnel idle timeout to trigger"
+        );
 
         let err = handle.await.expect("join should succeed").unwrap_err();
         assert!(
             err.to_string()
-                .contains("timed out reading from upstream server during CONNECT splice"),
+                .contains("CONNECT tunnel idle timeout exceeded"),
             "unexpected error: {err}"
         );
 
         drop(client_peer);
         drop(upstream_peer);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_upload_keeps_response_silent_tunnel_active() -> Result<()> {
+        let (mut client_peer, mut client_stream) = duplex(1024);
+        let (mut upstream_stream, mut upstream_peer) = duplex(1024);
+        let idle_timeout = Duration::from_secs(1);
+        let handle = tokio::spawn(async move {
+            relay_with_idle_timeout(&mut client_stream, &mut upstream_stream, idle_timeout).await
+        });
+
+        for byte in 0u8..4 {
+            client_peer.write_all(&[byte]).await?;
+            let mut received = [0u8; 1];
+            upstream_peer.read_exact(&mut received).await?;
+            assert_eq!(received, [byte]);
+            tokio::time::advance(Duration::from_millis(750)).await;
+            tokio::task::yield_now().await;
+            assert!(!handle.is_finished(), "active upload tunnel timed out");
+        }
+
+        drop(client_peer);
+        drop(upstream_peer);
+        let (client_bytes, upstream_bytes) = handle.await??;
+        assert_eq!(client_bytes, 4);
+        assert_eq!(upstream_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_download_keeps_request_silent_tunnel_active() -> Result<()> {
+        let (mut client_peer, mut client_stream) = duplex(1024);
+        let (mut upstream_stream, mut upstream_peer) = duplex(1024);
+        let idle_timeout = Duration::from_secs(1);
+        let handle = tokio::spawn(async move {
+            relay_with_idle_timeout(&mut client_stream, &mut upstream_stream, idle_timeout).await
+        });
+
+        for byte in 0u8..4 {
+            upstream_peer.write_all(&[byte]).await?;
+            let mut received = [0u8; 1];
+            client_peer.read_exact(&mut received).await?;
+            assert_eq!(received, [byte]);
+            tokio::time::advance(Duration::from_millis(750)).await;
+            tokio::task::yield_now().await;
+            assert!(!handle.is_finished(), "active download tunnel timed out");
+        }
+
+        drop(client_peer);
+        drop(upstream_peer);
+        let (client_bytes, upstream_bytes) = handle.await??;
+        assert_eq!(client_bytes, 0);
+        assert_eq!(upstream_bytes, 4);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_closed_upload_allows_long_running_download() -> Result<()> {
+        let (mut client_peer, mut client_stream) = duplex(1024);
+        let (mut upstream_stream, mut upstream_peer) = duplex(1024);
+        let idle_timeout = Duration::from_secs(1);
+        let handle = tokio::spawn(async move {
+            relay_with_idle_timeout(&mut client_stream, &mut upstream_stream, idle_timeout).await
+        });
+
+        client_peer.write_all(b"upload").await?;
+        client_peer.shutdown().await?;
+        let mut upload = [0u8; 6];
+        upstream_peer.read_exact(&mut upload).await?;
+        assert_eq!(&upload, b"upload");
+        let mut eof = [0u8; 1];
+        assert_eq!(upstream_peer.read(&mut eof).await?, 0);
+
+        for byte in 0u8..4 {
+            upstream_peer.write_all(&[byte]).await?;
+            let mut received = [0u8; 1];
+            client_peer.read_exact(&mut received).await?;
+            assert_eq!(received, [byte]);
+            tokio::time::advance(Duration::from_millis(750)).await;
+            tokio::task::yield_now().await;
+            assert!(!handle.is_finished(), "half-closed active tunnel timed out");
+        }
+
+        upstream_peer.shutdown().await?;
+        assert_eq!(client_peer.read(&mut eof).await?, 0);
+        let (client_bytes, upstream_bytes) = handle.await??;
+        assert_eq!(client_bytes, 6);
+        assert_eq!(upstream_bytes, 4);
         Ok(())
     }
 }

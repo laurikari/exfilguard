@@ -376,3 +376,16 @@ There is no fixed address-count cutoff. The total deadline and stagger bound the
 work naturally; candidates whose turn falls beyond the deadline remain
 unattempted. DNS resolution and TLS handshakes retain their own phase-specific
 timeouts.
+
+## Raw CONNECT tunnel idleness is bidirectional
+
+A raw CONNECT tunnel is idle only when no bytes have been successfully relayed
+in either direction for `connect_tunnel_idle_timeout`. Continuous upload or
+download traffic therefore keeps the tunnel active even when the reverse
+direction is silent. Successful half-close propagation refreshes the shared
+activity deadline so the surviving direction receives a full idle interval.
+
+Individual tunnel writes remain bounded by the same timeout, preventing a peer
+that stops reading from blocking one relay half indefinitely. The optional
+`connect_tunnel_max_lifetime` remains an independent absolute lifetime limit,
+including for continuously active tunnels.
