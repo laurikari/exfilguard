@@ -58,6 +58,18 @@ second plaintext status line would corrupt that stream and cannot reliably
 communicate the failure. Errors detected before commitment can still receive
 the appropriate HTTP error response.
 
+## Response-head limits include informational responses
+
+For upstream HTTP/1, `response_header_timeout` is one absolute deadline from
+the end of request transmission through the final response head.
+`max_response_header_size` is one aggregate wire-byte budget across every
+informational response and the final response head. Informational responses do
+not receive fresh limits.
+
+This bounds both slow header drips and fast informational-response floods using
+the existing operator controls. A separate informational-response count would
+add an arbitrary protocol limit without improving the byte or time bound.
+
 ## Cache only bodyless requests
 
 Shared-cache lookup and storage are limited to requests proven to have no body.

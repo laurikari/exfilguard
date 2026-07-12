@@ -309,7 +309,7 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | `tls_handshake_timeout` | u64 | 10 | Maximum time for TLS handshakes (client or upstream) |
 | `request_header_timeout` | u64 | 10 | Maximum time to read an HTTP/1 request line + headers or the downstream HTTP/2 connection preface |
 | `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |
-| `response_header_timeout` | u64 | 60 | Maximum time to receive upstream response headers |
+| `response_header_timeout` | u64 | 60 | Maximum total time from waiting for the first upstream response head through receiving the final response head |
 | `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
 | `request_total_timeout` | u64 | 0 | Maximum total time from request start until the response has been fully forwarded (0 disables) |
 | `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an HTTP/1 keep-alive connection or an HTTP/2 connection with no active request streams |
@@ -334,7 +334,7 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_request_header_size` | usize | 32768 (32 KiB) | Maximum HTTP request header size, including bumped HTTP/2 header lists |
-| `max_response_header_size` | usize | 32768 (32 KiB) | Maximum HTTP response header size, including upstream HTTP/2 header lists |
+| `max_response_header_size` | usize | 32768 (32 KiB) | Maximum HTTP response header size; for HTTP/1 this is shared by all informational and final heads, and for HTTP/2 it limits the upstream header list |
 | `max_request_body_size` | usize | 0 (unlimited) | Maximum HTTP request body size during forwarding (0 disables the limit) |
 
 ---

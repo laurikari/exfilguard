@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::forward_error::UpstreamClosed;
+use crate::proxy::forward_error::{InformationalResponseStarted, UpstreamClosed};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 
@@ -255,6 +255,7 @@ fn should_retry_reused_connection(
     if !reused_existing
         || !is_standard_idempotent_method(method)
         || !matches!(body_plan, BodyPlan::Empty)
+        || err.downcast_ref::<InformationalResponseStarted>().is_some()
     {
         return false;
     }

@@ -90,6 +90,57 @@ async fn test_max_request_body_size_enforced() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_header_timeout_returns_gateway_timeout_without_total_timeout() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(async move {
+        if let Ok((_stream, _)) = upstream_listener.accept().await {
+            sleep(StdDuration::from_secs(3)).await;
+        }
+    });
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-timeout"])
+        .policy(PolicySpec::new("allow-timeout").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.response_header_timeout = 1;
+            settings.request_total_timeout = 0;
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/slow HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = timeout(
+        StdDuration::from_secs(2),
+        read_http_response_with_length(&mut stream),
+    )
+    .await??;
+    assert!(
+        response.starts_with("HTTP/1.1 504"),
+        "unexpected response: {response}"
+    );
+    assert!(response.contains("request timed out"));
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_total_timeout_triggers_during_body() -> Result<()> {
     let dirs = TestDirs::new()?;
 

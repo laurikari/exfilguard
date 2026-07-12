@@ -4,12 +4,15 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
 
 use crate::io_util::write_all_with_timeout;
+use crate::proxy::forward_error::{InformationalResponseStarted, RequestTimeout};
+use crate::proxy::forward_limits::HeaderBudget;
 use crate::util::timeout_with_context;
 
 use super::super::body::{relay_chunked_body, relay_fixed_body, relay_until_close};
-use super::super::codec::{Http1ResponseHead, read_http1_response_head};
+use super::super::codec::{Http1ResponseHead, read_http1_response_head_with_budget};
 use super::ForwardTimeouts;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,48 +41,72 @@ where
     C: AsyncWrite + Unpin,
 {
     let mut informational_bytes = 0u64;
-    loop {
-        let mut head = read_http1_response_head(
-            upstream_reader,
-            timeouts.response_header,
-            upstream_peer,
-            max_header_bytes,
-        )
-        .await?;
-
-        if head.status == StatusCode::SWITCHING_PROTOCOLS {
-            bail!("upstream attempted protocol upgrade (101 Switching Protocols)");
-        }
-
-        if head.status.is_informational() && head.status != StatusCode::SWITCHING_PROTOCOLS {
-            if head.transfer_encoding_present {
-                bail!("informational response must not include a body");
-            }
-            if let Some(length) = head.content_length
-                && length > 0
-            {
-                bail!("informational response must not include a body");
-            }
-            head.content_length = None;
-            let encoded = head.encode(ResponseBodyPlan::Empty, None);
-            write_all_with_timeout(
-                client,
-                &encoded,
-                timeouts.response_io,
-                "writing informational response to client",
+    let mut budget = HeaderBudget::new(
+        max_header_bytes,
+        "upstream response headers exceed configured limit",
+    )?;
+    // The enclosing deadline is authoritative. Keep a longer per-read timeout
+    // only as a defensive fallback for the shared line-reading helper.
+    let per_read_timeout = timeouts
+        .response_header
+        .saturating_add(timeouts.response_header);
+    let read_sequence = async {
+        loop {
+            let mut head = read_http1_response_head_with_budget(
+                upstream_reader,
+                per_read_timeout,
+                upstream_peer,
+                max_header_bytes,
+                &mut budget,
             )
             .await?;
-            timeout_with_context(
-                timeouts.response_io,
-                client.flush(),
-                "flushing informational response to client",
-            )
-            .await?;
-            informational_bytes = informational_bytes.saturating_add(encoded.len() as u64);
-            continue;
-        }
 
-        return Ok((head, informational_bytes));
+            if head.status == StatusCode::SWITCHING_PROTOCOLS {
+                bail!("upstream attempted protocol upgrade (101 Switching Protocols)");
+            }
+
+            if head.status.is_informational() && head.status != StatusCode::SWITCHING_PROTOCOLS {
+                if head.transfer_encoding_present {
+                    bail!("informational response must not include a body");
+                }
+                if let Some(length) = head.content_length
+                    && length > 0
+                {
+                    bail!("informational response must not include a body");
+                }
+                head.content_length = None;
+                let encoded = head.encode(ResponseBodyPlan::Empty, None);
+                write_all_with_timeout(
+                    client,
+                    &encoded,
+                    timeouts.response_io,
+                    "writing informational response to client",
+                )
+                .await?;
+                timeout_with_context(
+                    timeouts.response_io,
+                    client.flush(),
+                    "flushing informational response to client",
+                )
+                .await?;
+                informational_bytes = informational_bytes.saturating_add(encoded.len() as u64);
+                continue;
+            }
+
+            return Ok(head);
+        }
+    };
+
+    let result = match timeout(timeouts.response_header, read_sequence).await {
+        Ok(result) => result,
+        Err(_) => Err(RequestTimeout.into()),
+    };
+    match result {
+        Ok(head) => Ok((head, informational_bytes)),
+        Err(source) if informational_bytes > 0 => {
+            Err(InformationalResponseStarted::new(source).into())
+        }
+        Err(source) => Err(source),
     }
 }
 
@@ -181,7 +208,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{ResponseBodyPlan, determine_response_body_plan, read_final_response_head};
-    use crate::proxy::forward_error::RequestTimeout;
+    use crate::proxy::forward_error::{
+        ForwardErrorKind, InformationalResponseStarted, RequestTimeout, UpstreamClosed,
+        classify_forward_error,
+    };
+    use crate::proxy::http::body::BodyPlan;
     use crate::proxy::http::codec::Http1ResponseHead;
     use crate::proxy::http::forward::ForwardTimeouts;
     use http::{Method, StatusCode};
@@ -203,6 +234,15 @@ mod tests {
             chunked: false,
             transfer_encoding_present: false,
             connection_close: false,
+        }
+    }
+
+    fn test_timeouts(response_header: Duration) -> ForwardTimeouts {
+        ForwardTimeouts {
+            connect: Duration::from_secs(1),
+            request_io: Duration::from_secs(1),
+            response_header,
+            response_io: Duration::from_secs(1),
         }
     }
 
@@ -242,6 +282,27 @@ mod tests {
             determine_response_body_plan(&Method::GET, head.status, &head),
             ResponseBodyPlan::Chunked
         );
+    }
+
+    #[test]
+    fn stale_connection_retry_is_disabled_after_informational_response() {
+        let err = anyhow::Error::new(InformationalResponseStarted::new(anyhow::Error::new(
+            UpstreamClosed,
+        )));
+        assert!(!super::super::should_retry_reused_connection(
+            true,
+            &Method::GET,
+            BodyPlan::Empty,
+            &err,
+        ));
+
+        let timeout = anyhow::Error::new(InformationalResponseStarted::new(anyhow::Error::new(
+            RequestTimeout,
+        )));
+        assert!(matches!(
+            classify_forward_error(&timeout),
+            ForwardErrorKind::RequestTimeout
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -318,6 +379,162 @@ mod tests {
         let mut buf = Vec::new();
         client_reader.read_to_end(&mut buf).await?;
         assert!(buf.starts_with(b"HTTP/1.1 100"));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_header_deadline_does_not_reset_for_each_byte() {
+        let (upstream_stream, mut upstream_writer) = duplex(256);
+        let (mut client_stream, _client_reader) = duplex(256);
+        let mut upstream_reader = BufReader::new(upstream_stream);
+        let timeouts = test_timeouts(Duration::from_millis(100));
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            read_final_response_head(
+                &mut upstream_reader,
+                &mut client_stream,
+                &timeouts,
+                peer,
+                256,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        upstream_writer.write_all(b"H").await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        upstream_writer.write_all(b"T").await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            handle.is_finished(),
+            "response-header timeout reset after partial-line progress"
+        );
+        let err = match handle.await.expect("response reader task panicked") {
+            Ok(_) => panic!("drip-fed status line should exceed one absolute deadline"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_header_deadline_does_not_reset_for_each_line() {
+        let (upstream_stream, mut upstream_writer) = duplex(256);
+        let (mut client_stream, _client_reader) = duplex(256);
+        let mut upstream_reader = BufReader::new(upstream_stream);
+        let timeouts = test_timeouts(Duration::from_millis(100));
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            read_final_response_head(
+                &mut upstream_reader,
+                &mut client_stream,
+                &timeouts,
+                peer,
+                256,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        upstream_writer
+            .write_all(b"HTTP/1.1 200 OK\r\n")
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        upstream_writer
+            .write_all(b"X-Test: progress\r\n")
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            handle.is_finished(),
+            "response-header timeout reset after a complete header line"
+        );
+        let err = match handle.await.expect("response reader task panicked") {
+            Ok(_) => panic!("line-dripped response head should exceed one absolute deadline"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn informational_and_final_heads_share_one_byte_budget() -> anyhow::Result<()> {
+        let (upstream_stream, mut upstream_writer) = duplex(512);
+        let (mut client_stream, _client_reader) = duplex(512);
+        upstream_writer
+            .write_all(
+                b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+        drop(upstream_writer);
+
+        let mut upstream_reader = BufReader::new(upstream_stream);
+        let peer: SocketAddr = "127.0.0.1:8080".parse()?;
+        let result = read_final_response_head(
+            &mut upstream_reader,
+            &mut client_stream,
+            &test_timeouts(Duration::from_secs(1)),
+            peer,
+            100,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("informational sequence should exceed aggregate header budget"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("headers exceed configured limit"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_informational_chain_reaches_final_response() -> anyhow::Result<()> {
+        let (upstream_stream, mut upstream_writer) = duplex(512);
+        let (mut client_stream, mut client_reader) = duplex(512);
+        upstream_writer
+            .write_all(
+                b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+        drop(upstream_writer);
+
+        let mut upstream_reader = BufReader::new(upstream_stream);
+        let peer: SocketAddr = "127.0.0.1:8080".parse()?;
+        let (head, informational_bytes) = read_final_response_head(
+            &mut upstream_reader,
+            &mut client_stream,
+            &test_timeouts(Duration::from_secs(1)),
+            peer,
+            256,
+        )
+        .await?;
+        assert_eq!(head.status, StatusCode::OK);
+        assert!(informational_bytes > 0);
+
+        client_stream.shutdown().await?;
+        let mut forwarded = Vec::new();
+        client_reader.read_to_end(&mut forwarded).await?;
+        assert!(forwarded.starts_with(b"HTTP/1.1 100 Continue\r\n"));
+        assert!(
+            forwarded
+                .windows(24)
+                .any(|bytes| bytes == b"HTTP/1.1 103 Early Hints")
+        );
         Ok(())
     }
 

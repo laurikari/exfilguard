@@ -14,6 +14,19 @@ use crate::proxy::{
 pub struct RequestTimeout;
 
 #[derive(Debug, Error)]
+#[error("upstream response failed after an informational response was forwarded: {source}")]
+pub struct InformationalResponseStarted {
+    #[source]
+    source: Error,
+}
+
+impl InformationalResponseStarted {
+    pub fn new(source: Error) -> Self {
+        Self { source }
+    }
+}
+
+#[derive(Debug, Error)]
 #[error("response forwarding failed after downstream response started: {source}")]
 pub struct ResponseAlreadyStarted {
     pub status: StatusCode,
@@ -87,7 +100,9 @@ impl ForwardErrorKind<'_> {
 }
 
 pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
-    if let Some(started) = err.downcast_ref::<ResponseAlreadyStarted>() {
+    if let Some(started) = err.downcast_ref::<InformationalResponseStarted>() {
+        classify_forward_error(&started.source)
+    } else if let Some(started) = err.downcast_ref::<ResponseAlreadyStarted>() {
         ForwardErrorKind::ResponseAlreadyStarted(started)
     } else if err.downcast_ref::<RequestTimeout>().is_some() {
         ForwardErrorKind::RequestTimeout

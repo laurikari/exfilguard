@@ -334,6 +334,7 @@ fn parse_transfer_codings(value: &str) -> Result<Vec<String>> {
     Ok(codings)
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) async fn read_http1_response_head<S>(
     reader: &mut BufReader<S>,
     timeout_dur: Duration,
@@ -343,15 +344,29 @@ pub(crate) async fn read_http1_response_head<S>(
 where
     S: AsyncRead + Unpin,
 {
+    let mut budget = HeaderBudget::new(
+        max_header_bytes,
+        "upstream response headers exceed configured limit",
+    )?;
+    read_http1_response_head_with_budget(reader, timeout_dur, peer, max_header_bytes, &mut budget)
+        .await
+}
+
+pub(crate) async fn read_http1_response_head_with_budget<S>(
+    reader: &mut BufReader<S>,
+    timeout_dur: Duration,
+    peer: SocketAddr,
+    max_header_bytes: usize,
+    budget: &mut HeaderBudget,
+) -> Result<Http1ResponseHead>
+where
+    S: AsyncRead + Unpin,
+{
     ensure!(
         max_header_bytes > 0,
         "max response header size must be greater than zero"
     );
     let mut status_line = Vec::new();
-    let mut budget = HeaderBudget::new(
-        max_header_bytes,
-        "upstream response headers exceed configured limit",
-    )?;
 
     let bytes = super::line::read_line_bytes_with_timeout(
         reader,
