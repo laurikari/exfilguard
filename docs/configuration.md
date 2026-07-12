@@ -378,6 +378,10 @@ downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
 sessions, active HTTP/2 streams, upstream connections, cache usage, and the
 last successful policy reload time.
 
+`requests_method_total` uses a bounded `method` label: the standard HTTP
+methods are reported by name and all extension methods are aggregated as
+`OTHER`. Access logs retain the exact method.
+
 CA lifecycle metrics are intentionally low-cardinality:
 
 | Metric | Description |

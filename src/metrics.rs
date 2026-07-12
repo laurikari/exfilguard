@@ -475,6 +475,21 @@ fn status_class(status: u16) -> &'static str {
     }
 }
 
+fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "CONNECT" => "CONNECT",
+        "OPTIONS" => "OPTIONS",
+        "TRACE" => "TRACE",
+        "PATCH" => "PATCH",
+        _ => "OTHER",
+    }
+}
+
 fn normalize_label(value: &str, empty: &'static str) -> String {
     if value.is_empty() {
         empty.to_string()
@@ -525,7 +540,7 @@ pub fn record_request(
         .with_label_values(&[status_class, effective_mode.as_str()])
         .inc();
     REQUEST_METHOD_TOTAL
-        .with_label_values(&[method, effective_mode.as_str()])
+        .with_label_values(&[method_label(method), effective_mode.as_str()])
         .inc();
 
     if let Some(client) = client {
@@ -987,6 +1002,41 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn request_method_labels_are_bounded() {
+        for method in [
+            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+        ] {
+            assert_eq!(method_label(method), method);
+        }
+        for method in ["get", "CUSTOM", "UNKNOWN", "M-SEARCH", ""] {
+            assert_eq!(method_label(method), "OTHER");
+        }
+
+        for index in 0..1_000 {
+            record_request(
+                None,
+                None,
+                "ALLOW",
+                "m17-cardinality-test",
+                &format!("CUSTOM-{index}"),
+                StatusCode::OK,
+                Duration::ZERO,
+            );
+        }
+        let text = String::from_utf8(gather()).expect("utf8");
+        let method_series: Vec<_> = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("requests_method_total{")
+                    && line.contains("effective_mode=\"m17-cardinality-test\"")
+            })
+            .collect();
+        assert_eq!(method_series.len(), 1, "{method_series:?}");
+        assert!(method_series[0].contains("method=\"OTHER\""));
+        assert!(method_series[0].ends_with(" 1000"));
+    }
 
     #[test]
     fn record_basic_metrics() {

@@ -499,4 +499,43 @@ mod tests {
             "missing cache_store in output: {output}"
         );
     }
+
+    #[test]
+    fn access_log_keeps_extension_method_while_metrics_use_other() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufferWriter {
+            buf: buffer.clone(),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_target(false)
+            .without_time()
+            .compact()
+            .finish();
+
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let event = AccessLogBuilder::new(peer)
+            .method("CUSTOM-M17")
+            .scheme("http")
+            .host("example.com")
+            .path("/resource")
+            .decision("ALLOW")
+            .status(StatusCode::OK)
+            .build();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_access(event);
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let output = strip_ansi(&output);
+        assert!(
+            output.contains("method=\"CUSTOM-M17\""),
+            "raw method missing from access log: {output}"
+        );
+
+        let metrics = String::from_utf8(crate::metrics::gather()).unwrap();
+        assert!(!metrics.contains("method=\"CUSTOM-M17\""));
+        assert!(metrics.contains("method=\"OTHER\""));
+    }
 }
