@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use nix::fcntl::{Flock, FlockArg};
 use nix::libc::O_NOFOLLOW;
 use nix::unistd::geteuid;
 use rand::{TryRng, rngs::SysRng};
@@ -27,6 +28,9 @@ const ROOT_CERT_FILE: &str = "root.crt";
 const ROOT_KEY_FILE: &str = "root.key";
 const INTERMEDIATE_CERT_FILE: &str = "intermediate.crt";
 const INTERMEDIATE_KEY_FILE: &str = "intermediate.key";
+const PENDING_GENERATION_DIR: &str = ".exfilguard-ca.pending";
+const GENERATION_READY_FILE: &str = "ready";
+const GENERATION_READY_CONTENTS: &str = "exfilguard-ca-generation-v1\n";
 const ROOT_VALIDITY_YEARS: i64 = 10;
 const LEAF_ISSUER_EXPIRY_MARGIN: Duration = Duration::minutes(5);
 
@@ -61,7 +65,26 @@ impl CertificateAuthority {
         let expected_uid = geteuid().as_raw();
         validate_ca_directory(ca_dir, expected_uid)?;
 
+        // Serialize built-in generation and recovery without persisting a lock
+        // file alongside the documented CA material. flock(2) on the directory
+        // is sufficient because all participating ExfilGuard processes take it.
+        let _generation_lock = if allow_generation {
+            Some(lock_ca_directory(ca_dir)?)
+        } else {
+            None
+        };
+
         let paths = CaPaths::new(ca_dir);
+        let pending_generation = ca_dir.join(PENDING_GENERATION_DIR);
+        if allow_generation {
+            recover_pending_generation(&paths, expected_uid)?;
+        } else if path_exists_no_follow(&pending_generation)? {
+            bail!(
+                "unfinished built-in CA generation found at {}; start once with source = \"builtin\" to recover it, or remove it after verifying the externally managed CA material",
+                pending_generation.display()
+            );
+        }
+
         let has_root_cert = path_exists_no_follow(&paths.root_cert)?;
         let has_root_key = path_exists_no_follow(&paths.root_key)?;
         let has_intermediate_cert = path_exists_no_follow(&paths.intermediate_cert)?;
@@ -121,6 +144,13 @@ impl CertificateAuthority {
     }
 
     fn generate(paths: &CaPaths) -> Result<Self> {
+        Self::generate_with_hook(paths, |_| Ok(()))
+    }
+
+    fn generate_with_hook(
+        paths: &CaPaths,
+        mut after_step: impl FnMut(GenerationStep) -> Result<()>,
+    ) -> Result<Self> {
         let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|err| anyhow!("failed to generate root key: {err}"))?;
         let now = OffsetDateTime::now_utc();
@@ -142,9 +172,48 @@ impl CertificateAuthority {
         let intermediate_cert_pem = intermediate_cert.pem();
         let intermediate_key_pem = Zeroizing::new(intermediate_key.serialize_pem());
 
-        write_pem_file(&paths.root_cert, &root_cert_pem, false)?;
-        write_pem_file(&paths.intermediate_cert, &intermediate_cert_pem, false)?;
-        write_pem_file(&paths.intermediate_key, intermediate_key_pem.as_str(), true)?;
+        let pending_dir = paths.dir.join(PENDING_GENERATION_DIR);
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&pending_dir)
+            .with_context(|| {
+                format!(
+                    "failed to create pending CA generation {}",
+                    pending_dir.display()
+                )
+            })?;
+        sync_directory(paths.dir)?;
+        after_step(GenerationStep::PendingDirectoryCreated)?;
+
+        let pending_paths = CaPaths::new(&pending_dir);
+        write_pem_file(&pending_paths.root_cert, &root_cert_pem, false)?;
+        after_step(GenerationStep::RootCertificateStaged)?;
+        write_pem_file(
+            &pending_paths.intermediate_cert,
+            &intermediate_cert_pem,
+            false,
+        )?;
+        after_step(GenerationStep::IntermediateCertificateStaged)?;
+        write_pem_file(
+            &pending_paths.intermediate_key,
+            intermediate_key_pem.as_str(),
+            true,
+        )?;
+        after_step(GenerationStep::IntermediateKeyStaged)?;
+        // The marker may become durable only after every prerequisite filename
+        // is durable; file fsync alone does not persist its directory entry.
+        sync_directory(&pending_dir)?;
+        after_step(GenerationStep::StagedFilesSynced)?;
+        write_pem_file(
+            &pending_dir.join(GENERATION_READY_FILE),
+            GENERATION_READY_CONTENTS,
+            true,
+        )?;
+        after_step(GenerationStep::ReadyMarkerStaged)?;
+        sync_directory(&pending_dir)?;
+        after_step(GenerationStep::ReadyMarkerSynced)?;
+
+        publish_pending_generation(paths, &pending_paths, &mut after_step)?;
 
         let expected_uid = geteuid().as_raw();
         for (path, kind) in [
@@ -154,6 +223,10 @@ impl CertificateAuthority {
         ] {
             validate_ca_file(path, kind, expected_uid)?;
         }
+
+        discard_pending_generation(&pending_dir)?;
+        sync_directory(paths.dir)?;
+        after_step(GenerationStep::PendingGenerationRemoved)?;
 
         // The built-in root key is intentionally never persisted.
         drop(root_key);
@@ -168,16 +241,22 @@ impl CertificateAuthority {
     }
 
     fn load_existing(paths: &CaPaths) -> Result<Self> {
+        let authority = Self::from_existing_material(paths)?;
+
+        info!(
+            directory = %paths.dir.display(),
+            "loaded existing certificate authority material"
+        );
+        Ok(authority)
+    }
+
+    fn from_existing_material(paths: &CaPaths) -> Result<Self> {
         let root_der = read_certificate_der(&paths.root_cert)?;
         let intermediate_der = read_certificate_der(&paths.intermediate_cert)?;
         let intermediate_key_pem = read_private_key_pem(&paths.intermediate_key)?;
         let intermediate_key = KeyPair::from_pem(intermediate_key_pem.as_ref())
             .map_err(|err| anyhow!("failed to parse intermediate key: {err}"))?;
 
-        info!(
-            directory = %paths.dir.display(),
-            "loaded existing certificate authority material"
-        );
         Self::from_material(root_der, intermediate_der, intermediate_key)
     }
 
@@ -359,10 +438,231 @@ fn write_pem_file(path: &Path, contents: &str, private: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationStep {
+    PendingDirectoryCreated,
+    RootCertificateStaged,
+    IntermediateCertificateStaged,
+    IntermediateKeyStaged,
+    StagedFilesSynced,
+    ReadyMarkerStaged,
+    ReadyMarkerSynced,
+    RootCertificatePublished,
+    IntermediateCertificatePublished,
+    IntermediateKeyPublished,
+    PublishedDirectorySynced,
+    PendingGenerationRemoved,
+}
+
+fn lock_ca_directory(path: &Path) -> Result<Flock<File>> {
+    let directory = File::open(path)
+        .with_context(|| format!("failed to open CA directory {} for locking", path.display()))?;
+    Flock::lock(directory, FlockArg::LockExclusive).map_err(|(_, err)| {
+        anyhow!(
+            "failed to lock CA directory {} for generation: {err}",
+            path.display()
+        )
+    })
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("failed to open directory {} for syncing", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", path.display()))
+}
+
+fn recover_pending_generation(paths: &CaPaths, expected_uid: u32) -> Result<()> {
+    let pending_dir = paths.dir.join(PENDING_GENERATION_DIR);
+    if !path_exists_no_follow(&pending_dir)? {
+        return Ok(());
+    }
+
+    validate_ca_directory(&pending_dir, expected_uid)?;
+    let ready_path = pending_dir.join(GENERATION_READY_FILE);
+    if !path_exists_no_follow(&ready_path)?
+        || !generation_marker_is_ready(&ready_path, expected_uid)?
+    {
+        discard_pending_generation(&pending_dir)?;
+        sync_directory(paths.dir)?;
+        return Ok(());
+    }
+
+    let pending_paths = CaPaths::new(&pending_dir);
+    validate_pending_generation(&pending_paths, expected_uid)?;
+    publish_pending_generation(paths, &pending_paths, &mut |_| Ok(()))?;
+    discard_pending_generation(&pending_dir)?;
+    sync_directory(paths.dir)?;
+    Ok(())
+}
+
+fn validate_pending_generation(paths: &CaPaths, expected_uid: u32) -> Result<()> {
+    validate_ca_directory(paths.dir, expected_uid)?;
+    ensure!(
+        !path_exists_no_follow(&paths.root_key)?,
+        "pending CA generation {} unexpectedly contains {}; ExfilGuard never persists a root private key",
+        paths.dir.display(),
+        ROOT_KEY_FILE
+    );
+    for (path, kind) in [
+        (&paths.root_cert, CaFileKind::Certificate),
+        (&paths.intermediate_cert, CaFileKind::Certificate),
+        (&paths.intermediate_key, CaFileKind::PrivateKey),
+    ] {
+        validate_ca_file(path, kind, expected_uid).with_context(|| {
+            format!(
+                "pending CA generation {} is incomplete or unsafe",
+                paths.dir.display()
+            )
+        })?;
+    }
+
+    let ready_path = paths.dir.join(GENERATION_READY_FILE);
+    ensure!(
+        generation_marker_is_ready(&ready_path, expected_uid)?,
+        "pending CA generation marker {} is incomplete",
+        ready_path.display()
+    );
+
+    // Do not publish a durable but unusable hierarchy. The staged key and
+    // certificates must pass the same cryptographic validation as live files.
+    CertificateAuthority::from_existing_material(paths)?;
+    Ok(())
+}
+
+fn generation_marker_is_ready(path: &Path, expected_uid: u32) -> Result<bool> {
+    let mut ready_file = open_validated_ca_file(path, CaFileKind::TransactionMarker, expected_uid)?;
+    let ready_metadata = ready_file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if ready_metadata.len() != GENERATION_READY_CONTENTS.len() as u64 {
+        return Ok(false);
+    }
+    let mut contents = Vec::with_capacity(GENERATION_READY_CONTENTS.len());
+    ready_file
+        .read_to_end(&mut contents)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(contents == GENERATION_READY_CONTENTS.as_bytes())
+}
+
+fn publish_pending_generation(
+    final_paths: &CaPaths,
+    pending_paths: &CaPaths,
+    after_step: &mut impl FnMut(GenerationStep) -> Result<()>,
+) -> Result<()> {
+    let expected_uid = geteuid().as_raw();
+    validate_pending_generation(pending_paths, expected_uid)?;
+
+    for (source, destination, kind, step) in [
+        (
+            &pending_paths.root_cert,
+            &final_paths.root_cert,
+            CaFileKind::Certificate,
+            GenerationStep::RootCertificatePublished,
+        ),
+        (
+            &pending_paths.intermediate_cert,
+            &final_paths.intermediate_cert,
+            CaFileKind::Certificate,
+            GenerationStep::IntermediateCertificatePublished,
+        ),
+        (
+            &pending_paths.intermediate_key,
+            &final_paths.intermediate_key,
+            CaFileKind::PrivateKey,
+            GenerationStep::IntermediateKeyPublished,
+        ),
+    ] {
+        if path_exists_no_follow(destination)? {
+            validate_ca_file(destination, kind, expected_uid)?;
+            let source_metadata = fs::metadata(source)
+                .with_context(|| format!("failed to inspect {}", source.display()))?;
+            let destination_metadata = fs::metadata(destination)
+                .with_context(|| format!("failed to inspect {}", destination.display()))?;
+            ensure!(
+                source_metadata.dev() == destination_metadata.dev()
+                    && source_metadata.ino() == destination_metadata.ino(),
+                "cannot recover pending CA generation because {} contains different material",
+                destination.display()
+            );
+            continue;
+        }
+
+        fs::hard_link(source, destination).with_context(|| {
+            format!(
+                "failed to publish pending CA file {} as {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        after_step(step)?;
+    }
+
+    sync_directory(final_paths.dir)?;
+    after_step(GenerationStep::PublishedDirectorySynced)?;
+    Ok(())
+}
+
+fn discard_pending_generation(path: &Path) -> Result<()> {
+    let allowed_names = [
+        GENERATION_READY_FILE,
+        ROOT_CERT_FILE,
+        INTERMEDIATE_CERT_FILE,
+        INTERMEDIATE_KEY_FILE,
+    ];
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to inspect pending CA generation {}", path.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("failed to inspect pending CA generation {}", path.display())
+        })?;
+        let name = entry.file_name();
+        ensure!(
+            allowed_names.iter().any(|allowed| name == *allowed),
+            "pending CA generation {} contains unrecognized entry {:?}; refusing to remove it",
+            path.display(),
+            name
+        );
+        let metadata = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        ensure!(
+            !metadata.is_dir(),
+            "pending CA generation entry {} is a directory; refusing to remove it",
+            entry.path().display()
+        );
+    }
+
+    // Remove and durably forget the commit marker first. If cleanup is
+    // interrupted, recovery can then recognize the remainder as disposable
+    // staging rather than complete material that still needs publishing.
+    let ready_path = path.join(GENERATION_READY_FILE);
+    if path_exists_no_follow(&ready_path)? {
+        fs::remove_file(&ready_path)
+            .with_context(|| format!("failed to remove {}", ready_path.display()))?;
+        sync_directory(path)?;
+    }
+    for name in [
+        ROOT_CERT_FILE,
+        INTERMEDIATE_CERT_FILE,
+        INTERMEDIATE_KEY_FILE,
+    ] {
+        let entry = path.join(name);
+        if path_exists_no_follow(&entry)? {
+            fs::remove_file(&entry)
+                .with_context(|| format!("failed to remove {}", entry.display()))?;
+        }
+    }
+    sync_directory(path)?;
+    fs::remove_dir(path)
+        .with_context(|| format!("failed to remove pending CA generation {}", path.display()))?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum CaFileKind {
     Certificate,
     PrivateKey,
+    TransactionMarker,
 }
 
 fn path_exists_no_follow(path: &Path) -> Result<bool> {
@@ -477,6 +777,12 @@ fn validate_ca_file_metadata(
             path.display(),
             mode,
             path.display()
+        ),
+        CaFileKind::TransactionMarker => ensure!(
+            matches!(mode, 0o400 | 0o600),
+            "CA transaction marker {} has mode {:04o}; expected 0400 or 0600",
+            path.display(),
+            mode
         ),
     }
     Ok(())
@@ -608,6 +914,8 @@ mod tests {
     use std::fs;
     use std::net::IpAddr;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
     use x509_parser::parse_x509_certificate;
@@ -662,6 +970,146 @@ mod tests {
             ca_second.intermediate_certificate_der().as_ref().to_vec()
         );
         assert_eq!(key_first, ca_second.signing_key().serialize_der());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_builtin_initialization_publishes_one_generation() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        let directory = Arc::new(dir.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let directory = directory.clone();
+            let barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                CertificateAuthority::load_builtin(directory.as_ref())
+            }));
+        }
+        barrier.wait();
+
+        let first = workers
+            .remove(0)
+            .join()
+            .expect("first CA initializer panicked")?;
+        let second = workers
+            .remove(0)
+            .join()
+            .expect("second CA initializer panicked")?;
+        assert_eq!(
+            first.root_certificate_der().as_ref(),
+            second.root_certificate_der().as_ref()
+        );
+        assert!(!dir.path().join(PENDING_GENERATION_DIR).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_generation_recovers_after_every_persistence_step() -> Result<()> {
+        let steps = [
+            GenerationStep::PendingDirectoryCreated,
+            GenerationStep::RootCertificateStaged,
+            GenerationStep::IntermediateCertificateStaged,
+            GenerationStep::IntermediateKeyStaged,
+            GenerationStep::StagedFilesSynced,
+            GenerationStep::ReadyMarkerStaged,
+            GenerationStep::ReadyMarkerSynced,
+            GenerationStep::RootCertificatePublished,
+            GenerationStep::IntermediateCertificatePublished,
+            GenerationStep::IntermediateKeyPublished,
+            GenerationStep::PublishedDirectorySynced,
+            GenerationStep::PendingGenerationRemoved,
+        ];
+
+        for failed_step in steps {
+            let dir = secure_ca_temp_dir()?;
+            let paths = CaPaths::new(dir.path());
+            let mut injected = false;
+            let error = CertificateAuthority::generate_with_hook(&paths, |completed_step| {
+                if completed_step == failed_step && !injected {
+                    injected = true;
+                    bail!("injected failure after {completed_step:?}");
+                }
+                Ok(())
+            })
+            .err()
+            .expect("the selected persistence step must fail");
+            assert!(injected, "step {failed_step:?} was not reached: {error:?}");
+
+            let recovered = CertificateAuthority::load_builtin(dir.path())?;
+            assert!(!dir.path().join(PENDING_GENERATION_DIR).exists());
+            assert!(dir.path().join(ROOT_CERT_FILE).is_file());
+            assert!(dir.path().join(INTERMEDIATE_CERT_FILE).is_file());
+            assert!(dir.path().join(INTERMEDIATE_KEY_FILE).is_file());
+            recovered.mint_leaf(&["recovered.example"], StdDuration::from_secs(60))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_generation_recovers_after_interrupted_cleanup() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        let paths = CaPaths::new(dir.path());
+        let error = CertificateAuthority::generate_with_hook(&paths, |completed_step| {
+            if completed_step == GenerationStep::PublishedDirectorySynced {
+                bail!("leave a durable published generation pending cleanup");
+            }
+            Ok(())
+        })
+        .err()
+        .expect("failure should leave the pending generation in place");
+        assert!(error.to_string().contains("durable published generation"));
+
+        let pending_dir = dir.path().join(PENDING_GENERATION_DIR);
+        fs::remove_file(pending_dir.join(GENERATION_READY_FILE))?;
+        fs::remove_file(pending_dir.join(ROOT_CERT_FILE))?;
+
+        CertificateAuthority::load_builtin(dir.path())?;
+        assert!(!pending_dir.exists());
+        assert!(dir.path().join(ROOT_CERT_FILE).is_file());
+        assert!(dir.path().join(INTERMEDIATE_CERT_FILE).is_file());
+        assert!(dir.path().join(INTERMEDIATE_KEY_FILE).is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_generation_discards_an_incompletely_written_ready_marker() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        let pending_dir = dir.path().join(PENDING_GENERATION_DIR);
+        DirBuilder::new().mode(0o700).create(&pending_dir)?;
+        write_pem_file(&pending_dir.join(ROOT_CERT_FILE), "partial", false)?;
+        write_pem_file(&pending_dir.join(GENERATION_READY_FILE), "", true)?;
+
+        CertificateAuthority::load_builtin(dir.path())?;
+        assert!(!pending_dir.exists());
+        assert!(dir.path().join(ROOT_CERT_FILE).is_file());
+        assert!(dir.path().join(INTERMEDIATE_CERT_FILE).is_file());
+        assert!(dir.path().join(INTERMEDIATE_KEY_FILE).is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_recovery_never_overwrites_different_final_material() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        let paths = CaPaths::new(dir.path());
+        CertificateAuthority::generate_with_hook(&paths, |completed_step| {
+            if completed_step == GenerationStep::ReadyMarkerSynced {
+                bail!("leave a complete staged generation");
+            }
+            Ok(())
+        })
+        .err()
+        .expect("generation should stop before publication");
+
+        let final_root = dir.path().join(ROOT_CERT_FILE);
+        write_pem_file(&final_root, "operator material", false)?;
+        let err = CertificateAuthority::load_builtin(dir.path())
+            .err()
+            .expect("recovery must reject conflicting final material");
+        assert!(err.to_string().contains("different material"), "{err:?}");
+        assert_eq!(fs::read_to_string(final_root)?, "operator material");
+        assert!(dir.path().join(PENDING_GENERATION_DIR).exists());
         Ok(())
     }
 
@@ -773,6 +1221,24 @@ mod tests {
             err.to_string().contains("files CA source requires"),
             "{err:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn files_source_does_not_recover_builtin_generation() -> Result<()> {
+        let dir = secure_ca_temp_dir()?;
+        let pending_dir = dir.path().join(PENDING_GENERATION_DIR);
+        DirBuilder::new().mode(0o700).create(&pending_dir)?;
+
+        let err = CertificateAuthority::load_files(dir.path())
+            .err()
+            .expect("files source must not mutate a built-in transaction");
+        assert!(
+            err.to_string()
+                .contains("unfinished built-in CA generation"),
+            "{err:?}"
+        );
+        assert!(pending_dir.exists());
         Ok(())
     }
 

@@ -132,11 +132,13 @@ ca/
 ```
 
 The root key exists only while the hierarchy is generated and is never written
-to disk. Consequently, `builtin` cannot renew or replace its intermediate
-under the same root. An incomplete directory fails startup rather than
-silently creating a new trust anchor. Before the hierarchy expires, or after a
-key compromise, generate a new hierarchy and distribute its new root to
-clients.
+to disk. First-run creation is a recoverable filesystem transaction: ExfilGuard
+stages and validates the complete hierarchy, publishes it durably, and resumes
+or discards only its own recognizable staging state after interruption.
+Operator-created incomplete material still fails startup rather than silently
+creating a new trust anchor. Consequently, `builtin` cannot renew or replace
+its intermediate under the same root. Before the hierarchy expires, or after a
+key compromise, generate a new hierarchy and distribute its new root to clients.
 
 The Debian package selects `builtin`, creates `/var/lib/exfilguard/ca` as
 `exfilguard:exfilguard` mode `0700`, and runs the service with `UMask=0077`.

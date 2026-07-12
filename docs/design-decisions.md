@@ -127,10 +127,11 @@ read.
 
 ExfilGuard has three CA sources with deliberately different ownership models.
 `builtin` creates a long-lived root and intermediate once, persists only the
-certificates and intermediate key, and does not renew them. `files` loads the
-same three artifacts but never creates or changes them. `vault` generates each
-intermediate key in memory, has a selected Vault PKI issuer sign it, and renews
-the complete issuer generation before expiry.
+certificates and intermediate key through a recoverable filesystem transaction,
+and does not renew them. `files` loads the same three artifacts but never creates
+or changes them. `vault` generates each intermediate key in memory, has a
+selected Vault PKI issuer sign it, and renews the complete issuer generation
+before expiry.
 
 The sources never silently fall back to one another. In particular, Vault
 unavailability after a restart prevents inspected HTTPS from starting because
