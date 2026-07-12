@@ -8,6 +8,7 @@ use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::warn;
 
+use crate::io_util::PrefixedIo;
 use crate::proxy::{
     AppContext,
     http::handle_decrypted_https,
@@ -24,13 +25,14 @@ pub struct BumpStats {
 
 pub async fn handle_bump(
     stream: TcpStream,
+    prefetched: Vec<u8>,
     target: &ConnectTarget,
     resolved: ResolvedTarget,
     app: &AppContext,
     peer: SocketAddr,
     flow_context: RequestFlowContext,
 ) -> Result<BumpStats> {
-    let mut stream = stream;
+    let mut stream = PrefixedIo::new(stream, prefetched);
     let tunnel_idle_timeout = app.settings.connect_tunnel_idle_timeout();
     let handshake_bytes = send_connect_established(&mut stream, tunnel_idle_timeout).await?;
 

@@ -23,6 +23,7 @@ use super::{session::ConnectSession, target::parse_connect_target};
 
 pub struct ConnectRequest<'a> {
     pub stream: TcpStream,
+    pub prefetched: Vec<u8>,
     pub peer: SocketAddr,
     pub target: &'a str,
     pub snapshot: PolicySnapshot,
@@ -36,6 +37,7 @@ pub struct ConnectRequest<'a> {
 pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
     let ConnectRequest {
         stream,
+        prefetched,
         peer,
         target,
         snapshot,
@@ -45,6 +47,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
     } = ctx;
     let response_timeout = app.settings.response_body_idle_timeout();
     let mut stream = Some(stream);
+    let mut prefetched = Some(prefetched);
     let parsed_target = match parse_connect_target(target) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -85,6 +88,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
     let mut handler = ConnectRequestHandler {
         session: &mut session,
         stream: &mut stream,
+        prefetched: &mut prefetched,
         app,
         peer,
         snapshot: &snapshot,
@@ -105,6 +109,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
 struct ConnectRequestHandler<'a> {
     session: &'a mut ConnectSession,
     stream: &'a mut Option<TcpStream>,
+    prefetched: &'a mut Option<Vec<u8>>,
     app: &'a AppContext,
     peer: SocketAddr,
     snapshot: &'a PolicySnapshot,
@@ -117,9 +122,10 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
 
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
         let stream = self.stream.take().expect("stream present");
+        let prefetched = self.prefetched.take().expect("prefetched bytes present");
         let policy_eval::AllowOutcome { decision, log } = outcome;
         self.session
-            .process_tunnel_allow(stream, decision, log, self.app)
+            .process_tunnel_allow(stream, prefetched, decision, log, self.app)
             .await
     }
 
@@ -143,9 +149,16 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
             .evaluate_tls_bump_preflight(self.peer.ip(), &request)
         {
             let stream = self.stream.take().expect("stream present");
+            let prefetched = self.prefetched.take().expect("prefetched bytes present");
             return self
                 .session
-                .process_tls_bump_preflight(stream, preflight.client, outcome.log, self.app)
+                .process_tls_bump_preflight(
+                    stream,
+                    prefetched,
+                    preflight.client,
+                    outcome.log,
+                    self.app,
+                )
                 .await;
         }
         self.session

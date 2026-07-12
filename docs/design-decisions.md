@@ -155,6 +155,13 @@ methods or paths. It checks those only after decryption.
 In `tunnel` mode, ExfilGuard may open a CONNECT tunnel and leave the payload
 alone.
 
+HTTP/1 clients may pipeline tunnel bytes immediately after the CONNECT header
+section. The HTTP parser can prefetch some of those bytes while finding the
+header boundary, so ExfilGuard preserves that bounded prefix across the mode
+switch. An allowed tunnel forwards it before later socket bytes; an inspected
+connection feeds it into the TLS handshake. A denied or failed CONNECT drops
+the prefix and never forwards it.
+
 This split makes the operator’s intent clear. It also keeps logs and metrics
 tied to the decision that actually mattered.
 

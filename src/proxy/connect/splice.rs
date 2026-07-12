@@ -54,6 +54,7 @@ impl ConnectTunnelCommittedError {
 
 pub async fn handle_splice(
     client_stream: &mut TcpStream,
+    prefetched: &[u8],
     target: &ConnectTarget,
     resolved: &ResolvedTarget,
     app: &AppContext,
@@ -72,6 +73,24 @@ pub async fn handle_splice(
         })?;
     let _tunnel_guard = crate::metrics::track_connect_tunnel();
 
+    if !prefetched.is_empty() {
+        write_all_with_timeout(
+            &mut upstream_stream,
+            prefetched,
+            tunnel_idle_timeout,
+            "forwarding prefetched CONNECT payload upstream",
+        )
+        .await
+        .map_err(|source| {
+            ConnectTunnelCommittedError::new(
+                handshake_bytes,
+                upstream_addr,
+                "tunnel_relay_failed",
+                source,
+            )
+        })?;
+    }
+
     let relay = relay_with_idle_timeouts(client_stream, &mut upstream_stream, tunnel_idle_timeout);
     let relay_result = if let Some(limit) = tunnel_max_lifetime {
         match tokio::time::timeout(limit, relay).await {
@@ -81,7 +100,7 @@ pub async fn handle_splice(
     } else {
         relay.await
     };
-    let (client_stream_bytes, upstream_stream_bytes) = relay_result
+    let (relayed_client_bytes, upstream_stream_bytes) = relay_result
         .context("CONNECT splice relay failed")
         .map_err(|source| {
             let error_reason = if source.downcast_ref::<ConnectTunnelTimeout>().is_some() {
@@ -91,6 +110,7 @@ pub async fn handle_splice(
             };
             ConnectTunnelCommittedError::new(handshake_bytes, upstream_addr, error_reason, source)
         })?;
+    let client_stream_bytes = (prefetched.len() as u64).saturating_add(relayed_client_bytes);
 
     timeout_with_context(
         tunnel_idle_timeout,
@@ -128,10 +148,10 @@ pub async fn handle_splice(
     })
 }
 
-pub async fn send_connect_established(
-    stream: &mut TcpStream,
-    write_timeout: Duration,
-) -> Result<u64> {
+pub async fn send_connect_established<S>(stream: &mut S, write_timeout: Duration) -> Result<u64>
+where
+    S: AsyncWrite + Unpin,
+{
     let established = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: exfilguard\r\n\r\n";
     write_all_with_timeout(
         stream,

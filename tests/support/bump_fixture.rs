@@ -471,6 +471,10 @@ impl BumpedTlsFixture {
         self.upstream_addr
     }
 
+    pub fn proxy_addr(&self) -> SocketAddr {
+        self.harness.addr
+    }
+
     pub fn accept_count(&self) -> usize {
         self.accept_count.load(Ordering::SeqCst)
     }

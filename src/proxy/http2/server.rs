@@ -11,7 +11,6 @@ use h2::server::{self, SendResponse};
 use http;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
     sync::{Mutex, Semaphore, watch},
     task::JoinSet,
     time::{sleep, timeout},
@@ -43,14 +42,17 @@ use super::{
     upstream::{Http2Upstream, PrimedHttp2Upstream},
 };
 
-pub async fn serve_bumped_http2(
-    stream: TlsStream<TcpStream>,
+pub async fn serve_bumped_http2<S>(
+    stream: TlsStream<S>,
     peer: SocketAddr,
     app: AppContext,
     connect_binding: Option<ResolvedTarget>,
     primed_upstream: Option<PrimedHttp2Upstream>,
     flow_context: RequestFlowContext,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut service = Http2BumpService::new(
         stream,
         peer,
@@ -63,19 +65,22 @@ pub async fn serve_bumped_http2(
     service.run().await
 }
 
-struct Http2BumpService {
+struct Http2BumpService<S> {
     peer: SocketAddr,
     app: AppContext,
-    connection: server::Connection<TlsStream<TcpStream>, Bytes>,
+    connection: server::Connection<TlsStream<S>, Bytes>,
     upstream: Arc<Mutex<Http2Upstream>>,
     upstream_closed: watch::Receiver<bool>,
     flow_context: RequestFlowContext,
     request_slots: Arc<Semaphore>,
 }
 
-impl Http2BumpService {
+impl<S> Http2BumpService<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     async fn new(
-        stream: TlsStream<TcpStream>,
+        stream: TlsStream<S>,
         peer: SocketAddr,
         app: AppContext,
         connect_binding: Option<ResolvedTarget>,

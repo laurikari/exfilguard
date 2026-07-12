@@ -89,6 +89,7 @@ impl ConnectSession {
     pub async fn process_tunnel_allow(
         &mut self,
         stream: TcpStream,
+        prefetched: Vec<u8>,
         allow: AllowDecision,
         log: RequestLogContext<'_>,
         app: &AppContext,
@@ -113,13 +114,14 @@ impl ConnectSession {
                 }
             };
 
-        self.handle_splice_path(stream, allow, log, resolved, app)
+        self.handle_splice_path(stream, prefetched, allow, log, resolved, app)
             .await
     }
 
     pub async fn process_tls_bump_preflight(
         &mut self,
         stream: TcpStream,
+        prefetched: Vec<u8>,
         client: Arc<str>,
         log: RequestLogContext<'_>,
         app: &AppContext,
@@ -143,7 +145,7 @@ impl ConnectSession {
                 }
             };
 
-        self.handle_bump_preflight_path(stream, client, log, resolved, app)
+        self.handle_bump_preflight_path(stream, prefetched, client, log, resolved, app)
             .await
     }
 
@@ -224,12 +226,13 @@ impl ConnectSession {
     async fn run_splice(
         &mut self,
         stream: &mut TcpStream,
+        prefetched: &[u8],
         resolved: &ResolvedTarget,
         allow: &AllowDecision,
         log: &RequestLogContext<'_>,
         app: &AppContext,
     ) -> Result<()> {
-        let stats = handle_splice(stream, &self.parsed, resolved, app).await?;
+        let stats = handle_splice(stream, prefetched, &self.parsed, resolved, app).await?;
         self.bytes_in = self.bytes_in.saturating_add(stats.client_stream_bytes);
         self.access_log_builder()
             .request_id(log.request_id())
@@ -253,6 +256,7 @@ impl ConnectSession {
     async fn run_bump(
         &mut self,
         stream: TcpStream,
+        prefetched: Vec<u8>,
         resolved: ResolvedTarget,
         client: &str,
         app: &AppContext,
@@ -260,6 +264,7 @@ impl ConnectSession {
     ) -> Result<()> {
         let bump_stats = handle_bump(
             stream,
+            prefetched,
             &self.parsed,
             resolved,
             app,
@@ -283,6 +288,7 @@ impl ConnectSession {
     async fn handle_splice_path(
         &mut self,
         stream: TcpStream,
+        prefetched: Vec<u8>,
         allow: AllowDecision,
         log: RequestLogContext<'_>,
         resolved: ResolvedTarget,
@@ -292,6 +298,7 @@ impl ConnectSession {
         let splice_result = self
             .run_splice(
                 stream_holder.as_mut().expect("CONNECT stream present"),
+                &prefetched,
                 &resolved,
                 &allow,
                 &log,
@@ -356,13 +363,14 @@ impl ConnectSession {
     async fn handle_bump_preflight_path(
         &mut self,
         stream: TcpStream,
+        prefetched: Vec<u8>,
         client: Arc<str>,
         log: RequestLogContext<'_>,
         resolved: ResolvedTarget,
         app: &AppContext,
     ) -> Result<()> {
         let bump_result = self
-            .run_bump(stream, resolved, client.as_ref(), app, &log)
+            .run_bump(stream, prefetched, resolved, client.as_ref(), app, &log)
             .await;
         match bump_result {
             Ok(()) => Ok(()),

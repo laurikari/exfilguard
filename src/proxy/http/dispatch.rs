@@ -32,6 +32,7 @@ pub(super) enum LoopOutcome<S> {
 
 pub(super) struct ConnectRequest<S> {
     pub stream: S,
+    pub prefetched: Vec<u8>,
     pub target: String,
     pub request_bytes: usize,
     pub start: Instant,
@@ -109,12 +110,14 @@ where
 
         if allow_connect && method == Method::CONNECT {
             let request_bytes = request_line_bytes + header_bytes;
+            let prefetched = reader.buffer().to_vec();
             let stream = reader.into_inner();
             upstream_pool
                 .shutdown_all(app.settings.response_body_idle_timeout())
                 .await?;
             return Ok(LoopOutcome::Connect(ConnectRequest {
                 stream,
+                prefetched,
                 target,
                 request_bytes,
                 start: header_start,

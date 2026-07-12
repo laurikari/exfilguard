@@ -7,6 +7,65 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::util::timeout_with_context;
 
+/// An I/O stream that returns an already-read prefix before continuing with the inner reader.
+/// Writes are passed directly to the inner stream.
+pub struct PrefixedIo<S> {
+    prefix: Vec<u8>,
+    position: usize,
+    inner: S,
+}
+
+impl<S> PrefixedIo<S> {
+    pub fn new(inner: S, prefix: Vec<u8>) -> Self {
+        Self {
+            prefix,
+            position: 0,
+            inner,
+        }
+    }
+}
+
+impl<S> AsyncRead for PrefixedIo<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.position < self.prefix.len() && buf.remaining() > 0 {
+            let available = &self.prefix[self.position..];
+            let read = available.len().min(buf.remaining());
+            buf.put_slice(&available[..read]);
+            self.position += read;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedIo<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 pub struct CountingWriter<W> {
     inner: W,
     bytes_written: u64,
@@ -342,13 +401,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BestEffortWriter, TeeWriter, copy_with_write_timeout, write_all_with_timeout};
+    use super::{
+        BestEffortWriter, PrefixedIo, TeeWriter, copy_with_write_timeout, write_all_with_timeout,
+    };
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
 
     use anyhow::Result;
-    use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex};
 
     struct ChunkWriter {
         max_chunk: usize,
@@ -440,6 +501,31 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn prefixed_io_reads_prefix_before_inner_and_delegates_writes() -> Result<()> {
+        let (inner, mut peer) = duplex(64);
+        peer.write_all(b"inner").await?;
+        peer.shutdown().await?;
+
+        let mut stream = PrefixedIo::new(inner, b"prefix-".to_vec());
+        let mut read = Vec::new();
+        let mut chunk = [0u8; 2];
+        loop {
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            read.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(read, b"prefix-inner");
+
+        stream.write_all(b"delegated").await?;
+        let mut written = [0u8; 9];
+        peer.read_exact(&mut written).await?;
+        assert_eq!(&written, b"delegated");
+        Ok(())
     }
 
     #[tokio::test]

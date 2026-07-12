@@ -25,6 +25,34 @@ use support::*;
 const CONNECT_ESTABLISHED_RESPONSE: &str =
     "HTTP/1.1 200 Connection Established\r\nProxy-Agent: exfilguard\r\n\r\n";
 
+async fn capture_tls_client_hello(host: &str) -> Result<Vec<u8>> {
+    let config = build_client_tls(rustls::RootCertStore::empty())?;
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+    let (client_io, mut capture_io) = tokio::io::duplex(16 * 1024);
+    let handshake = tokio::spawn(async move { connector.connect(server_name, client_io).await });
+
+    let mut header = [0u8; 5];
+    timeout(
+        StdDuration::from_secs(1),
+        capture_io.read_exact(&mut header),
+    )
+    .await??;
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let mut record = Vec::with_capacity(5 + record_len);
+    record.extend_from_slice(&header);
+    record.resize(5 + record_len, 0);
+    timeout(
+        StdDuration::from_secs(1),
+        capture_io.read_exact(&mut record[5..]),
+    )
+    .await??;
+
+    handshake.abort();
+    let _ = handshake.await;
+    Ok(record)
+}
+
 async fn read_tunnel_tail(stream: &mut TcpStream) -> Result<Vec<u8>> {
     timeout(StdDuration::from_secs(3), async {
         let mut tail = Vec::new();
@@ -1086,7 +1114,7 @@ async fn connect_bumped_private_resolution_is_blocked() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_splice_relays_payload() -> Result<()> {
+async fn connect_splice_preserves_pipelined_payload() -> Result<()> {
     const CLIENT_PAYLOAD: &[u8] = b"client->upstream";
     const UPSTREAM_PAYLOAD: &[u8] = b"upstream->client";
 
@@ -1133,7 +1161,9 @@ async fn connect_splice_relays_payload() -> Result<()> {
         upstream_addr.port(),
         upstream_addr.port()
     );
-    stream.write_all(connect_request.as_bytes()).await?;
+    let mut pipelined = connect_request.into_bytes();
+    pipelined.extend_from_slice(CLIENT_PAYLOAD);
+    stream.write_all(&pipelined).await?;
     stream.flush().await?;
 
     let response = read_http_response(&mut stream).await?;
@@ -1141,9 +1171,6 @@ async fn connect_splice_relays_payload() -> Result<()> {
         response.starts_with("HTTP/1.1 200"),
         "unexpected CONNECT establish response: {response}"
     );
-
-    stream.write_all(CLIENT_PAYLOAD).await?;
-    stream.flush().await?;
 
     let mut received = vec![0u8; UPSTREAM_PAYLOAD.len()];
     stream
@@ -1619,6 +1646,52 @@ async fn connect_bump_relays_https_response() -> Result<()> {
     client.stream_mut().shutdown().await.ok();
     fixture.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_preserves_pipelined_client_hello() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-pipelined-client-hello";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .upstream_mode(UpstreamMode::Http1Redirect),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+
+    let mut initial_client = fixture.take_tls_stream();
+    initial_client.shutdown().await.ok();
+
+    let client_hello = capture_tls_client_hello(upstream_host).await?;
+    let mut stream = TcpStream::connect(fixture.proxy_addr()).await?;
+    let connect_request = format!(
+        "CONNECT {upstream_host}:{port} HTTP/1.1\r\nHost: {upstream_host}:{port}\r\nProxy-Connection: keep-alive\r\n\r\n",
+        port = upstream_addr.port()
+    );
+    let mut pipelined = connect_request.into_bytes();
+    pipelined.extend_from_slice(&client_hello);
+    stream.write_all(&pipelined).await?;
+    stream.flush().await?;
+
+    let response = read_until_double_crlf(&mut stream).await?;
+    assert_eq!(response, CONNECT_ESTABLISHED_RESPONSE);
+
+    let mut server_record_header = [0u8; 5];
+    timeout(
+        StdDuration::from_secs(3),
+        stream.read_exact(&mut server_record_header),
+    )
+    .await??;
+    assert_eq!(
+        server_record_header[0], 22,
+        "proxy did not process the pipelined TLS ClientHello"
+    );
+
+    stream.shutdown().await.ok();
+    fixture.shutdown().await;
     Ok(())
 }
 
