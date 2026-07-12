@@ -26,7 +26,9 @@ use crate::{
         cache::HttpCache,
         connect::ResolvedTarget,
         forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
-        forward_limits::{AllowLogTracker, RequestDeadline, ResponseProgress},
+        forward_limits::{
+            AllowLogTracker, RequestDeadline, ResponseProgress, validate_declared_body_size,
+        },
         policy_eval::{self, AllowDecision, PolicyLogConfig, RequestLogContext},
         policy_response::{self, ForwardErrorSpec},
         request::RequestFlowContext,
@@ -568,6 +570,10 @@ impl RequestHandler for Http2RequestHandler {
         let progress = self.ctx.response_progress.clone();
         let result = deadline
             .run(&progress, async {
+                validate_declared_body_size(
+                    self.ctx.meta.content_length,
+                    self.ctx.max_request_body_size,
+                )?;
                 let cache_evaluation = evaluate_cache(
                     &self.ctx.meta,
                     self.ctx.body.is_end_stream(),

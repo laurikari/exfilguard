@@ -158,6 +158,18 @@ impl BodySizeTracker {
     }
 }
 
+pub fn validate_declared_body_size(
+    content_length: Option<usize>,
+    max_request_body_size: usize,
+) -> Result<()> {
+    if max_request_body_size > 0
+        && content_length.is_some_and(|length| length > max_request_body_size)
+    {
+        return Err(BodyTooLarge { bytes_read: 0 }.into());
+    }
+    Ok(())
+}
+
 /// Utility for enforcing a maximum number of header bytes while parsing.
 pub struct HeaderBudget {
     limit: usize,
@@ -246,6 +258,18 @@ impl AllowLogTracker {
 mod tests {
     use super::*;
     use std::future::pending;
+
+    #[test]
+    fn declared_body_size_validation_respects_limit_semantics() {
+        assert!(validate_declared_body_size(Some(999), 1000).is_ok());
+        assert!(validate_declared_body_size(Some(1000), 1000).is_ok());
+        assert!(validate_declared_body_size(None, 1000).is_ok());
+        assert!(validate_declared_body_size(Some(1001), 0).is_ok());
+
+        let error = validate_declared_body_size(Some(1001), 1000).unwrap_err();
+        let too_large = error.downcast_ref::<BodyTooLarge>().unwrap();
+        assert_eq!(too_large.bytes_read, 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn deadline_times_out_before_response_starts() {

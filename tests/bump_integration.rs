@@ -2388,6 +2388,74 @@ async fn connect_bump_http2_forwards_early_response_while_upload_is_active() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_rejects_declared_oversize_before_upstream_stream() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "limit-h2-declared-body";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET", "PUT"],
+        format!("https://{upstream_host}/**"),
+    ));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2CacheInspect)
+            .with_settings(|settings| {
+                settings.max_request_body_size = 1024;
+                settings.request_body_idle_timeout = 5;
+            }),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let oversized_request = http::Request::builder()
+        .method(Method::PUT)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/oversized")
+                .build()?,
+        )
+        .header(http::header::CONTENT_LENGTH, 1025)
+        .body(())?;
+    let (response, upload) = client.start_request_with_open_body(oversized_request)?;
+    let response = timeout(StdDuration::from_secs(1), response)
+        .await
+        .context("declared-oversize request was not rejected promptly")??;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        fixture.request_count(),
+        0,
+        "origin observed a stream for a known-oversize request"
+    );
+    drop(response);
+    drop(upload);
+
+    let follow_up = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/after-oversize")
+                .build()?,
+        )
+        .body(())?;
+    let (status, body) = timeout(StdDuration::from_secs(3), client.request_text(follow_up))
+        .await
+        .context("follow-up request timed out")??;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "request=1\npath=/after-oversize\nbody=");
+    assert_eq!(fixture.request_count(), 1);
+    assert_eq!(fixture.accept_count(), 1);
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_invalid_request_path_returns_400() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-invalid";

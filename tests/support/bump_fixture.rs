@@ -176,6 +176,15 @@ impl BumpedH2Client {
         Ok(response)
     }
 
+    pub fn start_request_with_open_body(
+        &mut self,
+        request: http::Request<()>,
+    ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>)> {
+        self.send_request
+            .send_request(request, false)
+            .context("failed to send HTTP/2 request")
+    }
+
     pub async fn request_text(
         &mut self,
         request: http::Request<()>,

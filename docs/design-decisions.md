@@ -248,6 +248,10 @@ controls for transport safety. Body size alone does not make a request invalid
 for policy purposes. Operators can still opt into a global request-body cap
 with `max_request_body_size` when that tradeoff fits their environment.
 
+When that cap is enabled, a request whose declared `Content-Length` already
+exceeds it is rejected before ExfilGuard opens an upstream request. Bodies
+without a declared length are still streamed and enforced incrementally.
+
 ## Real trust store for outbound TLS
 
 If the system trust store is empty, startup fails.
