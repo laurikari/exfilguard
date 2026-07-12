@@ -195,7 +195,8 @@ mod tests {
                 "HTTP/1.1 {} {}",
                 status.as_u16(),
                 status.canonical_reason().unwrap_or("OK")
-            ),
+            )
+            .into_bytes(),
             status,
             headers: Vec::new(),
             content_length: None,

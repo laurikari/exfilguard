@@ -64,6 +64,34 @@ fn log_field_value(line: &str, field: &str) -> Option<String> {
     }
 }
 
+async fn proxy_response_for_raw_upstream_response(upstream_response: Vec<u8>) -> Result<String> {
+    let upstream = TestUpstream::http_response(upstream_response).await?;
+    let upstream_port = upstream.port();
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/status HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(request.as_bytes()).await?;
+    let response = client.read_response().await?;
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    drop(upstream);
+    Ok(response)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_default_deny_returns_403() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
@@ -310,6 +338,60 @@ async fn http_invalid_upstream_header_value_returns_502() -> Result<()> {
     harness.shutdown().await;
     drop(upstream);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_upstream_status_lines_are_rejected_before_forwarding() -> Result<()> {
+    let cases = [
+        (
+            "embedded bare CR",
+            b"HTTP/1.1 200 OK\rInjected: yes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "bare LF terminator",
+            b"HTTP/1.1 200 OK\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ),
+    ];
+
+    for (case, upstream_response) in cases {
+        let response = proxy_response_for_raw_upstream_response(upstream_response).await?;
+        assert!(
+            response.starts_with("HTTP/1.1 502"),
+            "{case} reached the downstream client: {response:?}"
+        );
+        assert_eq!(
+            response.matches("HTTP/1.1 ").count(),
+            1,
+            "{case} produced more than one downstream response: {response:?}"
+        );
+        assert!(
+            !response.contains("200 OK") && !response.contains("Injected"),
+            "{case} leaked origin status-line bytes downstream: {response:?}"
+        );
+        assert!(
+            response.contains("upstream request failed"),
+            "{case} did not produce the standard upstream failure response: {response:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unusual_valid_upstream_reason_phrase_is_forwarded() -> Result<()> {
+    let status_line = "HTTP/1.1 299 Odd\tReason !~é";
+    let response = proxy_response_for_raw_upstream_response(
+        format!("{status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").into_bytes(),
+    )
+    .await?;
+
+    assert!(
+        response.starts_with(&format!("{status_line}\r\n")),
+        "valid reason phrase was rejected or rewritten: {response:?}"
+    );
+    assert!(response.ends_with("\r\n\r\nOK"));
     Ok(())
 }
 

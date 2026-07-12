@@ -26,7 +26,8 @@ a wildcard.
 
 ## Reject ambiguous syntax
 
-ExfilGuard rejects malformed or ambiguous request syntax.
+ExfilGuard rejects malformed or ambiguous HTTP syntax on both sides of the
+proxy.
 
 That includes cases such as:
 
@@ -36,8 +37,13 @@ That includes cases such as:
 - encoded path separators
 - encoded dot-segment tricks
 
+Upstream HTTP/1 status lines must use exact CRLF framing and the standard
+`HTTP/1.1 SP 3DIGIT SP [reason-phrase]` grammar. Valid reason-phrase bytes are
+preserved exactly; nonstandard separators and control bytes are rejected before
+the response is committed downstream.
+
 This is a security choice. ExfilGuard should not quietly “fix” a request into
-a different request.
+a different request or turn a malformed response into a different response.
 
 ## Close after a committed response fails
 

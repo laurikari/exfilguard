@@ -27,7 +27,7 @@ impl ConnectionOverride {
 }
 
 pub(crate) struct Http1ResponseHead {
-    pub status_line: String,
+    pub status_line: Vec<u8>,
     pub status: StatusCode,
     pub headers: Vec<Http1HeaderLine>,
     pub content_length: Option<u64>,
@@ -66,7 +66,7 @@ impl Http1ResponseHead {
         override_connection: Option<ConnectionOverride>,
     ) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(256);
-        buffer.extend_from_slice(self.status_line.as_bytes());
+        buffer.extend_from_slice(&self.status_line);
         buffer.extend_from_slice(b"\r\n");
 
         let mut connection_tokens = HashSet::new();
@@ -168,14 +168,14 @@ impl Http1ResponseHead {
 }
 
 pub(crate) fn encode_cached_http1_response(
-    status_line: &str,
+    status_line: &[u8],
     headers: &HeaderMap,
     body_plan: ResponseBodyPlan,
     content_length: Option<u64>,
     override_connection: Option<ConnectionOverride>,
 ) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(256);
-    buffer.extend_from_slice(status_line.as_bytes());
+    buffer.extend_from_slice(status_line);
     buffer.extend_from_slice(b"\r\n");
 
     let mut connection_tokens = HashSet::new();
@@ -347,13 +347,13 @@ where
         max_header_bytes > 0,
         "max response header size must be greater than zero"
     );
-    let mut status_line = String::new();
+    let mut status_line = Vec::new();
     let mut budget = HeaderBudget::new(
         max_header_bytes,
         "upstream response headers exceed configured limit",
     )?;
 
-    let bytes = read_line_with_timeout(
+    let bytes = super::line::read_line_bytes_with_timeout(
         reader,
         &mut status_line,
         timeout_dur,
@@ -365,8 +365,7 @@ where
         return Err(crate::proxy::forward_error::UpstreamClosed.into());
     }
     budget.record(bytes)?;
-    let trimmed = status_line.trim_end_matches(['\r', '\n']);
-    let (version, status, _) = parse_http1_status_line(trimmed)?;
+    let (version, status, _) = parse_http1_status_line(&status_line)?;
 
     let mut headers = Vec::new();
     let mut content_length = None;
@@ -455,7 +454,7 @@ where
     let chunked = transfer_codings.last().map(String::as_str) == Some("chunked");
 
     Ok(Http1ResponseHead {
-        status_line: trimmed.to_string(),
+        status_line: status_line[..status_line.len() - 2].to_vec(),
         status,
         headers,
         content_length,
@@ -465,28 +464,45 @@ where
     })
 }
 
-pub(crate) fn parse_http1_status_line(value: &str) -> Result<(Version, StatusCode, String)> {
-    let mut parts = value.split_whitespace();
-    let version = parts
-        .next()
-        .ok_or_else(|| anyhow!("upstream status line missing HTTP version"))?;
-    let status = parts
-        .next()
-        .ok_or_else(|| anyhow!("upstream status line missing status code"))?;
-    let reason = parts.collect::<Vec<_>>().join(" ");
+pub(crate) fn parse_http1_status_line(value: &[u8]) -> Result<(Version, StatusCode, &[u8])> {
+    ensure!(
+        value.ends_with(b"\r\n"),
+        "upstream status line must end with CRLF"
+    );
+    let line = &value[..value.len() - 2];
+    ensure!(
+        line.len() >= 13,
+        "upstream status line is missing required fields"
+    );
+    ensure!(
+        &line[..9] == b"HTTP/1.1 ",
+        "upstream status line must start with 'HTTP/1.1 '"
+    );
+    let status_bytes = &line[9..12];
+    ensure!(
+        status_bytes.iter().all(u8::is_ascii_digit),
+        "upstream status code must contain exactly three digits"
+    );
+    ensure!(
+        line[12] == b' ',
+        "upstream status code must be followed by a space"
+    );
 
-    let version = match version {
-        "HTTP/1.1" => Version::HTTP_11,
-        other => bail!("unsupported upstream HTTP version '{other}'"),
-    };
+    let reason = &line[13..];
+    ensure!(
+        reason
+            .iter()
+            .all(|byte| *byte == b'\t' || matches!(*byte, b' '..=b'~' | 0x80..=0xff)),
+        "upstream reason phrase contains invalid control bytes"
+    );
 
-    let status_code: u16 = status
-        .parse()
-        .with_context(|| format!("invalid upstream status code '{status}'"))?;
+    let status_code = u16::from(status_bytes[0] - b'0') * 100
+        + u16::from(status_bytes[1] - b'0') * 10
+        + u16::from(status_bytes[2] - b'0');
     let status = StatusCode::from_u16(status_code)
         .map_err(|_| anyhow!("unsupported upstream status code '{status_code}'"))?;
 
-    Ok((version, status, reason))
+    Ok((Version::HTTP_11, status, reason))
 }
 
 #[cfg(test)]
@@ -508,7 +524,7 @@ mod tests {
 
     fn empty_response_head(headers: Vec<Http1HeaderLine>) -> Http1ResponseHead {
         Http1ResponseHead {
-            status_line: "HTTP/1.1 200 OK".to_string(),
+            status_line: b"HTTP/1.1 200 OK".to_vec(),
             status: StatusCode::OK,
             headers,
             content_length: Some(0),
@@ -577,7 +593,7 @@ mod tests {
     #[test]
     fn response_encode_strips_hop_by_hop_and_connection_tokens() {
         let head = Http1ResponseHead {
-            status_line: "HTTP/1.1 200 OK".to_string(),
+            status_line: b"HTTP/1.1 200 OK".to_vec(),
             status: http::StatusCode::OK,
             headers: vec![
                 Http1HeaderLine::new("Connection", "Foo, Upgrade").expect("valid header"),
@@ -609,7 +625,7 @@ mod tests {
     #[test]
     fn response_encode_sets_content_length_for_fixed() {
         let head = Http1ResponseHead {
-            status_line: "HTTP/1.1 200 OK".to_string(),
+            status_line: b"HTTP/1.1 200 OK".to_vec(),
             status: http::StatusCode::OK,
             headers: vec![
                 Http1HeaderLine::new("Transfer-Encoding", "chunked").expect("valid header"),
@@ -665,7 +681,7 @@ mod tests {
         );
 
         let encoded = encode_cached_http1_response(
-            "HTTP/1.1 200 OK",
+            b"HTTP/1.1 200 OK",
             &headers,
             ResponseBodyPlan::Chunked,
             Some(123),
@@ -692,7 +708,7 @@ mod tests {
         );
 
         let encoded = encode_cached_http1_response(
-            "HTTP/1.1 200 OK",
+            b"HTTP/1.1 200 OK",
             &headers,
             ResponseBodyPlan::Empty,
             Some(5),
@@ -705,49 +721,86 @@ mod tests {
 
     #[test]
     fn parse_status_line_accepts_valid_line() -> anyhow::Result<()> {
-        let (version, status, reason) = parse_http1_status_line("HTTP/1.1 404 Not Found")?;
+        let (version, status, reason) = parse_http1_status_line(b"HTTP/1.1 404 Not Found\r\n")?;
         assert_eq!(version, Version::HTTP_11);
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(reason, "Not Found");
+        assert_eq!(reason, b"Not Found");
         Ok(())
     }
 
     #[test]
     fn parse_status_line_rejects_invalid_version() {
-        let err = parse_http1_status_line("BAD 200 OK").unwrap_err();
+        let err = parse_http1_status_line(b"NOTHTTP! 200 OK\r\n").unwrap_err();
         assert!(
-            err.to_string()
-                .contains("unsupported upstream HTTP version"),
+            err.to_string().contains("must start with 'HTTP/1.1 '"),
             "unexpected error: {err:?}"
         );
     }
 
     #[test]
     fn parse_status_line_rejects_http10() {
-        let err = parse_http1_status_line("HTTP/1.0 200 OK").unwrap_err();
+        let err = parse_http1_status_line(b"HTTP/1.0 200 OK\r\n").unwrap_err();
         assert!(
-            err.to_string()
-                .contains("unsupported upstream HTTP version"),
+            err.to_string().contains("must start with 'HTTP/1.1 '"),
             "unexpected error: {err:?}"
         );
     }
 
     #[test]
     fn parse_status_line_rejects_missing_code() {
-        let err = parse_http1_status_line("HTTP/1.1").unwrap_err();
+        let err = parse_http1_status_line(b"HTTP/1.1\r\n").unwrap_err();
         assert!(
-            err.to_string().contains("missing status code"),
+            err.to_string().contains("missing required fields"),
             "unexpected error: {err:?}"
         );
     }
 
     #[test]
     fn parse_status_line_rejects_non_numeric_code() {
-        let err = parse_http1_status_line("HTTP/1.1 twohundred OK").unwrap_err();
+        let err = parse_http1_status_line(b"HTTP/1.1 twohundred OK\r\n").unwrap_err();
         assert!(
-            err.to_string().contains("invalid upstream status code"),
+            err.to_string().contains("exactly three digits"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_status_line_accepts_standard_reason_bytes() -> anyhow::Result<()> {
+        for (line, expected_reason) in [
+            (&b"HTTP/1.1 204 \r\n"[..], &b""[..]),
+            (
+                &b"HTTP/1.1 299 unusual\t!~ \xff\r\n"[..],
+                &b"unusual\t!~ \xff"[..],
+            ),
+        ] {
+            let (_, _, reason) = parse_http1_status_line(line)?;
+            assert_eq!(reason, expected_reason);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_status_line_rejects_ambiguous_framing_and_controls() {
+        for line in [
+            &b"HTTP/1.1 200 OK\n"[..],
+            &b"HTTP/1.1 200 OK\r\r\n"[..],
+            &b"HTTP/1.1 200 OK\rInjected\r\n"[..],
+            &b" HTTP/1.1 200 OK\r\n"[..],
+            &b"HTTP/1.1\t200 OK\r\n"[..],
+            &b"HTTP/1.1  200 OK\r\n"[..],
+            &b"HTTP/1.1 200\r\n"[..],
+            &b"HTTP/1.1 0200 OK\r\n"[..],
+            &b"HTTP/1.1 +200 OK\r\n"[..],
+            &b"HTTP/1.1 200 bad\0reason\r\n"[..],
+            &b"HTTP/1.1 200 bad\x0breason\r\n"[..],
+            &b"HTTP/1.1 200 bad\x0creason\r\n"[..],
+            &b"HTTP/1.1 200 bad\x7freason\r\n"[..],
+        ] {
+            assert!(
+                parse_http1_status_line(line).is_err(),
+                "malformed status line was accepted: {line:?}"
+            );
+        }
     }
 
     #[tokio::test]

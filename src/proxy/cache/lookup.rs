@@ -29,7 +29,8 @@ impl CacheHit {
             "HTTP/1.1 {} {}",
             cached.status.as_u16(),
             cached.status.canonical_reason().unwrap_or("OK")
-        );
+        )
+        .into_bytes();
 
         let body_is_empty = method == Method::HEAD
             || matches!(
