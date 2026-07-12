@@ -408,6 +408,48 @@ async fn malformed_upstream_status_lines_are_rejected_before_forwarding() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forbidden_no_content_framing_is_rejected_before_forwarding() -> Result<()> {
+    let cases = [
+        (
+            "204 with Content-Length",
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+        ),
+        (
+            "204 with Transfer-Encoding",
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "205 with nonzero Content-Length",
+            b"HTTP/1.1 205 Reset Content\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+        ),
+        (
+            "205 with Transfer-Encoding",
+            b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec(),
+        ),
+    ];
+
+    for (case, upstream_response) in cases {
+        let response = proxy_response_for_raw_upstream_response(upstream_response).await?;
+        assert!(
+            response.starts_with("HTTP/1.1 502"),
+            "{case} reached the downstream client: {response:?}"
+        );
+        assert_eq!(
+            response.matches("HTTP/1.1 ").count(),
+            1,
+            "{case} produced more than one downstream response: {response:?}"
+        );
+        assert!(
+            !response.contains("204 No Content") && !response.contains("205 Reset Content"),
+            "{case} leaked the invalid origin response downstream: {response:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unusual_valid_upstream_reason_phrase_is_forwarded() -> Result<()> {
     let status_line = "HTTP/1.1 299 Odd\tReason !~é";
     let response = proxy_response_for_raw_upstream_response(

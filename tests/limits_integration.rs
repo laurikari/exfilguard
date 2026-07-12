@@ -589,6 +589,87 @@ async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unframed_reset_content_does_not_poison_upstream_pool() -> Result<()> {
+    let dirs = TestDirs::new()?;
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_connections = Arc::new(AtomicUsize::new(0));
+    let upstream_requests = Arc::new(AtomicUsize::new(0));
+    let upstream_connections_clone = upstream_connections.clone();
+    let upstream_requests_clone = upstream_requests.clone();
+
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match upstream_listener.accept().await {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            upstream_connections_clone.fetch_add(1, Ordering::SeqCst);
+            let upstream_requests = upstream_requests_clone.clone();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                loop {
+                    match read_until_double_crlf(&mut stream).await {
+                        Ok(request) if !request.is_empty() => {}
+                        Ok(_) | Err(_) => break,
+                    }
+                    let request_number = upstream_requests.fetch_add(1, Ordering::SeqCst);
+                    let response = if request_number == 0 {
+                        b"HTTP/1.1 205 Reset Content\r\n\r\nhello" as &[u8]
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                    };
+                    if stream.write_all(response).await.is_err() || stream.flush().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow"])
+        .policy(PolicySpec::new("allow").rule(RuleSpec::allow_any(format!(
+            "http://127.0.0.1:{upstream_port}/**"
+        ))))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut first = BufReader::new(TcpStream::connect(harness.addr).await?);
+    let first_request = format!(
+        "GET http://127.0.0.1:{upstream_port}/reset HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+    );
+    first.get_mut().write_all(first_request.as_bytes()).await?;
+    first.get_mut().flush().await?;
+    assert_eq!(read_response_status(&mut first).await?, 205);
+    drop(first);
+
+    let mut second = BufReader::new(TcpStream::connect(harness.addr).await?);
+    let second_request = format!(
+        "GET http://127.0.0.1:{upstream_port}/data HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    second
+        .get_mut()
+        .write_all(second_request.as_bytes())
+        .await?;
+    second.get_mut().flush().await?;
+    assert_eq!(read_response_status(&mut second).await?, 200);
+
+    assert_eq!(upstream_requests.load(Ordering::SeqCst), 2);
+    assert!(
+        upstream_connections.load(Ordering::SeqCst) >= 2,
+        "unframed 205 connection was returned to the upstream pool"
+    );
+
+    upstream_task.abort();
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_client_idle_timeout() -> Result<()> {
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()

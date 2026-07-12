@@ -4,7 +4,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
-use http::Method;
+use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -178,7 +178,9 @@ where
     let response_body_plan = determine_response_body_plan(&request.method, head.status, &head);
 
     let mut client_close = request_close || head.connection_close;
-    if matches!(response_body_plan, ResponseBodyPlan::UntilClose) {
+    if matches!(response_body_plan, ResponseBodyPlan::UntilClose)
+        || (head.status == StatusCode::RESET_CONTENT && head.content_length.is_none())
+    {
         client_close = true;
     }
 

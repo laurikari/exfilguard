@@ -52,7 +52,7 @@ where
         .saturating_add(timeouts.response_header);
     let read_sequence = async {
         loop {
-            let mut head = read_http1_response_head_with_budget(
+            let head = read_http1_response_head_with_budget(
                 upstream_reader,
                 per_read_timeout,
                 upstream_peer,
@@ -66,15 +66,9 @@ where
             }
 
             if head.status.is_informational() && head.status != StatusCode::SWITCHING_PROTOCOLS {
-                if head.transfer_encoding_present {
-                    bail!("informational response must not include a body");
+                if head.transfer_encoding_present || head.content_length.is_some() {
+                    bail!("informational response must not include body framing");
                 }
-                if let Some(length) = head.content_length
-                    && length > 0
-                {
-                    bail!("informational response must not include a body");
-                }
-                head.content_length = None;
                 let encoded = head.encode(ResponseBodyPlan::Empty, None);
                 write_all_with_timeout(
                     client,
@@ -93,6 +87,8 @@ where
                 continue;
             }
 
+            validate_final_response_framing(&head)?;
+
             return Ok(head);
         }
     };
@@ -108,6 +104,25 @@ where
         }
         Err(source) => Err(source),
     }
+}
+
+fn validate_final_response_framing(head: &Http1ResponseHead) -> Result<()> {
+    if head.status == StatusCode::NO_CONTENT
+        && (head.transfer_encoding_present || head.content_length.is_some())
+    {
+        bail!("204 response must not include Content-Length or Transfer-Encoding");
+    }
+
+    if head.status == StatusCode::RESET_CONTENT {
+        if head.transfer_encoding_present {
+            bail!("205 response with Transfer-Encoding is not supported");
+        }
+        if head.content_length.is_some_and(|length| length != 0) {
+            bail!("205 response must not include a nonzero Content-Length");
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn determine_response_body_plan(
@@ -606,8 +621,65 @@ mod tests {
             Ok(_) => panic!("expected informational response to be rejected"),
             Err(err) => assert!(
                 err.to_string()
-                    .contains("informational response must not include a body")
+                    .contains("informational response must not include body framing")
             ),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_final_response_head_rejects_forbidden_no_content_framing() -> anyhow::Result<()> {
+        for response in [
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 205 Reset Content\r\nContent-Length: 1\r\n\r\n".as_slice(),
+            b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+        ] {
+            let (mut upstream_writer, upstream_reader) = duplex(256);
+            let (_client_reader, mut client_writer) = duplex(256);
+            upstream_writer.write_all(response).await?;
+            drop(upstream_writer);
+
+            let mut upstream_reader = BufReader::new(upstream_reader);
+            let peer: SocketAddr = "127.0.0.1:8080".parse()?;
+            let result = read_final_response_head(
+                &mut upstream_reader,
+                &mut client_writer,
+                &test_timeouts(Duration::from_secs(1)),
+                peer,
+                256,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "invalid response was accepted: {response:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_final_response_head_accepts_safe_reset_content_framing() -> anyhow::Result<()> {
+        for response in [
+            b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 205 Reset Content\r\n\r\n".as_slice(),
+        ] {
+            let (mut upstream_writer, upstream_reader) = duplex(256);
+            let (_client_reader, mut client_writer) = duplex(256);
+            upstream_writer.write_all(response).await?;
+            drop(upstream_writer);
+
+            let mut upstream_reader = BufReader::new(upstream_reader);
+            let peer: SocketAddr = "127.0.0.1:8080".parse()?;
+            let (head, _) = read_final_response_head(
+                &mut upstream_reader,
+                &mut client_writer,
+                &test_timeouts(Duration::from_secs(1)),
+                peer,
+                256,
+            )
+            .await?;
+            assert_eq!(head.status, StatusCode::RESET_CONTENT);
         }
         Ok(())
     }
