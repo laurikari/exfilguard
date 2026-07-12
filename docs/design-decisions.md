@@ -39,6 +39,19 @@ That includes cases such as:
 This is a security choice. ExfilGuard should not quietly “fix” a request into
 a different request.
 
+## Close after a committed response fails
+
+Once ExfilGuard has sent a final HTTP response head or `200 Connection
+Established`, a later forwarding failure closes the downstream connection and
+is recorded in logs and metrics. It does not append another HTTP error
+response.
+
+After commitment, downstream bytes already have a defined protocol meaning;
+inside a CONNECT tunnel they may be arbitrary TLS or application data. A
+second plaintext status line would corrupt that stream and cannot reliably
+communicate the failure. Errors detected before commitment can still receive
+the appropriate HTTP error response.
+
 ## Cache only bodyless requests
 
 Shared-cache lookup and storage are limited to requests proven to have no body.

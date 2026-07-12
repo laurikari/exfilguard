@@ -26,7 +26,7 @@ use crate::{
 use super::{
     bump::handle_bump,
     resolve::{ResolvedTarget, resolve_connect_target},
-    splice::{ConnectTunnelTimeout, handle_splice},
+    splice::{ConnectTunnelCommittedError, handle_splice},
     target::ConnectTarget,
 };
 
@@ -299,8 +299,9 @@ impl ConnectSession {
             )
             .await;
         if let Err(err) = splice_result.as_ref()
-            && err.downcast_ref::<ConnectTunnelTimeout>().is_some()
+            && let Some(committed) = err.downcast_ref::<ConnectTunnelCommittedError>()
         {
+            crate::metrics::record_upstream_error("other");
             warn!(
                 peer = %self.peer,
                 request_id = log.request_id(),
@@ -308,20 +309,29 @@ impl ConnectSession {
                 host = %self.parsed.host,
                 path = log.logged_path(),
                 port = self.parsed.port,
-                "CONNECT tunnel exceeded max lifetime"
+                upstream_addr = %committed.upstream_addr,
+                error_reason = committed.error_reason,
+                error = %committed.source,
+                "CONNECT tunnel failed after the 200 response was committed"
             );
             self.access_log_builder()
                 .request_id(log.request_id())
-                .status(StatusCode::GATEWAY_TIMEOUT)
+                .status(StatusCode::OK)
                 .decision("ERROR")
                 .client(allow.client.as_ref())
                 .policy(allow.policy.as_ref())
                 .rule(allow.rule.as_ref())
                 .effective_mode("tunnel")
-                .bytes(self.bytes_in, 0)
+                .error_reason(committed.error_reason)
+                .error_detail(committed.source.to_string())
+                .bytes(self.bytes_in, committed.handshake_bytes)
                 .elapsed(self.start.elapsed())
+                .upstream_addr(committed.upstream_addr.to_string())
                 .upstream_reused(false)
                 .log();
+            // The downstream stream may now contain arbitrary tunneled bytes.
+            // Dropping it is the only protocol-safe response to a later error.
+            drop(stream_holder.take());
             return Ok(());
         }
         let stream_for_error = stream_holder;

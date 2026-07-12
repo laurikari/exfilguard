@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -26,6 +26,32 @@ pub struct SpliceStats {
 #[error("CONNECT tunnel max lifetime exceeded")]
 pub struct ConnectTunnelTimeout;
 
+#[derive(Debug, Error)]
+#[error("CONNECT tunnel failed after the downstream response was committed: {source}")]
+pub struct ConnectTunnelCommittedError {
+    pub handshake_bytes: u64,
+    pub upstream_addr: SocketAddr,
+    pub error_reason: &'static str,
+    #[source]
+    pub source: Error,
+}
+
+impl ConnectTunnelCommittedError {
+    fn new(
+        handshake_bytes: u64,
+        upstream_addr: SocketAddr,
+        error_reason: &'static str,
+        source: Error,
+    ) -> Self {
+        Self {
+            handshake_bytes,
+            upstream_addr,
+            error_reason,
+            source,
+        }
+    }
+}
+
 pub async fn handle_splice(
     client_stream: &mut TcpStream,
     target: &ConnectTarget,
@@ -39,33 +65,61 @@ pub async fn handle_splice(
     let tunnel_idle_timeout = app.settings.connect_tunnel_idle_timeout();
     let tunnel_max_lifetime = app.settings.connect_tunnel_max_lifetime();
 
-    let handshake_bytes = send_connect_established(client_stream, tunnel_idle_timeout).await?;
+    let handshake_bytes = send_connect_established(client_stream, tunnel_idle_timeout)
+        .await
+        .map_err(|source| {
+            ConnectTunnelCommittedError::new(0, upstream_addr, "tunnel_establish_failed", source)
+        })?;
     let _tunnel_guard = crate::metrics::track_connect_tunnel();
 
     let relay = relay_with_idle_timeouts(client_stream, &mut upstream_stream, tunnel_idle_timeout);
     let relay_result = if let Some(limit) = tunnel_max_lifetime {
         match tokio::time::timeout(limit, relay).await {
             Ok(result) => result,
-            Err(_) => return Err(ConnectTunnelTimeout.into()),
+            Err(_) => Err(ConnectTunnelTimeout.into()),
         }
     } else {
         relay.await
     };
-    let (client_stream_bytes, upstream_stream_bytes) =
-        relay_result.context("CONNECT splice relay failed")?;
+    let (client_stream_bytes, upstream_stream_bytes) = relay_result
+        .context("CONNECT splice relay failed")
+        .map_err(|source| {
+            let error_reason = if source.downcast_ref::<ConnectTunnelTimeout>().is_some() {
+                "tunnel_max_lifetime"
+            } else {
+                "tunnel_relay_failed"
+            };
+            ConnectTunnelCommittedError::new(handshake_bytes, upstream_addr, error_reason, source)
+        })?;
 
     timeout_with_context(
         tunnel_idle_timeout,
         client_stream.shutdown(),
         "closing client stream after CONNECT",
     )
-    .await?;
+    .await
+    .map_err(|source| {
+        ConnectTunnelCommittedError::new(
+            handshake_bytes,
+            upstream_addr,
+            "tunnel_shutdown_failed",
+            source,
+        )
+    })?;
     timeout_with_context(
         tunnel_idle_timeout,
         upstream_stream.shutdown(),
         "closing upstream stream after CONNECT",
     )
-    .await?;
+    .await
+    .map_err(|source| {
+        ConnectTunnelCommittedError::new(
+            handshake_bytes,
+            upstream_addr,
+            "tunnel_shutdown_failed",
+            source,
+        )
+    })?;
     Ok(SpliceStats {
         client_stream_bytes,
         upstream_stream_bytes,

@@ -22,6 +22,35 @@ use tokio::{
 
 use support::*;
 
+const CONNECT_ESTABLISHED_RESPONSE: &str =
+    "HTTP/1.1 200 Connection Established\r\nProxy-Agent: exfilguard\r\n\r\n";
+
+async fn read_tunnel_tail(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    timeout(StdDuration::from_secs(3), async {
+        let mut tail = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => return Ok(tail),
+                Ok(read) => tail.extend_from_slice(&buffer[..read]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return Ok(tail);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    })
+    .await
+    .context("tunnel did not close after terminal relay condition")?
+}
+
 fn log_field_value(line: &str, field: &str) -> Option<String> {
     let needle = format!("{field}=");
     let start = line.find(&needle)? + needle.len();
@@ -445,6 +474,53 @@ async fn http_invalid_upstream_chunk_closes_started_response_without_502() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_truncated_fixed_body_closes_started_response_without_502() -> Result<()> {
+    let upstream = TestUpstream::http_response(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort".to_vec(),
+    )
+    .await?;
+    let upstream_port = upstream.port();
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(PolicySpec::new("allow-local").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/truncated HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(request.as_bytes()).await?;
+
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "origin response head should have been forwarded: {response}"
+    );
+    assert_eq!(
+        response.matches("HTTP/1.1 ").count(),
+        1,
+        "proxy appended a second response after the truncated body: {response}"
+    );
+    assert!(
+        !response.contains("502 Bad Gateway"),
+        "proxy appended a 502 to the truncated response: {response}"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    drop(upstream);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_splice_stays_open_past_timeout() -> Result<()> {
     let upstream = TestUpstream::echo().await?;
     let upstream_port = upstream.port();
@@ -536,25 +612,155 @@ async fn connect_splice_max_lifetime_closes_without_http_response() -> Result<()
     stream.flush().await?;
 
     let response = read_until_double_crlf(&mut stream).await?;
-    assert!(
-        response.starts_with("HTTP/1.1 200"),
-        "unexpected CONNECT response: {response}"
-    );
+    assert_eq!(response, CONNECT_ESTABLISHED_RESPONSE);
 
     sleep(StdDuration::from_secs(2)).await;
 
-    let mut buf = [0u8; 64];
-    let read = timeout(StdDuration::from_secs(2), stream.read(&mut buf)).await??;
+    let tail = read_tunnel_tail(&mut stream).await?;
     assert!(
-        read == 0,
-        "expected tunnel to close without extra response, got: {}",
-        String::from_utf8_lossy(&buf[..read])
+        tail.is_empty(),
+        "proxy injected bytes after CONNECT max lifetime: {}",
+        String::from_utf8_lossy(&tail)
     );
 
     stream.shutdown().await.ok();
     harness.shutdown().await;
     drop(upstream);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_splice_idle_timeout_closes_without_http_response() -> Result<()> {
+    let log_capture = LogCapture::new("info").await;
+    let upstream = TestUpstream::echo().await?;
+    let upstream_port = upstream.port();
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["connect-splice"])
+        .policy(
+            PolicySpec::new("connect-splice").rule(
+                RuleSpec::allow(
+                    &["CONNECT"],
+                    format!("https://127.0.0.1:{upstream_port}/**"),
+                )
+                .https_mode("tunnel"),
+            ),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.connect_tunnel_idle_timeout = 1;
+            settings.connect_tunnel_max_lifetime = 0;
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = read_until_double_crlf(&mut stream).await?;
+    assert_eq!(response, CONNECT_ESTABLISHED_RESPONSE);
+
+    let tail = read_tunnel_tail(&mut stream).await?;
+    assert!(
+        tail.is_empty(),
+        "proxy injected an HTTP response after CONNECT idle timeout: {}",
+        String::from_utf8_lossy(&tail)
+    );
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+    drop(upstream);
+
+    let logs = log_capture.text();
+    let error_log = logs
+        .lines()
+        .find(|line| line.contains("tunnel_relay_failed") && line.contains("decision="))
+        .with_context(|| format!("missing committed tunnel error log: {logs}"))?;
+    assert_eq!(log_field_value(error_log, "status").as_deref(), Some("200"));
+    assert_eq!(
+        log_field_value(error_log, "decision").as_deref(),
+        Some("ERROR")
+    );
+    assert_eq!(
+        log_field_value(error_log, "error_reason").as_deref(),
+        Some("tunnel_relay_failed")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_splice_upstream_reset_does_not_append_http_response() -> Result<()> {
+    const UPSTREAM_PAYLOAD: &[u8] = b"tunnel bytes before reset";
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    let (reset_tx, reset_rx) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.context("accept failed")?;
+        stream
+            .write_all(UPSTREAM_PAYLOAD)
+            .await
+            .context("failed to write pre-reset tunnel payload")?;
+        stream.flush().await?;
+        reset_rx.await.context("reset signal sender dropped")?;
+        stream.set_zero_linger()?;
+        drop(stream);
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["connect-splice"])
+        .policy(
+            PolicySpec::new("connect-splice").rule(
+                RuleSpec::allow(
+                    &["CONNECT"],
+                    format!("https://127.0.0.1:{}/**", upstream_addr.port()),
+                )
+                .https_mode("tunnel"),
+            ),
+        )
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.connect_tunnel_idle_timeout = 30)
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n",
+        port = upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = read_until_double_crlf(&mut stream).await?;
+    assert_eq!(response, CONNECT_ESTABLISHED_RESPONSE);
+    let mut payload = vec![0u8; UPSTREAM_PAYLOAD.len()];
+    stream.read_exact(&mut payload).await?;
+    assert_eq!(payload, UPSTREAM_PAYLOAD);
+
+    reset_tx
+        .send(())
+        .expect("upstream reset receiver available");
+    upstream_task.await.context("upstream task join failed")??;
+    let tail = read_tunnel_tail(&mut stream).await?;
+    assert!(
+        tail.is_empty(),
+        "proxy injected an HTTP response after upstream reset: {}",
+        String::from_utf8_lossy(&tail)
+    );
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
     Ok(())
 }
 
