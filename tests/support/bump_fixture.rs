@@ -688,38 +688,68 @@ async fn serve_tls_h2_cache_inspect(
     let mut connection = h2_server::handshake(tls)
         .await
         .context("failed to establish HTTP/2 handshake with proxy")?;
+    let mut handlers = tokio::task::JoinSet::new();
 
-    while let Some(result) = connection.accept().await {
-        let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
-        let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
-        let path = request.uri().path().to_string();
-        let mut stream = request.into_body();
-        let mut request_body = Vec::new();
-        while let Some(frame) = stream.data().await {
-            let chunk = frame.context("failed to read HTTP/2 request body")?;
-            let chunk_len = chunk.len();
-            request_body.extend_from_slice(&chunk);
-            stream
-                .flow_control()
-                .release_capacity(chunk_len)
-                .context("failed to release HTTP/2 request body capacity")?;
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) = result.context("failed to accept HTTP/2 request")?;
+                    handlers.spawn(serve_h2_cache_inspect_request(
+                        request,
+                        respond,
+                        request_count.clone(),
+                    ));
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 handler available")
+                    .context("HTTP/2 cache-inspect handler task failed")??;
+            }
         }
-
-        let response_body = format!(
-            "request={sequence}\npath={path}\nbody={}",
-            String::from_utf8_lossy(&request_body)
-        );
-        let response = http::Response::builder()
-            .status(StatusCode::OK)
-            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(())
-            .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
-        let mut send = respond
-            .send_response(response, false)
-            .context("failed to send HTTP/2 response headers")?;
-        send.send_data(Bytes::from(response_body), true)
-            .context("failed to send HTTP/2 response body")?;
     }
+    while let Some(result) = handlers.join_next().await {
+        result.context("HTTP/2 cache-inspect handler task failed")??;
+    }
+
+    Ok(())
+}
+
+async fn serve_h2_cache_inspect_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2_server::SendResponse<Bytes>,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+    let path = request.uri().path().to_string();
+    let mut stream = request.into_body();
+    let mut request_body = Vec::new();
+    while let Some(frame) = stream.data().await {
+        let chunk = frame.context("failed to read HTTP/2 request body")?;
+        let chunk_len = chunk.len();
+        request_body.extend_from_slice(&chunk);
+        stream
+            .flow_control()
+            .release_capacity(chunk_len)
+            .context("failed to release HTTP/2 request body capacity")?;
+    }
+
+    let response_body = format!(
+        "request={sequence}\npath={path}\nbody={}",
+        String::from_utf8_lossy(&request_body)
+    );
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(())
+        .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+    let mut send = respond
+        .send_response(response, false)
+        .context("failed to send HTTP/2 response headers")?;
+    send.send_data(Bytes::from(response_body), true)
+        .context("failed to send HTTP/2 response body")?;
 
     Ok(())
 }
