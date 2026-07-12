@@ -1,3 +1,4 @@
+mod admission;
 pub mod allow_log;
 pub mod cache;
 pub mod connect;
@@ -45,6 +46,7 @@ pub struct AppContext {
     pub policies: PolicyStore,
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
+    client_connections: Arc<admission::ClientConnectionLimiter>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
 }
 
@@ -60,6 +62,7 @@ impl AppContext {
             policies,
             tls,
             cache,
+            client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
             upstream_resolver: default_upstream_resolver(),
         }
     }
@@ -79,6 +82,10 @@ impl AppContext {
 
     pub(crate) fn upstream_resolver(&self) -> &dyn UpstreamResolver {
         self.upstream_resolver.as_ref()
+    }
+
+    pub(crate) fn client_connections(&self) -> &Arc<admission::ClientConnectionLimiter> {
+        &self.client_connections
     }
 }
 

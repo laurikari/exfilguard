@@ -216,27 +216,28 @@ Clients are expected to know they are talking to a proxy.
 This keeps request meaning, client intent, and logging straightforward.
 Transparent proxying may come later.
 
-## Availability isolation belongs at the deployment boundary
+## Availability isolation combines client budgets with deployment controls
 
 ExfilGuard assumes its proxy and metrics listeners are reachable only by the
-authorized clients and monitoring systems an operator intends to serve. It
-enforces egress policy, but it is not a denial-of-service isolation or
-multi-tenant fairness boundary.
+authorized clients and monitoring systems an operator intends to serve. It is
+not a complete denial-of-service isolation or multi-tenant fairness boundary,
+but an authorized or compromised client must not retain unbounded downstream
+connections.
 
-The process therefore does not impose a default global or per-IP connection
-ceiling. Connection cost varies substantially between idle HTTP, TLS
-handshakes, multiplexed HTTP/2, and long-lived tunnels, while node capacity
-varies by orders of magnitude. A generic ceiling can strand most of a capable
-node and indiscriminately reject healthy clients without identifying the
-source of pressure.
+Each configured client therefore has a default budget of 1,024 simultaneous
+downstream TCP connections, with an explicit per-client override. The count
+includes ordinary HTTP keep-alive connections, raw CONNECT tunnels, and
+inspected CONNECT sessions. A CIDR identity deliberately shares one budget
+across all matching machines. Admission uses the client identity after trusted
+PROXY protocol processing; excess new connections are closed without evicting
+established ones.
 
-Deployments that need availability isolation should restrict listener access
-and apply coarse connection or rate controls at the firewall, load balancer,
-or equivalent network edge. ExfilGuard's client metrics and policy reload help
-identify and deny abusive traffic after attribution. A future in-process
-overload controller would need real resource-pressure signals, client-aware
-accounting, and hysteresis; it is a separate feature rather than a fixed
-connection-count safeguard.
+There is no separate global, per-IP, or per-rule ceiling. Client limits remain
+stable across policy reloads and are observable through bounded per-client
+metrics. Deployments that need broader availability isolation should still use
+firewall, load-balancer, or equivalent network-edge controls. A future adaptive
+overload controller would require real resource-pressure signals and
+hysteresis; it is separate from deterministic client budgets.
 
 ## Request body limits are opt-in
 

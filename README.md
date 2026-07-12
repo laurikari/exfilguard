@@ -247,6 +247,11 @@ Exactly one client must set `fallback = true`. That client handles requests that
 do not match any specific IP or CIDR. Config loading fails if zero or multiple
 fallback clients exist. The fallback must not set `ip` or `cidr`.
 
+Each client may have at most 1,024 simultaneous downstream connections by
+default. Set `max_connections` on a client to override that budget. A CIDR
+client shares its budget across every matching machine. The count includes
+ordinary HTTP keep-alive, raw CONNECT, and inspected CONNECT connections.
+
 ## Certificate storage and permissions
 
 The required `ca` table chooses one explicit source: `builtin` generates a
@@ -340,11 +345,12 @@ firewalled to Prometheus, or put an authenticating reverse proxy in front of
 it, because the metrics include internal hosts and policy decisions. Request
 series are labeled with `effective_mode=direct|bump|tunnel`, so inspected HTTPS
 and explicit CONNECT tunnels stay distinct. Current-state gauges cover
-downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
-sessions, active HTTP/2 streams, upstream connections, cache usage, and the
-last successful policy reload time. CA metrics report the configured source,
-root and intermediate expiry, issuer usability and generation, and Vault
-renewal outcomes. Example alert rules are in `docs/prometheus-alerts.yml`.
+downstream connections globally and by client, in-flight requests, CONNECT
+tunnels, bumped TLS sessions, active HTTP/2 streams, upstream connections,
+cache usage, and the last successful policy reload time. Rejected connections
+are counted by client. CA metrics report the configured source, root and
+intermediate expiry, issuer usability and generation, and Vault renewal
+outcomes. Example alert rules are in `docs/prometheus-alerts.yml`.
 
 ## Learn more
 

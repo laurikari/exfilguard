@@ -392,6 +392,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            max_connections: 1024,
         }];
         let config = Config {
             clients,

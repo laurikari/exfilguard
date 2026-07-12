@@ -54,6 +54,7 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         compiled_clients.push(ClientEntry {
             name: client.name.clone(),
             policies: Arc::from(indices.into_boxed_slice()),
+            max_connections: client.max_connections,
         });
     }
 
@@ -304,6 +305,7 @@ mod tests {
                 vec![Arc::<str>::from("allow-api"), Arc::<str>::from("deny-all")]
                     .into_boxed_slice(),
             ),
+            max_connections: 1024,
         }];
 
         let policies = vec![
@@ -342,11 +344,13 @@ mod tests {
                 name: Arc::<str>::from("a"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("b"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             },
         ];
         let config = Config { clients, policies };
@@ -365,11 +369,13 @@ mod tests {
                 name: Arc::<str>::from("finance"),
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("ops"),
                 selector: ClientSelector::Cidr("10.10.1.128/25".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             },
         ];
         let config = Config { clients, policies };
@@ -385,11 +391,13 @@ mod tests {
                 name: Arc::<str>::from("range"),
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("pin"),
                 selector: ClientSelector::Ip("10.10.1.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             },
         ];
         let config = Config { clients, policies };

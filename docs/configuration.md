@@ -71,6 +71,30 @@ restarting ExfilGuard.
 
 ---
 
+## Client Connection Admission
+
+Every configured client has a simultaneous downstream connection budget. The
+default is 1,024 connections and can be overridden on an individual client:
+
+```toml
+[[client]]
+name = "build-workers"
+cidr = "10.42.16.0/27"
+policies = ["build-egress"]
+max_connections = 2048
+```
+
+The budget counts ordinary HTTP keep-alive connections, raw CONNECT tunnels,
+and inspected CONNECT sessions. A CIDR client shares one budget across every
+machine it matches. When the budget is full, ExfilGuard closes new connections
+without evicting established ones. `max_connections` must be greater than zero.
+
+Client and policy reloads apply a changed limit to new admission without
+resetting active connection accounting. Existing connections retain the client
+identity assigned when they were accepted.
+
+---
+
 ## TLS / Certificate Settings
 
 These settings control TLS interception and leaf certificate generation.
@@ -374,9 +398,10 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 
 ExfilGuard exports counters and histograms for per-client and per-policy
 decisions, latency, cache activity, and upstream reuse, plus gauges for current
-downstream connections, in-flight requests, CONNECT tunnels, bumped TLS
-sessions, active HTTP/2 streams, upstream connections, cache usage, and the
-last successful policy reload time.
+downstream connections globally and by client, in-flight requests, CONNECT
+tunnels, bumped TLS sessions, active HTTP/2 streams, upstream connections,
+cache usage, and the last successful policy reload time. Rejected downstream
+connections are counted by configured client name.
 
 `requests_method_total` uses a bounded `method` label: the standard HTTP
 methods are reported by name and all extension methods are aggregated as

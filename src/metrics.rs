@@ -238,6 +238,36 @@ static DOWNSTREAM_CONNECTIONS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
     gauge
 });
 
+static DOWNSTREAM_CONNECTIONS_ACTIVE_BY_CLIENT: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let vec = IntGaugeVec::new(
+        Opts::new(
+            "downstream_connections_active_by_client",
+            "Current admitted downstream connections by configured client",
+        ),
+        &["client"],
+    )
+    .expect("create downstream_connections_active_by_client");
+    REGISTRY
+        .register(Box::new(vec.clone()))
+        .expect("register downstream_connections_active_by_client");
+    vec
+});
+
+static DOWNSTREAM_CONNECTION_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let vec = IntCounterVec::new(
+        Opts::new(
+            "downstream_connection_rejections_total",
+            "Downstream connections rejected at the configured client limit",
+        ),
+        &["client"],
+    )
+    .expect("create downstream_connection_rejections_total");
+    REGISTRY
+        .register(Box::new(vec.clone()))
+        .expect("register downstream_connection_rejections_total");
+    vec
+});
+
 static CONNECT_TUNNELS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
     let gauge = IntGauge::new(
         "connect_tunnels_active",
@@ -601,6 +631,19 @@ pub struct MetricGuard {
     on_drop: fn(),
 }
 
+#[must_use]
+pub struct ClientConnectionMetricGuard {
+    client: Arc<str>,
+}
+
+impl Drop for ClientConnectionMetricGuard {
+    fn drop(&mut self) {
+        DOWNSTREAM_CONNECTIONS_ACTIVE_BY_CLIENT
+            .with_label_values(&[self.client.as_ref()])
+            .dec();
+    }
+}
+
 impl Drop for MetricGuard {
     fn drop(&mut self) {
         (self.on_drop)();
@@ -656,6 +699,19 @@ fn dec_http2_streams_active() {
 pub fn track_downstream_connection() -> MetricGuard {
     DOWNSTREAM_CONNECTIONS_ACTIVE.inc();
     guard(dec_downstream_connections_active)
+}
+
+pub fn track_downstream_connection_for_client(client: Arc<str>) -> ClientConnectionMetricGuard {
+    DOWNSTREAM_CONNECTIONS_ACTIVE_BY_CLIENT
+        .with_label_values(&[client.as_ref()])
+        .inc();
+    ClientConnectionMetricGuard { client }
+}
+
+pub fn record_downstream_connection_rejection(client: &str) {
+    DOWNSTREAM_CONNECTION_REJECTIONS_TOTAL
+        .with_label_values(&[client])
+        .inc();
 }
 
 pub fn track_connect_tunnel() -> MetricGuard {

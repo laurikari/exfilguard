@@ -115,6 +115,28 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, app: AppCont
             "accepted proxy protocol header"
         );
     }
+    let snapshot = app.policies.snapshot();
+    let Some(client) = snapshot.resolve_client(peer.ip()) else {
+        warn!(peer = %peer, "rejecting connection without a configured client identity");
+        return Ok(());
+    };
+    let client_name = client.name.clone();
+    let max_connections = client.max_connections;
+    let Some(_client_connection_permit) = app
+        .client_connections()
+        .try_acquire(client_name.clone(), max_connections)
+    else {
+        crate::metrics::record_downstream_connection_rejection(client_name.as_ref());
+        warn!(
+            peer = %peer,
+            client = %client_name,
+            max_connections,
+            "rejecting connection at client connection limit"
+        );
+        return Ok(());
+    };
+    let _client_connection_metric =
+        crate::metrics::track_downstream_connection_for_client(client_name);
     http::handle_http(stream, peer, app).await
 }
 

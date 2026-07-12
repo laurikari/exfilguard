@@ -10,7 +10,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -20,6 +20,75 @@ use tokio::{
 use support::*;
 
 // --- Tests ---
+
+async fn wait_for_metric(sample: &str) -> Result<()> {
+    for _ in 0..100 {
+        let metrics = String::from_utf8(exfilguard::metrics::gather())?;
+        if metrics.lines().any(|line| line == sample) {
+            return Ok(());
+        }
+        sleep(StdDuration::from_millis(10)).await;
+    }
+    bail!("timed out waiting for metric sample: {sample}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_client_connection_limit_rejects_and_recovers() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let client_name = "connection-limit-client";
+    let (clients, policies) = TestConfigBuilder::new()
+        .fallback_client_with_max_connections(client_name, &["deny"], 1)
+        .policy(
+            PolicySpec::new("deny")
+                .rule(RuleSpec::deny(&["ANY"], "http://example.com/**").status(403)),
+        )
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let inactive_sample =
+        format!("downstream_connections_active_by_client{{client=\"{client_name}\"}} 0");
+    wait_for_metric(&inactive_sample).await?;
+
+    let partial_request = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n";
+    let mut first = TcpStream::connect(harness.addr).await?;
+    first.write_all(partial_request).await?;
+    first.flush().await?;
+    let active_sample =
+        format!("downstream_connections_active_by_client{{client=\"{client_name}\"}} 1");
+    wait_for_metric(&active_sample).await?;
+
+    let mut second = TcpStream::connect(harness.addr).await?;
+    let mut byte = [0u8; 1];
+    match timeout(StdDuration::from_secs(1), second.read(&mut byte)).await? {
+        Ok(0) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+            ) => {}
+        other => panic!("limited connection was not closed immediately: {other:?}"),
+    }
+
+    wait_for_metric(&format!(
+        "downstream_connection_rejections_total{{client=\"{client_name}\"}} 1"
+    ))
+    .await?;
+
+    drop(first);
+    wait_for_metric(&inactive_sample).await?;
+
+    let mut replacement = TcpStream::connect(harness.addr).await?;
+    replacement.write_all(partial_request).await?;
+    replacement.flush().await?;
+    wait_for_metric(&active_sample).await?;
+
+    replacement.shutdown().await.ok();
+    second.shutdown().await.ok();
+    harness.shutdown().await;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_max_request_body_size_enforced() -> Result<()> {

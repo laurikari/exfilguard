@@ -4,6 +4,8 @@ use std::sync::Arc;
 use http::{Method, StatusCode};
 use ipnet::IpNet;
 
+pub const DEFAULT_CLIENT_MAX_CONNECTIONS: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub clients: Vec<Client>,
@@ -15,6 +17,7 @@ pub struct Client {
     pub name: Arc<str>,
     pub selector: ClientSelector,
     pub policies: Arc<[Arc<str>]>,
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone)]

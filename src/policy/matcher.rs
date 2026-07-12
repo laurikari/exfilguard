@@ -295,6 +295,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(policy_refs.into_boxed_slice()),
+            max_connections: 1024,
         }];
         ValidatedConfig::new(Config { clients, policies }).expect("validate config")
     }
@@ -412,6 +413,7 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             }],
             policies: vec![policy],
         })
@@ -465,6 +467,7 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                max_connections: 1024,
             }],
             policies: vec![policy],
         })
@@ -501,21 +504,25 @@ mod tests {
                 name: Arc::<str>::from("exact"),
                 selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("cidr24"),
                 selector: ClientSelector::Cidr("10.0.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("cidr_other"),
                 selector: ClientSelector::Cidr("10.1.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: policy_refs.clone(),
+                max_connections: 1024,
             },
         ];
 
@@ -554,11 +561,13 @@ mod tests {
                 name: Arc::<str>::from("ipv4-client"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: policy_refs.clone(),
+                max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: policy_refs,
+                max_connections: 1024,
             },
         ];
 
@@ -623,6 +632,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {
             clients,
@@ -671,6 +681,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {
             clients,

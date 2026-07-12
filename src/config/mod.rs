@@ -327,6 +327,12 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
     let mut cidr_claims: Vec<CidrClaim<'_>> = Vec::new();
 
     for client in clients {
+        ensure!(
+            client.max_connections > 0,
+            "client '{}' max_connections must be greater than 0 (got {})",
+            client.name,
+            client.max_connections
+        );
         match &client.selector {
             ClientSelector::Fallback => {
                 ensure!(
@@ -468,6 +474,7 @@ mod tests {
             name: Arc::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![Arc::<str>::from(policy_name)].into_boxed_slice()),
+            max_connections: super::model::DEFAULT_CLIENT_MAX_CONNECTIONS,
         }
     }
 
@@ -545,6 +552,7 @@ mod tests {
                     name: Arc::from("mapped"),
                     selector,
                     policies: Arc::from([]),
+                    max_connections: 1024,
                 },
                 fallback_client("deny"),
             ];
@@ -563,6 +571,7 @@ mod tests {
                 name: Arc::from("native-v6"),
                 selector: ClientSelector::Cidr("2001:db8::/32".parse().unwrap()),
                 policies: Arc::from([]),
+                max_connections: 1024,
             },
             fallback_client("deny"),
         ];

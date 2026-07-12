@@ -53,6 +53,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             cidr,
             policies: policy_names,
             fallback,
+            max_connections,
         } = client;
 
         let selector = parse_client_selector(&name, ip, cidr, fallback)?;
@@ -67,6 +68,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             name: arc_name,
             selector,
             policies: Arc::from(policy_refs.into_boxed_slice()),
+            max_connections,
         });
     }
 
@@ -371,6 +373,12 @@ struct RawClient {
     policies: Vec<String>,
     #[serde(default)]
     fallback: bool,
+    #[serde(default = "default_client_max_connections")]
+    max_connections: usize,
+}
+
+const fn default_client_max_connections() -> usize {
+    super::model::DEFAULT_CLIENT_MAX_CONNECTIONS
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +462,7 @@ mod tests {
 name = "localhost"
 ip = "127.0.0.1"
 policies = ["allow"]
+max_connections = 64
 
 [[client]]
 name = "default"
@@ -480,6 +489,38 @@ name = "allow"
         let config = load_config(clients.path(), policies.path()).expect("load config");
         assert_eq!(config.clients.len(), 2);
         assert_eq!(config.policies.len(), 2);
+        assert_eq!(config.clients[0].max_connections, 64);
+        assert_eq!(
+            config.clients[1].max_connections,
+            super::super::model::DEFAULT_CLIENT_MAX_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn reject_zero_client_connection_limit() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+policies = ["deny"]
+fallback = true
+max_connections = 0
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "deny"
+  [[policy.rule]]
+  action = "DENY"
+  status = 403
+"#,
+        );
+
+        let err = load_config(clients.path(), policies.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_connections must be greater than 0"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

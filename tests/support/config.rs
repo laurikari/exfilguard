@@ -21,6 +21,17 @@ impl TestConfigBuilder {
         self
     }
 
+    pub fn fallback_client_with_max_connections(
+        mut self,
+        name: &str,
+        policies: &[&str],
+        max_connections: usize,
+    ) -> Self {
+        self.clients
+            .push(ClientSpec::fallback(name, policies).with_max_connections(max_connections));
+        self
+    }
+
     pub fn client_cidr(mut self, name: &str, cidr: &str, policies: &[&str]) -> Self {
         self.clients.push(ClientSpec::cidr(name, cidr, policies));
         self
@@ -60,6 +71,9 @@ impl TestConfigBuilder {
             );
             if matches!(client.selector, ClientSelectorSpec::Fallback) {
                 let _ = writeln!(clients_doc, "fallback = true");
+            }
+            if let Some(max_connections) = client.max_connections {
+                let _ = writeln!(clients_doc, "max_connections = {max_connections}");
             }
         }
 
@@ -121,6 +135,7 @@ pub struct ClientSpec {
     name: String,
     selector: ClientSelectorSpec,
     policies: Vec<String>,
+    max_connections: Option<usize>,
 }
 
 impl ClientSpec {
@@ -132,6 +147,7 @@ impl ClientSpec {
                 .iter()
                 .map(|policy| (*policy).to_string())
                 .collect(),
+            max_connections: None,
         }
     }
 
@@ -143,6 +159,7 @@ impl ClientSpec {
                 .iter()
                 .map(|policy| (*policy).to_string())
                 .collect(),
+            max_connections: None,
         }
     }
 
@@ -154,7 +171,13 @@ impl ClientSpec {
                 .iter()
                 .map(|policy| (*policy).to_string())
                 .collect(),
+            max_connections: None,
         }
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
+        self
     }
 }
 

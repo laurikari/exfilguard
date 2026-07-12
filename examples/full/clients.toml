@@ -2,6 +2,8 @@
 [[client]]
 name = "analytics-batch-workers"
 cidr = "10.42.16.0/27"
+# Optional per-client override; the built-in default is 1024.
+max_connections = 2048
 policies = [
   "trusted-analytics-egress",
   "fallback-egress-deny",
