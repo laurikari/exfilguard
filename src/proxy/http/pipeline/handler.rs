@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -11,7 +11,7 @@ use crate::proxy::{
     allow_log::log_allow_success,
     connect::ResolvedTarget,
     forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
-    forward_limits::AllowLogTracker,
+    forward_limits::{AllowLogTracker, RequestDeadline, ResponseProgress},
     policy_eval, policy_response,
     request::ParsedRequest,
     request_pipeline::RequestHandler,
@@ -28,6 +28,14 @@ use super::super::body::BodyPlan;
 use super::super::codec::Http1HeaderAccumulator;
 use super::super::upstream::UpstreamPool;
 
+enum AllowedRequestResult {
+    CacheHit(ClientDisposition),
+    Forwarded {
+        result: super::super::forward::ForwardResult,
+        cache_lookup: Option<&'static str>,
+    },
+}
+
 pub(super) struct Http1RequestHandler<'a, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -43,8 +51,8 @@ where
     pub(super) request_body_timeout: Duration,
     pub(super) response_header_timeout: Duration,
     pub(super) response_body_timeout: Duration,
-    pub(super) request_start: Instant,
-    pub(super) request_total_timeout: Option<Duration>,
+    pub(super) request_deadline: RequestDeadline,
+    pub(super) response_progress: ResponseProgress,
     pub(super) parsed: &'a ParsedRequest,
     pub(super) expect_continue: bool,
 }
@@ -59,55 +67,83 @@ where
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
         let policy_eval::AllowOutcome { decision, log } = outcome;
 
-        let cache_lookup = match evaluate_cache(self, &decision, &log).await? {
-            CacheEvaluation::Hit(disposition) => return Ok(disposition),
-            CacheEvaluation::Miss => Some("miss"),
-            CacheEvaluation::Bypass => Some("bypass"),
+        let deadline = self.request_deadline;
+        let progress = self.response_progress.clone();
+        let allowed_result = deadline
+            .run(&progress, async {
+                let cache_lookup = match evaluate_cache(self, &decision, &log).await? {
+                    CacheEvaluation::Hit(disposition) => {
+                        return Ok(AllowedRequestResult::CacheHit(disposition));
+                    }
+                    CacheEvaluation::Miss => Some("miss"),
+                    CacheEvaluation::Bypass => Some("bypass"),
+                };
+
+                let result = forward_request(self, &decision).await?;
+                Ok(AllowedRequestResult::Forwarded {
+                    result,
+                    cache_lookup,
+                })
+            })
+            .await;
+
+        let (success, cache_lookup) = match allowed_result {
+            Ok(AllowedRequestResult::CacheHit(disposition)) => return Ok(disposition),
+            Ok(AllowedRequestResult::Forwarded {
+                result,
+                cache_lookup,
+            }) => (result, cache_lookup),
+            Err(err) => {
+                let kind = classify_forward_error(&err);
+                if let ForwardErrorKind::ResponseAlreadyStarted(started) = &kind {
+                    crate::metrics::record_upstream_error(kind.as_metric_label());
+                    log_forward_error(&kind, &log, &err);
+                    let spec = policy_response::forward_error_spec(&kind);
+                    let error_detail = err.to_string();
+                    let shutdown_result =
+                        shutdown_stream(self.reader.get_mut(), self.response_body_timeout).await;
+                    policy_response::forward_error_log_builder(
+                        log.access_log_builder(),
+                        &decision,
+                        &spec,
+                        &error_detail,
+                    )
+                    .status(started.status)
+                    .bytes(self.log_tracker.current_bytes(), started.bytes_to_client)
+                    .elapsed(self.log_tracker.elapsed())
+                    .log();
+                    shutdown_result?;
+                    return Ok(ClientDisposition::Close);
+                }
+                let handled = policy_response::handle_forward_result::<
+                    super::super::forward::ForwardResult,
+                >(&decision, log.clone(), Err(err))
+                .await?;
+                match handled {
+                    policy_response::ForwardOutcome::Responded(ctx) => {
+                        return respond_forward_error(
+                            self,
+                            ctx.spec,
+                            ctx.log,
+                            ctx.decision,
+                            &ctx.error_detail,
+                        )
+                        .await;
+                    }
+                    policy_response::ForwardOutcome::Completed(_) => unreachable!(),
+                }
+            }
         };
 
-        let forward_result = forward_request(self, &decision).await;
-        if let Err(err) = forward_result.as_ref() {
-            let kind = classify_forward_error(err);
-            if let ForwardErrorKind::ResponseAlreadyStarted(started) = &kind {
-                crate::metrics::record_upstream_error(kind.as_metric_label());
-                log_forward_error(&kind, &log, err);
-                let spec = policy_response::forward_error_spec(&kind);
-                let error_detail = err.to_string();
-                let shutdown_result =
-                    shutdown_stream(self.reader.get_mut(), self.response_body_timeout).await;
-                policy_response::forward_error_log_builder(
-                    log.access_log_builder(),
-                    &decision,
-                    &spec,
-                    &error_detail,
-                )
-                .status(started.status)
-                .bytes(self.log_tracker.current_bytes(), started.bytes_to_client)
-                .elapsed(self.log_tracker.elapsed())
-                .log();
-                shutdown_result?;
-                return Ok(ClientDisposition::Close);
-            }
-        }
-        let handled =
-            policy_response::handle_forward_result(&decision, log.clone(), forward_result).await?;
-        match handled {
-            policy_response::ForwardOutcome::Completed(success) => {
-                let stats = build_allow_log_stats(self, &success);
-                log_allow_success(
-                    log,
-                    &decision,
-                    stats,
-                    cache_lookup,
-                    Some(success.stats.cache_store.as_str()),
-                );
-                handle_forward_success(self, success).await
-            }
-            policy_response::ForwardOutcome::Responded(ctx) => {
-                respond_forward_error(self, ctx.spec, ctx.log, ctx.decision, &ctx.error_detail)
-                    .await
-            }
-        }
+        let stats = build_allow_log_stats(self, &success);
+        log_allow_success(
+            log,
+            &decision,
+            stats,
+            cache_lookup,
+            Some(success.stats.cache_store.as_str()),
+        );
+        handle_forward_success(self, success).await
     }
 
     async fn on_deny(&mut self, outcome: policy_eval::DenyOutcome<'_>) -> Result<Self::Output> {

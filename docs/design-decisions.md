@@ -333,3 +333,16 @@ idle connection with the connection-idle timeout instead of maintaining a
 second partial HTTP/2 frame parser solely to apply a shorter header deadline.
 This keeps setup and idle retention bounded without imposing a lifetime on
 legitimate active or multiplexed sessions.
+
+## The total request timeout is an end-to-end inner-request budget
+
+When enabled, `request_total_timeout` starts after ExfilGuard accepts a complete
+inner HTTP request head. One absolute deadline covers policy and cache work,
+upstream resolution and connection setup, retries, request upload, and complete
+response delivery. Phase-specific timeouts remain nested within that budget.
+
+If the deadline expires before a final response starts, ExfilGuard returns a
+504. Once a final response has started, it closes or resets the request rather
+than writing a second response. Outer CONNECT setup and tunnel lifetime have
+separate controls, and cleanup after response delivery does not consume the
+request budget.

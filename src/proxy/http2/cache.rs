@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -222,8 +222,8 @@ pub(super) async fn send_cached_response(
     method: &Method,
     mut cached: CachedResponse,
     response_body_timeout: std::time::Duration,
-    request_start: Instant,
-    request_total_timeout: Option<std::time::Duration>,
+    request_deadline: crate::proxy::forward_limits::RequestDeadline,
+    response_progress: &crate::proxy::forward_limits::ResponseProgress,
     max_response_header_bytes: usize,
 ) -> Result<(StatusCode, u64)> {
     let status = cached.status;
@@ -254,11 +254,13 @@ pub(super) async fn send_cached_response(
     let mut send = respond
         .send_response(response, end_stream)
         .context("failed to send cached HTTP/2 response headers")?;
+    response_progress.mark_started(status, header_bytes);
     if end_stream {
+        response_progress.mark_complete();
         return Ok((status, header_bytes));
     }
 
-    let total_deadline = request_total_timeout.map(|timeout| request_start + timeout);
+    let total_deadline = request_deadline.instant();
     let mut remaining = cached.content_length;
     let mut buffer = vec![0u8; 8192];
     while remaining > 0 {
@@ -285,9 +287,11 @@ pub(super) async fn send_cached_response(
             "sending cached HTTP/2 response body",
         )
         .await?;
+        response_progress.add_bytes(read as u64);
     }
     send.send_data(Bytes::new(), true)
         .context("failed to finish cached HTTP/2 response body")?;
+    response_progress.mark_complete();
     Ok((status, header_bytes + cached.content_length))
 }
 

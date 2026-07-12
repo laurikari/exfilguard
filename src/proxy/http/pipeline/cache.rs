@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 use crate::io_util::{copy_n_with_write_timeout, write_all_with_timeout};
@@ -7,6 +7,7 @@ use crate::proxy::{
     cache::Http1CacheLookupOutcome,
     policy_eval::{AllowDecision, RequestLogContext},
 };
+use crate::util::timeout_with_context;
 
 use super::ClientDisposition;
 use super::handler::Http1RequestHandler;
@@ -64,6 +65,9 @@ where
                 head.content_length,
                 override_connection,
             );
+            handler
+                .response_progress
+                .mark_started(cached.status, encoded_head.len() as u64);
             write_all_with_timeout(
                 client_stream,
                 &encoded_head,
@@ -83,7 +87,16 @@ where
                     "writing cached response body",
                 )
                 .await?;
+                handler.response_progress.add_bytes(copied);
             }
+
+            timeout_with_context(
+                handler.response_body_timeout,
+                client_stream.flush(),
+                "flushing cached response to client",
+            )
+            .await?;
+            handler.response_progress.mark_complete();
 
             if should_close {
                 shutdown_stream(client_stream, handler.response_body_timeout).await?;

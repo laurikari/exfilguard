@@ -2492,6 +2492,46 @@ async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_total_timeout_returns_504_before_response() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-total-timeout-head";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2NoResponse)
+            .with_settings(|settings| {
+                settings.request_total_timeout = 2;
+                settings.response_header_timeout = 10;
+            }),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+    let mut client = fixture.h2_client().await?;
+
+    let authority = format!("{}:{}", upstream_host, upstream_addr.port());
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/total-timeout")
+                .build()?,
+        )
+        .body(())?;
+
+    let (status, body) = timeout(StdDuration::from_secs(3), client.request_text(request)).await??;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body, "request timed out");
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-total-timeout-body";
@@ -2502,7 +2542,7 @@ async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<(
             .client_protocols(ClientProtocols::Http2)
             .upstream_mode(UpstreamMode::Http2HeadersThenStallBody)
             .with_settings(|settings| {
-                settings.request_total_timeout = 1;
+                settings.request_total_timeout = 2;
                 settings.response_body_idle_timeout = 10;
             }),
     )
@@ -2522,11 +2562,18 @@ async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<(
         )
         .body(())?;
 
-    let result = timeout(StdDuration::from_secs(2), client.request_text(request)).await;
+    let response = timeout(StdDuration::from_secs(2), client.request(request)).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let result = timeout(
+        StdDuration::from_secs(3),
+        BumpedH2Client::read_body(response.into_body()),
+    )
+    .await;
     match result {
         Ok(Err(_)) => {}
-        Ok(Ok((status, body))) => {
-            panic!("expected HTTP/2 body relay to fail on total timeout, got {status} {body:?}");
+        Ok(Ok(body)) => {
+            panic!("expected HTTP/2 body relay to fail on total timeout, got {body:?}");
         }
         Err(_) => panic!("HTTP/2 response body relay ignored request_total_timeout"),
     }
@@ -2534,6 +2581,84 @@ async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<(
     client.shutdown().await;
     fixture.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_cache_timeout_resets_only_affected_stream() -> Result<()> {
+    const BODY_SIZE: usize = 16 * 1024 * 1024;
+
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-cache-timeout";
+    let policy = PolicySpec::new(policy_name).rule(
+        RuleSpec::allow(&["GET"], format!("https://{upstream_host}/**")).cache_force_duration(60),
+    );
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2)
+            .upstream_mode(UpstreamMode::Http2CacheInspect)
+            .with_cache()
+            .with_settings(|settings| {
+                settings.request_total_timeout = 2;
+                settings.response_body_idle_timeout = 10;
+                settings.cache_max_entry_size = 20 * 1024 * 1024;
+            }),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let large_uri = Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query("/h2/large-cache-hit")
+        .build()?;
+    fixture
+        .cache()
+        .store(
+            &Method::GET,
+            &large_uri,
+            &http::HeaderMap::new(),
+            StatusCode::OK,
+            &http::HeaderMap::new(),
+            &vec![b'x'; BODY_SIZE],
+            StdDuration::from_secs(60),
+        )
+        .await?;
+
+    let mut client = fixture.h2_client().await?;
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(large_uri)
+        .body(())?;
+    let response = timeout(StdDuration::from_secs(2), client.request(request)).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    sleep(StdDuration::from_secs(3)).await;
+    let body_result = timeout(
+        StdDuration::from_secs(2),
+        BumpedH2Client::read_body(response.into_body()),
+    )
+    .await?;
+    assert!(
+        body_result.is_err(),
+        "timed-out cache stream completed successfully"
+    );
+
+    let after_uri = Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query("/h2/after-cache-timeout")
+        .build()?;
+    let after = http::Request::builder()
+        .method(Method::GET)
+        .uri(after_uri)
+        .body(())?;
+    let (status, body) = timeout(StdDuration::from_secs(3), client.request_text(after)).await??;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "request=1\npath=/h2/after-cache-timeout\nbody=");
+    assert_eq!(fixture.request_count(), 1);
+
+    client.shutdown().await;
+    fixture.shutdown().await;
     Ok(())
 }
 

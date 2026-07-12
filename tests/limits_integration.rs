@@ -208,6 +208,116 @@ async fn request_total_timeout_triggers_during_body() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_total_timeout_caps_upstream_tls_setup() -> Result<()> {
+    let dirs = TestDirs::new()?;
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(async move {
+        if let Ok((_stream, _)) = upstream_listener.accept().await {
+            sleep(StdDuration::from_secs(10)).await;
+        }
+    });
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-tls"])
+        .policy(PolicySpec::new("allow-tls").rule(RuleSpec::allow(
+            &["GET"],
+            format!("https://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.request_total_timeout = 1;
+            settings.tls_handshake_timeout = 10;
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "GET https://127.0.0.1:{upstream_port}/slow HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = timeout(
+        StdDuration::from_secs(3),
+        read_http_response_with_length(&mut stream),
+    )
+    .await??;
+    assert!(
+        response.starts_with("HTTP/1.1 504"),
+        "unexpected response: {response}"
+    );
+    assert!(response.contains("request timed out"));
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_total_timeout_starts_after_complete_request_head() -> Result<()> {
+    let dirs = TestDirs::new()?;
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = upstream_listener.accept().await {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-slow-head"])
+        .policy(PolicySpec::new("allow-slow-head").rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{upstream_port}/**"),
+        )))
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.request_total_timeout = 1;
+            settings.request_header_timeout = 5;
+        })
+        .spawn()
+        .await?;
+
+    let mut stream = TcpStream::connect(harness.addr).await?;
+    let partial = format!(
+        "GET http://127.0.0.1:{upstream_port}/slow-head HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n"
+    );
+    stream.write_all(partial.as_bytes()).await?;
+    stream.flush().await?;
+    sleep(StdDuration::from_secs(2)).await;
+    stream.write_all(b"Connection: close\r\n\r\n").await?;
+    stream.flush().await?;
+
+    let response = timeout(
+        StdDuration::from_secs(3),
+        read_http_response_with_length(&mut stream),
+    )
+    .await??;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected response: {response}"
+    );
+
+    stream.shutdown().await.ok();
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
     let dirs = TestDirs::new()?;
 

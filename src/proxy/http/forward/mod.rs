@@ -5,7 +5,7 @@ mod response;
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use http::Method;
@@ -15,6 +15,7 @@ use tracing::debug;
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
 use crate::proxy::forward_error::{InformationalResponseStarted, UpstreamClosed};
+use crate::proxy::forward_limits::{RequestDeadline, ResponseProgress};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 
@@ -74,8 +75,8 @@ pub async fn forward_to_upstream<S>(
     body_plan: BodyPlan,
     connect_binding: Option<&ResolvedTarget>,
     timeouts: &ForwardTimeouts,
-    request_start: Instant,
-    request_total_timeout: Option<Duration>,
+    request_deadline: RequestDeadline,
+    response_progress: &ResponseProgress,
     expect_continue: bool,
     decision: &AllowDecision,
     peer: SocketAddr,
@@ -114,8 +115,8 @@ where
         headers,
         body_plan,
         timeouts,
-        request_start,
-        request_total_timeout,
+        request_deadline,
+        response_progress,
         expect_continue,
         peer,
         max_request_body_size,
@@ -165,8 +166,8 @@ where
                 headers,
                 body_plan,
                 timeouts,
-                request_start,
-                request_total_timeout,
+                request_deadline,
+                response_progress,
                 expect_continue,
                 peer,
                 max_request_body_size,

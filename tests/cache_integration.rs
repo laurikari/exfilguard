@@ -10,9 +10,10 @@ use std::{
 };
 
 use anyhow::Result;
+use http::{HeaderMap, Method, StatusCode, Uri};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
 };
 
 use support::*;
@@ -477,6 +478,76 @@ async fn run_forced_freshness_test(upstream_headers: &str, expect_cache_hit: boo
     harness.shutdown().await;
     upstream_task.abort();
     let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_total_timeout_caps_http1_cache_hit_delivery() -> Result<()> {
+    const BODY_SIZE: usize = 16 * 1024 * 1024;
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-test"])
+        .policy(
+            PolicySpec::new("cache-test").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{upstream_port}/**"))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.request_total_timeout = 1;
+            settings.response_body_idle_timeout = 10;
+            settings.cache_max_entry_size = 20 * 1024 * 1024;
+        })
+        .spawn()
+        .await?;
+
+    let uri: Uri = format!("http://127.0.0.1:{upstream_port}/large")
+        .parse()
+        .unwrap();
+    harness
+        .cache
+        .as_ref()
+        .unwrap()
+        .store(
+            &Method::GET,
+            &uri,
+            &HeaderMap::new(),
+            StatusCode::OK,
+            &HeaderMap::new(),
+            &vec![b'x'; BODY_SIZE],
+            StdDuration::from_secs(60),
+        )
+        .await?;
+
+    let socket = TcpSocket::new_v4()?;
+    socket.set_recv_buffer_size(4096)?;
+    let mut stream = socket.connect(harness.addr).await?;
+    stream
+        .write_all(bodyless_request(upstream_port, "/large", true).as_bytes())
+        .await?;
+    stream.flush().await?;
+
+    tokio::time::sleep(StdDuration::from_secs(2)).await;
+    let mut response = Vec::new();
+    tokio::time::timeout(StdDuration::from_secs(3), stream.read_to_end(&mut response)).await??;
+    assert!(response.starts_with(b"HTTP/1.1 200"), "cache lookup missed");
+    assert!(
+        !response.windows(12).any(|bytes| bytes == b"HTTP/1.1 504"),
+        "proxy appended a timeout response after the cache hit started"
+    );
+    assert!(
+        response.len() < BODY_SIZE,
+        "cache hit ignored request_total_timeout"
+    );
+
+    harness.shutdown().await;
+    drop(upstream_listener);
     Ok(())
 }
 

@@ -27,7 +27,7 @@ use crate::{
         cache::HttpCache,
         connect::ResolvedTarget,
         forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
-        forward_limits::AllowLogTracker,
+        forward_limits::{AllowLogTracker, RequestDeadline, ResponseProgress},
         policy_eval::{self, AllowDecision, PolicyLogConfig, RequestLogContext},
         policy_response::{self, ForwardErrorSpec},
         request::RequestFlowContext,
@@ -240,6 +240,7 @@ async fn process_downstream_request(
     flow_context: RequestFlowContext,
 ) -> Result<()> {
     let _stream_guard = crate::metrics::track_http2_stream();
+    let start = Instant::now();
 
     if let Err(err) = reject_expect_header(request.headers()) {
         warn!(
@@ -257,7 +258,6 @@ async fn process_downstream_request(
         return Ok(());
     }
 
-    let start = Instant::now();
     let snapshot = app.policies.snapshot();
     let max_request_header_size = app.settings.max_request_header_size;
     let (meta, body) = match sanitize_request(request, max_request_header_size, &flow_context) {
@@ -291,8 +291,8 @@ struct DownstreamRequestCtx {
     request_body_timeout: Duration,
     response_header_timeout: Duration,
     response_body_timeout: Duration,
-    request_total_timeout: Option<Duration>,
-    request_start: Instant,
+    request_deadline: RequestDeadline,
+    response_progress: ResponseProgress,
     max_request_body_size: usize,
     max_request_header_bytes: usize,
     max_response_header_bytes: usize,
@@ -322,8 +322,8 @@ impl DownstreamRequestCtx {
             request_body_timeout: app.settings.request_body_idle_timeout(),
             response_header_timeout: app.settings.response_header_timeout(),
             response_body_timeout: app.settings.response_body_idle_timeout(),
-            request_total_timeout: app.settings.request_total_timeout(),
-            request_start: start,
+            request_deadline: RequestDeadline::new(start, app.settings.request_total_timeout()),
+            response_progress: ResponseProgress::default(),
             max_request_body_size: app.settings.max_request_body_size,
             max_request_header_bytes: app.settings.max_request_header_size,
             max_response_header_bytes: app.settings.max_response_header_size,
@@ -425,6 +425,17 @@ struct Http2RequestHandler {
     upstream: Arc<Mutex<Http2Upstream>>,
 }
 
+enum AllowedRequestResult {
+    CacheHit {
+        status: http::StatusCode,
+        bytes_out: u64,
+    },
+    Forwarded {
+        success: super::forward::ForwardOutcome,
+        cache_lookup: &'static str,
+    },
+}
+
 impl Http2RequestHandler {
     fn should_disconnect_on_forward_error(kind: &ForwardErrorKind<'_>) -> bool {
         !matches!(
@@ -432,6 +443,7 @@ impl Http2RequestHandler {
             ForwardErrorKind::InvalidRequestBody(_)
                 | ForwardErrorKind::BodyTooLarge(_)
                 | ForwardErrorKind::PrivateAddress(_)
+                | ForwardErrorKind::RequestTimeout
                 | ForwardErrorKind::MisdirectedRequest(_)
         )
     }
@@ -465,8 +477,8 @@ impl Http2RequestHandler {
             self.ctx.request_body_timeout,
             self.ctx.response_header_timeout,
             self.ctx.response_body_timeout,
-            self.ctx.request_start,
-            self.ctx.request_total_timeout,
+            self.ctx.request_deadline,
+            &self.ctx.response_progress,
             self.ctx.max_request_body_size,
             self.ctx.max_request_header_bytes,
             self.ctx.max_response_header_bytes,
@@ -500,7 +512,12 @@ impl Http2RequestHandler {
         crate::metrics::record_upstream_error(kind.as_metric_label());
         log_forward_error(&kind, &log, &err);
 
-        if should_disconnect {
+        if matches!(kind, ForwardErrorKind::ResponseAlreadyStarted(_)) {
+            // Dropping the affected H2 stream resets it. Other multiplexed streams and the
+            // shared upstream session remain usable.
+            self.log_disconnect_forward_error(decision, log, &kind, &error_detail);
+            Ok(())
+        } else if should_disconnect {
             {
                 let mut upstream = self.upstream.lock().await;
                 upstream.terminate_session().await;
@@ -541,26 +558,47 @@ impl RequestHandler for Http2RequestHandler {
 
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
         let policy_eval::AllowOutcome { decision, log } = outcome;
-        let cache_evaluation = evaluate_cache(
-            &self.ctx.meta,
-            self.ctx.body.is_end_stream(),
-            &decision,
-            self.ctx.cache.as_ref(),
-            self.ctx.peer,
-        )
-        .await;
-        let (cache_lookup, cache_miss) = match cache_evaluation {
-            CacheEvaluation::Hit(cached) => {
-                let (status, bytes_out) = send_cached_response(
-                    &mut self.ctx.respond,
-                    &self.ctx.meta.parsed.method,
-                    *cached,
-                    self.ctx.response_body_timeout,
-                    self.ctx.request_start,
-                    self.ctx.request_total_timeout,
-                    self.ctx.max_response_header_bytes,
+
+        let deadline = self.ctx.request_deadline;
+        let progress = self.ctx.response_progress.clone();
+        let result = deadline
+            .run(&progress, async {
+                let cache_evaluation = evaluate_cache(
+                    &self.ctx.meta,
+                    self.ctx.body.is_end_stream(),
+                    &decision,
+                    self.ctx.cache.as_ref(),
+                    self.ctx.peer,
                 )
-                .await?;
+                .await;
+                let (cache_lookup, cache_miss) = match cache_evaluation {
+                    CacheEvaluation::Hit(cached) => {
+                        let (status, bytes_out) = send_cached_response(
+                            &mut self.ctx.respond,
+                            &self.ctx.meta.parsed.method,
+                            *cached,
+                            self.ctx.response_body_timeout,
+                            self.ctx.request_deadline,
+                            &self.ctx.response_progress,
+                            self.ctx.max_response_header_bytes,
+                        )
+                        .await?;
+                        return Ok(AllowedRequestResult::CacheHit { status, bytes_out });
+                    }
+                    CacheEvaluation::Miss(miss) => ("miss", Some(miss)),
+                    CacheEvaluation::Bypass => ("bypass", None),
+                };
+
+                let success = self.forward_request(cache_miss).await?;
+                Ok(AllowedRequestResult::Forwarded {
+                    success,
+                    cache_lookup,
+                })
+            })
+            .await;
+
+        match result {
+            Ok(AllowedRequestResult::CacheHit { status, bytes_out }) => {
                 log.access_log_builder()
                     .decision("CACHE_HIT")
                     .client(decision.client.as_ref())
@@ -572,14 +610,12 @@ impl RequestHandler for Http2RequestHandler {
                     .cache_lookup("hit")
                     .cache_store("bypassed")
                     .log();
-                return Ok(());
+                Ok(())
             }
-            CacheEvaluation::Miss(miss) => ("miss", Some(miss)),
-            CacheEvaluation::Bypass => ("bypass", None),
-        };
-
-        match self.forward_request(cache_miss).await {
-            Ok(success) => {
+            Ok(AllowedRequestResult::Forwarded {
+                success,
+                cache_lookup,
+            }) => {
                 let stats = self.build_allow_log_stats(&success);
                 log_allow_success(
                     log,

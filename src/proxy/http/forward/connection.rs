@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
 use http::Method;
@@ -13,6 +13,7 @@ use tokio_rustls::client::TlsStream;
 use crate::io_util::{CountingWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::forward_error::{RequestTimeout, ResponseAlreadyStarted};
+use crate::proxy::forward_limits::{RequestDeadline, ResponseProgress};
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 use crate::util::timeout_with_context;
@@ -80,8 +81,8 @@ pub(super) async fn forward_with_connection<S>(
     headers: &Http1HeaderAccumulator,
     body_plan: BodyPlan,
     timeouts: &ForwardTimeouts,
-    request_start: Instant,
-    request_total_timeout: Option<Duration>,
+    request_deadline: RequestDeadline,
+    response_progress: &ResponseProgress,
     expect_continue: bool,
     peer: SocketAddr,
     max_request_body_size: usize,
@@ -93,7 +94,7 @@ pub(super) async fn forward_with_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
+    let request_deadline = request_deadline.instant();
     let request_bytes =
         build_upstream_request(request, headers, request_close, &body_plan, expect_continue);
     let upstream_request_instant = Instant::now();
@@ -205,6 +206,10 @@ where
     };
 
     let encoded_head = head.encode(response_body_plan, override_connection);
+    response_progress.mark_started(
+        head.status,
+        informational_bytes.saturating_add(encoded_head.len() as u64),
+    );
     {
         let client_stream = client_reader.get_mut();
         write_all_with_timeout(
@@ -246,6 +251,7 @@ where
         }
     };
     bytes_to_client = bytes_to_client.saturating_add(body_bytes);
+    response_progress.add_bytes(body_bytes);
 
     if let Err(source) = timeout_with_context(
         timeouts.response_io,
@@ -256,6 +262,8 @@ where
     {
         return Err(ResponseAlreadyStarted::new(head.status, bytes_to_client, source).into());
     }
+
+    response_progress.mark_complete();
 
     drop(upstream_reader);
 

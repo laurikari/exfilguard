@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
+use exfilguard::proxy::cache::HttpCache;
 use exfilguard::settings::Settings;
 use exfilguard::tls::ca::CertificateAuthority;
 
@@ -478,6 +479,14 @@ impl BumpedTlsFixture {
         self.request_count.load(Ordering::SeqCst)
     }
 
+    pub fn cache(&self) -> Arc<HttpCache> {
+        self.harness
+            .cache
+            .as_ref()
+            .expect("fixture cache is enabled")
+            .clone()
+    }
+
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
         let _ = self.upstream_task.await;
@@ -836,7 +845,12 @@ async fn serve_tls_h2_headers_then_stall_body(
     let _send = respond
         .send_response(response, false)
         .context("failed to send HTTP/2 response headers")?;
-    sleep(Duration::from_secs(5)).await;
+    tokio::select! {
+        _ = sleep(Duration::from_secs(5)) => {}
+        result = poll_fn(|cx| connection.poll_closed(cx)) => {
+            result.context("HTTP/2 connection failed while stalling response body")?;
+        }
+    }
     Ok(())
 }
 

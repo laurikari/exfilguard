@@ -15,7 +15,7 @@ use tokio::time::timeout;
 
 use crate::{
     proxy::forward_error::RequestTimeout,
-    proxy::forward_limits::{BodySizeTracker, HeaderBudget},
+    proxy::forward_limits::{BodySizeTracker, HeaderBudget, RequestDeadline, ResponseProgress},
     proxy::headers::{
         response_header_should_skip, sanitize_request_trailer_map, sanitize_response_trailer_map,
     },
@@ -124,14 +124,14 @@ pub(super) async fn forward_request_to_upstream(
     request_body_timeout: Duration,
     response_header_timeout: Duration,
     response_body_timeout: Duration,
-    request_start: Instant,
-    request_total_timeout: Option<Duration>,
+    request_deadline: RequestDeadline,
+    response_progress: &ResponseProgress,
     max_request_body_size: usize,
     max_request_header_bytes: usize,
     max_response_header_bytes: usize,
     cache_miss: Option<Box<CacheMiss>>,
 ) -> Result<ForwardOutcome> {
-    let request_deadline = request_total_timeout.map(|timeout| request_start + timeout);
+    let request_deadline = request_deadline.instant();
     let mut sender = checkout.sender;
     let upstream_peer = checkout.peer;
     let reused_existing = checkout.reused_existing;
@@ -309,6 +309,7 @@ pub(super) async fn forward_request_to_upstream(
     let mut send_body = respond
         .send_response(response_head, end_stream)
         .context("failed to send HTTP/2 response headers downstream")?;
+    response_progress.mark_started(status, response_header_bytes as u64);
 
     let mut upstream_body_bytes = 0u64;
     let mut response_body = response.into_body();
@@ -337,6 +338,7 @@ pub(super) async fn forward_request_to_upstream(
                 "forwarding HTTP/2 response body to client",
             )
             .await?;
+            response_progress.add_bytes(chunk_len as u64);
             response_body
                 .flow_control()
                 .release_capacity(chunk_len)
@@ -374,6 +376,8 @@ pub(super) async fn forward_request_to_upstream(
             }
         }
     }
+
+    response_progress.mark_complete();
 
     let cache_store = cache_write.finish(upstream_peer).await;
 

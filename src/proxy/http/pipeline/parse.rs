@@ -48,7 +48,10 @@ where
     let request_body_timeout = app.settings.request_body_idle_timeout();
     let response_header_timeout = app.settings.response_header_timeout();
     let response_body_timeout = app.settings.response_body_idle_timeout();
-    let request_total_timeout = app.settings.request_total_timeout();
+    let request_deadline = crate::proxy::forward_limits::RequestDeadline::new(
+        start,
+        app.settings.request_total_timeout(),
+    );
     let content_length = match headers.content_length() {
         Ok(value) => value,
         Err(err) => {
@@ -180,8 +183,8 @@ where
         request_body_timeout,
         response_header_timeout,
         response_body_timeout,
-        request_start: start,
-        request_total_timeout,
+        request_deadline,
+        response_progress: Default::default(),
         parsed: &parsed,
         expect_continue,
     };

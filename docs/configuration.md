@@ -311,7 +311,7 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |
 | `response_header_timeout` | u64 | 60 | Maximum total time from waiting for the first upstream response head through receiving the final response head |
 | `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
-| `request_total_timeout` | u64 | 0 | Maximum total time from request start until the response has been fully forwarded (0 disables) |
+| `request_total_timeout` | u64 | 0 | Maximum total time from accepting a complete request head through policy/cache work, upstream setup, and full response delivery (0 disables) |
 | `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an HTTP/1 keep-alive connection or an HTTP/2 connection with no active request streams |
 | `connect_tunnel_idle_timeout` | u64 | 60 | Maximum idle time for CONNECT tunnels |
 | `connect_tunnel_max_lifetime` | u64 | 0 | Maximum lifetime for CONNECT tunnels (0 disables) |
@@ -323,6 +323,15 @@ that period. This also bounds an incomplete HTTP/2 header block while no other
 stream is active. Active streams remain governed by the request-body,
 response, and optional total-request timeouts rather than the connection-idle
 timer.
+
+The total-request timeout begins after a complete inner HTTP request head has
+been accepted. It caps cache lookup and delivery, DNS/TCP/TLS upstream setup,
+request upload, retries, and response delivery. Phase-specific timeouts still
+apply, so whichever deadline expires first wins. Before a final response has
+started, expiry returns `504 Gateway Timeout`; after response delivery has
+started, ExfilGuard closes or resets the request instead of appending another
+response. Outer CONNECT setup, tunnel lifetime, and cleanup after response
+delivery use their own limits.
 
 ---
 

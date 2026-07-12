@@ -61,7 +61,7 @@ where
     let binding = connect_binding.as_ref();
 
     loop {
-        let start = Instant::now();
+        let header_start = Instant::now();
         let request_head = match read_http1_request_head(
             &mut reader,
             peer,
@@ -87,7 +87,7 @@ where
                     b"invalid request\r\n",
                     response_timeout,
                     0,
-                    start.elapsed(),
+                    header_start.elapsed(),
                     AccessLogBuilder::new(peer)
                         .method("UNKNOWN")
                         .scheme(scheme_name(fallback_scheme))
@@ -117,9 +117,13 @@ where
                 stream,
                 target,
                 request_bytes,
-                start,
+                start: header_start,
             }));
         }
+
+        // Header receipt has its own deadline. The total request budget begins only after the
+        // complete request head is accepted, matching HTTP/2 stream handling.
+        let start = Instant::now();
 
         let ctx = RequestContext {
             method,
