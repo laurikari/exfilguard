@@ -27,6 +27,10 @@ pub fn build_client_tls_h2(root_store: RootCertStore) -> Result<Arc<ClientConfig
     build_client_tls_with_protocols(root_store, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
 }
 
+pub fn build_client_tls_h2_only(root_store: RootCertStore) -> Result<Arc<ClientConfig>> {
+    build_client_tls_with_protocols(root_store, vec![b"h2".to_vec()])
+}
+
 pub fn build_client_tls_with_protocols(
     root_store: RootCertStore,
     protocols: Vec<Vec<u8>>,

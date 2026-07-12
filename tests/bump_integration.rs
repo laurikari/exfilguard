@@ -1907,7 +1907,7 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http1Keepalive),
     )
     .await?;
@@ -1944,6 +1944,28 @@ async fn connect_bump_prefers_http1_when_upstream_http1_only() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_rejects_h2_only_client_when_upstream_http1_only() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-http1-only";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http1)
+            .upstream_mode(UpstreamMode::Http1Keepalive),
+    )
+    .await?;
+
+    let _handshake_error = fixture
+        .reconnect(ClientProtocols::Http2Only)
+        .await
+        .expect_err("H2-only client must not negotiate against an HTTP/1-only path");
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_supports_http2() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2";
@@ -1951,7 +1973,7 @@ async fn connect_bump_supports_http2() -> Result<()> {
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2),
     )
     .await?;
@@ -2020,7 +2042,7 @@ async fn connect_bump_http2_cache_miss_then_hit() -> Result<()> {
     );
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2CacheInspect)
             .with_cache(),
     )
@@ -2095,7 +2117,7 @@ async fn bumped_cache_reuses_http1_chunk_payload_for_http2() -> Result<()> {
     assert_eq!(fixture.request_count(), 1);
 
     sleep(StdDuration::from_millis(50)).await;
-    fixture.reconnect(ClientProtocols::Http2).await?;
+    fixture.reconnect(ClientProtocols::Http2Preferred).await?;
     let mut client = fixture.h2_client().await?;
     let request = http::Request::builder()
         .method(Method::GET)
@@ -2133,7 +2155,7 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
     );
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::DualProtocolCacheInspect)
             .with_cache(),
     )
@@ -2197,7 +2219,7 @@ async fn connect_bump_http2_body_requests_bypass_cache() -> Result<()> {
     );
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2CacheInspect)
             .with_cache(),
     )
@@ -2261,7 +2283,7 @@ async fn connect_bump_http2_invalid_request_path_returns_400() -> Result<()> {
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2),
     )
     .await?;
@@ -2305,7 +2327,7 @@ async fn connect_bump_http2_encoded_unreserved_hits_ordered_deny() -> Result<()>
         ));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2),
     )
     .await?;
@@ -2341,7 +2363,7 @@ async fn connect_bump_http2_closes_request_idle_session() -> Result<()> {
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2)
             .with_settings(|settings| settings.client_keepalive_idle_timeout = 1),
     )
@@ -2361,7 +2383,7 @@ async fn connect_bump_http2_closes_incomplete_request_headers_when_idle() -> Res
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2)
             .with_settings(|settings| settings.client_keepalive_idle_timeout = 1),
     )
@@ -2402,7 +2424,7 @@ async fn connect_bump_http2_does_not_apply_connection_idle_timeout_to_active_str
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2NoResponse)
             .with_settings(|settings| {
                 settings.client_keepalive_idle_timeout = 1;
@@ -2445,7 +2467,7 @@ async fn connect_bump_http2_closes_downstream_after_upstream_close() -> Result<(
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2SingleUse),
     )
     .await?;
@@ -2491,7 +2513,7 @@ async fn connect_bump_http2_disconnects_when_upstream_closes_before_response() -
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2CloseBeforeResponse),
     )
     .await?;
@@ -2530,7 +2552,7 @@ async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2NoResponse)
             .with_settings(|settings| {
                 settings.response_header_timeout = 1;
@@ -2572,7 +2594,7 @@ async fn connect_bump_http2_total_timeout_returns_504_before_response() -> Resul
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2NoResponse)
             .with_settings(|settings| {
                 settings.request_total_timeout = 2;
@@ -2612,7 +2634,7 @@ async fn connect_bump_http2_total_timeout_applies_to_response_body() -> Result<(
         .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2HeadersThenStallBody)
             .with_settings(|settings| {
                 settings.request_total_timeout = 2;
@@ -2668,7 +2690,7 @@ async fn connect_bump_http2_cache_timeout_resets_only_affected_stream() -> Resul
     );
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2CacheInspect)
             .with_cache()
             .with_settings(|settings| {
@@ -2745,7 +2767,7 @@ async fn connect_bump_http2_preserves_content_length_for_body_requests() -> Resu
     ));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2Inspect),
     )
     .await?;
@@ -2810,7 +2832,7 @@ async fn connect_bump_http2_policy_denied() -> Result<()> {
         ));
     let mut fixture = BumpedTlsFixture::new(
         BumpedTlsOptions::new(upstream_host, policy_name, policy)
-            .client_protocols(ClientProtocols::Http2)
+            .client_protocols(ClientProtocols::Http2Preferred)
             .upstream_mode(UpstreamMode::Http2),
     )
     .await?;

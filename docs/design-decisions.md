@@ -325,6 +325,15 @@ HTTP/1.0 and upgrade-style flows such as WebSocket over HTTP/1.1.
 
 We leave them out because that keeps the code easier to reason about.
 
+Inspected live forwarding also preserves the HTTP version across the client
+and upstream legs instead of translating between HTTP/1.1 and HTTP/2. The
+upstream ALPN preflight prevents ExfilGuard from advertising H2 unless the
+origin selected H2. Each live request uses the downstream-selected version
+upstream and fails rather than translating if that version is unavailable.
+This limits semantic changes and protocol-conversion attack surface. The opt-in
+response cache remains protocol-neutral because a cache hit has no live
+upstream leg to translate.
+
 ## HTTP/2 uses request-idle connection timeouts
 
 The downstream HTTP/2 connection preface must arrive within

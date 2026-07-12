@@ -121,7 +121,7 @@ pub async fn handle_bump(
 async fn build_server_config(
     app: &AppContext,
     host: &str,
-    prefer_h2: bool,
+    supports_h2: bool,
 ) -> Result<Arc<ServerConfig>> {
     let certified = app.tls.issuer.issue(&[host]).await?;
     let provider = ring::default_provider();
@@ -131,20 +131,25 @@ async fn build_server_config(
     let mut config = builder
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
-    if prefer_h2 {
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    } else {
-        config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
-    }
+    config.alpn_protocols = downstream_alpn_protocols(supports_h2);
     Ok(Arc::new(config))
+}
+
+fn downstream_alpn_protocols(supports_h2: bool) -> Vec<Vec<u8>> {
+    if supports_h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    }
 }
 
 /// Attempts to determine if the upstream server supports HTTP/2.
 ///
 /// This is critical because if the proxy negotiates H2 with the client but the
 /// upstream only supports H1.1, the proxy would have to perform expensive
-/// protocol translation. By probing first, we can align the ALPN offer
-/// sent to the client with the upstream's capabilities.
+/// protocol translation. Probing prevents us from advertising H2 downstream
+/// unless the origin selected it; live requests use the downstream-selected
+/// version upstream and fail rather than translating if it is unavailable.
 async fn probe_upstream_http2(
     resolved: &ResolvedTarget,
     app: &AppContext,
@@ -208,4 +213,18 @@ enum UpstreamProbe {
         peer: SocketAddr,
     },
     Http1,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downstream_alpn_protocols;
+
+    #[test]
+    fn downstream_alpn_matches_live_forwarding_path() {
+        assert_eq!(downstream_alpn_protocols(false), vec![b"http/1.1".to_vec()]);
+        assert_eq!(
+            downstream_alpn_protocols(true),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
 }

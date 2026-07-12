@@ -26,22 +26,24 @@ use exfilguard::tls::ca::CertificateAuthority;
 
 use super::{
     PolicySpec, ProxyHarness, ProxyHarnessBuilder, RuleSpec, TestConfigBuilder, build_client_tls,
-    build_client_tls_h2, build_upstream_h2_tls_config, build_upstream_tls_config,
-    build_upstream_tls_config_with_alpn, read_http_response, read_http_response_with_length,
-    read_until_double_crlf,
+    build_client_tls_h2, build_client_tls_h2_only, build_upstream_h2_tls_config,
+    build_upstream_tls_config, build_upstream_tls_config_with_alpn, read_http_response,
+    read_http_response_with_length, read_until_double_crlf,
 };
 
 #[derive(Clone, Copy)]
 pub enum ClientProtocols {
     Http1,
-    Http2,
+    Http2Preferred,
+    Http2Only,
 }
 
 impl ClientProtocols {
     fn build(self, root_store: RootCertStore) -> Result<Arc<rustls::ClientConfig>> {
         match self {
             ClientProtocols::Http1 => build_client_tls(root_store),
-            ClientProtocols::Http2 => build_client_tls_h2(root_store),
+            ClientProtocols::Http2Preferred => build_client_tls_h2(root_store),
+            ClientProtocols::Http2Only => build_client_tls_h2_only(root_store),
         }
     }
 }
