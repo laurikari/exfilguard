@@ -305,7 +305,7 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `dns_resolve_timeout` | u64 | 2 | Maximum time to resolve DNS for upstream hosts |
-| `upstream_connect_timeout` | u64 | 5 | Maximum time to establish upstream TCP connections |
+| `upstream_connect_timeout` | u64 | 5 | Maximum total time for one upstream TCP connection across all resolved addresses |
 | `tls_handshake_timeout` | u64 | 10 | Maximum time for TLS handshakes (client or upstream) |
 | `request_header_timeout` | u64 | 10 | Maximum time to read an HTTP/1 request line + headers or the downstream HTTP/2 connection preface |
 | `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |

@@ -362,3 +362,16 @@ If the deadline expires before a final response starts, ExfilGuard returns a
 than writing a second response. Outer CONNECT setup and tunnel lifetime have
 separate controls, and cleanup after response delivery does not consume the
 request budget.
+
+## Upstream TCP connection setup has one multi-address budget
+
+`upstream_connect_timeout` bounds one complete TCP connection operation across
+all resolved addresses, rather than granting a fresh timeout to each address.
+ExfilGuard preserves resolver preference within each address family, alternates
+IPv6 and IPv4 candidates, and starts attempts 250 milliseconds apart. The first
+success wins and cancels the remaining attempts.
+
+There is no fixed address-count cutoff. The total deadline and stagger bound the
+work naturally; candidates whose turn falls beyond the deadline remain
+unattempted. DNS resolution and TLS handshakes retain their own phase-specific
+timeouts.
