@@ -314,6 +314,9 @@ impl VaultCaSource {
                 .collect::<Result<Vec<_>>>()
                 .map_err(|err| vault_failure("validation", err))?
         };
+        if parent_chain.first() == Some(&intermediate_der) {
+            parent_chain.remove(0);
+        }
         if parent_chain.first() != Some(&issuing_ca_der) {
             return Err(vault_failure(
                 "validation",
@@ -836,6 +839,7 @@ mod tests {
         issuing_ca_pem: String,
         ca_chain: Vec<String>,
         signing_issuer: Issuer<'static, KeyPair>,
+        include_issued_intermediate_in_chain: bool,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -887,11 +891,16 @@ mod tests {
             request.params.key_usages =
                 vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
             let intermediate = request.signed_by(&signing_issuer).unwrap();
+            let intermediate_pem = intermediate.pem();
+            let mut ca_chain = ca_chain;
+            if include_issued_intermediate_in_chain {
+                ca_chain.insert(0, intermediate_pem.clone());
+            }
             respond_json(
                 &mut sign_stream,
                 json!({
                     "data": {
-                        "certificate": intermediate.pem(),
+                        "certificate": intermediate_pem,
                         "issuing_ca": issuing_ca_pem,
                         "ca_chain": ca_chain,
                     }
@@ -989,6 +998,7 @@ mod tests {
             signer_pem.clone(),
             vec![signer_pem, root_pem],
             signer_issuer,
+            false,
         )
         .await;
 
@@ -1010,6 +1020,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_ca_chain_that_begins_with_the_issued_intermediate() {
+        let directory = TempDir::new().unwrap();
+        let (root_pem, root_der, root_issuer) = generate_root("Pinned Root");
+        let roots = write_file(&directory, "roots.pem", root_pem.as_bytes());
+        let secret_id = write_file(&directory, "secret-id", b"test-secret\n");
+        let (address, server) =
+            spawn_fake_vault(root_pem.clone(), vec![root_pem], root_issuer, true).await;
+
+        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let authority = source.issue().await.unwrap();
+
+        assert_eq!(authority.root_certificate_der().as_ref(), root_der);
+        let chain = authority.certificate_chain();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].as_ref(), root_der);
+        authority
+            .mint_leaf(&["echoed-chain.example"], StdDuration::from_secs(60 * 60))
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_parents_after_removing_the_issued_intermediate() {
+        let directory = TempDir::new().unwrap();
+        let (root_pem, _, root_issuer) = generate_root("Pinned Root");
+        let roots = write_file(&directory, "roots.pem", root_pem.as_bytes());
+        let secret_id = write_file(&directory, "secret-id", b"test-secret\n");
+        let (address, server) = spawn_fake_vault(
+            root_pem.clone(),
+            vec![root_pem.clone(), root_pem],
+            root_issuer,
+            true,
+        )
+        .await;
+
+        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let error = match source.issue().await {
+            Ok(_) => panic!("duplicate parent certificates must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("duplicate certificate"),
+            "unexpected error: {error:#}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_an_intermediate_from_an_unpinned_root() {
         let directory = TempDir::new().unwrap();
         let (returned_root_pem, _, returned_root_issuer) = generate_root("Returned Root");
@@ -1020,6 +1079,7 @@ mod tests {
             returned_root_pem.clone(),
             vec![returned_root_pem],
             returned_root_issuer,
+            false,
         )
         .await;
 
