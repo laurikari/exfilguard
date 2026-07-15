@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use http::Method;
 
-use crate::config::{HttpsMode, RuleAction, Scheme};
+use crate::{
+    config::{HttpsMode, RuleAction, Scheme},
+    util::normalize_mapped_ip,
+};
 
 use super::Decision;
 use super::model::{ClientEntry, CompiledConfig};
@@ -70,7 +73,7 @@ impl PolicySnapshot {
     }
 
     pub fn resolve_client(&self, addr: IpAddr) -> Option<&ClientEntry> {
-        let addr = normalize_peer_ip(addr);
+        let addr = normalize_mapped_ip(addr);
         if let Some(index) = self.compiled.cidr_trie.find(addr)
             && let Some(client) = self.compiled.clients.get(index)
         {
@@ -105,15 +108,6 @@ impl PolicySnapshot {
         }
         None
     }
-}
-
-fn normalize_peer_ip(addr: IpAddr) -> IpAddr {
-    if let IpAddr::V6(v6) = addr
-        && let Some(mapped) = v6.to_ipv4_mapped()
-    {
-        return IpAddr::V4(mapped);
-    }
-    addr
 }
 
 #[derive(Debug, Clone)]

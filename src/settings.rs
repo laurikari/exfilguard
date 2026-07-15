@@ -12,6 +12,7 @@ use serde::de::{self, Deserializer, Visitor};
 
 use crate::cli::{Cli, LogFormat};
 use crate::config as runtime_config;
+use crate::util::normalize_mapped_ip;
 
 struct SettingsDefaults;
 
@@ -553,9 +554,12 @@ impl Settings {
     }
 
     pub fn proxy_protocol_allows_peer(&self, peer: IpAddr) -> bool {
+        let normalized_peer = normalize_mapped_ip(peer);
         match &self.proxy_protocol_allowed_cidrs {
             None => true,
-            Some(cidrs) => cidrs.iter().any(|cidr| cidr.contains(&peer)),
+            Some(cidrs) => cidrs
+                .iter()
+                .any(|cidr| cidr.contains(&peer) || cidr.contains(&normalized_peer)),
         }
     }
 
@@ -1406,5 +1410,27 @@ policies = "policies.toml"
             metrics_tls_key: None,
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn proxy_protocol_allowlist_matches_ipv4_mapped_peer() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"proxy_protocol = "required"
+proxy_protocol_allowed_cidrs = ["127.0.0.0/8"]
+
+[ca]
+source = "builtin"
+dir = "ca-material""#,
+        );
+        let settings = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap();
+
+        let mapped = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(settings.proxy_protocol_allows_peer(mapped));
+        assert!(!settings.proxy_protocol_allows_peer("::1".parse().unwrap()));
     }
 }

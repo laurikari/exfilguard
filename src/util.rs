@@ -40,6 +40,16 @@ pub fn canonicalize_ip_literal(value: &str) -> Option<String> {
     value.parse::<IpAddr>().ok().map(|addr| addr.to_string())
 }
 
+/// Treat an IPv4-mapped IPv6 address as the IPv4 address it represents.
+pub fn normalize_mapped_ip(addr: IpAddr) -> IpAddr {
+    if let IpAddr::V6(v6) = addr
+        && let Some(mapped) = v6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(mapped);
+    }
+    addr
+}
+
 /// Returns true if the provided IP address should be treated as non-public for upstream filtering.
 ///
 /// Historical note: despite the name, this is intentionally broader than RFC1918/RFC4193 private
