@@ -351,6 +351,21 @@ all relative paths retain the main file's directory as their base. Global
 settings remain restart-only, while SIGHUP reload stays limited to client and
 policy data.
 
+## Client limits use connection-time accounting
+
+Per-client `max_connections` is an operational resource guard, not a strict
+tenant quota. A connection acquires its permit using the client identity
+resolved when it is accepted, and that permit is not transferred if a later
+reload maps the peer address to another client. New connections use the new
+mapping and limits immediately.
+
+Requests on established HTTP and inspected HTTPS connections still use the
+latest policy snapshot, including any new client mapping. Reconciling their
+connection permits retroactively would add disruptive cross-generation
+accounting for an administrator-controlled transition without improving the
+normal steady-state resource bound. Established opaque CONNECT tunnels retain
+their setup-time decision until they close or reach their configured lifetime.
+
 ## Some protocol features stay out of scope
 
 ExfilGuard does not currently support some protocol features, including

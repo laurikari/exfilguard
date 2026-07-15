@@ -256,6 +256,8 @@ Each client may have at most 1,024 simultaneous downstream connections by
 default. Set `max_connections` on a client to override that budget. A CIDR
 client shares its budget across every matching machine. The count includes
 ordinary HTTP keep-alive, raw CONNECT, and inspected CONNECT connections.
+Permits remain charged to the connection-time client identity across reloads;
+new requests still use the latest client mapping and policies.
 
 ## Certificate storage and permissions
 

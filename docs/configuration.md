@@ -95,8 +95,11 @@ machine it matches. When the budget is full, ExfilGuard closes new connections
 without evicting established ones. `max_connections` must be greater than zero.
 
 Client and policy reloads apply a changed limit to new admission without
-resetting active connection accounting. Existing connections retain the client
-identity assigned when they were accepted.
+resetting active connection accounting. An existing connection's permit remains
+charged to the client identity assigned when it was accepted, even if a reload
+later maps its peer address to another client. Subsequent requests still use the
+latest client mapping and policies. The limit is an operational resource guard,
+not a retroactively reconciled tenant quota.
 
 ---
 
