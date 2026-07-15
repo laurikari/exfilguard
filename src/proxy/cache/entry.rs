@@ -25,7 +25,7 @@ pub(super) struct PersistedEntry {
     pub key_base: String,
     pub body_id: String,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub vary_headers: Vec<(String, Vec<u8>)>,
     pub response_time_unix_millis: u64,
     pub corrected_initial_age_millis: u64,
@@ -40,7 +40,7 @@ impl CacheEntry {
             key_base: key_base.to_string(),
             body_id: self.body_id.clone(),
             status: self.status.as_u16(),
-            headers: headermap_to_vec(&self.headers),
+            headers: headermap_to_bytes_vec(&self.headers),
             vary_headers: headermap_to_bytes_vec(self.vary.headers()),
             response_time_unix_millis: system_time_unix_millis(self.response_time),
             corrected_initial_age_millis: duration_millis(self.corrected_initial_age),
@@ -57,14 +57,15 @@ impl CacheEntry {
         response_time: SystemTime,
         corrected_initial_age: Duration,
         expires_at: SystemTime,
-    ) -> Self {
-        let headers = to_headermap(&persisted.headers);
-        let vary_headers = bytes_vec_to_headermap(&persisted.vary_headers);
+    ) -> Option<Self> {
+        let status = StatusCode::from_u16(persisted.status).ok()?;
+        let headers = bytes_vec_to_headermap(&persisted.headers)?;
+        let vary_headers = bytes_vec_to_headermap(&persisted.vary_headers)?;
         let vary = VaryKey::new(vary_headers);
 
-        Self {
+        Some(Self {
             id,
-            status: StatusCode::from_u16(persisted.status).unwrap_or(StatusCode::OK),
+            status,
             headers,
             vary,
             response_time,
@@ -74,7 +75,7 @@ impl CacheEntry {
             body_id: persisted.body_id.clone(),
             content_hash: persisted.content_hash.clone(),
             content_length: persisted.content_length,
-        }
+        })
     }
 
     pub(super) fn current_age(&self, now: SystemTime) -> Duration {
@@ -95,40 +96,14 @@ fn duration_millis(value: Duration) -> u64 {
     value.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn to_headermap(items: &[(String, String)]) -> HeaderMap {
+fn bytes_vec_to_headermap(items: &[(String, Vec<u8>)]) -> Option<HeaderMap> {
     let mut map = HeaderMap::new();
     for (name, value) in items {
-        if let (Ok(name), Ok(value)) = (
-            http::header::HeaderName::try_from(name.as_str()),
-            http::HeaderValue::from_str(value),
-        ) {
-            map.append(name, value);
-        }
+        let name = http::header::HeaderName::try_from(name.as_str()).ok()?;
+        let value = http::HeaderValue::from_bytes(value).ok()?;
+        map.append(name, value);
     }
-    map
-}
-
-fn headermap_to_vec(map: &HeaderMap) -> Vec<(String, String)> {
-    let mut items = Vec::new();
-    for (name, value) in map.iter() {
-        if let Ok(value_str) = value.to_str() {
-            items.push((name.as_str().to_string(), value_str.to_string()));
-        }
-    }
-    items
-}
-
-fn bytes_vec_to_headermap(items: &[(String, Vec<u8>)]) -> HeaderMap {
-    let mut map = HeaderMap::new();
-    for (name, value) in items {
-        if let (Ok(name), Ok(value)) = (
-            http::header::HeaderName::try_from(name.as_str()),
-            http::HeaderValue::from_bytes(value),
-        ) {
-            map.append(name, value);
-        }
-    }
-    map
+    Some(map)
 }
 
 fn headermap_to_bytes_vec(map: &HeaderMap) -> Vec<(String, Vec<u8>)> {

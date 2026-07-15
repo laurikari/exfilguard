@@ -589,6 +589,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_preserves_non_utf8_response_header_values() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/opaque-header");
+        let req_headers = HeaderMap::new();
+        let header_name = http::header::HeaderName::from_static("x-opaque");
+        let opaque_value = http::HeaderValue::from_bytes(b"\x80opaque")?;
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(header_name.clone(), opaque_value.clone());
+
+        let cache = build_cache(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &resp_headers,
+                b"persisted",
+                Duration::from_secs(60),
+            )
+            .await?;
+        drop(cache);
+
+        let rebuilt = build_cache(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        let hit = rebuilt
+            .lookup(&method, &uri, &req_headers)
+            .await
+            .expect("entry with an opaque HTTP/2 header should survive rebuild");
+        assert_eq!(hit.headers.get(header_name), Some(&opaque_value));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_drops_entry_with_invalid_persisted_header() -> Result<()> {
+        let dir = TempDir::new()?;
+        let disk_dir = dir.path().to_path_buf();
+        let method = Method::GET;
+        let uri = build_uri("example.com", 80, "/invalid-persisted-header");
+        let req_headers = HeaderMap::new();
+
+        let cache = build_cache(4, disk_dir.clone(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        cache
+            .store(
+                &method,
+                &uri,
+                &req_headers,
+                StatusCode::OK,
+                &HeaderMap::new(),
+                b"persisted",
+                Duration::from_secs(60),
+            )
+            .await?;
+        let (body_path, meta_path) = cache_entry_paths(&cache, &method, &uri)?;
+        let mut persisted: PersistedEntry = serde_json::from_slice(&fs::read(&meta_path)?)?;
+        persisted
+            .headers
+            .push(("x-corrupt".to_string(), b"embedded\rreturn".to_vec()));
+        fs::write(&meta_path, serde_json::to_vec(&persisted)?)?;
+        drop(cache);
+
+        let rebuilt = build_cache(4, disk_dir, 1024 * 1024, 1024 * 1024 * 10).await?;
+        assert!(rebuilt.lookup(&method, &uri, &req_headers).await.is_none());
+        assert!(!meta_path.exists(), "invalid metadata should be removed");
+        assert!(!body_path.exists(), "invalid entry body should be removed");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_restores_age_timeline_and_hits_replace_origin_age() -> Result<()> {
         let dir = TempDir::new()?;
         let disk_dir = dir.path().to_path_buf();
@@ -1001,7 +1071,7 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
-        assert_eq!(active_name, "v5");
+        assert_eq!(active_name, "v6");
         let mut cleaned = false;
         for _ in 0..10 {
             let dirs = fs::read_dir(dir.path())?

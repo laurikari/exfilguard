@@ -11,7 +11,7 @@ use tracing::{trace, warn};
 
 use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 
-const CACHE_LAYOUT_VERSION: u32 = 5;
+const CACHE_LAYOUT_VERSION: u32 = 6;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
 
@@ -311,14 +311,21 @@ impl CacheState {
             return Ok(None);
         }
 
-        let entry = CacheEntry::from_persisted(
+        let Some(entry) = CacheEntry::from_persisted(
             &persisted,
             entry_id,
             self.next_entry_id(),
             response_time,
             corrected_initial_age,
             expires_at,
-        );
+        ) else {
+            warn!(
+                "cache metadata {} contains an invalid status or header; removing entry",
+                meta_path.display()
+            );
+            self.store.remove_entry_files(entry_id, &persisted.body_id);
+            return Ok(None);
+        };
 
         let evicted = self.insert_entry(key.key_base().to_string(), entry);
         self.remove_evicted_files(evicted);

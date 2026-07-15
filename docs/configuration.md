@@ -513,7 +513,7 @@ removed on lookup.
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`v5` under the cache root).
+Cache entries live under a versioned subdirectory (`v6` under the cache root).
 Metadata is keyed by request URI and points to an immutable body generation.
 When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up
