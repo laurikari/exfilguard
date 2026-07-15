@@ -451,6 +451,7 @@ impl Http2RequestHandler {
                 | ForwardErrorKind::BodyTooLarge(_)
                 | ForwardErrorKind::PrivateAddress(_)
                 | ForwardErrorKind::RequestTimeout
+                | ForwardErrorKind::ClientBodyIdleTimeout
                 | ForwardErrorKind::MisdirectedRequest(_)
         )
     }
@@ -460,6 +461,7 @@ impl Http2RequestHandler {
             ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
             ForwardErrorKind::ResponseAlreadyStarted(_)
             | ForwardErrorKind::RequestTimeout
+            | ForwardErrorKind::ClientBodyIdleTimeout
             | ForwardErrorKind::InvalidRequestBody(_)
             | ForwardErrorKind::MisdirectedRequest(_)
             | ForwardErrorKind::UpstreamClosed

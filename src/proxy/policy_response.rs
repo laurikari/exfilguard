@@ -35,6 +35,14 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             extra_client_bytes: 0,
             log_reason: "request_timeout",
         },
+        ForwardErrorKind::ClientBodyIdleTimeout => ForwardErrorSpec {
+            status: StatusCode::REQUEST_TIMEOUT,
+            body_http1: b"request body timed out\r\n",
+            body_http2: "request body timed out",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "request_body_timeout",
+        },
         ForwardErrorKind::InvalidRequestBody(body) => ForwardErrorSpec {
             status: StatusCode::BAD_REQUEST,
             body_http1: b"invalid request body\r\n",
@@ -210,7 +218,7 @@ mod tests {
     use crate::{
         config::Scheme,
         proxy::{
-            forward_error::MisdirectedRequest,
+            forward_error::{ClientBodyIdleTimeout, MisdirectedRequest},
             policy_eval::{AllowDecision, DenyDecision},
             request::ParsedRequest,
         },
@@ -320,5 +328,16 @@ mod tests {
         assert_eq!(spec.status, StatusCode::MISDIRECTED_REQUEST);
         assert_eq!(spec.body_http2, "misdirected request");
         assert_eq!(spec.body_http1, b"misdirected request\r\n");
+    }
+
+    #[test]
+    fn client_body_idle_timeout_maps_to_408() {
+        let err = anyhow::Error::new(ClientBodyIdleTimeout);
+        let kind = classify_forward_error(&err);
+        let spec = forward_error_spec(&kind);
+        assert_eq!(spec.status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(spec.body_http2, "request body timed out");
+        assert_eq!(spec.body_http1, b"request body timed out\r\n");
+        assert_eq!(spec.log_reason, "request_body_timeout");
     }
 }

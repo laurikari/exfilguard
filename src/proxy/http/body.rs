@@ -2,7 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use crate::{
     io_util::write_all_with_timeout,
     proxy::{
-        forward_error::RequestTimeout,
+        forward_error::{ClientBodyIdleTimeout, RequestTimeout},
         forward_limits::BodySizeTracker,
         headers::{sanitize_request_trailer_lines, sanitize_response_trailer_lines},
         http::codec::read_line_bytes_with_timeout,
@@ -261,14 +261,36 @@ async fn with_idle_and_total<F, T, E>(
     total_deadline: Option<Instant>,
     future: F,
     context: impl Into<String>,
+    read_source: BodyReadSource,
 ) -> Result<T>
 where
     F: Future<Output = Result<T, E>>,
     E: std::error::Error + Send + Sync + 'static,
 {
     let context = context.into();
-    let idle_fut = timeout_with_context(idle_timeout, future, context);
+    let idle_fut = async {
+        timeout(idle_timeout, future)
+            .await
+            .map_err(|_| read_source.timeout_error(&context))?
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("failed while {context}"))
+    };
     with_total_deadline(total_deadline, idle_fut).await
+}
+
+#[derive(Clone, Copy)]
+enum BodyReadSource {
+    Client,
+    Upstream,
+}
+
+impl BodyReadSource {
+    fn timeout_error(self, context: &str) -> anyhow::Error {
+        match self {
+            Self::Client => ClientBodyIdleTimeout.into(),
+            Self::Upstream => anyhow!("timed out {context}"),
+        }
+    }
 }
 
 pub async fn stream_fixed_body<S, U>(
@@ -292,6 +314,7 @@ where
             total_deadline,
             reader.read(&mut buffer[..to_read]),
             "reading request body from client",
+            BodyReadSource::Client,
         )
         .await?;
         if read == 0 {
@@ -327,6 +350,7 @@ async fn relay_chunked_body_generic<R, W>(
     trailer_limit_error: &'static str,
     sanitize_trailers: TrailerSanitizer,
     mut payload_copy: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+    read_source: BodyReadSource,
 ) -> Result<ChunkedRelayStats>
 where
     R: AsyncRead + Unpin,
@@ -345,6 +369,7 @@ where
                 read_timeout,
                 peer,
                 MAX_CHUNK_LINE_LENGTH,
+                |context| read_source.timeout_error(context),
             ),
         )
         .await?;
@@ -387,6 +412,7 @@ where
                         read_timeout,
                         peer,
                         MAX_CHUNK_LINE_LENGTH,
+                        |context| read_source.timeout_error(context),
                     ),
                 )
                 .await?;
@@ -455,6 +481,7 @@ where
                 total_deadline,
                 reader.read(&mut buffer[..to_read]),
                 format!("reading chunk data from {peer}"),
+                read_source,
             )
             .await?;
             if read == 0 {
@@ -495,6 +522,7 @@ where
             total_deadline,
             reader.read_exact(&mut crlf),
             format!("reading chunk terminator from {peer}"),
+            read_source,
         )
         .await;
         if let Err(err) = terminator_result {
@@ -562,6 +590,7 @@ where
         "request trailer section exceeds configured limit",
         sanitize_request_trailer_lines,
         None,
+        BodyReadSource::Client,
     )
     .await;
 
@@ -649,6 +678,7 @@ where
         "response trailer section exceeds configured limit",
         sanitize_response_trailer_lines,
         None,
+        BodyReadSource::Upstream,
     )
     .await
 }
@@ -682,6 +712,7 @@ where
         "response trailer section exceeds configured limit",
         sanitize_response_trailer_lines,
         Some(payload_copy),
+        BodyReadSource::Upstream,
     )
     .await
 }

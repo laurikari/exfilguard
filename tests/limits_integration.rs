@@ -277,6 +277,73 @@ async fn request_total_timeout_triggers_during_body() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_body_idle_timeout_returns_request_timeout_for_http1_framing() -> Result<()> {
+    let dirs = TestDirs::new()?;
+
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = upstream_listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while stream.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            });
+        }
+    });
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-upload"])
+        .policy(
+            PolicySpec::new("allow-upload").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| {
+            settings.request_total_timeout = 0;
+            settings.request_body_idle_timeout = 1;
+        })
+        .spawn()
+        .await?;
+
+    for (framing, body_prefix) in [
+        ("Content-Length: 5", "A"),
+        ("Transfer-Encoding: chunked", "5\r\nA"),
+    ] {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        let request = format!(
+            "POST http://127.0.0.1:{upstream_port}/upload HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n{framing}\r\nConnection: close\r\n\r\n{body_prefix}"
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+
+        let response = timeout(
+            StdDuration::from_secs(3),
+            read_http_response_with_length(&mut stream),
+        )
+        .await??;
+        assert!(
+            response.starts_with("HTTP/1.1 408"),
+            "unexpected response for {framing}: {response}"
+        );
+        assert!(
+            response.contains("request body timed out"),
+            "missing timeout body for {framing}: {response}"
+        );
+    }
+
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_total_timeout_caps_upstream_tls_setup() -> Result<()> {
     let dirs = TestDirs::new()?;
 

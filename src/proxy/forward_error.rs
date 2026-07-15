@@ -14,6 +14,10 @@ use crate::proxy::{
 pub struct RequestTimeout;
 
 #[derive(Debug, Error)]
+#[error("client request body timed out")]
+pub struct ClientBodyIdleTimeout;
+
+#[derive(Debug, Error)]
 #[error("upstream response failed after an informational response was forwarded: {source}")]
 pub struct InformationalResponseStarted {
     #[source]
@@ -76,6 +80,7 @@ impl MisdirectedRequest {
 pub enum ForwardErrorKind<'a> {
     ResponseAlreadyStarted(&'a ResponseAlreadyStarted),
     RequestTimeout,
+    ClientBodyIdleTimeout,
     InvalidRequestBody(&'a InvalidRequestBody),
     BodyTooLarge(&'a BodyTooLarge),
     PrivateAddress(&'a PrivateAddressError),
@@ -89,6 +94,7 @@ impl ForwardErrorKind<'_> {
         match self {
             Self::ResponseAlreadyStarted(_) => "response_body_failed",
             Self::RequestTimeout => "request_timeout",
+            Self::ClientBodyIdleTimeout => "request_body_timeout",
             Self::InvalidRequestBody(_) => "invalid_request_body",
             Self::BodyTooLarge(_) => "body_too_large",
             Self::PrivateAddress(_) => "private_address",
@@ -106,6 +112,8 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
         ForwardErrorKind::ResponseAlreadyStarted(started)
     } else if err.downcast_ref::<RequestTimeout>().is_some() {
         ForwardErrorKind::RequestTimeout
+    } else if err.downcast_ref::<ClientBodyIdleTimeout>().is_some() {
+        ForwardErrorKind::ClientBodyIdleTimeout
     } else if let Some(invalid) = err.downcast_ref::<InvalidRequestBody>() {
         ForwardErrorKind::InvalidRequestBody(invalid)
     } else if let Some(body) = err.downcast_ref::<BodyTooLarge>() {
@@ -157,6 +165,18 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             inner_method = inner_method,
             effective_mode = effective_mode,
             "request timed out while forwarding"
+        ),
+        ForwardErrorKind::ClientBodyIdleTimeout => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            "client request body timed out"
         ),
         ForwardErrorKind::InvalidRequestBody(_) => warn!(
             peer = %peer,
@@ -266,6 +286,10 @@ mod tests {
         assert_eq!(
             ForwardErrorKind::RequestTimeout.as_metric_label(),
             "request_timeout"
+        );
+        assert_eq!(
+            ForwardErrorKind::ClientBodyIdleTimeout.as_metric_label(),
+            "request_body_timeout"
         );
         assert_eq!(
             ForwardErrorKind::InvalidRequestBody(&invalid).as_metric_label(),

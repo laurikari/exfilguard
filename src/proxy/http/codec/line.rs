@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Error, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::time::Instant;
 
@@ -73,33 +73,38 @@ where
 {
     buf.clear();
     let mut bytes = Vec::new();
-    let len = read_line_bytes_with_timeout(reader, &mut bytes, timeout_dur, peer, max_len).await?;
+    let len =
+        read_line_bytes_with_timeout(reader, &mut bytes, timeout_dur, peer, max_len, |context| {
+            anyhow!("timed out {context}")
+        })
+        .await?;
     let string = String::from_utf8(bytes)
         .map_err(|_| anyhow!("line from {peer} contained invalid bytes"))?;
     *buf = string;
     Ok(len)
 }
 
-pub(crate) async fn read_line_bytes_with_timeout<S>(
+pub(crate) async fn read_line_bytes_with_timeout<S, F>(
     reader: &mut BufReader<S>,
     buf: &mut Vec<u8>,
     timeout_dur: Duration,
     peer: SocketAddr,
     max_len: usize,
+    timeout_error: F,
 ) -> Result<usize>
 where
     S: AsyncRead + Unpin,
+    F: Fn(&str) -> Error,
 {
     ensure!(max_len > 0, "line length limit must be greater than zero");
     buf.clear();
 
     loop {
-        let available = timeout_with_context(
-            timeout_dur,
-            reader.fill_buf(),
-            format!("reading line from {peer}"),
-        )
-        .await?;
+        let context = format!("reading line from {peer}");
+        let available = tokio::time::timeout(timeout_dur, reader.fill_buf())
+            .await
+            .map_err(|_| timeout_error(&context))?
+            .with_context(|| format!("failed while {context}"))?;
 
         if available.is_empty() {
             if buf.is_empty() {

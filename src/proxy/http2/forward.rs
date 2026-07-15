@@ -14,7 +14,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use tokio::{sync::Mutex, time::timeout};
 
 use crate::{
-    proxy::forward_error::RequestTimeout,
+    proxy::forward_error::{ClientBodyIdleTimeout, RequestTimeout},
     proxy::forward_limits::{BodySizeTracker, HeaderBudget, RequestDeadline, ResponseProgress},
     proxy::headers::{
         response_header_should_skip, sanitize_request_trailer_map, sanitize_response_trailer_map,
@@ -116,7 +116,7 @@ async fn upload_request_body(
     while let Some(frame) = with_total_deadline(request_deadline, async {
         timeout(request_body_timeout, body.data())
             .await
-            .map_err(|_| anyhow!("timed out reading HTTP/2 request body from client"))
+            .map_err(|_| anyhow::Error::new(ClientBodyIdleTimeout))
     })
     .await?
     {
@@ -139,14 +139,12 @@ async fn upload_request_body(
             .context("failed to release HTTP/2 request body flow-control capacity")?;
     }
 
-    match with_total_deadline(
-        request_deadline,
-        timeout_with_context(
-            request_body_timeout,
-            body.trailers(),
-            "reading HTTP/2 request trailers from client",
-        ),
-    )
+    match with_total_deadline(request_deadline, async {
+        timeout(request_body_timeout, body.trailers())
+            .await
+            .map_err(|_| anyhow::Error::new(ClientBodyIdleTimeout))?
+            .context("failed while reading HTTP/2 request trailers from client")
+    })
     .await?
     {
         Some(trailers) => {

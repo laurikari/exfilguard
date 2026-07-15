@@ -374,6 +374,7 @@ where
         timeout_dur,
         peer,
         max_header_bytes,
+        |context| anyhow!("timed out {context}"),
     )
     .await?;
     if bytes == 0 {
