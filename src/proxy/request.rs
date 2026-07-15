@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use http::{Method, Uri};
 
+use crate::canonical_path::canonicalize_request_path;
 use crate::config::Scheme;
 use crate::logging::AccessLogBuilder;
 use crate::policy::matcher::Request as PolicyRequest;
@@ -310,7 +311,7 @@ fn build_parsed_request(
     port: Option<u16>,
     path: String,
 ) -> Result<ParsedRequest> {
-    let policy_path = canonicalize_policy_path(&path)?;
+    let policy_path = canonicalize_request_path(&path)?;
     Ok(ParsedRequest {
         method,
         scheme,
@@ -321,205 +322,6 @@ fn build_parsed_request(
         policy_path,
         flow: None,
     })
-}
-
-fn canonicalize_policy_path(raw_path: &str) -> Result<String> {
-    if raw_path == "*" {
-        return Ok("*".to_string());
-    }
-
-    let path = raw_path.split('?').next().unwrap_or("/");
-    if path.is_empty() {
-        return Ok("/".to_string());
-    }
-    if !path.starts_with('/') {
-        bail!("request path must be absolute");
-    }
-
-    validate_policy_path(path)?;
-    let path = canonicalize_policy_escapes(path)?;
-    Ok(remove_literal_dot_segments(&path))
-}
-
-fn canonicalize_policy_escapes(path: &str) -> Result<String> {
-    const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-    let bytes = path.as_bytes();
-    let mut canonical = Vec::with_capacity(bytes.len());
-    let mut idx = 0usize;
-
-    while idx < bytes.len() {
-        if bytes[idx] != b'%' {
-            canonical.push(bytes[idx]);
-            idx += 1;
-            continue;
-        }
-
-        if idx + 2 >= bytes.len() {
-            bail!("request path contains invalid percent-escape");
-        }
-        let decoded = decode_hex_byte(bytes[idx + 1], bytes[idx + 2])?;
-        if is_rfc3986_unreserved(decoded) {
-            canonical.push(decoded);
-        } else {
-            canonical.push(b'%');
-            canonical.push(UPPER_HEX[usize::from(decoded >> 4)]);
-            canonical.push(UPPER_HEX[usize::from(decoded & 0x0f)]);
-        }
-        idx += 3;
-    }
-
-    Ok(String::from_utf8(canonical)
-        .expect("canonical path preserves UTF-8 and decodes only ASCII bytes"))
-}
-
-fn is_rfc3986_unreserved(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-}
-
-fn validate_policy_path(path: &str) -> Result<()> {
-    if path.contains("//") {
-        bail!("request path must not contain repeated slashes");
-    }
-    for segment in path.split('/') {
-        validate_policy_segment(segment)?;
-    }
-    Ok(())
-}
-
-fn validate_policy_segment(segment: &str) -> Result<()> {
-    let bytes = segment.as_bytes();
-    let mut idx = 0usize;
-    let mut only_dots = true;
-    let mut dot_count = 0usize;
-    let mut used_encoded_dot = false;
-
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'%' => {
-                if idx + 2 >= bytes.len() {
-                    bail!("request path contains invalid percent-escape");
-                }
-                let decoded = decode_hex_byte(bytes[idx + 1], bytes[idx + 2])?;
-                if decoded == b'/' || decoded == b'\\' {
-                    bail!("request path must not contain encoded path separators");
-                }
-                if decoded.is_ascii_control() || decoded == 0x7f {
-                    bail!("request path must not contain encoded control characters");
-                }
-                if decoded == b'.' {
-                    used_encoded_dot = true;
-                    dot_count += 1;
-                } else {
-                    only_dots = false;
-                }
-                idx += 3;
-            }
-            b'\\' => bail!("request path must not contain backslashes"),
-            byte if byte.is_ascii_control() || byte == 0x7f => {
-                bail!("request path must not contain control characters");
-            }
-            b'.' => {
-                dot_count += 1;
-                idx += 1;
-            }
-            _ => {
-                only_dots = false;
-                idx += 1;
-            }
-        }
-    }
-
-    if used_encoded_dot && only_dots && (dot_count == 1 || dot_count == 2) {
-        bail!("request path must not contain encoded dot segments");
-    }
-
-    Ok(())
-}
-
-fn decode_hex_byte(high: u8, low: u8) -> Result<u8> {
-    let high = decode_hex_nibble(high)?;
-    let low = decode_hex_nibble(low)?;
-    Ok((high << 4) | low)
-}
-
-fn decode_hex_nibble(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => bail!("request path contains invalid percent-escape"),
-    }
-}
-
-fn remove_literal_dot_segments(path: &str) -> String {
-    let mut input = path;
-    let mut output = String::new();
-
-    while !input.is_empty() {
-        if let Some(rest) = input.strip_prefix("../") {
-            input = rest;
-            continue;
-        }
-        if let Some(rest) = input.strip_prefix("./") {
-            input = rest;
-            continue;
-        }
-        if input.starts_with("/./") {
-            input = &input[2..];
-            continue;
-        }
-        if input == "/." {
-            input = "/";
-            continue;
-        }
-        if input.starts_with("/../") {
-            input = &input[3..];
-            remove_last_path_segment(&mut output);
-            continue;
-        }
-        if input == "/.." {
-            input = "/";
-            remove_last_path_segment(&mut output);
-            continue;
-        }
-        if input == "." || input == ".." {
-            input = "";
-            continue;
-        }
-
-        let next = next_path_segment_end(input);
-        output.push_str(&input[..next]);
-        input = &input[next..];
-    }
-
-    if output.is_empty() {
-        "/".to_string()
-    } else {
-        output
-    }
-}
-
-fn next_path_segment_end(input: &str) -> usize {
-    if let Some(rest) = input.strip_prefix('/') {
-        match rest.find('/') {
-            Some(offset) => offset + 1,
-            None => input.len(),
-        }
-    } else {
-        input.find('/').unwrap_or(input.len())
-    }
-}
-
-fn remove_last_path_segment(output: &mut String) {
-    if output.is_empty() {
-        return;
-    }
-    if let Some(idx) = output.rfind('/') {
-        output.truncate(idx);
-    } else {
-        output.clear();
-    }
 }
 
 #[cfg(test)]
@@ -783,6 +585,18 @@ mod tests {
             err.to_string().contains("backslashes"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_request_rejects_non_rfc_path_characters() {
+        for path in ["/public|admin", "/public{admin}", "/public[admin]"] {
+            let err = parse_http1_request(Method::GET, path, Some("example.com"), Scheme::Https)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("outside RFC 3986 path syntax"),
+                "unexpected error for {path}: {err:#}"
+            );
+        }
     }
 
     #[test]

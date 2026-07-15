@@ -193,6 +193,8 @@ url_pattern = "https://example.com:8443/api/**"
 | `/users/*` | Single segment: `/users/123`, `/users/abc` |
 | `/api/**` | Any depth: `/api/v1`, `/api/v1/users/123` |
 | `/users/*/profile` | `/users/123/profile`, `/users/abc/profile` |
+| `/files/\*` | Exact path containing a raw asterisk: `/files/*` |
+| `/files/%2A` | Exact path containing a percent-encoded asterisk: `/files/%2A` |
 
 !!! note
     Policy path matching uses a canonical path view. It ignores query strings,
@@ -204,11 +206,30 @@ url_pattern = "https://example.com:8443/api/**"
 
     Patterns themselves must already use that canonical shape. A pattern with
     a `.` or `..` segment or repeated `/` separators is rejected instead of
-    being accepted as a rule that requests cannot match.
+    being accepted as a rule that requests cannot match. Literal path
+    characters follow RFC 3986 `pchar` syntax. Retained percent escapes must
+    use uppercase hex, while escapes for unreserved characters must be written
+    as the decoded character (for example, use `~`, not `%7E`).
 
 !!! note
-    Requests are rejected if the path contains invalid escapes, backslashes,
-    encoded path separators, or encoded dot-segments such as `%2e%2e`.
+    An unescaped `*` is a wildcard. Use `\*` to match a raw asterisk exactly;
+    backslash cannot escape any other character. This is distinct from `%2A`,
+    which matches a percent-encoded asterisk, and `%252A`, which matches the
+    literal text `%2A` in a request path.
+
+    TOML literal strings keep the backslash as written:
+
+    ```toml
+    url_pattern = 'https://example.com/files/\*'
+    ```
+
+    In a TOML basic (double-quoted) string, write the same pattern with a
+    doubled backslash: `"https://example.com/files/\\*"`.
+
+!!! note
+    Requests are rejected if the path contains characters outside RFC 3986
+    path syntax, invalid escapes, backslashes, encoded path separators, or
+    encoded dot-segments such as `%2e%2e`.
 
 ### Complete Examples
 

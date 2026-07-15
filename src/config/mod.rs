@@ -73,36 +73,7 @@ fn validate_host_pattern(host: &str) -> Result<()> {
 }
 
 fn validate_path_pattern(path: &str) -> Result<()> {
-    if !path.starts_with('/') {
-        bail!("path pattern must start with '/'");
-    }
-    if path.contains("//") {
-        bail!("path pattern must not contain repeated '/' separators");
-    }
-    for segment in path.split('/').skip(1) {
-        if segment.is_empty() {
-            continue;
-        }
-        if segment == "." || segment == ".." {
-            bail!("path pattern must not contain '.' or '..' segments");
-        }
-        if segment == "*" || segment == "**" {
-            continue;
-        }
-        if segment.contains('{') || segment.contains('}') {
-            bail!("path segment '{}' must not contain '{{' or '}}'", segment);
-        }
-        if segment.contains("**") {
-            bail!("'**' may only appear as its own segment");
-        }
-        if !segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-._*".contains(c))
-        {
-            bail!("path segment '{}' contains invalid character", segment);
-        }
-    }
-    Ok(())
+    crate::canonical_path::pattern_regex(path).map(|_| ())
 }
 
 fn validate_reason(reason: &str) -> Result<()> {
@@ -635,8 +606,30 @@ mod tests {
             "/v1..beta/*",
             "/files/.*",
             "/users/*/objects/**",
+            "/users/~name:@/%3A/%2A/%252A",
+            "/all/!$&'()+,;=:@",
+            r"/files/\*",
+            r"/files/\*\*",
         ] {
             validate_path_pattern(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn reject_invalid_or_noncanonical_policy_path_escapes() {
+        for path in [
+            r"/files/\q",
+            r"/files/\",
+            "/files/%7E",
+            "/files/%2a",
+            "/files/%2F",
+            "/files/%5C",
+            "/files/%00",
+        ] {
+            assert!(
+                validate_path_pattern(path).is_err(),
+                "unexpectedly accepted {path}"
+            );
         }
     }
 

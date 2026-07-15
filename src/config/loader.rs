@@ -575,6 +575,37 @@ name = "deny"
     }
 
     #[test]
+    fn load_literal_asterisk_pattern_from_toml_string_forms() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+policies = ["allow"]
+fallback = true
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+  url_pattern = 'https://example.com/files/\*'
+
+  [[policy.rule]]
+  action = "ALLOW"
+  url_pattern = "https://example.com/files/\\*"
+"#,
+        );
+
+        let config = load_config(clients.path(), policies.path()).expect("load config");
+        for rule in config.policies[0].rules.iter() {
+            assert_eq!(
+                rule.url_pattern.as_ref().unwrap().path.as_deref(),
+                Some(r"/files/\*")
+            );
+        }
+    }
+
+    #[test]
     fn reject_duplicate_client_ip() {
         let clients = write_temp(
             r#"[[client]]

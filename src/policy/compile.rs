@@ -177,53 +177,7 @@ fn compile_host_pattern(host: &str) -> Result<HostMatcher> {
 }
 
 fn compile_path_pattern(pattern: &Arc<str>) -> Result<PathMatcher> {
-    if !pattern.starts_with('/') {
-        return Err(anyhow!("path pattern must start with '/'"));
-    }
-
-    let mut regex = String::from("^/");
-    let mut first_segment = true;
-    for segment in pattern.split('/').skip(1) {
-        if !first_segment {
-            regex.push('/');
-        }
-        first_segment = false;
-
-        if segment == "**" {
-            regex.push_str(".*");
-            continue;
-        }
-
-        let mut literal = String::new();
-        let chars = segment.chars().peekable();
-        for ch in chars {
-            match ch {
-                '*' => {
-                    if !literal.is_empty() {
-                        regex.push_str(&regex::escape(&literal));
-                        literal.clear();
-                    }
-                    regex.push_str("[^/]*");
-                }
-                '{' | '}' => {
-                    return Err(anyhow!(
-                        "path pattern must not contain '{{' or '}}' segments: '{}'",
-                        pattern
-                    ));
-                }
-                _ => literal.push(ch),
-            }
-        }
-        if !literal.is_empty() {
-            regex.push_str(&regex::escape(&literal));
-        }
-    }
-
-    if first_segment {
-        // Pattern was just "/"; we already have "^/" in the regex.
-    }
-
-    regex.push('$');
+    let regex = crate::canonical_path::pattern_regex(pattern)?;
     let compiled = Regex::new(&regex).with_context(|| format!("invalid path regex '{}'", regex))?;
     Ok(PathMatcher::new(compiled, pattern.clone()))
 }
@@ -294,6 +248,26 @@ mod tests {
             matcher,
             HostMatcher::Ip(addr) if addr == "2001:db8::10".parse::<IpAddr>().unwrap()
         ));
+    }
+
+    #[test]
+    fn path_patterns_distinguish_asterisk_representations() {
+        let cases = [
+            (r"/files/\*", "/files/*"),
+            ("/files/%2A", "/files/%2A"),
+            ("/files/%252A", "/files/%252A"),
+        ];
+
+        for (pattern, expected) in cases {
+            let matcher = compile_path_pattern(&Arc::from(pattern)).unwrap();
+            for candidate in ["/files/*", "/files/%2A", "/files/%252A"] {
+                assert_eq!(
+                    matcher.matches(candidate),
+                    candidate == expected,
+                    "pattern {pattern} against {candidate}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -22,7 +22,11 @@ signature-sensitive traffic.
 Policy path patterns must already be canonical: configurations containing dot
 segments or repeated slash separators are rejected. Rewriting a pattern could
 silently change operator intent, especially when the removed segment contains
-a wildcard.
+a wildcard. Patterns accept the same literal RFC path characters and retained
+uppercase percent escapes as the canonical request view. Because `*` is the
+path wildcard, `\*` is the policy-only spelling for a literal raw asterisk;
+request paths themselves reject backslashes. This keeps raw `*`, encoded `%2A`,
+and literal `%2A` text exactly distinguishable in policy.
 
 ## Reject ambiguous syntax
 

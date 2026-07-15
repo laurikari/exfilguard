@@ -126,8 +126,9 @@ normalization.
   escapes use uppercase hex in the policy view.
 - Literal `.` and `..` path segments are normalized before policy evaluation.
 - Ambiguous path syntax is rejected with `400 Bad Request` instead of being
-  silently rewritten. This includes invalid escapes, backslashes, encoded path
-  separators, and encoded dot-segments such as `%2e%2e`.
+  silently rewritten. This includes characters outside RFC 3986 path syntax,
+  invalid escapes, backslashes, encoded path separators, and encoded
+  dot-segments such as `%2e%2e`.
 
 ## Security
 
