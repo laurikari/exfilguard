@@ -6,6 +6,7 @@ use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::{
     io::AsyncReadExt,
+    sync::OwnedSemaphorePermit,
     time::{sleep, timeout},
 };
 use tracing::{debug, error, info, warn};
@@ -39,16 +40,72 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
         if let Err(err) = stream.set_nodelay(true) {
             debug!(peer = %peer_addr, error = %err, "failed to set TCP_NODELAY on downstream stream");
         }
+        let proxy_protocol_pending_guard = match acquire_proxy_protocol_pending_guard(
+            &app, peer_addr,
+        ) {
+            ProxyProtocolPendingAdmission::NotRequired => None,
+            ProxyProtocolPendingAdmission::Admitted(guard) => Some(guard),
+            ProxyProtocolPendingAdmission::Full => {
+                crate::metrics::record_proxy_protocol_pending_connection_rejection();
+                warn!(
+                    peer = %peer_addr,
+                    max_pending_connections = app.settings.proxy_protocol_max_pending_connections,
+                    "rejecting connection at PROXY protocol pending limit"
+                );
+                continue;
+            }
+        };
         let connection_app = app.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer_addr, connection_app).await {
+            if let Err(err) = handle_connection(
+                stream,
+                peer_addr,
+                connection_app,
+                proxy_protocol_pending_guard,
+            )
+            .await
+            {
                 debug!(peer = %peer_addr, error = %err, "connection closed with error");
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, app: AppContext) -> Result<()> {
+enum ProxyProtocolPendingAdmission {
+    NotRequired,
+    Admitted(ProxyProtocolPendingGuard),
+    Full,
+}
+
+struct ProxyProtocolPendingGuard {
+    _permit: OwnedSemaphorePermit,
+    _metric: crate::metrics::MetricGuard,
+}
+
+fn acquire_proxy_protocol_pending_guard(
+    app: &AppContext,
+    peer: SocketAddr,
+) -> ProxyProtocolPendingAdmission {
+    if app.settings.proxy_protocol == ProxyProtocolMode::Off
+        || !app.settings.proxy_protocol_allows_peer(peer.ip())
+    {
+        return ProxyProtocolPendingAdmission::NotRequired;
+    }
+    let Some(permit) = app.try_acquire_proxy_protocol_pending() else {
+        return ProxyProtocolPendingAdmission::Full;
+    };
+    ProxyProtocolPendingAdmission::Admitted(ProxyProtocolPendingGuard {
+        _permit: permit,
+        _metric: crate::metrics::track_proxy_protocol_pending_connection(),
+    })
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    app: AppContext,
+    proxy_protocol_pending_guard: Option<ProxyProtocolPendingGuard>,
+) -> Result<()> {
     let _connection_guard = crate::metrics::track_downstream_connection();
     let original_peer = peer;
     let peer = match app.settings.proxy_protocol {
@@ -135,6 +192,7 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, app: AppCont
         );
         return Ok(());
     };
+    drop(proxy_protocol_pending_guard);
     let _client_connection_metric =
         crate::metrics::track_downstream_connection_for_client(client_name);
     http::handle_http(stream, peer, app).await

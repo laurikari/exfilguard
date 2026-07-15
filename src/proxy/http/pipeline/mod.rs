@@ -87,6 +87,7 @@ name = "allow"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            proxy_protocol_max_pending_connections: 1024,
             ca: CaSettings::Builtin {
                 dir: ca_dir.clone(),
             },

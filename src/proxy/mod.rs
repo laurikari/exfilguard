@@ -17,7 +17,7 @@ pub mod upstream;
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 pub(crate) use self::resolver::{
     UpstreamResolver, default_upstream_resolver, permissive_test_upstream_resolver,
@@ -47,6 +47,7 @@ pub struct AppContext {
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
     client_connections: Arc<admission::ClientConnectionLimiter>,
+    proxy_protocol_pending_connections: Arc<Semaphore>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
 }
 
@@ -57,12 +58,16 @@ impl AppContext {
         tls: Arc<TlsContext>,
         cache: Option<Arc<cache::HttpCache>>,
     ) -> Self {
+        let proxy_protocol_pending_connections = Arc::new(Semaphore::new(
+            settings.proxy_protocol_max_pending_connections,
+        ));
         Self {
             settings,
             policies,
             tls,
             cache,
             client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
+            proxy_protocol_pending_connections,
             upstream_resolver: default_upstream_resolver(),
         }
     }
@@ -86,6 +91,13 @@ impl AppContext {
 
     pub(crate) fn client_connections(&self) -> &Arc<admission::ClientConnectionLimiter> {
         &self.client_connections
+    }
+
+    pub(crate) fn try_acquire_proxy_protocol_pending(&self) -> Option<OwnedSemaphorePermit> {
+        self.proxy_protocol_pending_connections
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 }
 

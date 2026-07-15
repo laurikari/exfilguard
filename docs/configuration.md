@@ -14,6 +14,7 @@ These settings are required.
 | `listen` | String | Yes | Listen address and port (e.g., `"127.0.0.1:3128"`) |
 | `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
 | `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
+| `proxy_protocol_max_pending_connections` | usize | 1024 | Maximum connections from allowlisted peers concurrently awaiting PROXY header processing |
 | `ca` | Table | Yes | Explicit TLS interception CA source: `builtin`, `files`, or `vault` |
 | `clients` | Path | Yes | Path to clients configuration file |
 | `policies` | Path | Yes | Path to policies configuration file |
@@ -37,6 +38,11 @@ These settings are required.
 
     In `"required"` mode, peers outside that allowlist are rejected before
     HTTP parsing, and allowlisted peers must send a valid PROXY header.
+
+    Allowlisted peers are trusted to send the complete PROXY header promptly as
+    the first bytes of a backend connection. ExfilGuard bounds this setup with
+    `request_header_timeout` and `proxy_protocol_max_pending_connections`.
+    Excess pending connections are closed without spawning a handler task.
 
 !!! note
     Set `proxy_protocol_allowed_cidrs` when PROXY protocol is enabled.

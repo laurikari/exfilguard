@@ -1,13 +1,36 @@
 mod support;
 
+use std::io::ErrorKind;
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration as StdDuration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use exfilguard::settings::ProxyProtocolMode;
 use ipnet::IpNet;
 use support::*;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::{sleep, timeout},
+};
+
+async fn wait_for_metric(sample: &str) -> Result<()> {
+    let mut last_metrics = String::new();
+    for _ in 0..100 {
+        last_metrics = String::from_utf8(exfilguard::metrics::gather())?;
+        if last_metrics.lines().any(|line| line == sample) {
+            return Ok(());
+        }
+        sleep(StdDuration::from_millis(10)).await;
+    }
+    let proxy_metrics: Vec<_> = last_metrics
+        .lines()
+        .filter(|line| line.contains("proxy_protocol_pending"))
+        .collect();
+    bail!("timed out waiting for metric sample {sample}; observed {proxy_metrics:?}")
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_protocol_allows_forwarded_client() -> Result<()> {
@@ -47,6 +70,75 @@ async fn proxy_protocol_allows_forwarded_client() -> Result<()> {
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "unexpected response: {response}"
+    );
+
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_protocol_pending_limit_rejects_and_recovers() -> Result<()> {
+    let upstream = TestUpstream::http_ok("ok").await?;
+    let upstream_port = upstream.port();
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .client_ip("forwarded", "203.0.113.10", &["allow-proxy"])
+        .fallback_client("fallback", &["deny-all"])
+        .policy(
+            PolicySpec::new("allow-proxy").rule(RuleSpec::allow_any(format!(
+                "http://127.0.0.1:{upstream_port}/**"
+            ))),
+        )
+        .policy(PolicySpec::new("deny-all").rule(
+            RuleSpec::deny(&["ANY"], format!("http://127.0.0.1:{upstream_port}/**")).status(403),
+        ))
+        .render();
+
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(|settings| {
+            settings.proxy_protocol = ProxyProtocolMode::Required;
+            settings.proxy_protocol_allowed_cidrs =
+                Some(vec!["127.0.0.1/32".parse::<IpNet>().unwrap()]);
+            settings.proxy_protocol_max_pending_connections = 1;
+            settings.request_header_timeout = 5;
+        })
+        .spawn()
+        .await?;
+
+    wait_for_metric("proxy_protocol_pending_connections_active 0").await?;
+    let mut stalled = TcpStream::connect(harness.addr).await?;
+    stalled.write_all(b"PROXY").await?;
+    wait_for_metric("proxy_protocol_pending_connections_active 1").await?;
+
+    let mut rejected = TcpStream::connect(harness.addr).await?;
+    let mut byte = [0u8; 1];
+    match timeout(StdDuration::from_secs(1), rejected.read(&mut byte)).await? {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+            ) => {}
+        other => panic!("pending connection was not closed immediately: {other:?}"),
+    }
+    wait_for_metric("proxy_protocol_pending_connection_rejections_total 1").await?;
+
+    drop(stalled);
+    wait_for_metric("proxy_protocol_pending_connections_active 0").await?;
+
+    let mut replacement = ProxyClient::connect(harness.addr).await?;
+    replacement
+        .send("PROXY TCP4 203.0.113.10 192.0.2.1 5555 3128\r\n")
+        .await?;
+    replacement
+        .send(&format!(
+            "GET http://127.0.0.1:{upstream_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+        ))
+        .await?;
+    let response = replacement.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected replacement response: {response}"
     );
 
     harness.shutdown().await;

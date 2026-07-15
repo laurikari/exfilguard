@@ -71,6 +71,10 @@ impl SettingsDefaults {
         10
     }
 
+    const fn proxy_protocol_max_pending_connections() -> usize {
+        1024
+    }
+
     const fn request_body_idle_timeout() -> u64 {
         30
     }
@@ -377,6 +381,8 @@ pub struct Settings {
     pub proxy_protocol: ProxyProtocolMode,
     #[serde(default)]
     pub proxy_protocol_allowed_cidrs: Option<Vec<IpNet>>,
+    #[serde(default = "SettingsDefaults::proxy_protocol_max_pending_connections")]
+    pub proxy_protocol_max_pending_connections: usize,
     pub ca: CaSettings,
     pub clients: PathBuf,
     pub policies: PathBuf,
@@ -702,6 +708,13 @@ impl Settings {
                 "proxy_protocol_allowed_cidrs must be set when proxy_protocol is enabled"
             );
         }
+        ensure!(
+            (1..=tokio::sync::Semaphore::MAX_PERMITS)
+                .contains(&self.proxy_protocol_max_pending_connections),
+            "proxy_protocol_max_pending_connections must be between 1 and {} (got {})",
+            tokio::sync::Semaphore::MAX_PERMITS,
+            self.proxy_protocol_max_pending_connections
+        );
         ensure!(
             self.upstream_pool_capacity > 0,
             "upstream_pool_capacity must be at least 1 (got {})",
@@ -1200,6 +1213,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            proxy_protocol_max_pending_connections: 1024,
             ca: CaSettings::Builtin {
                 dir: PathBuf::from("ca"),
             },
@@ -1266,6 +1280,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            proxy_protocol_max_pending_connections: 1024,
             ca: CaSettings::Builtin {
                 dir: PathBuf::from("ca"),
             },
@@ -1322,6 +1337,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            proxy_protocol_max_pending_connections: 1024,
             ca: CaSettings::Builtin {
                 dir: PathBuf::from("ca"),
             },
@@ -1371,6 +1387,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Required,
             proxy_protocol_allowed_cidrs: None,
+            proxy_protocol_max_pending_connections: 1024,
             ca: CaSettings::Builtin {
                 dir: PathBuf::from("ca"),
             },
@@ -1430,7 +1447,34 @@ dir = "ca-material""#,
         .unwrap();
 
         let mapped = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(settings.proxy_protocol_max_pending_connections, 1024);
         assert!(settings.proxy_protocol_allows_peer(mapped));
         assert!(!settings.proxy_protocol_allows_peer("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn proxy_protocol_pending_limit_must_be_positive() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"proxy_protocol = "required"
+proxy_protocol_allowed_cidrs = ["127.0.0.0/8"]
+proxy_protocol_max_pending_connections = 0
+
+[ca]
+source = "builtin"
+dir = "ca-material""#,
+        );
+        let error = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("proxy_protocol_max_pending_connections must be between 1"),
+            "unexpected error: {error:#}"
+        );
     }
 }

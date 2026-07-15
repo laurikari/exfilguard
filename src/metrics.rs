@@ -268,6 +268,30 @@ static DOWNSTREAM_CONNECTION_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|
     vec
 });
 
+static PROXY_PROTOCOL_PENDING_CONNECTIONS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "proxy_protocol_pending_connections_active",
+        "Current connections from allowlisted peers awaiting PROXY protocol admission",
+    )
+    .expect("create proxy_protocol_pending_connections_active");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register proxy_protocol_pending_connections_active");
+    gauge
+});
+
+static PROXY_PROTOCOL_PENDING_CONNECTION_REJECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "proxy_protocol_pending_connection_rejections_total",
+        "Connections rejected at the PROXY protocol pending admission limit",
+    )
+    .expect("create proxy_protocol_pending_connection_rejections_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register proxy_protocol_pending_connection_rejections_total");
+    counter
+});
+
 static CONNECT_TUNNELS_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
     let gauge = IntGauge::new(
         "connect_tunnels_active",
@@ -684,6 +708,10 @@ fn dec_downstream_connections_active() {
     DOWNSTREAM_CONNECTIONS_ACTIVE.dec();
 }
 
+fn dec_proxy_protocol_pending_connections_active() {
+    PROXY_PROTOCOL_PENDING_CONNECTIONS_ACTIVE.dec();
+}
+
 fn dec_connect_tunnels_active() {
     CONNECT_TUNNELS_ACTIVE.dec();
 }
@@ -712,6 +740,15 @@ pub fn record_downstream_connection_rejection(client: &str) {
     DOWNSTREAM_CONNECTION_REJECTIONS_TOTAL
         .with_label_values(&[client])
         .inc();
+}
+
+pub fn track_proxy_protocol_pending_connection() -> MetricGuard {
+    PROXY_PROTOCOL_PENDING_CONNECTIONS_ACTIVE.inc();
+    guard(dec_proxy_protocol_pending_connections_active)
+}
+
+pub fn record_proxy_protocol_pending_connection_rejection() {
+    PROXY_PROTOCOL_PENDING_CONNECTION_REJECTIONS_TOTAL.inc();
 }
 
 pub fn track_connect_tunnel() -> MetricGuard {

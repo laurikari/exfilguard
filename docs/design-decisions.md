@@ -196,6 +196,12 @@ By default, it trusts the immediate peer address. If you enable PROXY protocol
 and trust the sender, it may use the address from that header instead. It does
 not use `X-Forwarded-For` or similar HTTP headers for client identity.
 
+Allowlisted PROXY peers are trusted infrastructure and must send their complete
+header promptly as the first bytes on the backend connection. A timeout and a
+separate pending-connection limit bound resource retention if that
+infrastructure stalls or malfunctions before ExfilGuard learns the logical
+client identity.
+
 Other auth or identity methods may come later.
 
 ## Block non-public upstreams by default
@@ -235,14 +241,16 @@ includes ordinary HTTP keep-alive connections, raw CONNECT tunnels, and
 inspected CONNECT sessions. A CIDR identity deliberately shares one budget
 across all matching machines. Admission uses the client identity after trusted
 PROXY protocol processing; excess new connections are closed without evicting
-established ones.
+established ones. Before that identity is available, connections from
+allowlisted PROXY peers use a separate, configurable pending budget; the permit
+is released as soon as ordinary per-client admission succeeds.
 
-There is no separate global, per-IP, or per-rule ceiling. Client limits remain
-stable across policy reloads and are observable through bounded per-client
-metrics. Deployments that need broader availability isolation should still use
-firewall, load-balancer, or equivalent network-edge controls. A future adaptive
-overload controller would require real resource-pressure signals and
-hysteresis; it is separate from deterministic client budgets.
+There is no separate global lifetime, per-IP, or per-rule ceiling. Client
+limits remain stable across policy reloads and are observable through bounded
+per-client metrics. Deployments that need broader availability isolation should
+still use firewall, load-balancer, or equivalent network-edge controls. A
+future adaptive overload controller would require real resource-pressure
+signals and hysteresis; it is separate from deterministic client budgets.
 
 ## Request body limits are opt-in
 
