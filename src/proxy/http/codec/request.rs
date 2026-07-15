@@ -53,18 +53,22 @@ where
         bail!("empty request line from {peer}");
     }
 
-    let mut parts = request_line.split_whitespace();
-    let method_str = parts
-        .next()
-        .ok_or_else(|| anyhow!("malformed request line: missing method"))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| anyhow!("malformed request line: missing target"))?;
-    let version = parts
-        .next()
+    if request_line.bytes().filter(|byte| *byte == b' ').count() != 2
+        || request_line
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() && byte != b' ')
+    {
+        bail!("malformed request line: expected exactly two SP separators");
+    }
+
+    let (method_str, remainder) = request_line
+        .split_once(' ')
+        .ok_or_else(|| anyhow!("malformed request line: missing target and version"))?;
+    let (target, version) = remainder
+        .split_once(' ')
         .ok_or_else(|| anyhow!("malformed request line: missing version"))?;
-    if parts.next().is_some() {
-        bail!("malformed request line: unexpected data");
+    if method_str.is_empty() || target.is_empty() || version.is_empty() {
+        bail!("malformed request line: expected exactly two SP separators");
     }
     match version {
         "HTTP/1.1" => {}
@@ -314,9 +318,43 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("unexpected data"),
+            err.to_string().contains("exactly two SP separators"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_ambiguous_whitespace() {
+        let cases: &[&[u8]] = &[
+            b"GET\t/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET /\tHTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET /\t HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET  / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET /  HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b" GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET / HTTP/1.1 \r\nHost: example.com\r\n\r\n",
+        ];
+
+        for request in cases {
+            let (mut client, server) = tokio::io::duplex(128);
+            let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            client.write_all(request).await.expect("write request");
+            drop(client);
+
+            let mut reader = BufReader::new(server);
+            let result = read_http1_request_head(
+                &mut reader,
+                peer,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                1024,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "ambiguous request line was accepted: {request:?}"
+            );
+        }
     }
 
     #[tokio::test]

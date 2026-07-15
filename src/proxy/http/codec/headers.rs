@@ -65,6 +65,28 @@ pub(crate) fn parse_header_value(name: &str, value: &str) -> Result<HeaderValue>
         .map_err(|_| anyhow!("invalid header value for '{name}'"))
 }
 
+pub(crate) fn parse_header_line(line: &str) -> Result<Option<(&str, &str)>> {
+    if !line.ends_with("\r\n") {
+        bail!("header line must end with CRLF");
+    }
+
+    let field = &line[..line.len() - 2];
+    if field.is_empty() {
+        return Ok(None);
+    }
+    if field.contains(['\r', '\n']) {
+        bail!("header line must contain exactly one terminating CRLF");
+    }
+
+    let (name, value) = field
+        .split_once(':')
+        .ok_or_else(|| anyhow!("header missing ':' separator"))?;
+    let value = value.trim_matches(|ch| matches!(ch, ' ' | '\t'));
+    parse_header_name(name)?;
+    parse_header_value(name, value)?;
+    Ok(Some((name, value)))
+}
+
 pub(crate) struct Http1HeaderAccumulator {
     sanitizer: RequestHeaderSanitizer,
     headers: Vec<Http1HeaderLine>,
@@ -79,23 +101,11 @@ impl Http1HeaderAccumulator {
     }
 
     pub fn push_line(&mut self, line: &str) -> Result<bool> {
-        if !line.ends_with("\r\n") {
-            bail!("header line must end with CRLF");
-        }
         let line_len = line.len();
-        let trimmed = &line[..line_len - 2];
-        if trimmed.is_empty() {
+        let Some((name, value)) = parse_header_line(line)? else {
             self.sanitizer.reserve(line_len)?;
             return Ok(false);
-        }
-
-        let (name, value) = trimmed
-            .split_once(':')
-            .ok_or_else(|| anyhow!("header missing ':' separator"))?;
-        let name = name.trim();
-        let value = value.trim();
-        parse_header_name(name)?;
-        parse_header_value(name, value)?;
+        };
         match self.sanitizer.record(name, value, line_len)? {
             HeaderAction::Forward => {
                 self.headers.push(Http1HeaderLine::new(name, value)?);
@@ -253,7 +263,7 @@ mod tests {
             .push_line("X-Test: ok\rX-Evil: 1\r\n")
             .expect_err("invalid header value should error");
         assert!(
-            err.to_string().contains("invalid header value"),
+            err.to_string().contains("terminating CRLF"),
             "unexpected error: {err}"
         );
     }
@@ -265,5 +275,45 @@ mod tests {
             .push_line("Host: example.com\n")
             .expect_err("header line without CRLF should error");
         assert!(err.to_string().contains("CRLF"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_whitespace_around_header_name() {
+        for line in [
+            " Host: example.com\r\n",
+            "Host : example.com\r\n",
+            "\tHost: example.com\r\n",
+            "Host\t: example.com\r\n",
+        ] {
+            let mut accumulator = Http1HeaderAccumulator::new(256);
+            let err = accumulator
+                .push_line(line)
+                .expect_err("whitespace around header name should error");
+            assert!(
+                err.to_string().contains("invalid header name"),
+                "unexpected error for {line:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_only_legal_header_value_ows() {
+        let mut accumulator = Http1HeaderAccumulator::new(256);
+        accumulator
+            .push_line("X-Test:\t value \t\r\n")
+            .expect("legal OWS should be accepted");
+        let header = accumulator
+            .forward_headers()
+            .next()
+            .expect("header should be retained");
+        assert_eq!(header.value_text(), "value");
+
+        let err = accumulator
+            .push_line("X-Control: \u{b}value\r\n")
+            .expect_err("non-OWS whitespace should be rejected");
+        assert!(
+            err.to_string().contains("invalid header value"),
+            "unexpected error: {err}"
+        );
     }
 }

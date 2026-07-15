@@ -10,7 +10,7 @@ use tracing::warn;
 use crate::proxy::forward_limits::HeaderBudget;
 use crate::proxy::http::forward::ResponseBodyPlan;
 
-use super::headers::{Http1HeaderLine, header_lines_to_map, parse_header_name, parse_header_value};
+use super::headers::{Http1HeaderLine, header_lines_to_map, parse_header_line, parse_header_name};
 use super::line::read_line_with_timeout;
 
 #[derive(Clone, Copy)]
@@ -404,17 +404,11 @@ where
             return Err(crate::proxy::forward_error::UpstreamClosed.into());
         }
         budget.record(read)?;
-        let trimmed_line = header_line.trim_end_matches(['\r', '\n']);
-        if trimmed_line.is_empty() {
+        let Some((name, value)) =
+            parse_header_line(&header_line).context("invalid response header from upstream")?
+        else {
             break;
-        }
-        let (name, value) = trimmed_line
-            .split_once(':')
-            .ok_or_else(|| anyhow!("header missing ':' separator from upstream"))?;
-        let name = name.trim();
-        let value = value.trim();
-        parse_header_name(name)?;
-        parse_header_value(name, value)?;
+        };
         if name.eq_ignore_ascii_case("content-length") {
             if content_length_seen {
                 bail!("multiple Content-Length headers from upstream are not supported");
@@ -430,19 +424,10 @@ where
             transfer_codings.extend(parse_transfer_codings(value)?);
         }
         if name.eq_ignore_ascii_case("connection") {
-            let mut saw_close = false;
-            let mut saw_keep_alive = false;
             for token in value.split(',').map(|token| token.trim()) {
                 if token.eq_ignore_ascii_case("close") {
-                    saw_close = true;
-                } else if token.eq_ignore_ascii_case("keep-alive") {
-                    saw_keep_alive = true;
+                    connection_close = true;
                 }
-            }
-            if saw_close {
-                connection_close = true;
-            } else if saw_keep_alive {
-                connection_close = false;
             }
         }
         headers.push(Http1HeaderLine::new(name, value)?);
@@ -928,10 +913,63 @@ mod tests {
         .await;
         match result {
             Ok(_) => panic!("invalid header value should be rejected"),
-            Err(err) => assert!(
-                err.to_string().contains("invalid header value"),
-                "unexpected error: {err}"
-            ),
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("terminating CRLF"),
+                    "unexpected error: {message}"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn read_response_head_requires_exact_header_crlf() {
+        let cases: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nX-Test: value\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-Test: value\r\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\n",
+        ];
+
+        for response in cases {
+            let mut reader = tokio::io::BufReader::new(*response);
+            let result = read_http1_response_head(
+                &mut reader,
+                Duration::from_secs(1),
+                "127.0.0.1:80".parse().unwrap(),
+                1024,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "ambiguous response header ending was accepted: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_head_makes_connection_close_monotonic() -> anyhow::Result<()> {
+        let cases: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nConnection: close, keep-alive\r\n\r\n",
+        ];
+
+        for response in cases {
+            let mut reader = tokio::io::BufReader::new(*response);
+            let head = read_http1_response_head(
+                &mut reader,
+                Duration::from_secs(1),
+                "127.0.0.1:80".parse().unwrap(),
+                1024,
+            )
+            .await?;
+            assert!(
+                head.connection_close,
+                "Connection: close was overridden in {response:?}"
+            );
+        }
+        Ok(())
     }
 }

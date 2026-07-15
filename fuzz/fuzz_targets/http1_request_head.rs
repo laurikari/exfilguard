@@ -12,6 +12,9 @@ use tokio::io::{AsyncRead, BufReader, ReadBuf};
 
 use exfilguard::proxy::http::fuzzing::parse_http1_request_head;
 
+mod corpus;
+use corpus::decode_tracked_seed;
+
 struct CursorRead {
     inner: Cursor<Vec<u8>>,
 }
@@ -48,11 +51,12 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fuzz_target!(|data: &[u8]| {
+    let data = decode_tracked_seed(data);
     let max_header_bytes = data.len().max(1).min(16 * 1024);
     let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345));
 
     runtime().block_on(async {
-        let mut reader = BufReader::new(CursorRead::new(data));
+        let mut reader = BufReader::new(CursorRead::new(&data));
         let _ = parse_http1_request_head(
             &mut reader,
             peer,

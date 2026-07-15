@@ -326,6 +326,59 @@ async fn http_invalid_header_value_returns_400() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ambiguous_http1_request_whitespace_returns_400() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-listed"])
+        .policy(
+            PolicySpec::new("allow-listed")
+                .rule(RuleSpec::allow(&["GET"], "http://allowed.test/**")),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "tab request separator",
+            b"GET\thttp://allowed.test/resource HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "repeated request separator",
+            b"GET  http://allowed.test/resource HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "leading header whitespace",
+            b"GET http://allowed.test/resource HTTP/1.1\r\n Host: allowed.test\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "whitespace before header colon",
+            b"GET http://allowed.test/resource HTTP/1.1\r\nHost : allowed.test\r\nConnection: close\r\n\r\n",
+        ),
+    ];
+
+    for (case, request) in cases {
+        let mut client = ProxyClient::connect(harness.addr).await?;
+        client.send(request).await?;
+        let response = client.read_response().await?;
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "{case} was not rejected as a bad request: {response}"
+        );
+        assert!(
+            response.contains("invalid request"),
+            "{case} produced an unexpected error body: {response}"
+        );
+        client.shutdown().await;
+    }
+
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_invalid_upstream_header_value_returns_502() -> Result<()> {
     let upstream = TestUpstream::http_response(
         b"HTTP/1.1 200 OK\r\nX-Test: ok\rX-Evil: 1\r\nConnection: close\r\n\r\n".to_vec(),
@@ -397,6 +450,47 @@ async fn malformed_upstream_status_lines_are_rejected_before_forwarding() -> Res
         assert!(
             !response.contains("200 OK") && !response.contains("Injected"),
             "{case} leaked origin status-line bytes downstream: {response:?}"
+        );
+        assert!(
+            response.contains("upstream request failed"),
+            "{case} did not produce the standard upstream failure response: {response:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_upstream_header_line_endings_are_rejected_before_forwarding() -> Result<()> {
+    let cases = [
+        (
+            "bare LF header line",
+            b"HTTP/1.1 200 OK\r\nX-Test: value\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
+        (
+            "extra CR before header LF",
+            b"HTTP/1.1 200 OK\r\nX-Test: value\r\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
+        (
+            "bare LF header terminator",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\n".to_vec(),
+        ),
+    ];
+
+    for (case, upstream_response) in cases {
+        let response = proxy_response_for_raw_upstream_response(upstream_response).await?;
+        assert!(
+            response.starts_with("HTTP/1.1 502"),
+            "{case} reached the downstream client: {response:?}"
+        );
+        assert_eq!(
+            response.matches("HTTP/1.1 ").count(),
+            1,
+            "{case} produced more than one downstream response: {response:?}"
+        );
+        assert!(
+            !response.contains("200 OK") && !response.contains("X-Test"),
+            "{case} leaked origin header bytes downstream: {response:?}"
         );
         assert!(
             response.contains("upstream request failed"),
@@ -1366,6 +1460,91 @@ async fn http_keepalive_reuses_upstream_connections() -> Result<()> {
 
     harness.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_close_cannot_be_overridden_or_pooled() -> Result<()> {
+    let upstream_host = "localhost";
+    let dirs = TestDirs::new()?;
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-http"])
+        .policy(
+            PolicySpec::new("allow-http")
+                .rule(RuleSpec::allow_any(format!("http://{upstream_host}/**")))
+                .bind_host_port(upstream_host, upstream_addr.port()),
+        )
+        .render();
+
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let accept_counter = accept_count.clone();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                accept = upstream_listener.accept() => {
+                    let (stream, peer) = match accept {
+                        Ok(pair) => pair,
+                        Err(err) => return Err(anyhow::anyhow!("upstream accept error: {err}")),
+                    };
+                    accept_counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        if let Err(err) = serve_http_mixed_connection_headers(stream, peer).await {
+                            tracing::warn!(error = %err, "mixed Connection upstream handler error");
+                        }
+                    });
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+
+    for path in ["first", "second"] {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        let request = format!(
+            "GET http://{host}:{port}/{path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\n\r\n",
+            host = upstream_host,
+            port = upstream_addr.port(),
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+        let response = read_http_response(&mut stream).await?;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected {path} response: {response}"
+        );
+        assert!(
+            response.contains("Connection: close"),
+            "mixed Connection fields did not force downstream close: {response}"
+        );
+        assert!(
+            response.ends_with(path),
+            "{path} response body missing path: {response}"
+        );
+        stream.shutdown().await.ok();
+    }
+
+    assert_eq!(
+        accept_count.load(Ordering::SeqCst),
+        2,
+        "an upstream connection carrying Connection: close must not be pooled"
+    );
+
+    let _ = shutdown_tx.send(());
+    upstream_task
+        .await
+        .expect("upstream task join failed")
+        .expect("upstream task error");
+    harness.shutdown().await;
     Ok(())
 }
 
@@ -3167,6 +3346,38 @@ async fn serve_http_keepalive(mut stream: TcpStream, _peer: SocketAddr) -> Resul
         .shutdown()
         .await
         .context("failed to shutdown HTTP upstream stream")?;
+    Ok(())
+}
+
+async fn serve_http_mixed_connection_headers(
+    mut stream: TcpStream,
+    _peer: SocketAddr,
+) -> Result<()> {
+    loop {
+        let request_bytes = read_request(&mut stream).await?;
+        if request_bytes.is_empty() {
+            break;
+        }
+        let request = String::from_utf8(request_bytes)?;
+        let body = request_path(&request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("failed to write mixed Connection response")?;
+        stream
+            .flush()
+            .await
+            .context("failed to flush mixed Connection response")?;
+    }
+    stream
+        .shutdown()
+        .await
+        .context("failed to shutdown mixed Connection upstream stream")?;
     Ok(())
 }
 
