@@ -254,6 +254,17 @@ fn build_tls_client_configs(_settings: &Settings) -> Result<TlsClientConfigs> {
 }
 
 #[cfg(unix)]
+async fn run_runtime_policy_reload_build<T, F>(build: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(build)
+        .await
+        .context("runtime policy reload worker failed")?
+}
+
+#[cfg(unix)]
 fn spawn_runtime_policy_reload_task(
     settings: Arc<Settings>,
     policy_tx: watch::Sender<PolicySnapshot>,
@@ -271,7 +282,9 @@ fn spawn_runtime_policy_reload_task(
 
         while hup.recv().await.is_some() {
             tracing::info!("received SIGHUP; reloading runtime policy");
-            match build_runtime_policy_snapshot(&settings) {
+            let reload_settings = settings.clone();
+            let build = move || build_runtime_policy_snapshot(&reload_settings);
+            match run_runtime_policy_reload_build(build).await {
                 Ok(snapshot) => {
                     let client_count = snapshot.client_count();
                     let policy_count = snapshot.policy_count();
@@ -353,6 +366,53 @@ ca = {{ source = "builtin", dir = {ca_dir:?} }}
         assert!(
             !ca_dir.exists(),
             "policy preflight failure created CA material"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_policy_reload_build_does_not_block_runtime_worker() -> Result<()> {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+        use tokio::sync::oneshot;
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (cancel_watchdog_tx, cancel_watchdog_rx) = mpsc::channel();
+        let fallback_release_tx = release_tx.clone();
+        let watchdog = thread::spawn(move || {
+            if cancel_watchdog_rx
+                .recv_timeout(StdDuration::from_secs(2))
+                .is_err()
+            {
+                let _ = fallback_release_tx.send(());
+            }
+        });
+
+        let started_at = StdInstant::now();
+        let reload = tokio::spawn(run_runtime_policy_reload_build(move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .context("reload test release channel closed")?;
+            Ok(())
+        }));
+
+        started_rx.await.context("reload build did not start")?;
+        let start_delay = started_at.elapsed();
+        let _ = release_tx.send(());
+        let _ = cancel_watchdog_tx.send(());
+        watchdog
+            .join()
+            .map_err(|_| anyhow::anyhow!("reload watchdog panicked"))?;
+        reload.await.context("reload build task panicked")??;
+
+        ensure!(
+            start_delay < StdDuration::from_secs(1),
+            "reload build blocked the single runtime worker for {start_delay:?}"
         );
         Ok(())
     }

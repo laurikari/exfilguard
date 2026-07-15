@@ -48,6 +48,11 @@ These settings are required.
     in `exfilguard.toml` itself, including `listen`, metrics, cache, TLS,
     logging, and timeout settings, restart the server.
 
+    Treat all configured client and policy files as one generation: finish
+    replacing every file before sending `SIGHUP`, and do not modify them during
+    the reload. ExfilGuard validates and atomically publishes the resulting
+    in-memory snapshot; if loading fails, the previous snapshot remains active.
+
 ---
 
 ## Global Configuration Fragments

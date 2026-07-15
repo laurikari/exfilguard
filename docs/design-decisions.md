@@ -312,6 +312,18 @@ That keeps reload simple. Policy data changes decisions. The other settings
 change long-lived runtime state. Restart handles those cases more clearly than
 live reload does.
 
+The configured client and policy files are one operator-managed generation.
+Deployment tooling must finish replacing the complete generation before it
+sends `SIGHUP`, and must leave those files unchanged while ExfilGuard reads
+them. ExfilGuard does not attempt to infer filesystem transactions, coordinate
+independent file updates, or defend against signals sent during an incomplete
+deployment.
+
+Each completed reload is still validated as a whole and published atomically
+in memory. A failed reload leaves the previous snapshot active. Filesystem I/O,
+TOML parsing, validation, and policy compilation run on Tokio's blocking pool
+so a legitimate reload does not stall proxy I/O or timers.
+
 ## One semantic config validator
 
 The loader reads files, parses TOML, and builds config structs. One validator

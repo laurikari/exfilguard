@@ -77,6 +77,10 @@ policies.
 `exfilguard.toml` or `config.d/*.toml`, including listener, metrics, cache, TLS,
 logging, and timeout settings, require restarting the process.
 
+Finish replacing the complete set of client and policy files before sending
+`SIGHUP`, and leave them unchanged while the reload runs. A reload is validated
+and published atomically in memory; failure keeps the previous snapshot active.
+
 ## Platform Support
 
 - **Linux** — primary production target.
