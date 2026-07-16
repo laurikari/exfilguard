@@ -1,4 +1,5 @@
 use std::fs::{File, Metadata, OpenOptions};
+use std::future::Future;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -24,6 +25,7 @@ const MAX_VAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 const INITIAL_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
 const MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(15 * 60);
+const MAX_RENEWAL_SCHEDULE_SLEEP: StdDuration = StdDuration::from_secs(60 * 60);
 
 #[derive(Clone, Debug)]
 pub(crate) enum VaultAuthConfig {
@@ -369,14 +371,17 @@ impl VaultCaSource {
     async fn renewal_loop(&self, issuer: Arc<TlsIssuer>) {
         let mut retry_delay = INITIAL_RETRY_DELAY;
         loop {
-            let active = issuer.current_ca();
-            let now = OffsetDateTime::now_utc();
             let threshold =
                 time::Duration::try_from(self.renewal_threshold).unwrap_or(time::Duration::days(1));
-            let renew_at = active.intermediate_not_after() - threshold;
-            if renew_at > now {
-                let wait = StdDuration::try_from(renew_at - now).unwrap_or(StdDuration::ZERO);
-                sleep(wait).await;
+            let waited_for_schedule = wait_until_renewal(
+                || issuer.current_ca().intermediate_not_after(),
+                threshold,
+                OffsetDateTime::now_utc,
+                sleep,
+            )
+            .await;
+            if waited_for_schedule {
+                // A normally scheduled attempt starts fresh. An overdue retry retains its backoff.
                 retry_delay = INITIAL_RETRY_DELAY;
             }
 
@@ -489,6 +494,33 @@ impl VaultCaSource {
             bail!("Vault returned {status}: {message}");
         }
         serde_json::from_slice(&bytes).context("failed to parse Vault response")
+    }
+}
+
+async fn wait_until_renewal<NotAfter, Now, SleepFor, SleepFuture>(
+    mut intermediate_not_after: NotAfter,
+    threshold: time::Duration,
+    mut now: Now,
+    mut sleep_for: SleepFor,
+) -> bool
+where
+    NotAfter: FnMut() -> OffsetDateTime,
+    Now: FnMut() -> OffsetDateTime,
+    SleepFor: FnMut(StdDuration) -> SleepFuture,
+    SleepFuture: Future<Output = ()>,
+{
+    let mut slept = false;
+    loop {
+        let renew_at = intermediate_not_after() - threshold;
+        let remaining = renew_at - now();
+        if remaining <= time::Duration::ZERO {
+            return slept;
+        }
+        let wait = StdDuration::try_from(remaining)
+            .unwrap_or(MAX_RENEWAL_SCHEDULE_SLEEP)
+            .min(MAX_RENEWAL_SCHEDULE_SLEEP);
+        sleep_for(wait).await;
+        slept = true;
     }
 }
 
@@ -712,9 +744,11 @@ fn validate_checked_metadata(path: &Path, metadata: &Metadata, secret: bool) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
+    use std::rc::Rc;
 
     use rcgen::{BasicConstraints, CertificateSigningRequestParams, IsCa, Issuer, KeyUsagePurpose};
     use serde_json::{Value, json};
@@ -938,6 +972,86 @@ mod tests {
                 secret_id_file,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn renewal_schedule_caps_sleep_and_rechecks_after_wall_clock_jump() {
+        let start = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+        let clock = Rc::new(Cell::new(start));
+        let sleeps = Rc::new(RefCell::new(Vec::new()));
+        let sleep_clock = clock.clone();
+        let recorded_sleeps = sleeps.clone();
+
+        wait_until_renewal(
+            || start + time::Duration::hours(4),
+            time::Duration::hours(1),
+            {
+                let clock = clock.clone();
+                move || clock.get()
+            },
+            move |duration| {
+                let clock = sleep_clock.clone();
+                let sleeps = recorded_sleeps.clone();
+                async move {
+                    sleeps.borrow_mut().push(duration);
+                    clock.set(start + time::Duration::hours(3));
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(sleeps.borrow().as_slice(), &[MAX_RENEWAL_SCHEDULE_SLEEP]);
+    }
+
+    #[tokio::test]
+    async fn renewal_schedule_repeats_bounded_sleeps_until_threshold() {
+        let start = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+        let clock = Rc::new(Cell::new(start));
+        let sleeps = Rc::new(RefCell::new(Vec::new()));
+        let sleep_clock = clock.clone();
+        let recorded_sleeps = sleeps.clone();
+
+        wait_until_renewal(
+            || start + time::Duration::hours(4),
+            time::Duration::hours(1),
+            {
+                let clock = clock.clone();
+                move || clock.get()
+            },
+            move |duration| {
+                let clock = sleep_clock.clone();
+                let sleeps = recorded_sleeps.clone();
+                async move {
+                    sleeps.borrow_mut().push(duration);
+                    clock.set(clock.get() + time::Duration::try_from(duration).unwrap());
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[
+                MAX_RENEWAL_SCHEDULE_SLEEP,
+                MAX_RENEWAL_SCHEDULE_SLEEP,
+                MAX_RENEWAL_SCHEDULE_SLEEP,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_schedule_reports_when_renewal_is_already_due() {
+        let now = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+
+        let slept = wait_until_renewal(
+            || now + time::Duration::hours(1),
+            time::Duration::hours(1),
+            || now,
+            |_| async { panic!("already-due renewal must not sleep") },
+        )
+        .await;
+
+        assert!(!slept);
     }
 
     #[test]

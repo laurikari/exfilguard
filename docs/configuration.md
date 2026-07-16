@@ -243,6 +243,11 @@ secret_id_file = "/etc/exfilguard/vault-secret-id"
 threshold must be shorter than the requested lifetime. Set it early enough to
 cover a realistic Vault outage and operator response window.
 
+The renewal scheduler rechecks certificate expiry against wall-clock time at
+least hourly rather than sleeping for the complete multi-day interval. This
+keeps renewal responsive after host suspend or a wall-clock adjustment. Failed
+renewals retry with jittered exponential backoff from 5 seconds to 15 minutes.
+
 Set `tls_server_name` when `address` uses an IP literal but the Vault server
 certificate names a DNS host. It controls certificate verification while the
 client still connects to the configured IP.
