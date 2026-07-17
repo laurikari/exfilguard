@@ -129,6 +129,12 @@ never falls back to another source. In every mode, leaf validity is capped by
 the active intermediate's remaining validity, with a safety margin; issuance
 stops when too little safe lifetime remains.
 
+ExfilGuard enforces the CA semantics needed for arbitrary policy-selected leaf
+names. It rejects name-constrained hierarchies and critical certificate
+extensions other than `basicConstraints` and `keyUsage`; accepting either would
+require applying additional constraints during every leaf issuance. Noncritical
+informational extensions remain permitted.
+
 #### `builtin`
 
 ```toml

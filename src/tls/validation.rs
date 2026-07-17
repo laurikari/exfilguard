@@ -162,6 +162,7 @@ fn parse_certificate_exact<'a>(der: &'a [u8], label: &str) -> Result<X509Certifi
 fn validate_extensions(certificate: &X509Certificate<'_>, label: &str) -> Result<()> {
     let mut extension_oids = HashSet::new();
     for extension in certificate.extensions() {
+        let parsed = extension.parsed_extension();
         ensure!(
             extension_oids.insert(extension.oid.clone()),
             "{label} certificate contains duplicate extension {}",
@@ -169,10 +170,23 @@ fn validate_extensions(certificate: &X509Certificate<'_>, label: &str) -> Result
         );
         ensure!(
             !matches!(
-                extension.parsed_extension(),
+                parsed,
                 ParsedExtension::ParseError { .. } | ParsedExtension::Unparsed
             ),
             "{label} certificate contains malformed extension {}",
+            extension.oid
+        );
+        ensure!(
+            !matches!(parsed, ParsedExtension::NameConstraints(_)),
+            "{label} certificate contains unsupported nameConstraints"
+        );
+        ensure!(
+            !extension.critical
+                || matches!(
+                    parsed,
+                    ParsedExtension::BasicConstraints(_) | ParsedExtension::KeyUsage(_)
+                ),
+            "{label} certificate contains unsupported critical extension {}",
             extension.oid
         );
     }
@@ -244,7 +258,7 @@ mod tests {
     use anyhow::Result;
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, CustomExtension, DistinguishedName,
-        DnType, IsCa, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+        DnType, GeneralSubtree, IsCa, KeyUsagePurpose, NameConstraints, PKCS_ECDSA_P256_SHA256,
     };
     use time::Duration;
 
@@ -633,6 +647,46 @@ mod tests {
             ));
         let chain = generate_chain(malformed_root, intermediate_params())?;
         assert!(validate(&chain).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_name_constrained_ca_hierarchy() -> Result<()> {
+        let mut root = root_params("Constrained Root");
+        root.name_constraints = Some(NameConstraints {
+            permitted_subtrees: vec![GeneralSubtree::DnsName(".corp.example".to_string())],
+            excluded_subtrees: Vec::new(),
+        });
+        let chain = generate_chain(root, intermediate_params())?;
+
+        let error = validate(&chain).unwrap_err();
+        assert!(error.to_string().contains("unsupported nameConstraints"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_only_critical_unknown_extensions() -> Result<()> {
+        fn private_extension(critical: bool) -> CustomExtension {
+            let mut extension =
+                CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 55_555, 1], vec![5, 0]);
+            extension.set_criticality(critical);
+            extension
+        }
+
+        let mut critical_root = root_params("Critical Extension Root");
+        critical_root
+            .custom_extensions
+            .push(private_extension(true));
+        let critical_chain = generate_chain(critical_root, intermediate_params())?;
+        let error = validate(&critical_chain).unwrap_err();
+        assert!(error.to_string().contains("unsupported critical extension"));
+
+        let mut noncritical_root = root_params("Noncritical Extension Root");
+        noncritical_root
+            .custom_extensions
+            .push(private_extension(false));
+        let noncritical_chain = generate_chain(noncritical_root, intermediate_params())?;
+        validate(&noncritical_chain)?;
         Ok(())
     }
 }

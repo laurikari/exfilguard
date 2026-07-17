@@ -145,6 +145,12 @@ fails closed instead of becoming a CONNECT tunnel. Replacing an issuer also
 replaces its leaf cache atomically so new handshakes cannot receive a leaf from
 the previous generation.
 
+CA hierarchies must support arbitrary leaf names selected by policy. ExfilGuard
+therefore rejects name constraints and any critical extension other than the
+`basicConstraints` and `keyUsage` semantics it explicitly enforces, rather than
+accepting an issuer whose additional constraints are ignored during leaf
+minting.
+
 ExfilGuard never loads or stores a root private key. File mode makes external
 ownership explicit, while Vault mode keeps CA and leaf private keys off disk.
 This separation is preferable to accepting partially managed directories or
