@@ -378,6 +378,10 @@ started, ExfilGuard closes or resets the request instead of appending another
 response. Outer CONNECT setup, tunnel lifetime, and cleanup after response
 delivery use their own limits.
 
+For HTTP/2 cacheable responses, `response_body_idle_timeout` also bounds each
+cache file operation on the response path. A storage error or timeout abandons
+the cache copy while response forwarding continues.
+
 ---
 
 ## Request Size Limits

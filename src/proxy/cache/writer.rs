@@ -17,6 +17,8 @@ enum CacheWriterFile {
     File(AsyncFile),
     #[cfg(test)]
     Partial(PartialWrite<AsyncFile>),
+    #[cfg(test)]
+    Pending,
 }
 
 impl CacheWriterFile {
@@ -40,6 +42,8 @@ impl AsyncWrite for CacheWriterFile {
             CacheWriterFile::File(file) => Pin::new(file).poll_write(cx, buf),
             #[cfg(test)]
             CacheWriterFile::Partial(file) => Pin::new(file).poll_write(cx, buf),
+            #[cfg(test)]
+            CacheWriterFile::Pending => Poll::Pending,
         }
     }
 
@@ -48,6 +52,8 @@ impl AsyncWrite for CacheWriterFile {
             CacheWriterFile::File(file) => Pin::new(file).poll_flush(cx),
             #[cfg(test)]
             CacheWriterFile::Partial(file) => Pin::new(file).poll_flush(cx),
+            #[cfg(test)]
+            CacheWriterFile::Pending => Poll::Pending,
         }
     }
 
@@ -56,6 +62,8 @@ impl AsyncWrite for CacheWriterFile {
             CacheWriterFile::File(file) => Pin::new(file).poll_shutdown(cx),
             #[cfg(test)]
             CacheWriterFile::Partial(file) => Pin::new(file).poll_shutdown(cx),
+            #[cfg(test)]
+            CacheWriterFile::Pending => Poll::Pending,
         }
     }
 }
@@ -115,6 +123,7 @@ pub(crate) struct CacheWriter {
     reserved_bytes: u64,
     pending_reservation: u64,
     discard: bool,
+    deferred_cleanup: bool,
     committed: bool,
     finished: bool,
 }
@@ -144,6 +153,7 @@ impl CacheWriter {
             reserved_bytes: 0,
             pending_reservation: 0,
             discard: false,
+            deferred_cleanup: false,
             committed: false,
             finished: false,
         }
@@ -169,9 +179,15 @@ impl CacheWriter {
             reserved_bytes: 0,
             pending_reservation: 0,
             discard: false,
+            deferred_cleanup: false,
             committed: false,
             finished: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stall_file_operations(&mut self) {
+        self.file = Some(CacheWriterFile::Pending);
     }
 
     pub(crate) fn discard(&mut self) {
@@ -182,6 +198,21 @@ impl CacheWriter {
         self.file.take();
         let _ = std::fs::remove_file(&self.temp_path);
         self.release_reserved_bytes();
+    }
+
+    pub(crate) fn discard_in_background(&mut self) {
+        if self.discard {
+            return;
+        }
+        self.discard = true;
+        self.deferred_cleanup = true;
+        self.file.take();
+        remove_file_in_background(self.temp_path.clone());
+        self.release_reserved_bytes();
+    }
+
+    pub(crate) fn defer_cleanup(&mut self) {
+        self.deferred_cleanup = true;
     }
 
     fn release_reserved_bytes(&mut self) {
@@ -373,9 +404,23 @@ impl Drop for CacheWriter {
 
         self.file.take();
         if !self.committed {
-            let _ = std::fs::remove_file(&self.temp_path);
+            if self.deferred_cleanup {
+                remove_file_in_background(self.temp_path.clone());
+            } else {
+                let _ = std::fs::remove_file(&self.temp_path);
+            }
         }
         self.release_reserved_bytes();
+    }
+}
+
+fn remove_file_in_background(path: std::path::PathBuf) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        drop(runtime.spawn(async move {
+            let _ = async_fs::remove_file(path).await;
+        }));
+    } else {
+        let _ = std::fs::remove_file(path);
     }
 }
 

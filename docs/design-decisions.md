@@ -311,9 +311,11 @@ metadata and filesystem overhead still require headroom.
 
 When the staging allowance is exhausted, ExfilGuard abandons only the cache
 copy and continues forwarding the response. It does not slow or reject client
-traffic to protect cache population. Same-key fills are not coalesced: that is
-an upstream-load optimization with response-variant complexity, not necessary
-for bounding temporary disk use.
+traffic to protect cache population. HTTP/2 cache file operations on the
+response path are likewise bounded by the response-body idle timeout; a storage
+error or timeout abandons caching without failing the forwarded response.
+Same-key fills are not coalesced: that is an upstream-load optimization with
+response-variant complexity, not necessary for bounding temporary disk use.
 
 ## `SIGHUP` reloads policy data only
 

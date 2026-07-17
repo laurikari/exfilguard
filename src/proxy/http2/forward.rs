@@ -243,6 +243,7 @@ async fn relay_upstream_response(
         response_time,
         response_delay,
         upstream_peer,
+        response_body_timeout,
     )
     .await;
 
@@ -293,7 +294,9 @@ async fn relay_upstream_response(
             upstream_body_bytes = upstream_body_bytes
                 .checked_add(chunk_len as u64)
                 .ok_or_else(|| anyhow!("response body size overflow"))?;
-            cache_write.write(&chunk, upstream_peer).await;
+            cache_write
+                .write(&chunk, upstream_peer, response_body_timeout)
+                .await;
             send_data_with_backpressure(
                 &mut send_body,
                 chunk,
@@ -350,7 +353,9 @@ async fn relay_upstream_response(
     }
 
     response_progress.mark_complete();
-    let cache_store = cache_write.finish(upstream_peer).await;
+    let cache_store = cache_write
+        .finish(upstream_peer, response_body_timeout)
+        .await;
 
     Ok(RelayedResponse {
         status,
