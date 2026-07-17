@@ -536,7 +536,9 @@ Metadata is keyed by request URI and points to an immutable body generation.
 When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up
 to `cache_sweeper_batch_size` entries, removing expired entries and pruning
-empty shard directories.
+empty shard directories. It retains an in-memory offset so successive bounded
+runs advance through the complete metadata set; restart resets the offset after
+the startup scan has already examined every entry.
 
 `cache_total_capacity` is an advisory bound for completed response bodies, not
 a filesystem quota. In-progress cache fills share an additional

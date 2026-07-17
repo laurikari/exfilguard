@@ -452,6 +452,7 @@ mod tests {
             max_bytes: 1024 * 1024,
             in_flight_bytes: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
+            sweep_offset: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 

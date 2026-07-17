@@ -3,6 +3,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -14,6 +15,16 @@ use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 const CACHE_LAYOUT_VERSION: u32 = 6;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
+
+async fn sorted_directory_entries(path: &Path) -> std::io::Result<Vec<async_fs::DirEntry>> {
+    let mut entries = async_fs::read_dir(path).await?;
+    let mut sorted = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        sorted.push(entry);
+    }
+    sorted.sort_unstable_by_key(|entry| entry.file_name());
+    Ok(sorted)
+}
 
 fn unix_millis_to_system_time(value: u64) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(value))
@@ -365,41 +376,50 @@ impl CacheState {
             return Ok(stats);
         }
         let now = SystemTime::now();
-        let mut shard1_entries = match async_fs::read_dir(self.store.disk_dir()).await {
+        let shard1_entries = match sorted_directory_entries(self.store.disk_dir()).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(stats),
             Err(err) => return Err(err.into()),
         };
+        let start_offset = self.sweep_offset.load(Ordering::Relaxed);
+        let mut skipped = 0usize;
+        let mut next_offset = start_offset;
+        let mut batch_full = false;
 
-        'outer: while let Some(shard1) = shard1_entries.next_entry().await? {
+        'outer: for shard1 in shard1_entries {
             if !shard1.file_type().await?.is_dir() {
                 continue;
             }
-            let mut shard2_entries = match async_fs::read_dir(shard1.path()).await {
+            let shard2_entries = match sorted_directory_entries(&shard1.path()).await {
                 Ok(entries) => entries,
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
-            while let Some(shard2) = shard2_entries.next_entry().await? {
+            for shard2 in shard2_entries {
                 if !shard2.file_type().await?.is_dir() {
                     continue;
                 }
-                let mut entries = match async_fs::read_dir(shard2.path()).await {
+                let entries = match sorted_directory_entries(&shard2.path()).await {
                     Ok(entries) => entries,
                     Err(err) if err.kind() == ErrorKind::NotFound => continue,
                     Err(err) => return Err(err.into()),
                 };
-                while let Some(entry) = entries.next_entry().await? {
-                    if stats.inspected >= batch_size {
-                        break 'outer;
+                for entry in entries {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("meta") {
+                        continue;
                     }
                     let file_type = entry.file_type().await?;
                     if !file_type.is_file() {
                         continue;
                     }
-                    let path = entry.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("meta") {
+                    if skipped < start_offset {
+                        skipped += 1;
                         continue;
+                    }
+                    if stats.inspected >= batch_size {
+                        batch_full = true;
+                        break 'outer;
                     }
                     stats.inspected += 1;
                     let _publish_guard = self.publish_lock().lock().await;
@@ -410,11 +430,28 @@ impl CacheState {
                     };
                     let persisted: PersistedEntry = match serde_json::from_slice(&data) {
                         Ok(value) => value,
-                        Err(_) => continue,
+                        Err(err) => {
+                            warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "removing malformed cache metadata during sweep"
+                            );
+                            match async_fs::remove_file(&path).await {
+                                Ok(()) => {}
+                                Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => {}
+                                Err(remove_err) => return Err(remove_err.into()),
+                            }
+                            if let Some(entry_id) = path.file_stem().and_then(|s| s.to_str()) {
+                                self.prune_empty_shards(entry_id).await;
+                            }
+                            stats.removed += 1;
+                            continue;
+                        }
                     };
                     if persisted_timing(&persisted)
                         .is_some_and(|(_, _, expires_at)| now < expires_at)
                     {
+                        next_offset = next_offset.saturating_add(1);
                         continue;
                     }
                     self.remove_entry_by_key_base(&persisted.key_base);
@@ -433,9 +470,17 @@ impl CacheState {
                     stats.bytes_reclaimed = stats
                         .bytes_reclaimed
                         .saturating_add(persisted.content_length);
+                    match async_fs::metadata(&path).await {
+                        Ok(_) => next_offset = next_offset.saturating_add(1),
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
             }
         }
+
+        self.sweep_offset
+            .store(if batch_full { next_offset } else { 0 }, Ordering::Relaxed);
 
         Ok(stats)
     }

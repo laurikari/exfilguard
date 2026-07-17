@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow, ensure};
@@ -67,6 +67,7 @@ struct CacheState {
     max_bytes: u64,
     in_flight_bytes: AtomicU64,
     next_id: AtomicU64,
+    sweep_offset: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +105,7 @@ impl HttpCache {
             max_bytes,
             in_flight_bytes: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
+            sweep_offset: AtomicUsize::new(0),
         });
         spawn_cache_dir_cleanup(cleanup_dirs);
         let rebuild = {
@@ -320,6 +322,35 @@ mod tests {
         let meta_path = cache.state.meta_path(&key_id);
         let persisted: PersistedEntry = serde_json::from_slice(&fs::read(&meta_path)?)?;
         let body_path = cache.state.body_path(&persisted.body_id);
+        Ok((body_path, meta_path))
+    }
+
+    fn write_sweep_entry(
+        cache: &HttpCache,
+        key_base: String,
+        expires_at_unix_millis: u64,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let entry_id = CacheKey::entry_id_for_key(&key_base);
+        let mut body_id = blake3::hash(key_base.as_bytes()).to_hex().to_string();
+        body_id.replace_range(..4, &entry_id[..4]);
+        let body = key_base.as_bytes().to_vec();
+        let body_path = cache.state.body_path(&body_id);
+        fs::create_dir_all(body_path.parent().expect("body shard"))?;
+        fs::write(&body_path, &body)?;
+        let meta_path = cache.state.meta_path(&entry_id);
+        let persisted = PersistedEntry {
+            key_base,
+            body_id,
+            status: 200,
+            headers: Vec::new(),
+            vary_headers: Vec::new(),
+            response_time_unix_millis: now_unix_millis().saturating_sub(1_000),
+            corrected_initial_age_millis: 0,
+            expires_at_unix_millis,
+            content_hash: blake3::hash(&body).to_hex().to_string(),
+            content_length: body.len() as u64,
+        };
+        fs::write(&meta_path, serde_json::to_vec(&persisted)?)?;
         Ok((body_path, meta_path))
     }
 
@@ -1162,6 +1193,57 @@ mod tests {
         assert_eq!(stats.removed, 1);
         assert!(!meta_path.exists());
         assert!(!body_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_sweeps_advance_past_fresh_metadata() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache =
+            build_cache(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        let mut keys = [
+            "GET::http://example.com:80/sweep-a".to_string(),
+            "GET::http://example.com:80/sweep-b".to_string(),
+        ];
+        keys.sort_unstable_by_key(|key| CacheKey::entry_id_for_key(key));
+        let now = now_unix_millis();
+        let (fresh_body, fresh_meta) = write_sweep_entry(&cache, keys[0].clone(), now + 60_000)?;
+        let (expired_body, expired_meta) =
+            write_sweep_entry(&cache, keys[1].clone(), now.saturating_sub(1))?;
+
+        let first = cache.state.sweep_expired_entries(1).await?;
+        assert_eq!(first.inspected, 1);
+        assert_eq!(first.removed, 0);
+        assert!(fresh_body.exists());
+        assert!(fresh_meta.exists());
+        assert!(expired_body.exists());
+
+        let second = cache.state.sweep_expired_entries(1).await?;
+        assert_eq!(second.inspected, 1);
+        assert_eq!(second.removed, 1);
+        assert!(fresh_body.exists());
+        assert!(fresh_meta.exists());
+        assert!(!expired_body.exists());
+        assert!(!expired_meta.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweeper_removes_malformed_metadata() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache =
+            build_cache(10, dir.path().to_path_buf(), 1024 * 1024, 1024 * 1024 * 10).await?;
+        let key_base = "GET::http://example.com:80/sweep-malformed";
+        let entry_id = CacheKey::entry_id_for_key(key_base);
+        let meta_path = cache.state.meta_path(&entry_id);
+        fs::create_dir_all(meta_path.parent().expect("metadata shard"))?;
+        fs::write(&meta_path, b"{not-json")?;
+
+        let stats = cache.state.sweep_expired_entries(10).await?;
+
+        assert_eq!(stats.inspected, 1);
+        assert_eq!(stats.removed, 1);
+        assert!(!meta_path.exists());
         Ok(())
     }
 
