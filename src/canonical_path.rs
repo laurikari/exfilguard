@@ -380,6 +380,22 @@ mod tests {
     }
 
     #[test]
+    fn literal_and_encoded_semicolons_remain_distinct_path_data() {
+        let literal = canonicalize_request_path("/items;color=red?filter=a;b").unwrap();
+        let encoded = canonicalize_request_path("/items%3bcolor=red?filter=a;b").unwrap();
+        assert_eq!(literal, "/items;color=red");
+        assert_eq!(encoded, "/items%3Bcolor=red");
+
+        let literal_matcher = Regex::new(&pattern_regex("/items;color=red").unwrap()).unwrap();
+        assert!(literal_matcher.is_match(&literal));
+        assert!(!literal_matcher.is_match(&encoded));
+
+        let encoded_matcher = Regex::new(&pattern_regex("/items%3Bcolor=red").unwrap()).unwrap();
+        assert!(encoded_matcher.is_match(&encoded));
+        assert!(!encoded_matcher.is_match(&literal));
+    }
+
+    #[test]
     fn reject_noncanonical_pattern_escapes() {
         for pattern in ["/files/%7E", "/files/%2a", "/files/%2F", "/files/%5C"] {
             assert!(pattern_regex(pattern).is_err(), "accepted {pattern}");

@@ -28,6 +28,19 @@ path wildcard, `\*` is the policy-only spelling for a literal raw asterisk;
 request paths themselves reject backslashes. This keeps raw `*`, encoded `%2A`,
 and literal `%2A` text exactly distinguishable in policy.
 
+## Policy stops at the application-routing boundary
+
+ExfilGuard evaluates the HTTP method and RFC-defined request target that it
+receives on the wire. It does not emulate framework- or origin-specific routing
+transformations. Valid reserved path characters remain part of the canonical
+policy path and the original target is forwarded unchanged. In particular,
+semicolon is valid path data, and literal `;` remains distinct from `%3B`.
+
+Operators are responsible for making policy rules consistent with downstream
+routing semantics. Guessing application transformations here would reject
+standards-compliant traffic without providing a complete model of arbitrary
+origin rewrites.
+
 ## Reject ambiguous syntax
 
 ExfilGuard rejects malformed or ambiguous HTTP syntax on both sides of the
