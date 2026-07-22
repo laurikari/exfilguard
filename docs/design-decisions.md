@@ -159,9 +159,12 @@ present.
 
 ## HTTPS inspect and tunnel modes
 
-In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that
-lets it start a bumped TLS session. That does not allow arbitrary inner
-methods or paths. It checks those only after decryption.
+In `inspect` mode, only a matching `ALLOW` rule may authorize the CONNECT host
+and port preflight that lets ExfilGuard start a bumped TLS session. A matching
+`DENY` rule does not authorize transport setup by itself, so deny-only
+authorities fail at the outer CONNECT without opening an upstream connection.
+Preflight does not allow arbitrary inner methods or paths. ExfilGuard checks
+those only after decryption.
 
 In `tunnel` mode, ExfilGuard may open a CONNECT tunnel and leave the payload
 alone.

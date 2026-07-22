@@ -41,8 +41,8 @@ Accepts raw TCP connections and hands them to the dispatcher.
 
 ### 2. The Dispatcher Layer (`src/proxy/http/dispatch.rs`)
 Figures out whether the connection is HTTP/1.1, HTTP/2, or CONNECT. If a
-`CONNECT` request has matching HTTPS inspect rules, it starts the TLS bump
-flow.
+`CONNECT` request has matching HTTPS inspect `ALLOW` rules, it starts the TLS
+bump flow.
 
 ### 3. The Policy Engine (`src/policy/`)
 Takes a request view with scheme, host, port, path, and method, then returns
@@ -194,9 +194,10 @@ Each HTTPS policy rule declares an explicit mode:
 
 - `https_mode = "inspect"` (default) terminates TLS so the proxy can enforce
   scheme, host, path, and method checks on the inner HTTP request. Matching
-  HTTPS rules authorize a TLS bump preflight for the same host/port, but the
-  real policy decision is attached to the inner request. Private upstream
-  addresses are still blocked.
+  HTTPS `ALLOW` rules authorize a TLS bump preflight for the same host/port,
+  but the real policy decision is attached to the inner request. Deny-only
+  authorities fail at the outer CONNECT. Private upstream addresses are still
+  blocked.
 - `https_mode = "tunnel"` only enforces scheme/host/port on the outer CONNECT.
   These rules must use `methods = ["CONNECT"]` and a `url_pattern` ending in
   `/**`, making it clear that the intent is to tunnel the host untouched. Use
@@ -230,8 +231,9 @@ Config loading fails if the HTTPS mode and method set are inconsistent.
    selectors must not overlap, so the match is unambiguous.
 2. If no selector matches, the `fallback` client is used.
 3. It evaluates that client's policies in order; the first matching rule wins.
-4. Tunnel-mode CONNECT rules stream bytes once allowed; inspect-mode HTTPS rules
-   authorize TLS bump preflight and then evaluate the inner request normally.
+4. Tunnel-mode CONNECT rules stream bytes once allowed; inspect-mode HTTPS
+   `ALLOW` rules authorize TLS bump preflight and then evaluate the inner
+   request normally. Deny-only authorities fail at the outer CONNECT.
 
 ## Configuration Basics
 

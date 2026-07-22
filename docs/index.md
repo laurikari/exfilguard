@@ -117,7 +117,7 @@ These examples assume ExfilGuard is being used as an explicit proxy.
 
 ```toml
 # Allow analytics service to reach trusted endpoint
-# HTTPS inspect rules authorize TLS bump preflight for the same host/port.
+# HTTPS inspect ALLOW rules authorize TLS bump preflight for the same host/port.
 [[policy.rule]]
 action = "ALLOW"
 methods = ["GET", "POST"]

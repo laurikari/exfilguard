@@ -1130,6 +1130,49 @@ async fn connect_default_deny_returns_403() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_inspect_deny_does_not_authorize_transport_preflight() -> Result<()> {
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["deny-only"])
+        .policy(
+            PolicySpec::new("deny-only").rule(
+                RuleSpec::deny(&["ANY"], format!("https://*:{}/**", upstream_addr.port()))
+                    .status(470)
+                    .body("inner request denied"),
+            ),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+        port = upstream_addr.port()
+    );
+    client.send(request).await?;
+
+    let response = client.read_headers().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "deny-only inspect rule authorized CONNECT preflight: {response}"
+    );
+    assert!(
+        timeout(StdDuration::from_millis(100), upstream_listener.accept())
+            .await
+            .is_err(),
+        "deny-only inspect rule caused an upstream connection"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_equivalent_ipv6_spelling_hits_ordered_deny() -> Result<()> {
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()

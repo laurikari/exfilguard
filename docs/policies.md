@@ -144,11 +144,12 @@ methods = ["ANY"]
 
 ExfilGuard evaluates CONNECT requests against explicit CONNECT tunnel rules
 first. If no tunnel rule matches, it can still perform a TLS bump preflight
-when matching HTTPS inspect rules exist for the same host and port. It then
-attaches the real policy decision to the inner HTTP request. ExfilGuard still
-blocks private upstream addresses in every mode. That includes plain HTTP,
-tunneled CONNECT, and bumped HTTPS. The point is to reduce SSRF risk and stop
-clients from reaching internal address space by mistake.
+when matching HTTPS inspect `ALLOW` rules exist for the same host and port. It
+then attaches the real policy decision to the inner HTTP request. A deny-only
+authority fails at the outer CONNECT without opening an upstream connection.
+ExfilGuard still blocks private upstream addresses in every mode. That includes
+plain HTTP, tunneled CONNECT, and bumped HTTPS. The point is to reduce SSRF risk
+and stop clients from reaching internal address space by mistake.
 
 ---
 
@@ -258,7 +259,8 @@ url_pattern = "https://example.com:8443/api/**"
 - Decrypted HTTP requests are checked after TLS interception
 - TLS is terminated and re-encrypted
 - Used for normal HTTPS `GET`/`POST`/`PUT`/`DELETE` style rules
-- Matching HTTPS rules authorize a TLS bump preflight for the same host/port
+- Matching HTTPS `ALLOW` rules authorize a TLS bump preflight for the same
+  host/port; deny-only authorities fail at the outer CONNECT
 - The real policy decision is attached to the inner HTTP request
 - Private upstream resolution is still blocked
 - Enables normal request logging, metrics, and caching when configured
