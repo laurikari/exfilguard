@@ -200,4 +200,40 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port)
         );
     }
+
+    #[tokio::test]
+    async fn literal_resolution_rejects_non_global_special_destinations() {
+        let timeout = Duration::from_secs(1);
+
+        for host in [
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "100:0:0:1::1",
+            "192.88.99.2",
+        ] {
+            let err = resolve_host_with_policy_inner(host, 443, timeout, false, "unit-test")
+                .await
+                .expect_err("non-global special destination should be rejected");
+            assert!(
+                err.downcast_ref::<PrivateAddressError>().is_some(),
+                "unexpected error for {host}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn literal_resolution_allows_nat64_public_destination() {
+        let host = "64:ff9b::8.8.8.8";
+        let port = 443;
+        let timeout = Duration::from_secs(1);
+
+        let addrs = resolve_host_with_policy_inner(host, port, timeout, false, "unit-test")
+            .await
+            .expect("public NAT64 destination should be allowed");
+        assert_eq!(
+            addrs.allowed,
+            vec![SocketAddr::new(host.parse::<IpAddr>().unwrap(), port)]
+        );
+    }
 }
