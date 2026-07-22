@@ -40,6 +40,7 @@ That includes cases such as:
 - malformed CONNECT authorities
 - encoded path separators
 - encoded dot-segment tricks
+- request targets containing URI-fragment delimiters
 
 Upstream HTTP/1 status lines must use exact CRLF framing and the standard
 `HTTP/1.1 SP 3DIGIT SP [reason-phrase]` grammar. Valid reason-phrase bytes are

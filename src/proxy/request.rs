@@ -97,6 +97,10 @@ fn parse_http1_request_with_mode(
     fallback_scheme: Scheme,
     mode: Http1TargetMode,
 ) -> Result<ParsedRequest> {
+    if target.contains('#') {
+        bail!("request target must not contain a URI fragment");
+    }
+
     let uri: Uri = target.parse().context("invalid request target")?;
 
     if uri.scheme().is_some() {
@@ -353,6 +357,24 @@ mod tests {
         let target = "http://[malformed?query-secret-sentinel";
         let err = parse_http1_request(Method::GET, target, None, Scheme::Http).unwrap_err();
         assert!(!format!("{err:?}").contains("query-secret-sentinel"));
+    }
+
+    #[test]
+    fn parse_http1_request_rejects_uri_fragments() {
+        let targets = [
+            "http://example.com/allowed#fragment",
+            "http://example.com/allowed?key=value#fragment",
+            "/allowed?key=value#fragment",
+        ];
+
+        for target in targets {
+            let err = parse_http1_request(Method::GET, target, Some("example.com"), Scheme::Http)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("URI fragment"),
+                "unexpected error for {target:?}: {err:?}"
+            );
+        }
     }
 
     #[test]
