@@ -2089,6 +2089,52 @@ async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http1_accepts_npm_encoded_slash_without_rewriting_target() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-npm-scoped-package";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET"],
+        format!("https://{upstream_host}/@scope%2Fpackage"),
+    ));
+    let mut fixture =
+        BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
+    let upstream_addr = fixture.upstream_addr();
+    let authority = format!("{upstream_host}:{}", upstream_addr.port());
+    let mut client = fixture.http1_client();
+
+    let encoded_request =
+        format!("GET /@scope%2fpackage?write=true HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(encoded_request).await?;
+    let encoded_response = client.read_response_with_length().await?;
+    assert!(
+        encoded_response.starts_with("HTTP/1.1 200"),
+        "lowercase encoded slash did not match the canonical policy pattern: {encoded_response}"
+    );
+    let (_, encoded_body) = encoded_response
+        .split_once("\r\n\r\n")
+        .context("encoded-slash response missing head terminator")?;
+    assert_eq!(
+        encoded_body, "/@scope%2fpackage?write=true",
+        "upstream did not receive the original npm request target"
+    );
+
+    let literal_request = format!(
+        "GET /@scope/package?write=true HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(literal_request).await?;
+    let literal_response = client.read_response_with_length().await?;
+    assert!(
+        literal_response.starts_with("HTTP/1.1 403"),
+        "literal slash unexpectedly matched the encoded-slash rule: {literal_response}"
+    );
+
+    client.stream_mut().shutdown().await.ok();
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http1_encoded_unreserved_hits_ordered_deny() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "deny-canonical-admin";
@@ -2792,6 +2838,60 @@ async fn connect_bump_http2_encoded_unreserved_hits_ordered_deny() -> Result<()>
     let (status, text) = client.request_text(request).await?;
     assert_eq!(status, StatusCode::from_u16(451)?);
     assert_eq!(text, "canonical path denied");
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_accepts_npm_encoded_slash_as_distinct_path_data() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-npm-scoped-package";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET"],
+        format!("https://{upstream_host}/@scope%2Fpackage"),
+    ));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let encoded_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/@scope%2fpackage")
+                .build()?,
+        )
+        .body(())?;
+    let (encoded_status, encoded_body) = client.request_text(encoded_request).await?;
+    assert_eq!(encoded_status, StatusCode::OK);
+    assert_eq!(
+        encoded_body, "/@scope%2fpackage",
+        "HTTP/2 upstream did not receive the original encoded path"
+    );
+
+    let literal_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/@scope/package")
+                .build()?,
+        )
+        .body(())?;
+    let (literal_status, literal_body) = client.request_text(literal_request).await?;
+    assert_eq!(literal_status, StatusCode::FORBIDDEN);
+    assert_eq!(literal_body, "request blocked by policy");
 
     client.shutdown().await;
     fixture.shutdown().await;

@@ -607,6 +607,7 @@ mod tests {
             "/files/.*",
             "/users/*/objects/**",
             "/users/~name:@/%3A/%2A/%252A",
+            "/@scope%2F*",
             "/all/!$&'()+,;=:@",
             r"/files/\*",
             r"/files/\*\*",
@@ -622,7 +623,6 @@ mod tests {
             r"/files/\",
             "/files/%7E",
             "/files/%2a",
-            "/files/%2F",
             "/files/%5C",
             "/files/%00",
         ] {

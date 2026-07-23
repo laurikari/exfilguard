@@ -86,8 +86,8 @@ fn compile_pattern_segment(segment: &str, regex: &mut String) -> Result<()> {
                         &segment[idx..idx + 3]
                     );
                 }
-                if decoded == b'/' || decoded == b'\\' {
-                    bail!("path pattern must not contain encoded path separators");
+                if decoded == b'\\' {
+                    bail!("path pattern must not contain encoded backslashes");
                 }
                 if decoded.is_ascii_control() || decoded == 0x7f {
                     bail!("path pattern must not contain encoded control characters");
@@ -184,8 +184,8 @@ fn validate_request_segment(segment: &str) -> Result<()> {
                     bail!("request path contains invalid percent-escape");
                 }
                 let decoded = decode_hex_byte(bytes[idx + 1], bytes[idx + 2])?;
-                if decoded == b'/' || decoded == b'\\' {
-                    bail!("request path must not contain encoded path separators");
+                if decoded == b'\\' {
+                    bail!("request path must not contain encoded backslashes");
                 }
                 if decoded.is_ascii_control() || decoded == 0x7f {
                     bail!("request path must not contain encoded control characters");
@@ -346,7 +346,7 @@ mod tests {
         for byte in 0u8..=u8::MAX {
             let raw = format!("/%{byte:02X}x");
             let result = canonicalize_request_path(&raw);
-            if byte == b'/' || byte == b'\\' || byte.is_ascii_control() || byte == 0x7f {
+            if byte == b'\\' || byte.is_ascii_control() || byte == 0x7f {
                 assert!(result.is_err(), "unexpectedly accepted {raw}");
                 continue;
             }
@@ -396,8 +396,23 @@ mod tests {
     }
 
     #[test]
+    fn encoded_slash_remains_distinct_path_data() {
+        let encoded = canonicalize_request_path("/@scope%2fname").unwrap();
+        let literal = canonicalize_request_path("/@scope/name").unwrap();
+        let double_encoded = canonicalize_request_path("/@scope%252fname").unwrap();
+        assert_eq!(encoded, "/@scope%2Fname");
+        assert_eq!(literal, "/@scope/name");
+        assert_eq!(double_encoded, "/@scope%252fname");
+
+        let matcher = Regex::new(&pattern_regex("/@scope%2F*").unwrap()).unwrap();
+        assert!(matcher.is_match(&encoded));
+        assert!(!matcher.is_match(&literal));
+        assert!(!matcher.is_match(&double_encoded));
+    }
+
+    #[test]
     fn reject_noncanonical_pattern_escapes() {
-        for pattern in ["/files/%7E", "/files/%2a", "/files/%2F", "/files/%5C"] {
+        for pattern in ["/files/%7E", "/files/%2a", "/files/%5C"] {
             assert!(pattern_regex(pattern).is_err(), "accepted {pattern}");
         }
     }

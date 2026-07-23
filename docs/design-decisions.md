@@ -33,8 +33,9 @@ and literal `%2A` text exactly distinguishable in policy.
 ExfilGuard evaluates the HTTP method and RFC-defined request target that it
 receives on the wire. It does not emulate framework- or origin-specific routing
 transformations. Valid reserved path characters remain part of the canonical
-policy path and the original target is forwarded unchanged. In particular,
-semicolon is valid path data, and literal `;` remains distinct from `%3B`.
+policy path, retained percent escapes remain encoded, and the original target
+is forwarded unchanged. In particular, semicolon is valid path data, literal
+`;` remains distinct from `%3B`, and `%2F` remains distinct from `/`.
 
 Operators are responsible for making policy rules consistent with downstream
 routing semantics. Guessing application transformations here would reject
@@ -51,7 +52,7 @@ That includes cases such as:
 - both `Content-Length` and `Transfer-Encoding`
 - malformed or ambiguously terminated chunk framing
 - malformed CONNECT authorities
-- encoded path separators
+- raw or encoded backslashes
 - encoded dot-segment tricks
 - request targets containing URI-fragment delimiters
 

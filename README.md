@@ -122,13 +122,14 @@ canonical path view so rule matching does not depend on origin-specific path
 normalization.
 
 - Query strings are ignored for path matching.
-- Percent-encoded RFC-unreserved characters are decoded and other valid
-  escapes use uppercase hex in the policy view.
+- Percent-encoded RFC-unreserved characters are decoded. Other valid escapes
+  remain encoded and use uppercase hex in the policy view, so `%2F` remains
+  distinct from `/`.
 - Literal `.` and `..` path segments are normalized before policy evaluation.
 - Ambiguous path syntax is rejected with `400 Bad Request` instead of being
   silently rewritten. This includes characters outside RFC 3986 path syntax,
-  invalid escapes, backslashes, encoded path separators, and encoded
-  dot-segments such as `%2e%2e`.
+  invalid escapes, raw or encoded backslashes, and encoded dot-segments such
+  as `%2e%2e`.
 
 ## Security
 

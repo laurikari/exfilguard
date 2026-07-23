@@ -229,8 +229,13 @@ url_pattern = "https://example.com:8443/api/**"
 
 !!! note
     Requests are rejected if the path contains characters outside RFC 3986
-    path syntax, invalid escapes, backslashes, encoded path separators, or
-    encoded dot-segments such as `%2e%2e`.
+    path syntax, invalid escapes, raw or encoded backslashes, or encoded
+    dot-segments such as `%2e%2e`.
+
+    Percent-encoded reserved characters remain encoded for policy matching,
+    with uppercase hexadecimal digits. For example, npm's scoped-package path
+    `/@scope%2fname` has the canonical policy path `/@scope%2Fname`, which
+    remains distinct from `/@scope/name`.
 
 ### Complete Examples
 

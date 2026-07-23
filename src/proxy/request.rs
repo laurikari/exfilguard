@@ -580,16 +580,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_request_rejects_encoded_path_separator() {
+    fn parse_request_preserves_encoded_slash_for_policy() -> Result<()> {
+        let parsed = parse_http1_request(
+            Method::GET,
+            "/@scope%2fname?download=true",
+            Some("registry.example"),
+            Scheme::Https,
+        )?;
+        assert_eq!(parsed.path, "/@scope%2fname?download=true");
+        assert_eq!(parsed.policy_path(), "/@scope%2Fname");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_request_rejects_encoded_backslash() {
         let err = parse_http1_request(
             Method::GET,
-            "/public%2fadmin",
+            "/public%5cadmin",
             Some("example.com"),
             Scheme::Https,
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("encoded path separators"),
+            err.to_string().contains("encoded backslashes"),
             "unexpected error: {err:?}"
         );
     }
