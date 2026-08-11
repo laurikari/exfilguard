@@ -111,9 +111,19 @@ pub struct AuthorizationServiceSettings {
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizationClientCertificateSettings {
     Files { cert: PathBuf, key: PathBuf },
+    Vault { role: String, common_name: String },
 }
 
 impl AuthorizationSettings {
+    pub(crate) fn uses_vault(&self) -> bool {
+        self.services.iter().any(|service| {
+            matches!(
+                &service.client_certificate,
+                AuthorizationClientCertificateSettings::Vault { .. }
+            )
+        })
+    }
+
     pub(crate) fn apply_base_dir(&mut self, base_dir: &Path) {
         for service in &mut self.services {
             service.apply_base_dir(base_dir);
@@ -230,10 +240,12 @@ impl AuthorizationSettings {
 impl AuthorizationServiceSettings {
     fn apply_base_dir(&mut self, base_dir: &Path) {
         self.server_ca_cert = absolutize(&self.server_ca_cert, base_dir);
-        let AuthorizationClientCertificateSettings::Files { cert, key } =
-            &mut self.client_certificate;
-        *cert = absolutize(cert, base_dir);
-        *key = absolutize(key, base_dir);
+        if let AuthorizationClientCertificateSettings::Files { cert, key } =
+            &mut self.client_certificate
+        {
+            *cert = absolutize(cert, base_dir);
+            *key = absolutize(key, base_dir);
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -247,11 +259,21 @@ impl AuthorizationServiceSettings {
             self.max_concurrency > 0 && self.max_concurrency <= tokio::sync::Semaphore::MAX_PERMITS,
             "{field}.max_concurrency must be within the runtime semaphore limit"
         );
-        let AuthorizationClientCertificateSettings::Files { cert, key } = &self.client_certificate;
-        if cert == key {
-            bail!(
-                "{field}.client_certificate.cert and client_certificate.key must be different files"
-            );
+        match &self.client_certificate {
+            AuthorizationClientCertificateSettings::Files { cert, key } => {
+                if cert == key {
+                    bail!(
+                        "{field}.client_certificate.cert and client_certificate.key must be different files"
+                    );
+                }
+            }
+            AuthorizationClientCertificateSettings::Vault { role, common_name } => {
+                ensure_nonempty(&format!("{field}.client_certificate.role"), role)?;
+                ensure_nonempty(
+                    &format!("{field}.client_certificate.common_name"),
+                    common_name,
+                )?;
+            }
         }
         Ok(())
     }

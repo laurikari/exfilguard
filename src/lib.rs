@@ -81,6 +81,13 @@ async fn run_with_upstream_resolver(
     if let Some(vault_source) = vault_source {
         vault_source.spawn_renewal(tls_issuer.clone());
     }
+    let authorization = if let Some(authorization) = &settings.authorization {
+        Some(Arc::new(
+            authorization::AuthorizationServices::new(authorization, vault).await?,
+        ))
+    } else {
+        None
+    };
     spawn_ca_usability_monitor(tls_issuer.clone());
     let TlsClientConfigs { http1, http2 } = tls_client_configs;
     crate::metrics::mark_policy_reload_success();
@@ -105,8 +112,14 @@ async fn run_with_upstream_resolver(
         None
     };
 
-    let app = proxy::AppContext::new(settings, policy_store, tls_context, cache)?
-        .with_upstream_resolver(upstream_resolver);
+    let app = proxy::AppContext::from_preflight(
+        settings,
+        policy_store,
+        tls_context,
+        cache,
+        authorization,
+    )
+    .with_upstream_resolver(upstream_resolver);
 
     if let Some((addr, path, tls)) = metrics {
         tracing::info!(address = %addr, tls = tls.is_some(), "metrics endpoint starting");

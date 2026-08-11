@@ -14,13 +14,15 @@ use reqwest::redirect::Policy as RedirectPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
-use tokio::time::{Instant, timeout, timeout_at};
-use tracing::warn;
+use time::OffsetDateTime;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::{
     config::{MethodMatch, RuleAction},
+    tls::validation::ClientCertificateValidity,
     util::normalize_mapped_ip,
 };
 
@@ -220,7 +222,7 @@ trait PolicyClient: Send + Sync {
 }
 
 struct HttpsPolicyClient {
-    client: reqwest::Client,
+    client: AuthorizationHttpClient,
     url: reqwest::Url,
     concurrency: Arc<Semaphore>,
     max_response_size: usize,
@@ -236,8 +238,8 @@ impl PolicyClient for HttpsPolicyClient {
                 .acquire()
                 .await
                 .context("authorization-service concurrency limiter closed")?;
-            let response = self
-                .client
+            let client = self.client.current().await?;
+            let response = client
                 .post(self.url.clone())
                 .json(&request)
                 .send()
@@ -251,6 +253,43 @@ impl PolicyClient for HttpsPolicyClient {
         })
         .await
         .context("authorization-service policy operation timed out")?
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct AuthorizationHttpClient {
+    current: Arc<RwLock<ClientGeneration>>,
+}
+
+struct ClientGeneration {
+    client: reqwest::Client,
+    validity: Option<ClientCertificateValidity>,
+}
+
+impl AuthorizationHttpClient {
+    fn new(client: reqwest::Client, validity: Option<ClientCertificateValidity>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(ClientGeneration { client, validity })),
+        }
+    }
+
+    pub(super) async fn current(&self) -> Result<reqwest::Client> {
+        let generation = self.current.read().await;
+        if let Some(validity) = generation.validity {
+            let now = OffsetDateTime::now_utc();
+            ensure!(
+                now >= validity.not_before && now < validity.not_after,
+                "authorization-service client certificate is not currently valid"
+            );
+        }
+        Ok(generation.client.clone())
+    }
+
+    async fn replace(&self, client: reqwest::Client, validity: ClientCertificateValidity) {
+        *self.current.write().await = ClientGeneration {
+            client,
+            validity: Some(validity),
+        };
     }
 }
 
@@ -280,14 +319,17 @@ pub(crate) struct AuthorizationServices {
 }
 
 impl AuthorizationServices {
-    pub(crate) fn new(settings: &AuthorizationSettings) -> Result<Self> {
+    pub(crate) async fn new(
+        settings: &AuthorizationSettings,
+        vault: Option<Arc<crate::tls::vault::VaultClient>>,
+    ) -> Result<Self> {
         settings.validate()?;
         let mut services = HashMap::with_capacity(settings.services.len());
         for service in &settings.services {
             let name = Arc::<str>::from(service.name.as_str());
             services.insert(
                 name,
-                Arc::new(AuthorizationService::new(service, settings)?),
+                Arc::new(AuthorizationService::new(service, settings, vault.clone()).await?),
             );
         }
         Ok(Self {
@@ -357,17 +399,45 @@ impl AuthorizationServices {
 }
 
 impl AuthorizationService {
-    fn new(
+    async fn new(
         service: &AuthorizationServiceSettings,
         settings: &AuthorizationSettings,
+        vault: Option<Arc<crate::tls::vault::VaultClient>>,
     ) -> Result<Self> {
         let name = Arc::<str>::from(service.name.as_str());
         let audience = Arc::<str>::from(service.audience.as_str());
         let client_config = AuthorizationClientConfig::load(service)?;
-        let AuthorizationClientCertificateSettings::Files { cert, key } =
-            &service.client_certificate;
-        let identity = load_file_identity(cert, key)?;
-        let client = client_config.build(&identity)?;
+        let client = match &service.client_certificate {
+            AuthorizationClientCertificateSettings::Files { cert, key } => {
+                let identity = load_file_identity(cert, key)?;
+                AuthorizationHttpClient::new(client_config.build(&identity)?, None)
+            }
+            AuthorizationClientCertificateSettings::Vault { role, common_name } => {
+                let source = Arc::new(VaultAuthorizationClientSource {
+                    vault: vault.context("Vault-backed client certificate requires [vault]")?,
+                    role: role.clone(),
+                    common_name: common_name.clone(),
+                    service_name: name.clone(),
+                    client_config,
+                });
+                let (initial, validity) = source
+                    .issue()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to initialize Vault-backed client certificate for authorization service '{}'",
+                            service.name
+                        )
+                    })?;
+                crate::metrics::set_authorization_service_client_certificate(
+                    &name,
+                    validity.not_after.unix_timestamp(),
+                );
+                let client = AuthorizationHttpClient::new(initial, Some(validity));
+                source.spawn_renewal(client.clone(), validity);
+                client
+            }
+        };
         let concurrency = Arc::new(Semaphore::new(service.max_concurrency));
         let policy_client: Arc<dyn PolicyClient> = Arc::new(HttpsPolicyClient {
             client: client.clone(),
@@ -783,6 +853,110 @@ fn load_file_identity(cert_path: &Path, key_path: &Path) -> Result<Zeroizing<Vec
     Ok(identity_pem)
 }
 
+struct VaultAuthorizationClientSource {
+    vault: Arc<crate::tls::vault::VaultClient>,
+    role: String,
+    common_name: String,
+    service_name: Arc<str>,
+    client_config: AuthorizationClientConfig,
+}
+
+impl VaultAuthorizationClientSource {
+    async fn issue(&self) -> Result<(reqwest::Client, ClientCertificateValidity)> {
+        let certificate = self
+            .vault
+            .issue_client_certificate(&self.role, &self.common_name)
+            .await?;
+        ensure_client_certificate_is_renewable(certificate.validity, OffsetDateTime::now_utc())?;
+        let client = self.client_config.build(&certificate.identity_pem)?;
+        Ok((client, certificate.validity))
+    }
+
+    fn spawn_renewal(
+        self: Arc<Self>,
+        client: AuthorizationHttpClient,
+        initial_validity: ClientCertificateValidity,
+    ) {
+        tokio::spawn(async move {
+            self.renewal_loop(client, initial_validity).await;
+        });
+    }
+
+    async fn renewal_loop(
+        &self,
+        client: AuthorizationHttpClient,
+        mut validity: ClientCertificateValidity,
+    ) {
+        let mut retry_delay = crate::tls::vault::INITIAL_RETRY_DELAY;
+        loop {
+            let threshold = renewal_threshold(validity);
+            let waited_for_schedule =
+                crate::tls::vault::wait_until_renewal_due(validity.not_after, threshold).await;
+            if waited_for_schedule {
+                retry_delay = crate::tls::vault::INITIAL_RETRY_DELAY;
+            }
+
+            match self.issue().await {
+                Ok((next, next_validity)) => {
+                    client.replace(next, next_validity).await;
+                    validity = next_validity;
+                    crate::metrics::set_authorization_service_client_certificate(
+                        &self.service_name,
+                        validity.not_after.unix_timestamp(),
+                    );
+                    crate::metrics::record_authorization_service_vault_renewal(
+                        &self.service_name,
+                        "success",
+                        "none",
+                    );
+                    info!(
+                        authorization_service = %self.service_name,
+                        not_after = %validity.not_after,
+                        "renewed Vault-backed authorization-service client certificate"
+                    );
+                    retry_delay = crate::tls::vault::INITIAL_RETRY_DELAY;
+                    continue;
+                }
+                Err(error) => {
+                    let reason = crate::tls::vault::failure_kind(&error);
+                    crate::metrics::record_authorization_service_vault_renewal(
+                        &self.service_name,
+                        "failure",
+                        reason,
+                    );
+                    warn!(
+                        authorization_service = %self.service_name,
+                        reason,
+                        error = %error,
+                        "Vault authorization-service client certificate renewal failed"
+                    );
+                }
+            }
+
+            sleep(crate::tls::vault::with_jitter(retry_delay)).await;
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(crate::tls::vault::MAX_RETRY_DELAY);
+        }
+    }
+}
+
+fn renewal_threshold(validity: ClientCertificateValidity) -> time::Duration {
+    let lifetime = validity.not_after - validity.not_before;
+    time::Duration::seconds((lifetime.whole_seconds() / 2).max(1))
+}
+
+fn ensure_client_certificate_is_renewable(
+    validity: ClientCertificateValidity,
+    now: OffsetDateTime,
+) -> Result<()> {
+    ensure!(
+        validity.not_after - now > renewal_threshold(validity),
+        "Vault-issued authorization-service client certificate is already due for renewal"
+    );
+    Ok(())
+}
+
 pub(super) async fn read_bounded_response(
     mut response: reqwest::Response,
     limit: usize,
@@ -915,7 +1089,7 @@ mod tests {
             negative_cache_duration: Duration::from_secs(1),
             credential_preparer: CredentialPreparerClient::new(
                 &service_settings,
-                reqwest::Client::new(),
+                AuthorizationHttpClient::new(reqwest::Client::new(), None),
                 Arc::new(Semaphore::new(1)),
                 1024,
             )
@@ -942,6 +1116,55 @@ mod tests {
                 "accepted {value:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn authorization_http_client_never_starts_with_an_expired_certificate() {
+        let now = OffsetDateTime::now_utc();
+        let client = AuthorizationHttpClient::new(
+            reqwest::Client::new(),
+            Some(ClientCertificateValidity {
+                not_before: now - time::Duration::hours(2),
+                not_after: now - time::Duration::hours(1),
+            }),
+        );
+        assert!(client.current().await.is_err());
+
+        client
+            .replace(
+                reqwest::Client::new(),
+                ClientCertificateValidity {
+                    not_before: now - time::Duration::minutes(1),
+                    not_after: now + time::Duration::hours(1),
+                },
+            )
+            .await;
+        assert!(client.current().await.is_ok());
+    }
+
+    #[test]
+    fn vault_client_certificate_must_have_more_than_half_its_lifetime_remaining() {
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            ensure_client_certificate_is_renewable(
+                ClientCertificateValidity {
+                    not_before: now - time::Duration::minutes(1),
+                    not_after: now + time::Duration::hours(1),
+                },
+                now,
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_client_certificate_is_renewable(
+                ClientCertificateValidity {
+                    not_before: now - time::Duration::hours(2),
+                    not_after: now + time::Duration::hours(1),
+                },
+                now,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -11,7 +11,10 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::libc::O_NOFOLLOW;
 use nix::unistd::geteuid;
 use rand::{TryRng, rngs::SysRng};
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::OffsetDateTime;
@@ -23,8 +26,8 @@ use super::{ca::CertificateAuthority, issuer::TlsIssuer};
 
 const MAX_VAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
-const INITIAL_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
-const MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(15 * 60);
+pub(crate) const INITIAL_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
+pub(crate) const MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(15 * 60);
 const MAX_RENEWAL_SCHEDULE_SLEEP: StdDuration = StdDuration::from_secs(60 * 60);
 
 #[derive(Clone, Debug)]
@@ -101,7 +104,7 @@ fn vault_failure(kind: &'static str, error: impl std::fmt::Display) -> anyhow::E
     .into()
 }
 
-fn failure_kind(error: &anyhow::Error) -> &'static str {
+pub(crate) fn failure_kind(error: &anyhow::Error) -> &'static str {
     error
         .downcast_ref::<VaultFailure>()
         .map_or("other", |failure| failure.kind)
@@ -136,15 +139,39 @@ struct SignIntermediateRequest<'a> {
 
 #[derive(Deserialize)]
 struct SignIntermediateResponse {
-    data: SignedIntermediate,
+    data: SignedCertificate,
 }
 
 #[derive(Deserialize)]
-struct SignedIntermediate {
+struct SignedCertificate {
     certificate: String,
     issuing_ca: String,
     #[serde(default)]
     ca_chain: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SignClientCertificateRequest<'a> {
+    csr: &'a str,
+    common_name: &'a str,
+    exclude_cn_from_sans: bool,
+    format: &'static str,
+    remove_roots_from_chain: bool,
+}
+
+#[derive(Deserialize)]
+struct SignClientCertificateResponse {
+    data: SignedCertificate,
+}
+
+struct ParsedSignedChain {
+    der: Vec<Vec<u8>>,
+    pem: Vec<String>,
+}
+
+pub(crate) struct VaultClientCertificate {
+    pub identity_pem: Zeroizing<Vec<u8>>,
+    pub validity: super::validation::ClientCertificateValidity,
 }
 
 #[derive(Deserialize)]
@@ -329,6 +356,114 @@ impl VaultClient {
         }
         serde_json::from_slice(&bytes).context("failed to parse Vault response")
     }
+
+    pub(crate) async fn issue_client_certificate(
+        &self,
+        role: &str,
+        common_name: &str,
+    ) -> Result<VaultClientCertificate> {
+        let role = validate_single_api_segment(role, "Vault PKI role")?;
+        let common_name = common_name.to_string();
+        let csr_name = common_name.clone();
+        let (key, csr) = tokio::task::spawn_blocking(move || build_client_csr(&csr_name))
+            .await
+            .context("client certificate CSR worker failed")??;
+        let token = self.authenticate().await?;
+        let mut segments: Vec<&str> = self.pki_mount.split('/').collect();
+        segments.extend(["sign", role.as_str()]);
+        let url = api_url(&self.base_url, &segments)?;
+        let body = SignClientCertificateRequest {
+            csr: &csr,
+            common_name: &common_name,
+            exclude_cn_from_sans: true,
+            format: "pem",
+            remove_roots_from_chain: false,
+        };
+        let response: SignClientCertificateResponse = self
+            .post_json(url, token.as_deref().map(|value| value.as_str()), &body)
+            .await
+            .map_err(|err| vault_failure("signing", err))?;
+        drop(token);
+
+        let chain = self
+            .parse_signed_chain(response.data, "Vault client certificate")
+            .map_err(|err| vault_failure("validation", err))?;
+        let chain_refs: Vec<&[u8]> = chain.der.iter().map(Vec::as_slice).collect();
+        let validity = super::validation::validate_client_certificate_chain(
+            &chain_refs,
+            &key,
+            &common_name,
+            OffsetDateTime::now_utc(),
+        )
+        .map_err(|err| vault_failure("validation", err))?;
+
+        let mut identity_pem = Zeroizing::new(Vec::new());
+        let identity_certificate_count = chain.pem.len() - 1;
+        for certificate in chain.pem.into_iter().take(identity_certificate_count) {
+            identity_pem.extend_from_slice(certificate.trim().as_bytes());
+            identity_pem.push(b'\n');
+        }
+        identity_pem.extend_from_slice(key.serialize_pem().as_bytes());
+        Ok(VaultClientCertificate {
+            identity_pem,
+            validity,
+        })
+    }
+
+    fn parse_signed_chain(
+        &self,
+        signed: SignedCertificate,
+        leaf_name: &str,
+    ) -> Result<ParsedSignedChain> {
+        let leaf_der = parse_single_certificate(signed.certificate.as_bytes(), leaf_name)?;
+        let issuing_ca_der =
+            parse_single_certificate(signed.issuing_ca.as_bytes(), "Vault issuing certificate")?;
+        let (mut parent_der, mut parent_pem) = if signed.ca_chain.is_empty() {
+            (vec![issuing_ca_der.clone()], vec![signed.issuing_ca])
+        } else {
+            let der = signed
+                .ca_chain
+                .iter()
+                .enumerate()
+                .map(|(index, certificate)| {
+                    parse_single_certificate(
+                        certificate.as_bytes(),
+                        &format!("Vault CA chain certificate {index}"),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (der, signed.ca_chain)
+        };
+        if parent_der.first() == Some(&leaf_der) {
+            parent_der.remove(0);
+            parent_pem.remove(0);
+        }
+        ensure!(
+            parent_der.first() == Some(&issuing_ca_der),
+            "Vault ca_chain does not begin with issuing_ca"
+        );
+        for (index, certificate) in parent_der.iter().enumerate() {
+            ensure!(
+                !parent_der[..index].contains(certificate),
+                "Vault ca_chain contains a duplicate certificate"
+            );
+        }
+        let pinned_root = parent_der.last().expect("parent chain is nonempty");
+        ensure!(
+            self.expected_roots
+                .iter()
+                .any(|expected| expected == pinned_root),
+            "Vault returned a certificate chained to an unpinned root"
+        );
+
+        let mut der = Vec::with_capacity(parent_der.len() + 1);
+        der.push(leaf_der);
+        der.append(&mut parent_der);
+        let mut pem = Vec::with_capacity(parent_pem.len() + 1);
+        pem.push(signed.certificate);
+        pem.append(&mut parent_pem);
+        Ok(ParsedSignedChain { der, pem })
+    }
 }
 
 impl VaultCaSource {
@@ -369,67 +504,11 @@ impl VaultCaSource {
             .map_err(|err| vault_failure("signing", err))?;
         drop(token);
 
-        let intermediate_der = parse_single_certificate(
-            response.data.certificate.as_bytes(),
-            "Vault intermediate certificate",
-        )
-        .map_err(|err| vault_failure("validation", err))?;
-        let issuing_ca_der = parse_single_certificate(
-            response.data.issuing_ca.as_bytes(),
-            "Vault issuing certificate",
-        )
-        .map_err(|err| vault_failure("validation", err))?;
-        let mut parent_chain = if response.data.ca_chain.is_empty() {
-            vec![issuing_ca_der.clone()]
-        } else {
-            response
-                .data
-                .ca_chain
-                .iter()
-                .enumerate()
-                .map(|(index, certificate)| {
-                    parse_single_certificate(
-                        certificate.as_bytes(),
-                        &format!("Vault CA chain certificate {index}"),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map_err(|err| vault_failure("validation", err))?
-        };
-        if parent_chain.first() == Some(&intermediate_der) {
-            parent_chain.remove(0);
-        }
-        if parent_chain.first() != Some(&issuing_ca_der) {
-            return Err(vault_failure(
-                "validation",
-                "Vault ca_chain does not begin with issuing_ca",
-            ));
-        }
-        for (index, certificate) in parent_chain.iter().enumerate() {
-            if parent_chain[..index].contains(certificate) {
-                return Err(vault_failure(
-                    "validation",
-                    "Vault ca_chain contains a duplicate certificate",
-                ));
-            }
-        }
-        let pinned_root = parent_chain.last().expect("parent chain is nonempty");
-        if !self
+        let chain = self
             .vault
-            .expected_roots
-            .iter()
-            .any(|expected| expected == pinned_root)
-        {
-            return Err(vault_failure(
-                "validation",
-                "Vault returned an intermediate chained to an unpinned root",
-            ));
-        }
-
-        let mut certificate_chain = Vec::with_capacity(parent_chain.len() + 1);
-        certificate_chain.push(intermediate_der);
-        certificate_chain.append(&mut parent_chain);
-        let ca = CertificateAuthority::from_chain(certificate_chain, key)
+            .parse_signed_chain(response.data, "Vault intermediate certificate")
+            .map_err(|err| vault_failure("validation", err))?;
+        let ca = CertificateAuthority::from_chain(chain.der, key)
             .map_err(|err| vault_failure("validation", err))?;
         let remaining = ca.intermediate_not_after() - OffsetDateTime::now_utc();
         let threshold = time::Duration::try_from(self.renewal_threshold)
@@ -454,7 +533,7 @@ impl VaultCaSource {
         loop {
             let threshold =
                 time::Duration::try_from(self.renewal_threshold).unwrap_or(time::Duration::days(1));
-            let waited_for_schedule = wait_until_renewal(
+            let waited_for_schedule = wait_until_renewal_with(
                 || issuer.current_ca().intermediate_not_after(),
                 threshold,
                 OffsetDateTime::now_utc,
@@ -516,7 +595,14 @@ impl VaultCaSource {
     }
 }
 
-async fn wait_until_renewal<NotAfter, Now, SleepFor, SleepFuture>(
+pub(crate) async fn wait_until_renewal_due(
+    not_after: OffsetDateTime,
+    threshold: time::Duration,
+) -> bool {
+    wait_until_renewal_with(|| not_after, threshold, OffsetDateTime::now_utc, sleep).await
+}
+
+async fn wait_until_renewal_with<NotAfter, Now, SleepFor, SleepFuture>(
     mut intermediate_not_after: NotAfter,
     threshold: time::Duration,
     mut now: Now,
@@ -543,7 +629,7 @@ where
     }
 }
 
-fn with_jitter(delay: StdDuration) -> StdDuration {
+pub(crate) fn with_jitter(delay: StdDuration) -> StdDuration {
     let sample = SysRng.try_next_u64().unwrap_or(500) % 501;
     delay.mul_f64(0.75 + sample as f64 / 1000.0)
 }
@@ -561,6 +647,29 @@ fn build_intermediate_csr() -> Result<(KeyPair, String)> {
         .pem()
         .map_err(|err| anyhow!("failed to encode Vault intermediate CSR: {err}"))?;
     Ok((key, csr))
+}
+
+fn build_client_csr(common_name: &str) -> Result<(KeyPair, String)> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|err| anyhow!("failed to generate Vault client key: {err}"))?;
+    let mut params = CertificateParams::default();
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, common_name);
+    params.distinguished_name = name;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let csr = params
+        .serialize_request(&key)
+        .map_err(|err| anyhow!("failed to generate Vault client CSR: {err}"))?
+        .pem()
+        .map_err(|err| anyhow!("failed to encode Vault client CSR: {err}"))?;
+    Ok((key, csr))
+}
+
+fn validate_single_api_segment(value: &str, name: &str) -> Result<String> {
+    let value = validate_api_path(value, name)?;
+    ensure!(!value.contains('/'), "{name} must be one path segment");
+    Ok(value)
 }
 
 fn validate_api_path(value: &str, name: &str) -> Result<String> {
@@ -964,6 +1073,59 @@ mod tests {
         (address, server)
     }
 
+    async fn spawn_fake_vault_client_signer(
+        issuing_ca_pem: String,
+        ca_chain: Vec<String>,
+        signing_issuer: Issuer<'static, KeyPair>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut login_stream, _) = listener.accept().await.unwrap();
+            let login = read_request(&mut login_stream).await;
+            assert_eq!(login.target, "/v1/auth/team-approle/login");
+            respond_json(
+                &mut login_stream,
+                json!({"auth": {"client_token": "one-use-token"}}),
+            )
+            .await;
+
+            let (mut sign_stream, _) = listener.accept().await.unwrap();
+            let sign = read_request(&mut sign_stream).await;
+            assert_eq!(sign.target, "/v1/team/pki/sign/authorization-client");
+            assert_eq!(sign.headers.get("x-vault-token").unwrap(), "one-use-token");
+            let body: Value = serde_json::from_slice(&sign.body).unwrap();
+            assert_eq!(body["common_name"], "exfilguard-production");
+            assert_eq!(body["exclude_cn_from_sans"], true);
+            assert_eq!(body["format"], "pem");
+            assert_eq!(body["remove_roots_from_chain"], false);
+
+            let mut request = CertificateSigningRequestParams::from_pem(
+                body["csr"].as_str().expect("CSR must be a string"),
+            )
+            .unwrap();
+            let now = OffsetDateTime::now_utc();
+            request.params.not_before = now - time::Duration::minutes(1);
+            request.params.not_after = now + time::Duration::hours(12);
+            request.params.is_ca = IsCa::NoCa;
+            request.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            request.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            let certificate = request.signed_by(&signing_issuer).unwrap();
+            respond_json(
+                &mut sign_stream,
+                json!({
+                    "data": {
+                        "certificate": certificate.pem(),
+                        "issuing_ca": issuing_ca_pem,
+                        "ca_chain": ca_chain,
+                    }
+                }),
+            )
+            .await;
+        });
+        (address, server)
+    }
+
     fn write_file(directory: &TempDir, name: &str, contents: &[u8]) -> PathBuf {
         let path = directory.path().join(name);
         std::fs::write(&path, contents).unwrap();
@@ -1019,7 +1181,7 @@ mod tests {
         let sleep_clock = clock.clone();
         let recorded_sleeps = sleeps.clone();
 
-        wait_until_renewal(
+        wait_until_renewal_with(
             || start + time::Duration::hours(4),
             time::Duration::hours(1),
             {
@@ -1048,7 +1210,7 @@ mod tests {
         let sleep_clock = clock.clone();
         let recorded_sleeps = sleeps.clone();
 
-        wait_until_renewal(
+        wait_until_renewal_with(
             || start + time::Duration::hours(4),
             time::Duration::hours(1),
             {
@@ -1080,7 +1242,7 @@ mod tests {
     async fn renewal_schedule_reports_when_renewal_is_already_due() {
         let now = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
 
-        let slept = wait_until_renewal(
+        let slept = wait_until_renewal_with(
             || now + time::Duration::hours(1),
             time::Duration::hours(1),
             || now,
@@ -1122,6 +1284,21 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn secret_file_reader_rejects_permissive_and_symlinked_keys() {
+        let directory = TempDir::new().unwrap();
+        let key = write_file(&directory, "client.key", b"private key");
+        assert_eq!(read_secret_bytes(&key).unwrap().as_slice(), b"private key");
+
+        std::fs::set_permissions(&key, Permissions::from_mode(0o644)).unwrap();
+        assert!(read_secret_bytes(&key).is_err());
+        std::fs::set_permissions(&key, Permissions::from_mode(0o600)).unwrap();
+
+        let link = directory.path().join("client-link.key");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        assert!(read_secret_bytes(&link).is_err());
     }
 
     #[test]
@@ -1167,6 +1344,33 @@ mod tests {
         assert!(authority.intermediate_not_after() > OffsetDateTime::now_utc());
         let new_leaf = issuer.issue(&["renew.example"]).await.unwrap();
         assert!(!Arc::ptr_eq(&old_leaf, &new_leaf));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signs_a_client_certificate_without_exporting_its_private_key() {
+        let directory = TempDir::new().unwrap();
+        let (root_pem, _, signer_pem, _, signer_issuer) = generate_vault_signing_hierarchy();
+        let roots = write_file(&directory, "roots.pem", root_pem.as_bytes());
+        let secret_id = write_file(&directory, "secret-id", b"test-secret");
+        let (address, server) = spawn_fake_vault_client_signer(
+            signer_pem.clone(),
+            vec![signer_pem, root_pem],
+            signer_issuer,
+        )
+        .await;
+        let vault = VaultClient::new(vault_config(address, roots, secret_id)).unwrap();
+
+        let certificate = vault
+            .issue_client_certificate("authorization-client", "exfilguard-production")
+            .await
+            .unwrap();
+
+        assert!(certificate.validity.not_before < OffsetDateTime::now_utc());
+        assert!(certificate.validity.not_after > OffsetDateTime::now_utc());
+        let identity = std::str::from_utf8(&certificate.identity_pem).unwrap();
+        assert_eq!(identity.matches("BEGIN CERTIFICATE").count(), 2);
+        assert!(identity.contains("BEGIN PRIVATE KEY"));
         server.await.unwrap();
     }
 

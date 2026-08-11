@@ -14,15 +14,15 @@ use bytes::Bytes;
 use exfilguard::config::BodyAccess;
 use exfilguard::settings::{
     AuthorizationClientCertificateSettings, AuthorizationServiceSettings, AuthorizationSettings,
-    ProxyProtocolMode,
+    ProxyProtocolMode, VaultAuth, VaultPkiSettings, VaultSettings,
 };
 use exfilguard::tls::ca::CertificateAuthority;
 use futures::future::poll_fn;
 use h2::server::SendResponse;
 use http::{Method, StatusCode, Uri};
 use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose,
+    IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
@@ -55,6 +55,7 @@ struct AuthorizationFixture {
     ca_path: std::path::PathBuf,
     client_cert_path: std::path::PathBuf,
     client_key_path: std::path::PathBuf,
+    signing_issuer: Option<Issuer<'static, KeyPair>>,
     policy_calls: Arc<AtomicUsize>,
     credential_calls: Arc<AtomicUsize>,
     task: JoinHandle<()>,
@@ -75,6 +76,7 @@ impl AuthorizationFixture {
             ca_path,
             client_cert_path,
             client_key_path,
+            signing_issuer,
         } = make_service_tls(&temp)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
@@ -113,6 +115,7 @@ impl AuthorizationFixture {
             ca_path,
             client_cert_path,
             client_key_path,
+            signing_issuer: Some(signing_issuer),
             policy_calls,
             credential_calls,
             task,
@@ -145,6 +148,95 @@ impl AuthorizationFixture {
             max_buffered_body_size: 1024,
             max_buffered_body_capacity: 8192,
         }
+    }
+
+    async fn spawn_vault_signer(&mut self) -> Result<(VaultSettings, JoinHandle<Result<()>>)> {
+        let signing_issuer = self
+            .signing_issuer
+            .take()
+            .context("authorization fixture Vault signer already started")?;
+        let root_pem = fs::read_to_string(&self.ca_path)?;
+        let secret_id_file = self._temp.path().join("vault-secret-id");
+        fs::write(&secret_id_file, "integration-secret-id\n")?;
+        fs::set_permissions(&secret_id_file, fs::Permissions::from_mode(0o600))?;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let task = tokio::spawn(async move {
+            let (mut login, _) = listener.accept().await?;
+            let (path, body) = read_json_request(&mut login).await?;
+            ensure!(
+                path == "/v1/auth/approle/login",
+                "unexpected Vault login path"
+            );
+            ensure!(
+                serde_json::from_slice::<Value>(&body)?
+                    == json!({
+                        "role_id": "integration-role",
+                        "secret_id": "integration-secret-id"
+                    }),
+                "unexpected Vault AppRole login body"
+            );
+            write_json_response(
+                &mut login,
+                StatusCode::OK,
+                &json!({"auth": {"client_token": "one-use-integration-token"}}),
+            )
+            .await?;
+
+            let (mut sign, _) = listener.accept().await?;
+            let (path, body) = read_json_request(&mut sign).await?;
+            ensure!(
+                path == "/v1/pki/sign/authorization-client",
+                "unexpected Vault signing path"
+            );
+            let body: Value = serde_json::from_slice(&body)?;
+            ensure!(body["common_name"] == "exfilguard-integration");
+            let mut request = CertificateSigningRequestParams::from_pem(
+                body["csr"].as_str().context("Vault fixture CSR missing")?,
+            )?;
+            let now = time::OffsetDateTime::now_utc();
+            request.params.not_before = now - time::Duration::minutes(1);
+            request.params.not_after = now + time::Duration::hours(12);
+            request.params.is_ca = IsCa::NoCa;
+            request.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            request.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            let certificate = request.signed_by(&signing_issuer)?;
+            write_json_response(
+                &mut sign,
+                StatusCode::OK,
+                &json!({
+                    "data": {
+                        "certificate": certificate.pem(),
+                        "issuing_ca": root_pem.clone(),
+                        "ca_chain": [root_pem],
+                    }
+                }),
+            )
+            .await
+        });
+
+        Ok((
+            VaultSettings {
+                address,
+                tls_ca_cert: None,
+                tls_server_name: None,
+                namespace: None,
+                request_timeout: 2,
+                tls_client_cert: None,
+                tls_client_key: None,
+                pki: VaultPkiSettings {
+                    mount: "pki".to_string(),
+                    expected_root_certs: self.ca_path.clone(),
+                },
+                auth: VaultAuth::AppRole {
+                    mount: "approle".to_string(),
+                    role_id: "integration-role".to_string(),
+                    secret_id_file,
+                },
+            },
+            task,
+        ))
     }
 }
 
@@ -351,6 +443,55 @@ async fn plain_http_binds_token_applies_credentials_and_bypasses_cache() -> Resu
     let logs = log_capture.text();
     assert!(!logs.contains(AUTHORIZATION_TOKEN), "{logs}");
     assert!(!logs.contains(PROTECTED_VALUE), "{logs}");
+
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vault_issued_client_certificate_authenticates_to_authorization_service() -> Result<()> {
+    let origin = Http1Origin::spawn().await?;
+    let credential_scope = format!("http://127.0.0.1:{}/credential", origin.addr.port());
+    let mut services = AuthorizationFixture::spawn(credential_scope.clone()).await?;
+    let (vault, vault_task) = services.spawn_vault_signer().await?;
+
+    let policy_name = "allow-vault-client-certificate-origin";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET"],
+        format!("http://127.0.0.1:{}/**", origin.addr.port()),
+    ));
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&[policy_name])
+        .policy(policy)
+        .render();
+    let clients = with_delegated_authorization(clients, &credential_scope, BodyAccess::None);
+    let mut authorization = services.settings();
+    authorization.services[0].client_certificate = AuthorizationClientCertificateSettings::Vault {
+        role: "authorization-client".to_string(),
+        common_name: "exfilguard-integration".to_string(),
+    };
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(move |settings| {
+            settings.vault = Some(vault);
+            settings.authorization = Some(authorization);
+        })
+        .spawn()
+        .await?;
+    vault_task.await??;
+
+    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let request = format!(
+        "GET http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+        origin.addr.port(),
+        origin.addr.port(),
+    );
+    downstream.write_all(request.as_bytes()).await?;
+    downstream.flush().await?;
+    let response = read_http_response_with_length(&mut downstream).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(&format!("authorization={PROTECTED_VALUE}")));
+    assert_eq!(services.policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(services.credential_calls.load(Ordering::SeqCst), 1);
 
     harness.shutdown().await;
     Ok(())
@@ -1221,6 +1362,7 @@ struct ServiceTls {
     ca_path: std::path::PathBuf,
     client_cert_path: std::path::PathBuf,
     client_key_path: std::path::PathBuf,
+    signing_issuer: Issuer<'static, KeyPair>,
 }
 
 fn make_service_tls(temp: &TempDir) -> Result<ServiceTls> {
@@ -1271,6 +1413,7 @@ fn make_service_tls(temp: &TempDir) -> Result<ServiceTls> {
         ca_path,
         client_cert_path,
         client_key_path,
+        signing_issuer: issuer,
     })
 }
 

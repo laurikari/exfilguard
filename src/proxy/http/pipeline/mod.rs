@@ -152,7 +152,7 @@ name = "allow"
             tls_client_h2_config,
         ));
 
-        proxy::AppContext::new(Arc::new(settings), policy_store, tls_context, None)
+        proxy::AppContext::new(Arc::new(settings), policy_store, tls_context, None).await
     }
 
     fn build_test_client_config() -> ClientConfig {

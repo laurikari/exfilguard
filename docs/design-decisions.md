@@ -177,9 +177,11 @@ guessing an operator's intended lifecycle from whichever files happen to be
 present.
 
 Vault connection, PKI trust, and login settings are global rather than owned by
-the inspection CA. These settings describe process-wide access to one Vault
-deployment; each certificate user keeps only its signing-specific
-configuration.
+the inspection CA. The inspection CA and authorization services use the same
+Vault connection and AppRole because both uses happen inside the same
+ExfilGuard process; separate logins would not isolate them. Vault permissions
+still name separate signing paths: one for the inspection intermediate and one
+leaf-certificate role for each authorization service.
 
 ## HTTPS inspect and tunnel modes
 
@@ -272,6 +274,15 @@ authenticate an entire connection rather than one request are not supported.
 
 Clients that use delegated authorization bypass the shared response cache.
 Requests with service-supplied authentication are also never retried.
+
+An authorization service may use a client certificate loaded from files or a
+client certificate signed by Vault. For Vault, ExfilGuard creates the private
+key and CSR in memory, verifies the returned client-only certificate against
+the globally pinned PKI roots, and renews it halfway through its actual
+lifetime. It builds the replacement HTTPS client before switching new service
+requests to it. Requests already in flight may finish with the previous
+certificate, but no new service request starts with an expired one. The
+inspection intermediate is never reused as a client identity.
 
 ## Block non-public upstreams by default
 

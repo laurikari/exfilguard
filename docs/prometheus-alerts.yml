@@ -44,3 +44,28 @@ groups:
           description: >-
             The current issuer remains active while valid. Check the bounded
             reason label, Vault availability, authentication, and PKI policy.
+
+  - name: exfilguard-authorization-service-tls
+    rules:
+      - alert: ExfilGuardAuthorizationClientCertificateUnusable
+        expr: authorization_service_client_certificate_not_after_timestamp_seconds - time() <= 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ExfilGuard cannot authenticate to an authorization service
+          description: >-
+            New policy and credential requests for the named service fail
+            closed. Check Vault reachability, authentication, and PKI policy.
+
+      - alert: ExfilGuardAuthorizationClientCertificateRenewalFailing
+        expr: increase(authorization_service_vault_renewal_attempts_total{result="failure"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Authorization-service client certificate renewal is failing
+          description: >-
+            The current certificate remains active while valid. Check the
+            bounded reason label, Vault availability, authentication, and PKI
+            policy.

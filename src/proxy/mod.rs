@@ -54,21 +54,40 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    pub fn new(
+    pub async fn new(
         settings: Arc<Settings>,
         policies: PolicyStore,
         tls: Arc<TlsContext>,
         cache: Option<Arc<cache::HttpCache>>,
     ) -> Result<Self> {
+        let vault = crate::build_vault_client(settings.vault.as_ref())?;
         let authorization = if let Some(authorization) = &settings.authorization {
-            Some(Arc::new(AuthorizationServices::new(authorization)?))
+            Some(Arc::new(
+                AuthorizationServices::new(authorization, vault).await?,
+            ))
         } else {
             None
         };
+        Ok(Self::from_preflight(
+            settings,
+            policies,
+            tls,
+            cache,
+            authorization,
+        ))
+    }
+
+    pub(crate) fn from_preflight(
+        settings: Arc<Settings>,
+        policies: PolicyStore,
+        tls: Arc<TlsContext>,
+        cache: Option<Arc<cache::HttpCache>>,
+        authorization: Option<Arc<AuthorizationServices>>,
+    ) -> Self {
         let proxy_protocol_pending_connections = Arc::new(Semaphore::new(
             settings.proxy_protocol_max_pending_connections,
         ));
-        Ok(Self {
+        Self {
             settings,
             policies,
             tls,
@@ -77,7 +96,7 @@ impl AppContext {
             client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
             proxy_protocol_pending_connections,
             upstream_resolver: default_upstream_resolver(),
-        })
+        }
     }
 
     pub(crate) fn with_upstream_resolver(

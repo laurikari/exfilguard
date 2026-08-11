@@ -202,7 +202,7 @@ impl ProxyHarnessBuilder {
             proxy_client_config,
             proxy_client_h2_config,
         ));
-        let app = AppContext::new(settings.clone(), policy_store, tls, cache.clone())?;
+        let app = AppContext::new(settings.clone(), policy_store, tls, cache.clone()).await?;
         let app = if self.allow_private_test_upstreams {
             app.with_permissive_test_upstream_resolver()
         } else {

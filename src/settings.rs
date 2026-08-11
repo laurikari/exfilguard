@@ -749,7 +749,11 @@ impl Settings {
         if let Some(authorization) = &self.authorization {
             authorization.validate()?;
         }
-        let vault_required = matches!(self.ca, CaSettings::Vault(_));
+        let vault_required = matches!(self.ca, CaSettings::Vault(_))
+            || self
+                .authorization
+                .as_ref()
+                .is_some_and(AuthorizationSettings::uses_vault);
         ensure!(
             !vault_required || self.vault.is_some(),
             "[vault] must be configured when a Vault-backed certificate source is used"
@@ -1021,10 +1025,106 @@ key = "authorization-client.key""#,
             authorization.services[0].server_ca_cert,
             dir.path().join("authorization-ca.pem")
         );
-        let key = match &authorization.services[0].client_certificate {
-            crate::settings::AuthorizationClientCertificateSettings::Files { key, .. } => key,
+        let crate::settings::AuthorizationClientCertificateSettings::Files { key, .. } =
+            &authorization.services[0].client_certificate
+        else {
+            panic!("expected file-backed client certificate");
         };
         assert_eq!(key, &dir.path().join("authorization-client.key"));
+    }
+
+    #[test]
+    fn vault_backed_authorization_service_uses_global_vault_configuration() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"[vault]
+address = "https://vault.example.test"
+
+[vault.pki]
+expected_root_certs = "roots.pem"
+
+[vault.auth]
+method = "approle"
+role_id = "role-id"
+secret_id_file = "secret-id"
+
+[ca]
+source = "builtin"
+dir = "ca-material"
+
+[authorization]
+
+[[authorization.service]]
+name = "central"
+audience = "integration"
+policy_url = "https://authorization.example.test/policy"
+credential_url = "https://authorization.example.test/credential"
+server_ca_cert = "roots.pem"
+
+[authorization.service.client_certificate]
+source = "vault"
+role = "authorization-client"
+common_name = "exfilguard-integration""#,
+        );
+
+        let settings = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap();
+        assert!(matches!(settings.ca, CaSettings::Builtin { .. }));
+        assert_eq!(
+            settings
+                .vault
+                .as_ref()
+                .expect("Vault settings")
+                .pki
+                .expected_root_certs,
+            dir.path().join("roots.pem")
+        );
+        let certificate = &settings
+            .authorization
+            .expect("authorization settings")
+            .services[0]
+            .client_certificate;
+        assert!(matches!(
+            certificate,
+            crate::settings::AuthorizationClientCertificateSettings::Vault {
+                role,
+                common_name,
+            } if role == "authorization-client" && common_name == "exfilguard-integration"
+        ));
+    }
+
+    #[test]
+    fn vault_backed_certificate_source_requires_global_vault_configuration() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"[ca]
+source = "builtin"
+dir = "ca-material"
+
+[authorization]
+
+[[authorization.service]]
+name = "central"
+audience = "integration"
+policy_url = "https://authorization.example.test/policy"
+credential_url = "https://authorization.example.test/credential"
+server_ca_cert = "roots.pem"
+
+[authorization.service.client_certificate]
+source = "vault"
+role = "authorization-client"
+common_name = "exfilguard-integration""#,
+        );
+
+        let error = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("[vault] must be configured"));
     }
 
     #[test]

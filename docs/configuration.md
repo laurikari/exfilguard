@@ -214,8 +214,9 @@ do not rewrite operator-provisioned files.
 
 #### `vault`
 
-ExfilGuard has one process-wide HashiCorp Vault connection. HCP Vault Secrets
-is a different product and API.
+ExfilGuard has one shared HashiCorp Vault connection. The inspection CA and
+authorization services can both use it. HCP Vault Secrets is a different
+product and API.
 
 Configure the Vault connection, PKI trust, and authentication once:
 
@@ -342,8 +343,9 @@ workaround that copied `intermediate.key` to `root.key`.
 
 Vault connection settings that were previously nested under `[ca]` now belong
 under `[vault]`, `[vault.pki]`, and `[vault.auth]`. Keep only `source`, `issuer`,
-`intermediate_ttl`, and `renewal_threshold` under `[ca]`. This separates the
-reusable Vault connection settings from the inspection CA settings.
+`intermediate_ttl`, and `renewal_threshold` under `[ca]`. This makes the same
+Vault connection available to authorization services without coupling them to
+the inspection CA source.
 
 For an existing locally generated directory, the direct migration is:
 
@@ -383,6 +385,28 @@ policy_url = "https://authorization.example.net/v1/policy"
 credential_url = "https://authorization.example.net/v1/credential"
 server_ca_cert = "/etc/exfilguard/exfilguard-roots.pem"
 
+[authorization.service.client_certificate]
+source = "vault"
+role = "exfilguard-authorization-client"
+common_name = "exfilguard-production"
+```
+
+This uses the shared `[vault]` configuration described above. ExfilGuard generates the client
+private key and CSR in memory, sends the CSR to
+`POST /v1/<mount>/sign/<role>`, and accepts the result only if it is a client-only certificate for
+the configured common name and chains to `vault.pki.expected_root_certs`. The Vault role chooses
+the issuer and certificate lifetime. ExfilGuard renews the certificate halfway through its actual
+lifetime and switches new service requests to it atomically. Requests already in flight may finish
+using the previous certificate.
+
+Give the AppRole `update` permission on the exact signing-role path. Configure the Vault PKI role
+to permit only the intended common name, issue client certificates rather than CA or server
+certificates, and impose an appropriate maximum lifetime. When Vault manages both the inspection
+CA and these client certificates, the one AppRole policy contains both exact signing paths.
+
+File-backed client certificates remain available as an explicit alternative:
+
+```toml
 [authorization.service.client_certificate]
 source = "files"
 cert = "/etc/exfilguard/authorization/client.pem"
@@ -439,9 +463,10 @@ because ExfilGuard cannot check the requests inside them.
 ExfilGuard calls the configured URLs directly over HTTPS with the service's client certificate. It
 trusts only `server_ca_cert`, does not follow redirects, and ignores proxy settings from the
 environment. Public CA files must be regular files, not symlinks, owned by root or the ExfilGuard
-process, and not writable by group or other users. The client key must be owned by the
+process, and not writable by group or other users. A file-backed client key must be owned by the
 ExfilGuard process, must not be a symlink, and must have mode `0400` or `0600`. Relative paths are
-resolved from the main configuration directory.
+resolved from the main configuration directory. Vault-backed client keys are never written to
+disk.
 
 Each named service has its own policy cache. Policy and credential calls to that service share its
 `max_concurrency` limit.
@@ -575,6 +600,11 @@ CA lifecycle metrics are intentionally low-cardinality:
 | `ca_vault_renewal_attempts_total{result,reason}` | Vault renewal outcomes with bounded reason labels |
 | `ca_vault_last_renewal_attempt_timestamp_seconds` | Last Vault renewal attempt time |
 | `ca_vault_last_renewal_success_timestamp_seconds` | Last successful Vault renewal time |
+| `authorization_service_client_certificate_not_after_timestamp_seconds{service}` | Expiry of a Vault-backed authorization-service client certificate |
+| `authorization_service_vault_renewal_attempts_total{service,result,reason}` | Client-certificate renewal outcomes |
+| `authorization_service_vault_last_renewal_attempt_timestamp_seconds{service}` | Last client-certificate renewal attempt |
+| `authorization_service_vault_last_renewal_success_timestamp_seconds{service}` | Last successful client-certificate renewal |
+
 Scrape these metrics in every CA mode: certificate expiry matters for
 `builtin` and `files` even though ExfilGuard does not renew those sources. See
 [`prometheus-alerts.yml`](prometheus-alerts.yml) for example expiry, usability,

@@ -14,10 +14,10 @@ use zeroize::Zeroizing;
 use super::config::AuthorizationServiceSettings;
 use super::finalized::FinalizedRequestV1;
 use super::policy::CredentialAuthorization;
-use super::service::read_bounded_response;
+use super::service::{AuthorizationHttpClient, read_bounded_response};
 
 pub(super) struct CredentialPreparerClient {
-    client: reqwest::Client,
+    client: AuthorizationHttpClient,
     url: reqwest::Url,
     concurrency: Arc<Semaphore>,
     max_response_size: usize,
@@ -27,7 +27,7 @@ pub(super) struct CredentialPreparerClient {
 impl CredentialPreparerClient {
     pub(super) fn new(
         settings: &AuthorizationServiceSettings,
-        client: reqwest::Client,
+        client: AuthorizationHttpClient,
         concurrency: Arc<Semaphore>,
         max_response_size: usize,
     ) -> Result<Self> {
@@ -74,8 +74,8 @@ impl CredentialPreparerClient {
                     .context("authorization-service concurrency limiter closed")?;
                 let request_body = serialize_json_exact(&wire_request)
                     .context("credential request could not be serialized")?;
-                let response = self
-                    .client
+                let client = self.client.current().await?;
+                let response = client
                     .post(self.url.clone())
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(request_body)

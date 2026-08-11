@@ -178,7 +178,8 @@ strict, and policy checks run before any upstream connection is made.
   must be isolated from one another for availability.
 - Choose an explicit `builtin`, `files`, or `vault` CA source. For file-backed
   sources, startup enforces owner-only directory/key modes and rejects
-  symlinks. Vault mode keeps CA and leaf private keys in memory.
+  symlinks. Vault mode keeps inspection and authorization-service private keys
+  in memory.
 - Review timeout and size limits for your setup (see `docs/configuration.md`).
 - Set `max_request_body_size`, `max_request_header_size`, and
   `max_response_header_size` to reasonable values.
@@ -278,9 +279,10 @@ new requests still use the latest client mapping and policies.
 The required `ca` table chooses one explicit source: `builtin` generates a
 long-lived local hierarchy, `files` loads an externally managed hierarchy, and
 `vault` obtains and renews an in-memory intermediate from HashiCorp Vault. The
-two file-backed CA sources require owner-controlled directories and private
-keys; both reject `root.key` because ExfilGuard never needs the root signing
-key.
+same global Vault connection can obtain in-memory client certificates for
+authorization services. The two file-backed CA sources require
+owner-controlled directories and private keys; both reject `root.key` because
+ExfilGuard never needs the root signing key.
 See `docs/configuration.md` for lifecycle, permission, Vault, and migration
 details. Anyone who can use the intermediate key or Vault signing credential
 can mint certificates, so run ExfilGuard as an unprivileged user. Generated
@@ -374,9 +376,9 @@ and explicit CONNECT tunnels stay distinct. Current-state gauges cover
 downstream connections globally and by client, in-flight requests, CONNECT
 tunnels, bumped TLS sessions, active HTTP/2 streams, upstream connections,
 cache usage, and the last successful policy reload time. Rejected connections
-are counted by client. CA metrics report the configured source, root and
-intermediate expiry, issuer usability and generation, and Vault renewal
-outcomes. Example alert rules are in `docs/prometheus-alerts.yml`.
+are counted by client. Certificate metrics report inspection-CA state and
+Vault-backed authorization-service client certificate expiry and renewal.
+Example alert rules are in `docs/prometheus-alerts.yml`.
 
 ## Learn more
 
