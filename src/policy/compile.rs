@@ -11,8 +11,9 @@ use crate::config::{
 };
 
 use super::model::{
-    CidrTrie, ClientEntry, CompiledCacheConfig, CompiledConfig, CompiledPolicy, CompiledRule,
-    HostLabel, HostMatcher, HostPattern, MethodMask, PathMatcher, UrlMatcher,
+    CidrTrie, ClientEntry, CompiledCacheConfig, CompiledConfig, CompiledCredentialLimit,
+    CompiledPolicy, CompiledRule, HostLabel, HostMatcher, HostPattern, MethodMask, PathMatcher,
+    UrlMatcher,
 };
 
 /// Transforms a validated configuration into a performance-optimized memory model.
@@ -55,6 +56,32 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
             name: client.name.clone(),
             policies: Arc::from(indices.into_boxed_slice()),
             authorization_service: client.authorization_service.clone(),
+            credential_limits: Arc::from(
+                client
+                    .credential_limits
+                    .iter()
+                    .map(|limit| {
+                        Ok(CompiledCredentialLimit {
+                            credential_reference: limit.credential_reference.clone(),
+                            origin: compile_url_pattern(&limit.origin_scope)?,
+                            protected_headers: Arc::from(
+                                limit
+                                    .protected_headers
+                                    .iter()
+                                    .map(|name| {
+                                        http::HeaderName::from_bytes(name.as_bytes()).map_err(
+                                            |_| anyhow!("invalid protected header name '{name}'"),
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>>>()?
+                                    .into_boxed_slice(),
+                            ),
+                            body_access: limit.body_access,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_boxed_slice(),
+            ),
             max_connections: client.max_connections,
         });
     }
@@ -281,6 +308,7 @@ mod tests {
                     .into_boxed_slice(),
             ),
             authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
 
@@ -321,6 +349,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -328,6 +357,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];
@@ -348,6 +378,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -355,6 +386,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.10.1.128/25".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];
@@ -372,6 +404,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -379,6 +412,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.10.1.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];

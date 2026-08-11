@@ -19,6 +19,7 @@ use tokio_rustls::server::TlsStream;
 use tracing::warn;
 
 use crate::{
+    authorization::{BodyAccess, BufferedBody, FinalizedProtocol, FinalizedRequestV1},
     policy::matcher::PolicySnapshot,
     proxy::{
         AppContext,
@@ -39,7 +40,10 @@ use async_trait::async_trait;
 
 use super::{
     cache::{CacheEvaluation, CacheMiss, evaluate_cache, send_cached_response},
-    forward::{forward_request_to_upstream, send_error_response},
+    forward::{
+        buffer_request_body, forward_finalized_request_to_upstream, forward_request_to_upstream,
+        send_error_response,
+    },
     request::{SanitizedRequest, reject_expect_header, sanitize_request},
     upstream::{Http2Upstream, PrimedHttp2Upstream},
 };
@@ -431,7 +435,8 @@ impl DownstreamRequestCtx {
         error_detail: &str,
     ) -> Result<()> {
         send_error_response(&mut self.respond, spec.status, spec.body_http2, None).await?;
-        self.log_tracker.add_client_bytes(spec.extra_client_bytes);
+        self.log_tracker
+            .record_client_body_bytes(spec.extra_client_bytes);
         policy_response::forward_error_log_builder(
             log.access_log_builder(),
             decision,
@@ -467,6 +472,8 @@ impl Http2RequestHandler {
             kind,
             ForwardErrorKind::InvalidRequestBody(_)
                 | ForwardErrorKind::BodyTooLarge(_)
+                | ForwardErrorKind::CredentialPreparationFailed
+                | ForwardErrorKind::CredentialRequestRejected(_)
                 | ForwardErrorKind::PrivateAddress(_)
                 | ForwardErrorKind::RequestTimeout
                 | ForwardErrorKind::ClientBodyIdleTimeout
@@ -477,9 +484,11 @@ impl Http2RequestHandler {
     fn forward_error_decision(kind: &ForwardErrorKind<'_>) -> &'static str {
         match kind {
             ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
+            ForwardErrorKind::CredentialRequestRejected(_) => "DENY",
             ForwardErrorKind::ResponseAlreadyStarted(_)
             | ForwardErrorKind::RequestTimeout
             | ForwardErrorKind::ClientBodyIdleTimeout
+            | ForwardErrorKind::CredentialPreparationFailed
             | ForwardErrorKind::InvalidRequestBody(_)
             | ForwardErrorKind::MisdirectedRequest(_)
             | ForwardErrorKind::UpstreamClosed
@@ -489,9 +498,93 @@ impl Http2RequestHandler {
 
     async fn forward_request(
         &mut self,
+        decision: &AllowDecision,
         cache_miss: Option<Box<CacheMiss>>,
     ) -> Result<super::forward::ForwardOutcome> {
         let forward_meta = self.ctx.meta.clone();
+        if let Some(credential) = decision
+            .authorization
+            .as_ref()
+            .and_then(|authorization| authorization.credential.as_ref())
+        {
+            if credential.body_access == BodyAccess::None
+                && (!self.ctx.body.is_end_stream()
+                    || self.ctx.meta.content_length.unwrap_or(0) != 0)
+            {
+                return Err(
+                    crate::proxy::forward_error::CredentialRequestRejected::body_not_allowed()
+                        .into(),
+                );
+            }
+            {
+                let upstream = self.upstream.lock().await;
+                upstream.validate_request_target(&forward_meta.parsed)?;
+            }
+            let buffered_body = if self.ctx.body.is_end_stream() {
+                None
+            } else {
+                let authorization = self
+                    .ctx
+                    .authorization
+                    .as_ref()
+                    .expect("credential decision requires authorization services");
+                let max_body_size =
+                    authorization.buffered_body_limit(self.ctx.max_request_body_size);
+                let buffer_limit =
+                    credential_body_buffer_limit(self.ctx.meta.content_length, max_body_size)?;
+                let permit = authorization.reserve_buffered_body(buffer_limit).await?;
+                let (bytes, wire_bytes) = buffer_request_body(
+                    &mut self.ctx.body,
+                    self.ctx.request_body_timeout,
+                    self.ctx.request_deadline.instant(),
+                    buffer_limit,
+                )
+                .await?;
+                Some(BufferedBody::new(bytes, wire_bytes, permit))
+            };
+            let client_body_bytes = buffered_body.as_ref().map_or(0, BufferedBody::wire_bytes);
+            self.ctx
+                .log_tracker
+                .record_client_body_bytes(client_body_bytes);
+            let mut finalized = FinalizedRequestV1::new(
+                &forward_meta.parsed,
+                forward_meta.forward_headers,
+                forward_meta.content_length,
+                buffered_body,
+                credential.protected_headers.clone(),
+                FinalizedProtocol::Http2,
+                self.ctx.max_request_header_bytes,
+            )
+            .map_err(crate::proxy::forward_error::credential_finalization_failed)?;
+            self.ctx
+                .authorization
+                .as_ref()
+                .expect("credential decision requires authorization services")
+                .prepare_headers(
+                    credential,
+                    &mut finalized,
+                    self.ctx.peer,
+                    self.ctx.max_request_header_bytes,
+                )
+                .await
+                .map_err(crate::proxy::forward_error::credential_preparation_failed)?;
+            let checkout = {
+                let mut upstream = self.upstream.lock().await;
+                upstream.checkout_sender(&forward_meta.parsed).await?
+            };
+            return forward_finalized_request_to_upstream(
+                checkout,
+                finalized,
+                &mut self.ctx.respond,
+                self.ctx.request_body_timeout,
+                self.ctx.response_header_timeout,
+                self.ctx.response_body_timeout,
+                self.ctx.request_deadline,
+                &self.ctx.response_progress,
+                self.ctx.max_response_header_bytes,
+            )
+            .await;
+        }
         let checkout = {
             let mut upstream = self.upstream.lock().await;
             upstream.checkout_sender(&forward_meta.parsed).await?
@@ -517,7 +610,7 @@ impl Http2RequestHandler {
     fn build_allow_log_stats(&mut self, success: &super::forward::ForwardOutcome) -> AllowLogStats {
         self.ctx
             .log_tracker
-            .add_client_bytes(success.client_body_bytes());
+            .record_client_body_bytes(success.client_body_bytes());
         self.ctx.log_tracker.build_allow_log_stats(
             success.status(),
             success.bytes_to_client(),
@@ -579,6 +672,11 @@ impl Http2RequestHandler {
     }
 }
 
+fn credential_body_buffer_limit(declared: Option<usize>, maximum: usize) -> Result<usize> {
+    validate_declared_body_size(declared, maximum)?;
+    Ok(declared.unwrap_or(maximum))
+}
+
 #[async_trait]
 impl RequestHandler for Http2RequestHandler {
     type Output = ();
@@ -620,7 +718,7 @@ impl RequestHandler for Http2RequestHandler {
                     CacheEvaluation::Bypass => ("bypass", None),
                 };
 
-                let success = self.forward_request(cache_miss).await?;
+                let success = self.forward_request(&decision, cache_miss).await?;
                 Ok(AllowedRequestResult::Forwarded {
                     success,
                     cache_lookup,
@@ -792,5 +890,12 @@ mod tests {
 
         assert_eq!(tasks.len(), 0);
         assert!(!accept_source.is_closed());
+    }
+
+    #[test]
+    fn credential_body_buffer_uses_declared_size() {
+        assert_eq!(credential_body_buffer_limit(Some(7), 1024).unwrap(), 7);
+        assert_eq!(credential_body_buffer_limit(None, 1024).unwrap(), 1024);
+        assert!(credential_body_buffer_limit(Some(1025), 1024).is_err());
     }
 }

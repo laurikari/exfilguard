@@ -5,8 +5,9 @@ as an explicit proxy. ExfilGuard checks each request against the client's
 policy, logs the decision, and then either forwards or denies it.
 
 ExfilGuard can ask an authorization service whether to allow a request. The
-client supplies an opaque authorization token, and both the local policy and
-the service must allow the request. See
+client supplies an authorization token, and the service can also provide
+authentication headers for an allowed request. This lets the client call an
+API without having its credential. See
 [delegated authorization](docs/configuration.md#delegated-authorization).
 
 For HTTPS, ExfilGuard can either inspect traffic by terminating TLS with its
@@ -103,7 +104,7 @@ environment, such as a minimal container, install the standard CA bundle
 
 - `src/cli.rs` — entry point and runtime flags.
 - `src/config/` — config schema and loaders.
-- `src/authorization/` — delegated request policy.
+- `src/authorization/` — delegated policy and authentication for outgoing requests.
 - `src/policy/` — policy compiler and matcher.
 - `src/proxy/` — listeners, HTTP handlers, and upstream clients.
 - `src/tls/` — CA lifecycle and the in-memory leaf cache.
@@ -151,9 +152,13 @@ any blocked attempts.
 - Drop slow or stalled connections via timeouts
 
 **Doesn't:**
-- Inspect request or response bodies
+- Interpret request or response bodies as application data
 - Stop data from leaving through allowed destinations
 - Detect compromised clients misusing allowed routes
+
+When explicitly allowed, delegated authorization may buffer a request body so
+the authorization service can sign it. ExfilGuard does not interpret the body,
+and both per-request and total memory limits apply.
 
 ### Defense in depth
 

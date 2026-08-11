@@ -150,6 +150,7 @@ policies = ["analytics-policy", "default-deny"]
 ## Further Reading
 
 - [Configuration Reference](configuration.md) - Global settings and options
-- [Authorization Service API](authorization-service.md) - Delegated policy decisions
+- [Authorization Service API](authorization-service.md) - Policy decisions and
+  authentication headers
 - [Policies Guide](policies.md) - Client mapping and policy rules
 - [Design Decisions](design-decisions.md) - Why the code works this way

@@ -21,7 +21,7 @@ These settings are required.
 | `policies` | Path | Yes | Path to policies configuration file |
 | `clients_dir` | Path | No | Directory containing additional client config files (*.toml) |
 | `policies_dir` | Path | No | Directory containing additional policy config files (*.toml) |
-| `authorization` | Table | No | Named services for delegated request policy |
+| `authorization` | Table | No | Named services for delegated request policy and authentication |
 
 !!! note
     Relative paths are resolved from the directory containing the main config file.
@@ -365,6 +365,11 @@ does not interpret the token.
 The service returns rules for the token, and ExfilGuard caches them briefly. Both the client's local
 policy and the service's policy must allow a request.
 
+The service can also provide authentication headers for an allowed request. A policy rule names the
+credential with a reference that only the service understands. ExfilGuard sends the token, the
+reference, and the exact outgoing request to the service, then adds the returned headers before
+forwarding it. The client can therefore call the API without ever having the credential.
+
 This is configured per client. A client with an `authorization_service` must send a token. Other
 clients on the same listener continue to use ordinary static policy.
 
@@ -375,6 +380,7 @@ Define one or more named services in the main configuration:
 name = "central"
 audience = "deployment-prod"
 policy_url = "https://authorization.example.net/v1/policy"
+credential_url = "https://authorization.example.net/v1/credential"
 server_ca_cert = "/etc/exfilguard/exfilguard-roots.pem"
 
 [authorization.service.client_certificate]
@@ -394,9 +400,14 @@ are optional:
 | `negative_cache_duration` | 1 second | How briefly to remember a denied policy lookup |
 | `max_policy_response_size` | 256 KiB | Largest accepted policy response |
 | `max_policy_rules` | 1024 | Most rules accepted in one policy response |
+| `max_credential_response_size` | 32 KiB | Largest accepted authentication-header response |
+| `max_protected_headers` | 16 | Most authentication headers allowed on one request |
+| `max_buffered_body_size` | 1 MiB | Largest request body the service may receive |
+| `max_buffered_body_capacity` | 16 MiB | Total memory available for bodies and their JSON copies |
 
 These settings belong under `[authorization]`. Each `[[authorization.service]]` also accepts an
 optional `timeout` (5 seconds by default) and `max_concurrency` (32 simultaneous calls by default).
+Both policy and credential calls use these values.
 
 Then assign the service in the client configuration:
 
@@ -406,7 +417,18 @@ name = "build-client"
 cidr = "192.0.2.0/24"
 policies = ["build-ceiling"]
 authorization_service = "central"
+
+[[client.credential_limit]]
+credential_reference = "build-api"
+origin_scope = "https://api.example.net/v1/**"
+protected_headers = ["authorization"]
+body_access = "bounded_payload"
 ```
+
+A `credential_limit` is a local safety rule, not a credential. It says where the named reference may
+be used, which headers the service may return, and whether the service may receive the request body.
+A rule that does not ask for credentials does not need a matching limit. If a rule asks for
+credentials outside the limit, ExfilGuard denies the request.
 
 The first request from a client that uses delegated authorization must contain
 `Proxy-Authorization: ExfilGuard <base64url-token>`. ExfilGuard keeps that token with the
@@ -414,21 +436,32 @@ connection. Later requests may omit it but cannot replace it. For inspected HTTP
 `CONNECT` carries the token and all decrypted requests use it. Raw CONNECT tunnels are denied
 because ExfilGuard cannot check the requests inside them.
 
-ExfilGuard calls the configured URL directly over HTTPS with the service's client certificate. It
+ExfilGuard calls the configured URLs directly over HTTPS with the service's client certificate. It
 trusts only `server_ca_cert`, does not follow redirects, and ignores proxy settings from the
 environment. Public CA files must be regular files, not symlinks, owned by root or the ExfilGuard
-process, and not writable by group or other users. A file-backed client key must be owned by the
+process, and not writable by group or other users. The client key must be owned by the
 ExfilGuard process, must not be a symlink, and must have mode `0400` or `0600`. Relative paths are
 resolved from the main configuration directory.
 
-Each named service has its own policy cache and `max_concurrency` limit. Requests that use delegated
-authorization bypass the shared response cache because the token is not part of its cache key.
+Each named service has its own policy cache. Policy and credential calls to that service share its
+`max_concurrency` limit.
 
-Service definitions and limits are read at startup. `SIGHUP` reloads client assignments and local
-policies together. A client that names an unknown service causes the reload to fail, leaving the
-current configuration in place.
+`body_access = "none"` permits credentials only on requests without a body. `"bounded_payload"`
+lets the service receive a size-limited body, for example to sign it. Requests that use credentials
+cannot have trailers or `Expect: 100-continue`. If the service does not return valid headers,
+ExfilGuard sends nothing to the API. The request is not retried or cached. All requests that use
+delegated authorization bypass the shared response cache, even when no credential is needed.
 
-See [Authorization Service API](authorization-service.md) for the policy operation.
+`max_buffered_body_size` limits one body. `max_buffered_body_capacity` limits the total memory used
+by all buffered bodies and their JSON copies. It must be at least
+`5 * max_buffered_body_size + 2`; ExfilGuard rejects a smaller value.
+
+Service definitions and limits are read at startup. `SIGHUP` reloads client assignments, credential
+limits, and local policies together. A client that names an unknown service causes the reload to
+fail, leaving the current configuration in place.
+
+See [Authorization Service API](authorization-service.md) for the two JSON operations and the exact
+request format.
 
 ---
 
@@ -542,7 +575,6 @@ CA lifecycle metrics are intentionally low-cardinality:
 | `ca_vault_renewal_attempts_total{result,reason}` | Vault renewal outcomes with bounded reason labels |
 | `ca_vault_last_renewal_attempt_timestamp_seconds` | Last Vault renewal attempt time |
 | `ca_vault_last_renewal_success_timestamp_seconds` | Last successful Vault renewal time |
-
 Scrape these metrics in every CA mode: certificate expiry matters for
 `builtin` and `files` even though ExfilGuard does not renew those sources. See
 [`prometheus-alerts.yml`](prometheus-alerts.yml) for example expiry, usability,

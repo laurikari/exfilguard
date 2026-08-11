@@ -298,6 +298,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(policy_refs.into_boxed_slice()),
             authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         ValidatedConfig::new(Config { clients, policies }).expect("validate config")
@@ -417,6 +418,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -483,6 +485,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -539,6 +542,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -577,6 +581,7 @@ mod tests {
                 selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -584,6 +589,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.0.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -591,6 +597,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.1.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -598,6 +605,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];
@@ -638,6 +646,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
@@ -645,6 +654,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: policy_refs,
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];
@@ -711,6 +721,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
             authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {
@@ -761,6 +772,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
             authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {

@@ -43,6 +43,30 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             extra_client_bytes: 0,
             log_reason: "request_body_timeout",
         },
+        ForwardErrorKind::CredentialPreparationFailed => ForwardErrorSpec {
+            status: StatusCode::BAD_GATEWAY,
+            body_http1: b"credential preparation failed\r\n",
+            body_http2: "credential preparation failed",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "credential_preparation_failed",
+        },
+        ForwardErrorKind::CredentialRequestRejected(rejected) => ForwardErrorSpec {
+            status: rejected.status,
+            body_http1: if rejected.status == StatusCode::EXPECTATION_FAILED {
+                b"expectation failed\r\n"
+            } else {
+                b"request blocked by credential policy\r\n"
+            },
+            body_http2: if rejected.status == StatusCode::EXPECTATION_FAILED {
+                "expectation failed"
+            } else {
+                "request blocked by credential policy"
+            },
+            decision: "DENY",
+            extra_client_bytes: 0,
+            log_reason: "credential_request_rejected",
+        },
         ForwardErrorKind::InvalidRequestBody(body) => ForwardErrorSpec {
             status: StatusCode::BAD_REQUEST,
             body_http1: b"invalid request body\r\n",

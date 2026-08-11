@@ -118,6 +118,10 @@ The method restriction follows HTTP idempotency semantics when delivery to the
 origin is ambiguous. Non-idempotent methods and extension methods whose
 semantics ExfilGuard cannot establish are not retried automatically.
 
+Requests with service-supplied authentication headers are never retried, even
+when they are bodyless and idempotent. The service prepared those headers for
+one exact request. A retry would have to ask the service for new headers.
+
 ## TLS leaf certificates are cached only in memory
 
 ExfilGuard does not persist generated TLS leaf certificates or their private
@@ -248,9 +252,26 @@ requests. ExfilGuard checks the current service policy for each one. It denies
 raw CONNECT tunnels because it cannot see or check the requests inside them.
 
 Both the local policy and the service policy must allow every request. The
-service cannot change local settings. Clients that use delegated authorization
-bypass the shared response cache because the token is not part of its cache
-key.
+service cannot change local settings. If it asks ExfilGuard to use a credential,
+the reference, destination, headers, and body access must fit a local
+`credential_limit` on the selected client.
+
+Before asking for authentication headers, ExfilGuard resolves and checks the
+destination and builds the exact request it will send. The service may fill only
+the header positions approved by the client configuration. A unique ID and a
+hash of the request tie the reply to that request. ExfilGuard sends nothing to
+the API until this succeeds. A body may be buffered and dechunked only when
+allowed; trailers and `Expect: 100-continue` are rejected.
+
+HTTP/1 connections are pooled separately for each token. Connections used for
+authenticated requests are not returned to the pool. Within one inspected
+HTTP/2 session, authenticated and unauthenticated streams for the same token may
+share one API connection. Service-supplied headers are marked sensitive so
+HTTP/2 header compression does not store their values. Credentials that
+authenticate an entire connection rather than one request are not supported.
+
+Clients that use delegated authorization bypass the shared response cache.
+Requests with service-supplied authentication are also never retried.
 
 ## Block non-public upstreams by default
 

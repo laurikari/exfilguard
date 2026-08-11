@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
-use http::Method;
+use http::{Method, header::HeaderName};
 use ipnet::IpNet;
 use regex::Regex;
 
-use crate::config::{HttpsMode, RuleAction, Scheme};
+use crate::config::{BodyAccess, HttpsMode, RuleAction, Scheme};
 
 #[derive(Debug, Clone)]
 pub struct CompiledConfig {
@@ -22,7 +22,16 @@ pub struct ClientEntry {
     pub name: Arc<str>,
     pub policies: Arc<[usize]>,
     pub authorization_service: Option<Arc<str>>,
+    pub credential_limits: Arc<[CompiledCredentialLimit]>,
     pub max_connections: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledCredentialLimit {
+    pub credential_reference: Arc<str>,
+    pub origin: UrlMatcher,
+    pub protected_headers: Arc<[HeaderName]>,
+    pub body_access: BodyAccess,
 }
 
 #[derive(Debug, Clone)]

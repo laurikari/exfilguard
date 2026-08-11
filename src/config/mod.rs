@@ -9,15 +9,15 @@ use anyhow::{Context, Result, bail, ensure};
 use http::Method;
 use ipnet::IpNet;
 
+pub(crate) use loader::parse_url_pattern;
 pub use loader::{load_config, load_config_with_dirs};
 pub use model::{
-    Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
-    UrlPattern,
+    BodyAccess, Client, ClientSelector, Config, CredentialLimit, HttpsMode, MethodMatch, Policy,
+    Rule, RuleAction, Scheme, UrlPattern,
 };
 
 use crate::util::cidrs_overlap;
 
-pub(crate) use loader::parse_url_pattern;
 pub(crate) const MAX_CACHE_TTL_SECONDS: u64 = 1 << 31;
 
 fn methods_include_connect(methods: &MethodMatch) -> bool {
@@ -285,6 +285,40 @@ fn validate_config(config: &Config) -> Result<()> {
                 client.name
             );
         }
+        if client.authorization_service.is_none() && !client.credential_limits.is_empty() {
+            bail!(
+                "client '{}' defines credential limits without an authorization_service",
+                client.name
+            );
+        }
+        for (index, limit) in client.credential_limits.iter().enumerate() {
+            ensure!(
+                !limit.credential_reference.trim().is_empty(),
+                "client '{}' credential_limit[{index}].credential_reference must not be empty",
+                client.name
+            );
+            ensure!(
+                !limit.protected_headers.is_empty(),
+                "client '{}' credential_limit[{index}].protected_headers must not be empty",
+                client.name
+            );
+            let mut names = HashSet::new();
+            for name in limit.protected_headers.iter() {
+                let parsed = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!(
+                        "client '{}' credential_limit[{index}] contains invalid protected header name '{}'",
+                        client.name,
+                        name
+                    )
+                })?;
+                ensure!(
+                    names.insert(parsed),
+                    "client '{}' credential_limit[{index}] contains duplicate protected header '{}'",
+                    client.name,
+                    name
+                );
+            }
+        }
     }
 
     validate_clients(&config.clients)
@@ -457,6 +491,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![Arc::<str>::from(policy_name)].into_boxed_slice()),
             authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: super::model::DEFAULT_CLIENT_MAX_CONNECTIONS,
         }
     }
@@ -536,6 +571,7 @@ mod tests {
                     selector,
                     policies: Arc::from([]),
                     authorization_service: None,
+                    credential_limits: Arc::from([]),
                     max_connections: 1024,
                 },
                 fallback_client("deny"),
@@ -556,6 +592,7 @@ mod tests {
                 selector: ClientSelector::Cidr("2001:db8::/32".parse().unwrap()),
                 policies: Arc::from([]),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             fallback_client("deny"),

@@ -36,6 +36,35 @@ const fn default_policy_rule_count() -> usize {
     1024
 }
 
+const fn default_credential_response_size() -> usize {
+    32 * 1024
+}
+
+const fn default_protected_header_count() -> usize {
+    16
+}
+
+const fn default_buffered_body_size() -> usize {
+    1024 * 1024
+}
+
+const fn default_buffered_body_capacity() -> usize {
+    16 * 1024 * 1024
+}
+
+// A buffered payload remains resident while its authorization-service request is serialized.
+// JSON represents each byte as up to three decimal digits plus a comma, so the body array needs
+// at most four bytes per payload byte, plus its brackets. Reserve both representations before
+// reading the payload.
+const BUFFERED_BODY_MEMORY_MULTIPLIER: usize = 5;
+
+pub(super) fn buffered_body_memory_reservation(payload_size: usize) -> Result<usize> {
+    payload_size
+        .checked_mul(BUFFERED_BODY_MEMORY_MULTIPLIER)
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or_else(|| anyhow::anyhow!("credential body memory reservation exceeds platform limit"))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationSettings {
@@ -53,6 +82,14 @@ pub struct AuthorizationSettings {
     pub max_policy_response_size: usize,
     #[serde(default = "default_policy_rule_count")]
     pub max_policy_rules: usize,
+    #[serde(default = "default_credential_response_size")]
+    pub max_credential_response_size: usize,
+    #[serde(default = "default_protected_header_count")]
+    pub max_protected_headers: usize,
+    #[serde(default = "default_buffered_body_size")]
+    pub max_buffered_body_size: usize,
+    #[serde(default = "default_buffered_body_capacity")]
+    pub max_buffered_body_capacity: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +98,7 @@ pub struct AuthorizationServiceSettings {
     pub name: String,
     pub audience: String,
     pub policy_url: String,
+    pub credential_url: String,
     pub server_ca_cert: PathBuf,
     pub client_certificate: AuthorizationClientCertificateSettings,
     #[serde(default = "default_remote_timeout")]
@@ -112,6 +150,29 @@ impl AuthorizationSettings {
             self.max_policy_rules > 0,
             "authorization.max_policy_rules must be greater than 0"
         );
+        ensure!(
+            self.max_credential_response_size > 0,
+            "authorization.max_credential_response_size must be greater than 0"
+        );
+        ensure!(
+            self.max_protected_headers > 0,
+            "authorization.max_protected_headers must be greater than 0"
+        );
+        ensure!(
+            self.max_buffered_body_size > 0,
+            "authorization.max_buffered_body_size must be greater than 0"
+        );
+        let minimum_body_capacity = buffered_body_memory_reservation(self.max_buffered_body_size)?;
+        ensure!(
+            self.max_buffered_body_capacity >= minimum_body_capacity,
+            "authorization.max_buffered_body_capacity must cover one max_buffered_body_size request ({minimum_body_capacity} bytes)"
+        );
+        ensure!(
+            self.max_buffered_body_capacity <= tokio::sync::Semaphore::MAX_PERMITS
+                && self.max_buffered_body_capacity <= u32::MAX as usize,
+            "authorization.max_buffered_body_capacity exceeds the runtime semaphore limit"
+        );
+
         let mut names = HashSet::new();
         for service in &self.services {
             service.validate()?;
@@ -139,6 +200,28 @@ impl AuthorizationSettings {
                     service
                 );
             }
+            for (index, limit) in client.credential_limits.iter().enumerate() {
+                ensure!(
+                    limit.protected_headers.len() <= self.max_protected_headers,
+                    "client '{}' credential_limit[{index}].protected_headers exceeds authorization.max_protected_headers",
+                    client.name
+                );
+                for name in limit.protected_headers.iter() {
+                    let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        anyhow::anyhow!(
+                            "client '{}' credential_limit[{index}] contains invalid protected header name '{}'",
+                            client.name,
+                            name
+                        )
+                    })?;
+                    ensure!(
+                        !super::policy::is_forbidden_protected_header(name.as_str()),
+                        "client '{}' credential_limit[{index}] contains forbidden protected header '{}'",
+                        client.name,
+                        name.as_str()
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -147,12 +230,10 @@ impl AuthorizationSettings {
 impl AuthorizationServiceSettings {
     fn apply_base_dir(&mut self, base_dir: &Path) {
         self.server_ca_cert = absolutize(&self.server_ca_cert, base_dir);
-        match &mut self.client_certificate {
-            AuthorizationClientCertificateSettings::Files { cert, key } => {
-                *cert = absolutize(cert, base_dir);
-                *key = absolutize(key, base_dir);
-            }
-        }
+        let AuthorizationClientCertificateSettings::Files { cert, key } =
+            &mut self.client_certificate;
+        *cert = absolutize(cert, base_dir);
+        *key = absolutize(key, base_dir);
     }
 
     fn validate(&self) -> Result<()> {
@@ -160,19 +241,17 @@ impl AuthorizationServiceSettings {
         ensure_nonempty(&format!("{field}.name"), &self.name)?;
         ensure_nonempty(&format!("{field}.audience"), &self.audience)?;
         validate_url(&format!("{field}.policy_url"), &self.policy_url)?;
+        validate_url(&format!("{field}.credential_url"), &self.credential_url)?;
         ensure!(self.timeout > 0, "{field}.timeout must be greater than 0");
         ensure!(
             self.max_concurrency > 0 && self.max_concurrency <= tokio::sync::Semaphore::MAX_PERMITS,
             "{field}.max_concurrency must be within the runtime semaphore limit"
         );
-        match &self.client_certificate {
-            AuthorizationClientCertificateSettings::Files { cert, key } => {
-                if cert == key {
-                    bail!(
-                        "{field}.client_certificate.cert and client_certificate.key must be different files"
-                    );
-                }
-            }
+        let AuthorizationClientCertificateSettings::Files { cert, key } = &self.client_certificate;
+        if cert == key {
+            bail!(
+                "{field}.client_certificate.cert and client_certificate.key must be different files"
+            );
         }
         Ok(())
     }
@@ -209,7 +288,7 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthorizationSettings;
+    use super::{AuthorizationSettings, buffered_body_memory_reservation};
 
     #[test]
     fn minimal_service_uses_secure_defaults() {
@@ -219,6 +298,7 @@ mod tests {
 name = "central"
 audience = "production"
 policy_url = "https://authorization.example/policy"
+credential_url = "https://authorization.example/credential"
 server_ca_cert = "/etc/exfilguard/authorization/ca.pem"
 
 [service.client_certificate]
@@ -236,8 +316,18 @@ key = "/etc/exfilguard/authorization/client.key"
         assert_eq!(settings.negative_cache_duration, 1);
         assert_eq!(settings.max_policy_response_size, 256 * 1024);
         assert_eq!(settings.max_policy_rules, 1024);
+        assert_eq!(settings.max_credential_response_size, 32 * 1024);
+        assert_eq!(settings.max_protected_headers, 16);
+        assert_eq!(settings.max_buffered_body_size, 1024 * 1024);
+        assert_eq!(settings.max_buffered_body_capacity, 16 * 1024 * 1024);
         assert_eq!(settings.services.len(), 1);
         assert_eq!(settings.services[0].timeout, 5);
         assert_eq!(settings.services[0].max_concurrency, 32);
+    }
+
+    #[test]
+    fn body_memory_reservation_covers_raw_and_worst_case_json() {
+        assert_eq!(buffered_body_memory_reservation(1).unwrap(), 7);
+        assert_eq!(buffered_body_memory_reservation(1024).unwrap(), 5122);
     }
 }

@@ -40,6 +40,7 @@ where
         handler.peer,
         handler.app.settings.max_request_body_size,
         handler.app,
+        &mut handler.log_tracker,
     )
     .await
 }
@@ -53,7 +54,7 @@ where
 {
     handler
         .log_tracker
-        .add_client_bytes(success.stats.client_body_bytes);
+        .record_client_body_bytes(success.stats.client_body_bytes);
     handler.log_tracker.build_allow_log_stats(
         success.stats.status,
         success.stats.bytes_to_client,
@@ -90,7 +91,7 @@ where
     if spec.extra_client_bytes > 0 {
         handler
             .log_tracker
-            .add_client_bytes(spec.extra_client_bytes);
+            .record_client_body_bytes(spec.extra_client_bytes);
     }
     respond_with_access_log(
         handler.reader.get_mut(),

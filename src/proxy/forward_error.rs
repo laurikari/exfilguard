@@ -3,6 +3,7 @@ use http::StatusCode;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::authorization::FinalizationRejection;
 use crate::proxy::{
     http::{BodyTooLarge, InvalidRequestBody},
     policy_eval::RequestLogContext,
@@ -16,6 +17,61 @@ pub struct RequestTimeout;
 #[derive(Debug, Error)]
 #[error("client request body timed out")]
 pub struct ClientBodyIdleTimeout;
+
+#[derive(Debug, Error)]
+#[error("{detail}")]
+pub struct CredentialRequestRejected {
+    pub status: StatusCode,
+    pub detail: &'static str,
+}
+
+#[derive(Debug, Error)]
+#[error("credential preparation failed")]
+struct CredentialPreparationFailed {
+    #[source]
+    source: Error,
+}
+
+pub(crate) fn credential_preparation_failed(source: Error) -> Error {
+    CredentialPreparationFailed { source }.into()
+}
+
+pub(crate) fn credential_finalization_failed(source: Error) -> Error {
+    if let Some(rejection) = source.downcast_ref::<FinalizationRejection>() {
+        return CredentialRequestRejected::from_finalization(*rejection).into();
+    }
+    credential_preparation_failed(source)
+}
+
+impl CredentialRequestRejected {
+    pub const fn expectation_failed() -> Self {
+        Self {
+            status: StatusCode::EXPECTATION_FAILED,
+            detail: "credential-bearing requests must not use Expect: 100-continue",
+        }
+    }
+
+    pub const fn body_not_allowed() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            detail: "client credential limit does not permit request body access",
+        }
+    }
+
+    const fn from_finalization(rejection: FinalizationRejection) -> Self {
+        match rejection {
+            FinalizationRejection::Expectation => Self::expectation_failed(),
+            FinalizationRejection::Trailers => Self {
+                status: StatusCode::FORBIDDEN,
+                detail: "credential-bearing requests must not declare trailers",
+            },
+            FinalizationRejection::ProtectedHeader => Self {
+                status: StatusCode::FORBIDDEN,
+                detail: "client supplied a protected header",
+            },
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 #[error("upstream response failed after an informational response was forwarded: {source}")]
@@ -81,6 +137,8 @@ pub enum ForwardErrorKind<'a> {
     ResponseAlreadyStarted(&'a ResponseAlreadyStarted),
     RequestTimeout,
     ClientBodyIdleTimeout,
+    CredentialPreparationFailed,
+    CredentialRequestRejected(&'a CredentialRequestRejected),
     InvalidRequestBody(&'a InvalidRequestBody),
     BodyTooLarge(&'a BodyTooLarge),
     PrivateAddress(&'a PrivateAddressError),
@@ -95,6 +153,8 @@ impl ForwardErrorKind<'_> {
             Self::ResponseAlreadyStarted(_) => "response_body_failed",
             Self::RequestTimeout => "request_timeout",
             Self::ClientBodyIdleTimeout => "request_body_timeout",
+            Self::CredentialPreparationFailed => "credential_preparation_failed",
+            Self::CredentialRequestRejected(_) => "credential_request_rejected",
             Self::InvalidRequestBody(_) => "invalid_request_body",
             Self::BodyTooLarge(_) => "body_too_large",
             Self::PrivateAddress(_) => "private_address",
@@ -114,6 +174,10 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
         ForwardErrorKind::RequestTimeout
     } else if err.downcast_ref::<ClientBodyIdleTimeout>().is_some() {
         ForwardErrorKind::ClientBodyIdleTimeout
+    } else if err.downcast_ref::<CredentialPreparationFailed>().is_some() {
+        ForwardErrorKind::CredentialPreparationFailed
+    } else if let Some(rejected) = err.downcast_ref::<CredentialRequestRejected>() {
+        ForwardErrorKind::CredentialRequestRejected(rejected)
     } else if let Some(invalid) = err.downcast_ref::<InvalidRequestBody>() {
         ForwardErrorKind::InvalidRequestBody(invalid)
     } else if let Some(body) = err.downcast_ref::<BodyTooLarge>() {
@@ -177,6 +241,31 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             inner_method = inner_method,
             effective_mode = effective_mode,
             "client request body timed out"
+        ),
+        ForwardErrorKind::CredentialPreparationFailed => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            "credential preparation failed before origin forwarding"
+        ),
+        ForwardErrorKind::CredentialRequestRejected(_) => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            error = %err,
+            "credential-bearing request rejected before forwarding"
         ),
         ForwardErrorKind::InvalidRequestBody(_) => warn!(
             peer = %peer,
@@ -290,6 +379,10 @@ mod tests {
         assert_eq!(
             ForwardErrorKind::ClientBodyIdleTimeout.as_metric_label(),
             "request_body_timeout"
+        );
+        assert_eq!(
+            ForwardErrorKind::CredentialPreparationFailed.as_metric_label(),
+            "credential_preparation_failed"
         );
         assert_eq!(
             ForwardErrorKind::InvalidRequestBody(&invalid).as_metric_label(),

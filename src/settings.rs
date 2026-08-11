@@ -1001,6 +1001,7 @@ max_policy_cache_duration = 15
 name = "central"
 audience = "integration"
 policy_url = "https://authorization.example.test/policy"
+credential_url = "https://authorization.example.test/credential"
 server_ca_cert = "authorization-ca.pem"
 
 [authorization.service.client_certificate]
@@ -1060,6 +1061,7 @@ dir = "ca-material"
 name = "central"
 audience = "integration"
 policy_url = "https://authorization.example.test/policy"
+credential_url = "https://authorization.example.test/credential"
 server_ca_cert = "authorization-ca.pem"
 
 [authorization.service.client_certificate]

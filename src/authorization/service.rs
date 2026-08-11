@@ -14,7 +14,7 @@ use reqwest::redirect::Policy as RedirectPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -24,8 +24,15 @@ use crate::{
     util::normalize_mapped_ip,
 };
 
-use super::config::{AuthorizationServiceSettings, AuthorizationSettings};
-use super::policy::{DynamicPolicy, make_dynamic_rule};
+use super::FinalizedRequestV1;
+use super::config::{
+    AuthorizationClientCertificateSettings, AuthorizationServiceSettings, AuthorizationSettings,
+    buffered_body_memory_reservation,
+};
+use super::credentials::CredentialPreparerClient;
+use super::policy::{
+    CredentialAuthorization, DynamicPolicy, build_dynamic_credential, make_dynamic_rule,
+};
 
 const AUTHORIZATION_SCHEME: &str = "ExfilGuard";
 const MAX_POLICY_VERSION_SIZE: usize = 128;
@@ -187,6 +194,8 @@ struct DynamicRuleWire {
     methods: Option<Vec<String>>,
     #[serde(default)]
     url_pattern: Option<String>,
+    #[serde(default)]
+    credential: Option<DynamicCredentialWire>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +203,15 @@ struct DynamicRuleWire {
 enum DynamicAction {
     Allow,
     Deny,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicCredentialWire {
+    credential_reference: String,
+    protected_headers: Vec<String>,
+    #[serde(default)]
+    body_access: crate::config::BodyAccess,
 }
 
 #[async_trait]
@@ -241,17 +259,24 @@ struct PolicyResolver {
     policy_client: Arc<dyn PolicyClient>,
     max_cache_duration: Duration,
     max_rules: usize,
+    max_protected_headers: usize,
 }
 
 pub(crate) struct AuthorizationService {
+    name: Arc<str>,
+    audience: Arc<str>,
     resolver: Arc<PolicyResolver>,
     cache: Arc<Mutex<CacheState>>,
     negative_cache_duration: Duration,
+    credential_preparer: CredentialPreparerClient,
+    max_protected_headers: usize,
 }
 
 pub(crate) struct AuthorizationServices {
     services: HashMap<Arc<str>, Arc<AuthorizationService>>,
     max_token_header_size: usize,
+    buffered_body_permits: Arc<Semaphore>,
+    max_buffered_body_size: usize,
 }
 
 impl AuthorizationServices {
@@ -268,6 +293,8 @@ impl AuthorizationServices {
         Ok(Self {
             services,
             max_token_header_size: settings.max_token_header_size,
+            buffered_body_permits: Arc::new(Semaphore::new(settings.max_buffered_body_capacity)),
+            max_buffered_body_size: settings.max_buffered_body_size,
         })
     }
 
@@ -281,6 +308,52 @@ impl AuthorizationServices {
     ) -> Result<Arc<AuthorizationToken>, AuthorizationError> {
         AuthorizationToken::parse(proxy_authorization, self.max_token_header_size)
     }
+
+    pub(crate) async fn prepare_headers(
+        &self,
+        authorization: &CredentialAuthorization,
+        request: &mut FinalizedRequestV1,
+        peer: SocketAddr,
+        max_header_bytes: usize,
+    ) -> Result<()> {
+        let service = self
+            .services
+            .get(&authorization.authorization_service)
+            .context("credential decision references an unavailable authorization service")?;
+        service
+            .credential_preparer
+            .prepare_headers(
+                &service.audience,
+                normalize_mapped_ip(peer.ip()),
+                authorization,
+                request,
+                service.max_protected_headers,
+                max_header_bytes,
+            )
+            .await
+    }
+
+    pub(crate) fn buffered_body_limit(&self, max_request_body_size: usize) -> usize {
+        if max_request_body_size == 0 {
+            self.max_buffered_body_size
+        } else {
+            self.max_buffered_body_size.min(max_request_body_size)
+        }
+    }
+
+    pub(crate) async fn reserve_buffered_body(
+        &self,
+        payload_limit: usize,
+    ) -> Result<OwnedSemaphorePermit> {
+        let reservation = buffered_body_memory_reservation(payload_limit)?;
+        let permits = u32::try_from(reservation)
+            .context("credential body memory reservation exceeds semaphore limit")?;
+        self.buffered_body_permits
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .context("credential body memory limiter closed")
+    }
 }
 
 impl AuthorizationService {
@@ -288,13 +361,12 @@ impl AuthorizationService {
         service: &AuthorizationServiceSettings,
         settings: &AuthorizationSettings,
     ) -> Result<Self> {
+        let name = Arc::<str>::from(service.name.as_str());
         let audience = Arc::<str>::from(service.audience.as_str());
         let client_config = AuthorizationClientConfig::load(service)?;
-        let identity = match &service.client_certificate {
-            super::config::AuthorizationClientCertificateSettings::Files { cert, key } => {
-                load_file_identity(cert, key)?
-            }
-        };
+        let AuthorizationClientCertificateSettings::Files { cert, key } =
+            &service.client_certificate;
+        let identity = load_file_identity(cert, key)?;
         let client = client_config.build(&identity)?;
         let concurrency = Arc::new(Semaphore::new(service.max_concurrency));
         let policy_client: Arc<dyn PolicyClient> = Arc::new(HttpsPolicyClient {
@@ -307,11 +379,14 @@ impl AuthorizationService {
         let cache_capacity = NonZeroUsize::new(settings.policy_cache_capacity)
             .expect("validated nonzero policy cache capacity");
         Ok(Self {
+            name,
+            audience: audience.clone(),
             resolver: Arc::new(PolicyResolver {
                 audience,
                 policy_client,
                 max_cache_duration: Duration::from_secs(settings.max_policy_cache_duration),
                 max_rules: settings.max_policy_rules,
+                max_protected_headers: settings.max_protected_headers,
             }),
             cache: Arc::new(Mutex::new(CacheState {
                 entries: LruCache::new(cache_capacity),
@@ -319,7 +394,18 @@ impl AuthorizationService {
                 pending_capacity: settings.policy_cache_capacity,
             })),
             negative_cache_duration: Duration::from_secs(settings.negative_cache_duration),
+            credential_preparer: CredentialPreparerClient::new(
+                service,
+                client,
+                concurrency,
+                settings.max_credential_response_size,
+            )?,
+            max_protected_headers: settings.max_protected_headers,
         })
+    }
+
+    pub(crate) fn name(&self) -> &Arc<str> {
+        &self.name
     }
 
     pub(crate) async fn resolve(
@@ -508,15 +594,38 @@ impl PolicyResolver {
                 .with_context(|| format!("dynamic rule {index} has invalid url_pattern"))?;
             let action = match raw.action {
                 DynamicAction::Allow => RuleAction::Allow,
-                DynamicAction::Deny => RuleAction::Deny {
-                    status: StatusCode::FORBIDDEN,
-                    reason: None,
-                    body: None,
-                },
+                DynamicAction::Deny => {
+                    ensure!(
+                        raw.credential.is_none(),
+                        "dynamic deny rule {index} must not contain a credential"
+                    );
+                    RuleAction::Deny {
+                        status: StatusCode::FORBIDDEN,
+                        reason: None,
+                        body: None,
+                    }
+                }
             };
-            rules.push(make_dynamic_rule(index, action, methods, url_pattern));
+            let credential = raw
+                .credential
+                .map(|credential| {
+                    ensure!(
+                        credential.protected_headers.len() <= self.max_protected_headers,
+                        "dynamic rule {index} credential exceeds the protected-header count limit"
+                    );
+                    build_dynamic_credential(
+                        credential.credential_reference,
+                        credential.protected_headers,
+                        credential.body_access,
+                    )
+                })
+                .transpose()?;
+            rules.push((
+                make_dynamic_rule(index, action, methods, url_pattern),
+                credential,
+            ));
         }
-        let dynamic = DynamicPolicy::compile_rules(rules)?;
+        let dynamic = DynamicPolicy::compile(rules)?;
         let wall_valid_until = expires_at.min(cache_until);
         let ttl = bounded_cache_ttl(now_system, wall_valid_until, self.max_cache_duration)?;
         let valid_until = Instant::now()
@@ -775,12 +884,28 @@ mod tests {
         max_cache_duration: Duration,
     ) -> AuthorizationService {
         let audience: Arc<str> = Arc::from("test-audience");
+        let service_settings = AuthorizationServiceSettings {
+            name: "test".to_string(),
+            audience: "test-audience".to_string(),
+            policy_url: "https://example.invalid/policy".to_string(),
+            credential_url: "https://example.invalid/credential".to_string(),
+            server_ca_cert: "unused-ca".into(),
+            client_certificate: AuthorizationClientCertificateSettings::Files {
+                cert: "unused-cert".into(),
+                key: "unused-key".into(),
+            },
+            timeout: 1,
+            max_concurrency: 1,
+        };
         AuthorizationService {
+            name: Arc::from("test"),
+            audience: audience.clone(),
             resolver: Arc::new(PolicyResolver {
                 audience,
                 policy_client,
                 max_cache_duration,
                 max_rules: 16,
+                max_protected_headers: 4,
             }),
             cache: Arc::new(Mutex::new(CacheState {
                 entries: LruCache::new(NonZeroUsize::new(16).unwrap()),
@@ -788,6 +913,14 @@ mod tests {
                 pending_capacity: 16,
             })),
             negative_cache_duration: Duration::from_secs(1),
+            credential_preparer: CredentialPreparerClient::new(
+                &service_settings,
+                reqwest::Client::new(),
+                Arc::new(Semaphore::new(1)),
+                1024,
+            )
+            .unwrap(),
+            max_protected_headers: 4,
         }
     }
 
@@ -845,6 +978,19 @@ mod tests {
             wait_for_resolution(&mut resolution, None).await,
             Err(AuthorizationError::Denied)
         ));
+    }
+
+    #[test]
+    fn buffered_body_limit_keeps_the_stricter_cap() {
+        let services = AuthorizationServices {
+            services: HashMap::new(),
+            max_token_header_size: 128,
+            buffered_body_permits: Arc::new(Semaphore::new(8192)),
+            max_buffered_body_size: 1024,
+        };
+        assert_eq!(services.buffered_body_limit(0), 1024);
+        assert_eq!(services.buffered_body_limit(2048), 1024);
+        assert_eq!(services.buffered_body_limit(512), 512);
     }
 
     #[test]

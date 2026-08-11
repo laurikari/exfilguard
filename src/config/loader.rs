@@ -53,6 +53,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             cidr,
             policies: policy_names,
             authorization_service,
+            credential_limits,
             fallback,
             max_connections,
         } = client;
@@ -65,11 +66,35 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
         }
 
         let arc_name = Arc::<str>::from(name.as_str());
+        let credential_limits = credential_limits
+            .into_iter()
+            .map(|limit| {
+                Ok(super::CredentialLimit {
+                    credential_reference: Arc::from(limit.credential_reference),
+                    origin_scope: parse_url_pattern(&limit.origin_scope).with_context(|| {
+                        format!(
+                            "client '{name}' has invalid credential_limit origin_scope '{}'",
+                            limit.origin_scope
+                        )
+                    })?,
+                    protected_headers: Arc::from(
+                        limit
+                            .protected_headers
+                            .into_iter()
+                            .map(Arc::<str>::from)
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    ),
+                    body_access: limit.body_access,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         clients.push(Client {
             name: arc_name,
             selector,
             policies: Arc::from(policy_refs.into_boxed_slice()),
             authorization_service: authorization_service.map(Arc::from),
+            credential_limits: Arc::from(credential_limits.into_boxed_slice()),
             max_connections,
         });
     }
@@ -375,10 +400,22 @@ struct RawClient {
     policies: Vec<String>,
     #[serde(default)]
     authorization_service: Option<String>,
+    #[serde(default, rename = "credential_limit")]
+    credential_limits: Vec<RawCredentialLimit>,
     #[serde(default)]
     fallback: bool,
     #[serde(default = "default_client_max_connections")]
     max_connections: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredentialLimit {
+    credential_reference: String,
+    origin_scope: String,
+    protected_headers: Vec<String>,
+    #[serde(default)]
+    body_access: super::BodyAccess,
 }
 
 const fn default_client_max_connections() -> usize {
@@ -985,13 +1022,19 @@ name = "allow"
     }
 
     #[test]
-    fn loads_client_authorization_service() {
+    fn loads_client_authorization_service_and_credential_limits() {
         let clients = write_temp(
             r#"[[client]]
 name = "default"
 policies = ["allow"]
 fallback = true
 authorization_service = "central"
+
+[[client.credential_limit]]
+credential_reference = "customer-api"
+origin_scope = "https://api.example.com/v1/**"
+protected_headers = ["authorization"]
+body_access = "bounded_payload"
 "#,
         );
         let policies = write_temp(
@@ -1005,6 +1048,15 @@ name = "allow"
         let config = load_config(clients.path(), policies.path()).expect("config should load");
         let client = &config.clients[0];
         assert_eq!(client.authorization_service.as_deref(), Some("central"));
+        assert_eq!(client.credential_limits.len(), 1);
+        assert_eq!(
+            client.credential_limits[0].credential_reference.as_ref(),
+            "customer-api"
+        );
+        assert_eq!(
+            client.credential_limits[0].body_access,
+            crate::config::BodyAccess::BoundedPayload
+        );
     }
 
     #[test]

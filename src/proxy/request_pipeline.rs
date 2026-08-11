@@ -145,6 +145,7 @@ pub(crate) async fn process_request<H: RequestHandler + Send>(
             parsed,
             snapshot,
             (token.clone(), authorization_policy),
+            service.name().clone(),
             log_queries,
             log_config,
         )

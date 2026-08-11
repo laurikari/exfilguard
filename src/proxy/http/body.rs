@@ -336,6 +336,41 @@ where
     Ok(transferred)
 }
 
+pub(crate) async fn buffer_fixed_body<S>(
+    reader: &mut BufReader<S>,
+    length: usize,
+    read_timeout: Duration,
+    total_deadline: Option<Instant>,
+) -> Result<(Vec<u8>, u64)>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut body = Vec::with_capacity(length);
+    let mut remaining = length;
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = remaining.min(buffer.len());
+        let read = with_idle_and_total(
+            read_timeout,
+            total_deadline,
+            reader.read(&mut buffer[..to_read]),
+            "buffering credential-bearing request body",
+            BodyReadSource::Client,
+        )
+        .await?;
+        if read == 0 {
+            return Err(InvalidRequestBody::new(
+                (length - remaining) as u64,
+                "unexpected EOF while buffering credential-bearing request body",
+            )
+            .into());
+        }
+        body.extend_from_slice(&buffer[..read]);
+        remaining -= read;
+    }
+    Ok((body, length as u64))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_chunked_body_generic<R, W>(
     reader: &mut BufReader<R>,
@@ -607,6 +642,56 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn buffer_chunked_body<S>(
+    reader: &mut BufReader<S>,
+    read_timeout: Duration,
+    total_deadline: Option<Instant>,
+    peer: SocketAddr,
+    max_payload_size: usize,
+    max_trailer_bytes: usize,
+) -> Result<(Vec<u8>, u64)>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut tracker = BodySizeTracker::new(max_payload_size);
+    let mut framing_sink = tokio::io::sink();
+    let mut payload = Vec::with_capacity(max_payload_size);
+    let result = relay_chunked_body_generic(
+        reader,
+        &mut framing_sink,
+        read_timeout,
+        read_timeout,
+        total_deadline,
+        peer,
+        "to credential buffer",
+        Some(&mut tracker),
+        max_trailer_bytes,
+        "request trailer section exceeds configured limit",
+        sanitize_request_trailer_lines,
+        Some(&mut payload),
+        BodyReadSource::Client,
+    )
+    .await;
+
+    match result {
+        Ok(stats) if stats.had_trailers => Err(InvalidRequestBody::new(
+            stats.bytes_read,
+            "credential-bearing requests must not contain trailers",
+        )
+        .into()),
+        Ok(stats) => Ok((payload, stats.bytes_read)),
+        Err(err) => {
+            if let Some(invalid) = err.downcast_ref::<InvalidChunkedBody>() {
+                return Err(
+                    InvalidRequestBody::new(invalid.bytes_read, invalid.detail.clone()).into(),
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
 pub async fn relay_fixed_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
@@ -762,7 +847,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        InvalidRequestBody, parse_chunk_size_line, relay_chunked_body,
+        InvalidRequestBody, buffer_chunked_body, parse_chunk_size_line, relay_chunked_body,
         relay_chunked_body_with_payload_copy, stream_chunked_body,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -978,5 +1063,62 @@ mod tests {
             .await
             .expect("read relayed response");
         assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn credential_buffer_decodes_payload_and_rejects_trailers() {
+        let body = b"5;extension=yes\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let (client_stream, mut writer) = duplex(256);
+        writer.write_all(body).await.unwrap();
+        drop(writer);
+        let (payload, wire_bytes) = buffer_chunked_body(
+            &mut BufReader::new(client_stream),
+            Duration::from_secs(1),
+            None,
+            peer(),
+            1024,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload, b"hello world");
+        assert_eq!(payload.capacity(), 1024);
+        assert_eq!(wire_bytes, body.len() as u64);
+
+        let body = b"1\r\nx\r\n0\r\nDigest: value\r\n\r\n";
+        let (client_stream, mut writer) = duplex(256);
+        writer.write_all(body).await.unwrap();
+        drop(writer);
+        let error = buffer_chunked_body(
+            &mut BufReader::new(client_stream),
+            Duration::from_secs(1),
+            None,
+            peer(),
+            1024,
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<InvalidRequestBody>().is_some());
+    }
+
+    #[tokio::test]
+    async fn credential_buffer_enforces_payload_limit() {
+        let body = b"5\r\nhello\r\n0\r\n\r\n";
+        let (client_stream, mut writer) = duplex(256);
+        writer.write_all(body).await.unwrap();
+        drop(writer);
+        assert!(
+            buffer_chunked_body(
+                &mut BufReader::new(client_stream),
+                Duration::from_secs(1),
+                None,
+                peer(),
+                4,
+                1024,
+            )
+            .await
+            .is_err()
+        );
     }
 }

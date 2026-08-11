@@ -4,6 +4,7 @@ use http::StatusCode;
 use tracing::Level;
 use uuid::Uuid;
 
+use crate::authorization::policy::authorize_credential;
 use crate::{
     authorization::{AuthorizationToken, DelegatedAuthorization, ResolvedAuthorizationPolicy},
     logging::{AccessLogBuilder, log_with_level},
@@ -209,13 +210,14 @@ pub(crate) fn evaluate_delegated_request<'a>(
     parsed: &'a ParsedRequest,
     snapshot: &'a PolicySnapshot,
     authorization: (Arc<AuthorizationToken>, Arc<ResolvedAuthorizationPolicy>),
+    authorization_service: Arc<str>,
     log_queries: bool,
     log_config: PolicyLogConfig,
 ) -> PolicyOutcome<'a> {
     let (token, authorization_policy) = authorization;
     let log_ctx = RequestLogContext::new(peer, parsed, log_queries);
     let policy_request = parsed.as_policy_request();
-    let Some(_client) = snapshot.resolve_client(peer.ip()) else {
+    let Some(client) = snapshot.resolve_client(peer.ip()) else {
         log_policy_default(
             log_config.default_level,
             log_config.default_message,
@@ -270,7 +272,7 @@ pub(crate) fn evaluate_delegated_request<'a>(
     };
     crate::metrics::record_rule_hit(decision.rule.as_ref());
 
-    let Some(dynamic_decision) = authorization_policy.dynamic.evaluate(&policy_request) else {
+    let Some(dynamic_evaluation) = authorization_policy.dynamic.evaluate(&policy_request) else {
         log_authorization_deny(
             peer,
             parsed,
@@ -282,7 +284,7 @@ pub(crate) fn evaluate_delegated_request<'a>(
         );
         return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
     };
-    let dynamic_rule = match dynamic_decision {
+    let dynamic_rule = match dynamic_evaluation.decision {
         crate::policy::Decision::Allow { rule, .. } => rule,
         crate::policy::Decision::Deny { rule, .. } => {
             log_authorization_deny(
@@ -297,13 +299,33 @@ pub(crate) fn evaluate_delegated_request<'a>(
             return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
         }
     };
+    let credential = match authorize_credential(
+        token.clone(),
+        authorization_service,
+        dynamic_evaluation.credential.as_ref(),
+        &policy_request,
+        &client.credential_limits,
+    ) {
+        Ok(credential) => credential,
+        Err(error) => {
+            tracing::warn!(
+                peer = %peer,
+                authorization_token_id = token.correlation(),
+                policy_version = %authorization_policy.policy_version,
+                error = %error,
+                "credential request denied by client limit"
+            );
+            return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
+        }
+    };
     decision.authorization = Some(DelegatedAuthorization {
         token,
         policy: authorization_policy,
         rule: dynamic_rule,
+        credential,
     });
-    // Delegated requests are isolated from the shared response cache because the authorization
-    // token is not part of that cache key.
+    // Delegated requests are deliberately isolated from the shared response cache. This is
+    // conservative for credential-free requests and avoids a second token-aware cache key.
     decision.cache = None;
     log_policy_allow(
         log_config.allow_level,
@@ -619,6 +641,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
             authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         let config = Config {
@@ -653,6 +676,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from([policy.name.clone()]),
                 authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -735,6 +759,7 @@ mod tests {
                 &static_denies,
                 &snapshot,
                 (token.clone(), dynamic_post),
+                Arc::from("test"),
                 false,
                 PolicyLogConfig::http1(),
             ),
@@ -760,6 +785,7 @@ mod tests {
                 &static_allows,
                 &snapshot,
                 (token, dynamic_other_path),
+                Arc::from("test"),
                 false,
                 PolicyLogConfig::http1(),
             ),
@@ -796,6 +822,7 @@ mod tests {
                 &parsed,
                 &snapshot,
                 (token, dynamic),
+                Arc::from("test"),
                 false,
                 PolicyLogConfig::connect_tunnel(),
             ),
