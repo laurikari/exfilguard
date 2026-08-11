@@ -16,7 +16,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -264,6 +264,8 @@ pub struct BumpedTlsFixture {
     upstream_task: tokio::task::JoinHandle<Result<()>>,
     harness: ProxyHarness,
     accept_count: Arc<AtomicUsize>,
+    upstream_close_count: Arc<AtomicUsize>,
+    upstream_close_notify: Arc<Notify>,
     request_count: Arc<AtomicUsize>,
 }
 
@@ -327,9 +329,13 @@ impl BumpedTlsFixture {
         };
 
         let accept_count = Arc::new(AtomicUsize::new(0));
+        let upstream_close_count = Arc::new(AtomicUsize::new(0));
+        let upstream_close_notify = Arc::new(Notify::new());
         let request_count = Arc::new(AtomicUsize::new(0));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let accept_counter = accept_count.clone();
+        let upstream_close_counter = upstream_close_count.clone();
+        let upstream_close_notifier = upstream_close_notify.clone();
         let request_counter = request_count.clone();
         let upstream_task = {
             let upstream_config = upstream_config.clone();
@@ -347,6 +353,8 @@ impl BumpedTlsFixture {
                             };
                             accept_counter.fetch_add(1, Ordering::SeqCst);
                             let acceptor = TlsAcceptor::from(upstream_config.clone());
+                            let close_counter = upstream_close_counter.clone();
+                            let close_notify = upstream_close_notifier.clone();
                             let request_counter = request_counter.clone();
                             tokio::spawn(async move {
                                 let result = match upstream_mode {
@@ -397,6 +405,8 @@ impl BumpedTlsFixture {
                                         serve_tls_h2_inspect(stream, acceptor, peer).await
                                     }
                                 };
+                                close_counter.fetch_add(1, Ordering::SeqCst);
+                                close_notify.notify_one();
                                 if let Err(err) = result {
                                     tracing::warn!(error = %err, "tls upstream handler error");
                                 }
@@ -430,6 +440,8 @@ impl BumpedTlsFixture {
             upstream_task,
             harness,
             accept_count,
+            upstream_close_count,
+            upstream_close_notify,
             request_count,
         })
     }
@@ -493,6 +505,21 @@ impl BumpedTlsFixture {
 
     pub fn accept_count(&self) -> usize {
         self.accept_count.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_upstream_close(&self, timeout_duration: Duration) -> Result<()> {
+        timeout(timeout_duration, async {
+            loop {
+                let notified = self.upstream_close_notify.notified();
+                if self.upstream_close_count.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .context("timed out waiting for an upstream connection to close")?;
+        Ok(())
     }
 
     pub fn request_count(&self) -> usize {

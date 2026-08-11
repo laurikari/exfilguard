@@ -95,6 +95,7 @@ pub async fn handle_bump(
             )
             .await
         } else {
+            drop(primed);
             handle_decrypted_https(
                 tls_stream,
                 peer,

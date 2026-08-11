@@ -2276,6 +2276,60 @@ async fn connect_bump_rejects_h2_only_client_when_upstream_http1_only() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http1_closes_unused_http2_probe() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "close-unused-h2-probe";
+    let policy = PolicySpec::new(policy_name)
+        .rule(
+            RuleSpec::deny(
+                &["GET"],
+                format!("https://{upstream_host}/downstream-still-open"),
+            )
+            .status(451)
+            .body("downstream session remained open"),
+        )
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http1)
+            .upstream_mode(UpstreamMode::Http2),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+
+    fixture
+        .wait_for_upstream_close(StdDuration::from_secs(2))
+        .await?;
+
+    let mut client = fixture.http1_client();
+    assert_eq!(
+        client.stream().get_ref().1.alpn_protocol(),
+        Some(&b"http/1.1"[..])
+    );
+    let request = format!(
+        "GET /downstream-still-open HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port(),
+    );
+    client.send(request).await?;
+    let response = client.read_response().await?;
+    assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+    assert!(
+        response.contains("downstream session remained open"),
+        "{response}"
+    );
+    client.stream_mut().shutdown().await.ok();
+
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "the denied request must not open another origin connection"
+    );
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_supports_http2() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2";
