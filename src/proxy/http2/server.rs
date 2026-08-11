@@ -470,7 +470,8 @@ impl Http2RequestHandler {
     fn should_disconnect_on_forward_error(kind: &ForwardErrorKind<'_>) -> bool {
         !matches!(
             kind,
-            ForwardErrorKind::InvalidRequestBody(_)
+            ForwardErrorKind::Http2StreamReset
+                | ForwardErrorKind::InvalidRequestBody(_)
                 | ForwardErrorKind::BodyTooLarge(_)
                 | ForwardErrorKind::CredentialPreparationFailed
                 | ForwardErrorKind::CredentialRequestRejected(_)
@@ -486,6 +487,7 @@ impl Http2RequestHandler {
             ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
             ForwardErrorKind::CredentialRequestRejected(_) => "DENY",
             ForwardErrorKind::ResponseAlreadyStarted(_)
+            | ForwardErrorKind::Http2StreamReset
             | ForwardErrorKind::RequestTimeout
             | ForwardErrorKind::ClientBodyIdleTimeout
             | ForwardErrorKind::CredentialPreparationFailed
@@ -632,7 +634,10 @@ impl Http2RequestHandler {
         crate::metrics::record_upstream_error(kind.as_metric_label());
         log_forward_error(&kind, &log, &err);
 
-        if matches!(kind, ForwardErrorKind::ResponseAlreadyStarted(_)) {
+        if matches!(
+            kind,
+            ForwardErrorKind::ResponseAlreadyStarted(_) | ForwardErrorKind::Http2StreamReset
+        ) {
             // Dropping the affected H2 stream resets it. Other multiplexed streams and the
             // shared upstream session remain usable.
             self.log_disconnect_forward_error(decision, log, &kind, &error_detail);

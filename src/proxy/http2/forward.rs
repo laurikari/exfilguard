@@ -502,7 +502,7 @@ pub(super) async fn forward_request_to_upstream(
         let response = with_total_deadline(request_deadline, async {
             timeout(response_header_timeout, &mut receive_response)
                 .await
-                .map_err(|_| anyhow!("timed out receiving HTTP/2 response from upstream"))?
+                .map_err(|_| anyhow::Error::new(RequestTimeout))?
         })
         .await?;
         relay_upstream_response(
@@ -567,7 +567,7 @@ pub(super) async fn forward_request_to_upstream(
                 let response = with_total_deadline(request_deadline, async {
                     timeout(response_header_timeout, &mut receive_response)
                         .await
-                        .map_err(|_| anyhow!("timed out receiving HTTP/2 response from upstream"))?
+                        .map_err(|_| anyhow::Error::new(RequestTimeout))?
                 })
                 .await?;
                 relay_upstream_response(
@@ -679,7 +679,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
                 let response = with_total_deadline(request_deadline, async {
                     timeout(response_header_timeout, &mut receive_response)
                         .await
-                        .map_err(|_| anyhow!("timed out receiving HTTP/2 response from upstream"))?
+                        .map_err(|_| anyhow::Error::new(RequestTimeout))?
                 })
                 .await?;
                 relay_upstream_response(
@@ -702,7 +702,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
         let response = with_total_deadline(request_deadline, async {
             timeout(response_header_timeout, &mut receive_response)
                 .await
-                .map_err(|_| anyhow!("timed out receiving HTTP/2 response from upstream"))?
+                .map_err(|_| anyhow::Error::new(RequestTimeout))?
         })
         .await?;
         relay_upstream_response(

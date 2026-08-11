@@ -59,6 +59,7 @@ pub enum UpstreamMode {
     Http2CloseBeforeResponse,
     Http2HeadersThenStallBody,
     Http2EarlyResponse,
+    Http2StreamIsolation,
     Http2NoResponse,
     Http2SingleUse,
     Http2Inspect,
@@ -318,6 +319,7 @@ impl BumpedTlsFixture {
             | UpstreamMode::Http2CloseBeforeResponse
             | UpstreamMode::Http2HeadersThenStallBody
             | UpstreamMode::Http2EarlyResponse
+            | UpstreamMode::Http2StreamIsolation
             | UpstreamMode::Http2NoResponse
             | UpstreamMode::Http2SingleUse
             | UpstreamMode::Http2Inspect => build_upstream_h2_tls_config(&ca, upstream_host)?,
@@ -394,6 +396,14 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http2EarlyResponse => {
                                         serve_tls_h2_early_response(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http2StreamIsolation => {
+                                        serve_tls_h2_stream_isolation(
+                                            stream,
+                                            acceptor,
+                                            peer,
+                                            request_counter,
+                                        ).await
                                     }
                                     UpstreamMode::Http2NoResponse => {
                                         serve_tls_h2_no_response(stream, acceptor, peer).await
@@ -1033,6 +1043,98 @@ async fn serve_h2_early_response_request(
     Ok(())
 }
 
+async fn serve_tls_h2_stream_isolation(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+    let client_reset_seen = Arc::new(Notify::new());
+    let survivor_release = Arc::new(Notify::new());
+    let mut handlers = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) = result.context("failed to accept HTTP/2 request")?;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    handlers.spawn(serve_h2_stream_isolation_request(
+                        request,
+                        respond,
+                        client_reset_seen.clone(),
+                        survivor_release.clone(),
+                    ));
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 handler available")
+                    .context("HTTP/2 stream-isolation handler task failed")??;
+            }
+        }
+    }
+
+    handlers.abort_all();
+    while handlers.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn serve_h2_stream_isolation_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2_server::SendResponse<Bytes>,
+    client_reset_seen: Arc<Notify>,
+    survivor_release: Arc<Notify>,
+) -> Result<()> {
+    let path = request.uri().path().to_string();
+    match path.as_str() {
+        "/client-reset" => {
+            let _body = request.into_body();
+            poll_fn(|cx| respond.poll_reset(cx))
+                .await
+                .context("failed while waiting for client HTTP/2 stream reset")?;
+            client_reset_seen.notify_one();
+        }
+        "/survivor" => {
+            survivor_release.notified().await;
+            send_h2_ok(respond, &path)?;
+        }
+        "/release-after-client-reset" => {
+            client_reset_seen.notified().await;
+            survivor_release.notify_one();
+            send_h2_ok(respond, &path)?;
+        }
+        "/origin-reset" => respond.send_reset(h2::Reason::CANCEL),
+        "/release" => {
+            survivor_release.notify_one();
+            send_h2_ok(respond, &path)?;
+        }
+        _ => send_h2_ok(respond, &path)?,
+    }
+    Ok(())
+}
+
+fn send_h2_ok(mut respond: h2_server::SendResponse<Bytes>, body: &str) -> Result<()> {
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+    let mut send = respond
+        .send_response(response, false)
+        .context("failed to send HTTP/2 response headers")?;
+    send.send_data(Bytes::copy_from_slice(body.as_bytes()), true)
+        .context("failed to send HTTP/2 response body")?;
+    Ok(())
+}
+
 async fn serve_tls_h2_no_response(
     stream: TcpStream,
     acceptor: TlsAcceptor,
@@ -1045,12 +1147,36 @@ async fn serve_tls_h2_no_response(
     let mut connection = h2_server::handshake(tls)
         .await
         .context("failed to establish HTTP/2 handshake with proxy")?;
+    let mut handlers = tokio::task::JoinSet::new();
 
-    let Some(result) = connection.accept().await else {
-        return Ok(());
-    };
-    let (_request, _respond) = result.context("failed to accept HTTP/2 request")?;
-    sleep(Duration::from_secs(5)).await;
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) =
+                        result.context("failed to accept HTTP/2 request")?;
+                    handlers.spawn(async move {
+                        let path = request.uri().path().to_string();
+                        if path == "/h2/after-timeout" {
+                            send_h2_ok(respond, &path)?;
+                        } else {
+                            sleep(Duration::from_secs(5)).await;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    });
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 no-response handler available")
+                    .context("HTTP/2 no-response handler task failed")??;
+            }
+        }
+    }
+    handlers.abort_all();
+    while handlers.join_next().await.is_some() {}
+
     Ok(())
 }
 

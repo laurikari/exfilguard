@@ -92,6 +92,33 @@ fn log_field_value(line: &str, field: &str) -> Option<String> {
     }
 }
 
+async fn wait_for_bumped_upstream_requests(
+    fixture: &BumpedTlsFixture,
+    expected: usize,
+) -> Result<()> {
+    timeout(StdDuration::from_secs(2), async {
+        while fixture.request_count() < expected {
+            sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for {expected} upstream HTTP/2 requests"))?;
+    Ok(())
+}
+
+fn bumped_h2_request(authority: &str, method: Method, path: &str) -> Result<http::Request<()>> {
+    Ok(http::Request::builder()
+        .method(method)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority)
+                .path_and_query(path)
+                .build()?,
+        )
+        .body(())?)
+}
+
 async fn proxy_response_for_raw_upstream_response(upstream_response: Vec<u8>) -> Result<String> {
     let upstream = TestUpstream::http_response(upstream_response).await?;
     let upstream_port = upstream.port();
@@ -2398,6 +2425,119 @@ async fn connect_bump_supports_http2() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_client_reset_preserves_other_streams() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-client-reset";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2StreamIsolation),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let (cancelled_response, mut cancelled_body) = client.start_request_with_open_body(
+        bumped_h2_request(&authority, Method::PUT, "/client-reset")?,
+    )?;
+    wait_for_bumped_upstream_requests(&fixture, 1).await?;
+
+    let survivor_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/survivor")?)?;
+    wait_for_bumped_upstream_requests(&fixture, 2).await?;
+
+    cancelled_body.send_reset(h2::Reason::CANCEL);
+    let reset_error = timeout(StdDuration::from_secs(2), cancelled_response)
+        .await
+        .context("timed out waiting for cancelled downstream HTTP/2 stream")?
+        .expect_err("cancelled downstream HTTP/2 stream returned a response");
+    assert!(reset_error.is_reset());
+
+    let release_response = client.start_request(bumped_h2_request(
+        &authority,
+        Method::GET,
+        "/release-after-client-reset",
+    )?)?;
+    let release_response = timeout(StdDuration::from_secs(2), release_response)
+        .await
+        .context("timed out waiting for release HTTP/2 response")??;
+    assert_eq!(release_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(release_response.into_body()).await?,
+        "/release-after-client-reset"
+    );
+
+    let survivor_response = timeout(StdDuration::from_secs(2), survivor_response)
+        .await
+        .context("timed out waiting for surviving HTTP/2 stream")??;
+    assert_eq!(survivor_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(survivor_response.into_body()).await?,
+        "/survivor"
+    );
+    assert_eq!(fixture.accept_count(), 1);
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_origin_reset_preserves_other_streams() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-origin-reset";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2StreamIsolation),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let survivor_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/survivor")?)?;
+    wait_for_bumped_upstream_requests(&fixture, 1).await?;
+
+    let reset_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/origin-reset")?)?;
+    let reset_error = timeout(StdDuration::from_secs(2), reset_response)
+        .await
+        .context("timed out waiting for origin HTTP/2 stream reset")?
+        .expect_err("origin-reset HTTP/2 stream returned a response");
+    assert!(reset_error.is_reset());
+
+    let release_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/release")?)?;
+    let release_response = timeout(StdDuration::from_secs(2), release_response)
+        .await
+        .context("timed out waiting for release HTTP/2 response")??;
+    assert_eq!(release_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(release_response.into_body()).await?,
+        "/release"
+    );
+
+    let survivor_response = timeout(StdDuration::from_secs(2), survivor_response)
+        .await
+        .context("timed out waiting for surviving HTTP/2 stream")??;
+    assert_eq!(survivor_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(survivor_response.into_body()).await?,
+        "/survivor"
+    );
+    assert_eq!(fixture.accept_count(), 1);
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_cache_miss_then_hit() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "cache-h2";
@@ -3143,7 +3283,7 @@ async fn connect_bump_http2_disconnects_when_upstream_closes_before_response() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result<()> {
+async fn connect_bump_http2_response_header_timeout_preserves_session() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-timeout";
     let policy = PolicySpec::new(policy_name)
@@ -3172,11 +3312,30 @@ async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result
         )
         .body(())?;
 
-    let _ = client
-        .request_text(request)
-        .await
-        .expect_err("expected downstream disconnect after upstream response timeout");
-    client.wait_closed(StdDuration::from_secs(2)).await?;
+    let (status, body) = timeout(StdDuration::from_secs(2), client.request_text(request)).await??;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body, "request timed out");
+
+    let follow_up = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/after-timeout")
+                .build()?,
+        )
+        .body(())?;
+    let (status, body) =
+        timeout(StdDuration::from_secs(2), client.request_text(follow_up)).await??;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "/h2/after-timeout");
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "upstream H2 session was replaced"
+    );
+
     client.shutdown().await;
 
     fixture.shutdown().await;

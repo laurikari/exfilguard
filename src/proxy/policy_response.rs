@@ -27,6 +27,14 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             extra_client_bytes: 0,
             log_reason: "response_body_failed",
         },
+        ForwardErrorKind::Http2StreamReset => ForwardErrorSpec {
+            status: StatusCode::BAD_GATEWAY,
+            body_http1: b"HTTP/2 stream reset\r\n",
+            body_http2: "HTTP/2 stream reset",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "http2_stream_reset",
+        },
         ForwardErrorKind::RequestTimeout => ForwardErrorSpec {
             status: StatusCode::GATEWAY_TIMEOUT,
             body_http1: b"request timed out\r\n",

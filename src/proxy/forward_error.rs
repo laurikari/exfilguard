@@ -1,7 +1,7 @@
 use anyhow::Error;
 use http::StatusCode;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::authorization::FinalizationRejection;
 use crate::proxy::{
@@ -135,6 +135,7 @@ impl MisdirectedRequest {
 /// Normalized classification of forwarding failures so HTTP/1.1 and HTTP/2 can react consistently.
 pub enum ForwardErrorKind<'a> {
     ResponseAlreadyStarted(&'a ResponseAlreadyStarted),
+    Http2StreamReset,
     RequestTimeout,
     ClientBodyIdleTimeout,
     CredentialPreparationFailed,
@@ -151,6 +152,7 @@ impl ForwardErrorKind<'_> {
     pub fn as_metric_label(&self) -> &'static str {
         match self {
             Self::ResponseAlreadyStarted(_) => "response_body_failed",
+            Self::Http2StreamReset => "http2_stream_reset",
             Self::RequestTimeout => "request_timeout",
             Self::ClientBodyIdleTimeout => "request_body_timeout",
             Self::CredentialPreparationFailed => "credential_preparation_failed",
@@ -188,6 +190,12 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
         ForwardErrorKind::MisdirectedRequest(misdirected)
     } else if err.downcast_ref::<UpstreamClosed>().is_some() {
         ForwardErrorKind::UpstreamClosed
+    } else if err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<h2::Error>())
+        .any(h2::Error::is_reset)
+    {
+        ForwardErrorKind::Http2StreamReset
     } else {
         ForwardErrorKind::Other
     }
@@ -217,6 +225,19 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             effective_mode = effective_mode,
             error = %err,
             "response forwarding failed after downstream response started"
+        ),
+        ForwardErrorKind::Http2StreamReset => debug!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            error = %err,
+            "HTTP/2 stream reset while forwarding"
         ),
         ForwardErrorKind::RequestTimeout => warn!(
             peer = %peer,
@@ -371,6 +392,10 @@ mod tests {
             ))
             .as_metric_label(),
             "response_body_failed"
+        );
+        assert_eq!(
+            ForwardErrorKind::Http2StreamReset.as_metric_label(),
+            "http2_stream_reset"
         );
         assert_eq!(
             ForwardErrorKind::RequestTimeout.as_metric_label(),
