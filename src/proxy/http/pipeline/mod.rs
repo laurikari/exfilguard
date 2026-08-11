@@ -88,6 +88,7 @@ name = "allow"
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
             proxy_protocol_max_pending_connections: 1024,
+            vault: None,
             ca: CaSettings::Builtin {
                 dir: ca_dir.clone(),
             },

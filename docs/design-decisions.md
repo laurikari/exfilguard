@@ -172,6 +172,11 @@ This separation is preferable to accepting partially managed directories or
 guessing an operator's intended lifecycle from whichever files happen to be
 present.
 
+Vault connection, PKI trust, and login settings are global rather than owned by
+the inspection CA. These settings describe process-wide access to one Vault
+deployment; each certificate user keeps only its signing-specific
+configuration.
+
 ## HTTPS inspect and tunnel modes
 
 In `inspect` mode, only a matching `ALLOW` rule may authorize the CONNECT host

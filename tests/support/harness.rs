@@ -28,6 +28,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         proxy_protocol: ProxyProtocolMode::Off,
         proxy_protocol_allowed_cidrs: None,
         proxy_protocol_max_pending_connections: 1024,
+        vault: None,
         ca: CaSettings::Builtin {
             dir: dirs.ca_dir.clone(),
         },

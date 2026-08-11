@@ -22,12 +22,12 @@ use tracing::warn;
 use crate::{
     policy::matcher::PolicySnapshot,
     proxy::{default_upstream_resolver, permissive_test_upstream_resolver},
-    settings::{CaSettings, Settings, VaultAuth},
+    settings::{CaSettings, Settings, VaultAuth, VaultSettings},
     tls::{
         ca::CertificateAuthority,
         cache::CertificateCache,
         issuer::TlsIssuer,
-        vault::{VaultAuthConfig, VaultCaSource, VaultConfig},
+        vault::{VaultAuthConfig, VaultCaConfig, VaultCaSource, VaultClient, VaultConfig},
     },
 };
 
@@ -45,6 +45,7 @@ async fn run_with_upstream_resolver(
     upstream_resolver: Arc<dyn proxy::UpstreamResolver>,
 ) -> Result<()> {
     settings.validate()?;
+    let vault = build_vault_client(settings.vault.as_ref())?;
     let StartupPreflight {
         policy_snapshot,
         tls_client_configs,
@@ -61,7 +62,7 @@ async fn run_with_upstream_resolver(
         };
         (addr, path, tls)
     });
-    let (ca, ca_source, vault_source) = load_ca(&settings.ca).await?;
+    let (ca, ca_source, vault_source) = load_ca(&settings.ca, vault.clone()).await?;
     let cert_cache = Arc::new(CertificateCache::new(settings.leaf_cache_capacity)?);
     let tls_issuer = Arc::new(TlsIssuer::new(
         ca.clone(),
@@ -142,6 +143,7 @@ fn spawn_ca_usability_monitor(issuer: Arc<TlsIssuer>) {
 
 async fn load_ca(
     settings: &CaSettings,
+    vault: Option<Arc<VaultClient>>,
 ) -> Result<(
     Arc<CertificateAuthority>,
     &'static str,
@@ -159,36 +161,15 @@ async fn load_ca(
             None,
         )),
         CaSettings::Vault(settings) => {
-            let auth = match &settings.auth {
-                VaultAuth::AppRole {
-                    mount,
-                    role_id,
-                    secret_id_file,
-                } => VaultAuthConfig::AppRole {
-                    mount: mount.clone(),
-                    role_id: role_id.clone(),
-                    secret_id_file: secret_id_file.clone(),
+            let vault = vault.context("Vault-backed CA requires [vault]")?;
+            let source = Arc::new(VaultCaSource::new(
+                vault,
+                VaultCaConfig {
+                    issuer: settings.issuer.clone(),
+                    intermediate_ttl: settings.intermediate_ttl(),
+                    renewal_threshold: settings.renewal_threshold(),
                 },
-                VaultAuth::TokenFile { token_file } => VaultAuthConfig::TokenFile {
-                    token_file: token_file.clone(),
-                },
-                VaultAuth::Proxy {} => VaultAuthConfig::Proxy,
-            };
-            let source = Arc::new(VaultCaSource::new(VaultConfig {
-                address: settings.address.clone(),
-                tls_ca_cert: settings.tls_ca_cert.clone(),
-                tls_server_name: settings.tls_server_name.clone(),
-                namespace: settings.namespace.clone(),
-                pki_mount: settings.pki_mount.clone(),
-                issuer: settings.issuer.clone(),
-                expected_root_certs: settings.expected_root_certs.clone(),
-                intermediate_ttl: settings.intermediate_ttl(),
-                renewal_threshold: settings.renewal_threshold(),
-                request_timeout: settings.request_timeout(),
-                tls_client_cert: settings.tls_client_cert.clone(),
-                tls_client_key: settings.tls_client_key.clone(),
-                auth,
-            })?);
+            )?);
             let ca = source
                 .issue()
                 .await
@@ -196,6 +177,39 @@ async fn load_ca(
             Ok((ca, "vault", Some(source)))
         }
     }
+}
+
+fn build_vault_client(settings: Option<&VaultSettings>) -> Result<Option<Arc<VaultClient>>> {
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    let auth = match &settings.auth {
+        VaultAuth::AppRole {
+            mount,
+            role_id,
+            secret_id_file,
+        } => VaultAuthConfig::AppRole {
+            mount: mount.clone(),
+            role_id: role_id.clone(),
+            secret_id_file: secret_id_file.clone(),
+        },
+        VaultAuth::TokenFile { token_file } => VaultAuthConfig::TokenFile {
+            token_file: token_file.clone(),
+        },
+        VaultAuth::Proxy {} => VaultAuthConfig::Proxy,
+    };
+    Ok(Some(Arc::new(VaultClient::new(VaultConfig {
+        address: settings.address.clone(),
+        tls_ca_cert: settings.tls_ca_cert.clone(),
+        tls_server_name: settings.tls_server_name.clone(),
+        namespace: settings.namespace.clone(),
+        pki_mount: settings.pki.mount.clone(),
+        expected_root_certs: settings.pki.expected_root_certs.clone(),
+        request_timeout: settings.request_timeout(),
+        tls_client_cert: settings.tls_client_cert.clone(),
+        tls_client_key: settings.tls_client_key.clone(),
+        auth,
+    })?)))
 }
 
 /// Reloadable runtime state derived from the configured client/policy files.

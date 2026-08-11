@@ -15,6 +15,7 @@ These settings are required.
 | `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
 | `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
 | `proxy_protocol_max_pending_connections` | usize | 1024 | Maximum connections from allowlisted peers concurrently awaiting PROXY header processing |
+| `vault` | Table | When used | Shared Vault connection, PKI trust, and authentication settings |
 | `ca` | Table | Yes | Explicit TLS interception CA source: `builtin`, `files`, or `vault` |
 | `clients` | Path | Yes | Path to clients configuration file |
 | `policies` | Path | Yes | Path to policies configuration file |
@@ -212,42 +213,52 @@ do not rewrite operator-provisioned files.
 
 #### `vault`
 
-This integration is for HashiCorp Vault's PKI secrets engine, including Vault
-Enterprise namespaces. HCP Vault Secrets is a different product and API.
+ExfilGuard has one process-wide HashiCorp Vault connection. HCP Vault Secrets
+is a different product and API.
 
-Vault mode generates a fresh intermediate key in process memory and submits
-its CSR to the configured selected Vault PKI issuer. The intermediate key and
-all generated leaf keys remain in memory. ExfilGuard authenticates only when
-it needs a signing operation, discards direct-auth tokens after that request,
-and renews the whole issuer generation before expiry. The immutable issuer and
-its empty leaf cache become active in one atomic switch.
+Configure the Vault connection, PKI trust, and authentication once:
 
 ```toml
-[ca]
-source = "vault"
+[vault]
 address = "https://vault.internal.example:8200"
 tls_ca_cert = "/etc/exfilguard/vault-tls-ca.crt"
 # namespace = "team-a"
-pki_mount = "pki"
-issuer = "exfilguard-parent"
-expected_root_certs = "/etc/exfilguard/exfilguard-roots.pem"
-intermediate_ttl = 2592000       # 30 days
-renewal_threshold = 1296000      # renew with 15 days remaining
-request_timeout = 10
+# tls_server_name = "vault.internal.example"
+# request_timeout = 10
 # tls_client_cert = "/etc/exfilguard/vault-client.crt"
 # tls_client_key = "/etc/exfilguard/vault-client.key"
 
-[ca.auth]
+[vault.pki]
+mount = "pki"
+expected_root_certs = "/etc/exfilguard/exfilguard-roots.pem"
+
+[vault.auth]
 method = "approle"
 mount = "approle"
 role_id = "00000000-0000-0000-0000-000000000000"
 secret_id_file = "/etc/exfilguard/vault-secret-id"
 ```
 
-`pki_mount` defaults to `pki`, `intermediate_ttl` to 30 days,
-`renewal_threshold` to 15 days, and `request_timeout` to 10 seconds. The
-threshold must be shorter than the requested lifetime. Set it early enough to
-cover a realistic Vault outage and operator response window.
+Then select Vault for the inspection CA:
+
+```toml
+[ca]
+source = "vault"
+issuer = "exfilguard-parent"
+# intermediate_ttl = 2592000
+# renewal_threshold = 1296000
+```
+
+ExfilGuard generates the intermediate private key and CSR in memory. Vault
+signs the CSR using the selected issuer. Before the intermediate expires,
+ExfilGuard generates a new key, obtains a new certificate, and switches the
+complete issuer generation atomically. Generated origin keys also remain in
+memory.
+
+`vault.pki.mount` defaults to `pki` and `vault.request_timeout` to 10 seconds.
+`ca.intermediate_ttl` defaults to 30 days and `ca.renewal_threshold` to 15
+days. The threshold must be shorter than the requested lifetime and should
+leave enough time to recover from a Vault outage.
 
 The renewal scheduler rechecks certificate expiry against wall-clock time at
 least hourly rather than sleeping for the complete multi-day interval. This
@@ -258,10 +269,10 @@ Set `tls_server_name` when `address` uses an IP literal but the Vault server
 certificate names a DNS host. It controls certificate verification while the
 client still connects to the configured IP.
 
-ExfilGuard calls only:
+For the inspection CA, ExfilGuard calls only:
 
 ```text
-POST /v1/<pki_mount>/issuer/<issuer>/sign-intermediate
+POST /v1/<mount>/issuer/<issuer>/sign-intermediate
 ```
 
 Vault must support selected issuers. ExfilGuard does not fall back to the
@@ -270,12 +281,13 @@ hierarchy. Give the AppRole or token `update` permission only on that exact
 path. If possible, use a selected signing issuer constrained to `pathlen:1` so
 the ExfilGuard intermediate is cryptographically limited to `pathlen:0`.
 
-`expected_root_certs` is a PEM bundle independent of the TLS CA used to reach
-Vault. ExfilGuard accepts the returned issuer only when it chains to one of
-these explicitly pinned roots and passes the same key, constraint, usage, and
-validity checks as file mode. Put old and new roots in the bundle during a
-planned root rotation, switch the Vault issuer, then remove the old root after
-the overlap period. Changing the bundle requires restarting ExfilGuard.
+`vault.pki.expected_root_certs` is a PEM bundle independent of the TLS CA used
+to reach Vault. ExfilGuard accepts the returned issuer only when it chains to
+one of these explicitly pinned roots and passes the same key, constraint,
+usage, and validity checks as file mode. Put old and new roots in the bundle
+during a planned root rotation, switch the Vault issuer, then remove the old
+root after the overlap period. Changing the bundle requires restarting
+ExfilGuard.
 
 Vault supports three authentication transports:
 
@@ -289,16 +301,16 @@ Vault supports three authentication transports:
 - `token_file` reads a token supplied and renewed by another component:
 
   ```toml
-  [ca.auth]
+  [vault.auth]
   method = "token_file"
   token_file = "/run/exfilguard/vault-token"
   ```
 
 - `proxy` sends the request without a token so a local Vault Proxy can attach
-  its auto-auth token. Point `ca.address` at its restricted listener:
+  its auto-auth token. Point `vault.address` at its restricted listener:
 
   ```toml
-  [ca.auth]
+  [vault.auth]
   method = "proxy"
   ```
 
@@ -310,16 +322,15 @@ being forwarded to another origin or back through ExfilGuard itself. Vault
 connections must use HTTPS; plaintext HTTP is accepted only for a loopback IP
 listener such as a local Vault Proxy.
 
-Vault mode has a deliberate availability dependency: after every process
-restart, Vault must be reachable because the old intermediate key was never
-persisted. If a renewal fails while the active issuer is still valid,
-ExfilGuard keeps serving with it, retries with bounded backoff, and exposes the
-failure to Prometheus. An invalid Vault response never replaces the issuer. If
-no usable issuer exists, inspected HTTPS fails closed; it never falls back to
-`builtin`, `files`, direct forwarding, or CONNECT tunneling. Renewal failures
-do not crash a process that still has a valid issuer.
+ExfilGuard generates Vault-backed private keys in memory and does not save
+them. It must therefore reach Vault after each restart to obtain certificates
+for the new keys. A failed renewal leaves the current valid certificate in
+place and triggers bounded retries. An invalid Vault response never replaces
+it. Once no valid certificate remains, the affected operation fails closed.
+Inspection never falls back to another CA, direct forwarding, or CONNECT
+tunneling.
 
-### Migrating from `ca_dir`
+### Configuration migration
 
 The old top-level `ca_dir` setting is not accepted. Replace it with one of the
 explicit configurations above. Existing installations must also remove
@@ -327,6 +338,11 @@ explicit configurations above. Existing installations must also remove
 a real root key that must be retained, move it to appropriately protected
 offline storage; ExfilGuard never reads it. Remove the older compatibility
 workaround that copied `intermediate.key` to `root.key`.
+
+Vault connection settings that were previously nested under `[ca]` now belong
+under `[vault]`, `[vault.pki]`, and `[vault.auth]`. Keep only `source`, `issuer`,
+`intermediate_ttl`, and `renewal_threshold` under `[ca]`. This separates the
+reusable Vault connection settings from the inspection CA settings.
 
 For an existing locally generated directory, the direct migration is:
 

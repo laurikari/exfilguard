@@ -47,10 +47,7 @@ pub(crate) struct VaultConfig {
     pub tls_server_name: Option<String>,
     pub namespace: Option<String>,
     pub pki_mount: String,
-    pub issuer: String,
     pub expected_root_certs: PathBuf,
-    pub intermediate_ttl: StdDuration,
-    pub renewal_threshold: StdDuration,
     pub request_timeout: StdDuration,
     pub tls_client_cert: Option<PathBuf>,
     pub tls_client_key: Option<PathBuf>,
@@ -58,16 +55,28 @@ pub(crate) struct VaultConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct VaultCaSource {
+pub(crate) struct VaultClient {
     client: Client,
     base_url: Url,
     namespace: Option<String>,
     pki_mount: String,
-    issuer: String,
     expected_roots: Arc<Vec<Vec<u8>>>,
+    auth: VaultAuthConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VaultCaConfig {
+    pub issuer: String,
+    pub intermediate_ttl: StdDuration,
+    pub renewal_threshold: StdDuration,
+}
+
+#[derive(Clone)]
+pub(crate) struct VaultCaSource {
+    vault: Arc<VaultClient>,
+    issuer: String,
     intermediate_ttl: StdDuration,
     renewal_threshold: StdDuration,
-    auth: VaultAuthConfig,
 }
 
 #[derive(Debug)]
@@ -144,7 +153,7 @@ struct VaultErrors {
     errors: Vec<String>,
 }
 
-impl VaultCaSource {
+impl VaultClient {
     pub(crate) fn new(config: VaultConfig) -> Result<Self> {
         let mut base_url = Url::parse(&config.address).context("invalid Vault address")?;
         ensure!(
@@ -195,7 +204,7 @@ impl VaultCaSource {
             if original_host != *server_name {
                 let address = original_host.parse::<IpAddr>().map_err(|_| {
                     anyhow!(
-                        "tls_server_name may differ from ca.address only when the address host is an IP literal"
+                        "tls_server_name may differ from vault.address only when the address host is an IP literal"
                     )
                 })?;
                 base_url
@@ -242,11 +251,6 @@ impl VaultCaSource {
             },
             other => other,
         };
-        let issuer = validate_api_path(&config.issuer, "Vault issuer")?;
-        ensure!(
-            !issuer.contains('/'),
-            "Vault issuer must be one path segment"
-        );
         if let Some(namespace) = &config.namespace {
             reqwest::header::HeaderValue::from_str(namespace)
                 .context("Vault namespace is not a valid HTTP header value")?;
@@ -259,11 +263,86 @@ impl VaultCaSource {
             base_url,
             namespace: config.namespace,
             pki_mount: validate_api_path(&config.pki_mount, "Vault PKI mount")?,
-            issuer,
             expected_roots: Arc::new(expected_roots),
+            auth,
+        })
+    }
+
+    async fn authenticate(&self) -> Result<Option<Zeroizing<String>>> {
+        match &self.auth {
+            VaultAuthConfig::AppRole {
+                mount,
+                role_id,
+                secret_id_file,
+            } => {
+                let secret_id = read_secret_value(secret_id_file)
+                    .map_err(|err| vault_failure("authentication", err))?;
+                let url = api_url(&self.base_url, &["auth", mount, "login"])?;
+                let body = AppRoleLoginRequest {
+                    role_id,
+                    secret_id: secret_id.as_str(),
+                };
+                let response: AppRoleLoginResponse = self
+                    .post_json(url, None, &body)
+                    .await
+                    .map_err(|err| vault_failure("authentication", err))?;
+                let client_token = Zeroizing::new(response.auth.client_token);
+                validate_secret_value(&client_token, "Vault token")
+                    .map_err(|err| vault_failure("authentication", err))?;
+                Ok(Some(client_token))
+            }
+            VaultAuthConfig::TokenFile { token_file } => Ok(Some(
+                read_secret_value(token_file)
+                    .map_err(|err| vault_failure("authentication", err))?,
+            )),
+            VaultAuthConfig::Proxy => Ok(None),
+        }
+    }
+
+    async fn post_json<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        url: Url,
+        token: Option<&str>,
+        body: &T,
+    ) -> Result<R> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("X-Vault-Request", "true")
+            .json(body);
+        if let Some(namespace) = &self.namespace {
+            request = request.header("X-Vault-Namespace", namespace);
+        }
+        if let Some(token) = token {
+            request = request.header("X-Vault-Token", token);
+        }
+        let response = request.send().await.context("Vault request failed")?;
+        let status = response.status();
+        let bytes = read_limited_response(response).await?;
+        if status != StatusCode::OK {
+            let message = serde_json::from_slice::<VaultErrors>(&bytes)
+                .ok()
+                .map(|body| body.errors.join("; "))
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            bail!("Vault returned {status}: {message}");
+        }
+        serde_json::from_slice(&bytes).context("failed to parse Vault response")
+    }
+}
+
+impl VaultCaSource {
+    pub(crate) fn new(vault: Arc<VaultClient>, config: VaultCaConfig) -> Result<Self> {
+        let issuer = validate_api_path(&config.issuer, "Vault issuer")?;
+        ensure!(
+            !issuer.contains('/'),
+            "Vault issuer must be one path segment"
+        );
+        Ok(Self {
+            vault,
+            issuer,
             intermediate_ttl: config.intermediate_ttl,
             renewal_threshold: config.renewal_threshold,
-            auth,
         })
     }
 
@@ -271,7 +350,7 @@ impl VaultCaSource {
         let (key, csr) = tokio::task::spawn_blocking(build_intermediate_csr)
             .await
             .context("intermediate CSR worker failed")??;
-        let token = self.authenticate().await?;
+        let token = self.vault.authenticate().await?;
         let url = self.sign_intermediate_url()?;
         let ttl = format!("{}s", self.intermediate_ttl.as_secs());
         let body = SignIntermediateRequest {
@@ -284,6 +363,7 @@ impl VaultCaSource {
             ttl,
         };
         let response: SignIntermediateResponse = self
+            .vault
             .post_json(url, token.as_deref().map(|value| value.as_str()), &body)
             .await
             .map_err(|err| vault_failure("signing", err))?;
@@ -335,6 +415,7 @@ impl VaultCaSource {
         }
         let pinned_root = parent_chain.last().expect("parent chain is nonempty");
         if !self
+            .vault
             .expected_roots
             .iter()
             .any(|expected| expected == pinned_root)
@@ -428,72 +509,10 @@ impl VaultCaSource {
         Ok(generation)
     }
 
-    async fn authenticate(&self) -> Result<Option<Zeroizing<String>>> {
-        match &self.auth {
-            VaultAuthConfig::AppRole {
-                mount,
-                role_id,
-                secret_id_file,
-            } => {
-                let secret_id = read_secret_value(secret_id_file)
-                    .map_err(|err| vault_failure("authentication", err))?;
-                let url = api_url(&self.base_url, &["auth", mount, "login"])?;
-                let body = AppRoleLoginRequest {
-                    role_id,
-                    secret_id: secret_id.as_str(),
-                };
-                let response: AppRoleLoginResponse = self
-                    .post_json(url, None, &body)
-                    .await
-                    .map_err(|err| vault_failure("authentication", err))?;
-                let client_token = Zeroizing::new(response.auth.client_token);
-                validate_secret_value(&client_token, "Vault token")
-                    .map_err(|err| vault_failure("authentication", err))?;
-                Ok(Some(client_token))
-            }
-            VaultAuthConfig::TokenFile { token_file } => Ok(Some(
-                read_secret_value(token_file)
-                    .map_err(|err| vault_failure("authentication", err))?,
-            )),
-            VaultAuthConfig::Proxy => Ok(None),
-        }
-    }
-
     fn sign_intermediate_url(&self) -> Result<Url> {
-        let mut segments: Vec<&str> = self.pki_mount.split('/').collect();
+        let mut segments: Vec<&str> = self.vault.pki_mount.split('/').collect();
         segments.extend(["issuer", self.issuer.as_str(), "sign-intermediate"]);
-        api_url(&self.base_url, &segments)
-    }
-
-    async fn post_json<T: Serialize + ?Sized, R: DeserializeOwned>(
-        &self,
-        url: Url,
-        token: Option<&str>,
-        body: &T,
-    ) -> Result<R> {
-        let mut request = self
-            .client
-            .post(url)
-            .header("X-Vault-Request", "true")
-            .json(body);
-        if let Some(namespace) = &self.namespace {
-            request = request.header("X-Vault-Namespace", namespace);
-        }
-        if let Some(token) = token {
-            request = request.header("X-Vault-Token", token);
-        }
-        let response = request.send().await.context("Vault request failed")?;
-        let status = response.status();
-        let bytes = read_limited_response(response).await?;
-        if status != StatusCode::OK {
-            let message = serde_json::from_slice::<VaultErrors>(&bytes)
-                .ok()
-                .map(|body| body.errors.join("; "))
-                .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| format!("HTTP {status}"));
-            bail!("Vault returned {status}: {message}");
-        }
-        serde_json::from_slice(&bytes).context("failed to parse Vault response")
+        api_url(&self.vault.base_url, &segments)
     }
 }
 
@@ -651,7 +670,7 @@ fn read_secret_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     ensure!(
         metadata.len() <= MAX_CREDENTIAL_BYTES,
-        "Vault credential {} is too large",
+        "secret file {} is too large",
         path.display()
     );
     let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
@@ -959,10 +978,7 @@ mod tests {
             tls_server_name: None,
             namespace: Some("team-a".to_string()),
             pki_mount: "team/pki".to_string(),
-            issuer: "selected-issuer".to_string(),
             expected_root_certs: roots,
-            intermediate_ttl: StdDuration::from_secs(30 * 24 * 60 * 60),
-            renewal_threshold: StdDuration::from_secs(7 * 24 * 60 * 60),
             request_timeout: StdDuration::from_secs(5),
             tls_client_cert: None,
             tls_client_key: None,
@@ -972,6 +988,27 @@ mod tests {
                 secret_id_file,
             },
         }
+    }
+
+    fn vault_ca_config() -> VaultCaConfig {
+        VaultCaConfig {
+            issuer: "selected-issuer".to_string(),
+            intermediate_ttl: StdDuration::from_secs(30 * 24 * 60 * 60),
+            renewal_threshold: StdDuration::from_secs(7 * 24 * 60 * 60),
+        }
+    }
+
+    fn vault_ca_source(
+        address: String,
+        roots: PathBuf,
+        secret_id_file: PathBuf,
+    ) -> Result<VaultCaSource> {
+        let vault = Arc::new(VaultClient::new(vault_config(
+            address,
+            roots,
+            secret_id_file,
+        ))?);
+        VaultCaSource::new(vault, vault_ca_config())
     }
 
     #[tokio::test]
@@ -1094,7 +1131,7 @@ mod tests {
             PathBuf::from("unused-roots.pem"),
             PathBuf::from("unused-secret-id"),
         );
-        let error = match VaultCaSource::new(config) {
+        let error = match VaultClient::new(config) {
             Ok(_) => panic!("remote plaintext Vault must be rejected"),
             Err(error) => error,
         };
@@ -1116,7 +1153,7 @@ mod tests {
         )
         .await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let issuer = initial_issuer(&directory);
         let old_leaf = issuer.issue(&["renew.example"]).await.unwrap();
         assert_eq!(source.renew_once(&issuer).await.unwrap(), 1);
@@ -1142,7 +1179,7 @@ mod tests {
         let (address, server) =
             spawn_fake_vault(root_pem.clone(), vec![root_pem], root_issuer, true).await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let authority = source.issue().await.unwrap();
 
         assert_eq!(authority.root_certificate_der().as_ref(), root_der);
@@ -1169,7 +1206,7 @@ mod tests {
         )
         .await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let error = match source.issue().await {
             Ok(_) => panic!("duplicate parent certificates must be rejected"),
             Err(error) => error,
@@ -1197,7 +1234,7 @@ mod tests {
         )
         .await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let issuer = initial_issuer(&directory);
         let original = issuer.current_ca();
         let original_leaf = issuer.issue(&["retain.example"]).await.unwrap();
