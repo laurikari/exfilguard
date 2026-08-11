@@ -565,6 +565,7 @@ pub(super) async fn send_error_response(
     respond: &mut SendResponse<Bytes>,
     status: StatusCode,
     message: &str,
+    proxy_authenticate: Option<&str>,
 ) -> Result<()> {
     let mut builder = http::Response::builder().status(status);
     {
@@ -579,6 +580,12 @@ pub(super) async fn send_error_response(
             http::header::CONTENT_LENGTH,
             HeaderValue::from_str(&message.len().to_string()).unwrap(),
         );
+        if let Some(value) = proxy_authenticate {
+            headers.insert(
+                http::header::PROXY_AUTHENTICATE,
+                HeaderValue::from_str(value).context("invalid proxy-authenticate value")?,
+            );
+        }
     }
     let response = builder
         .body(())

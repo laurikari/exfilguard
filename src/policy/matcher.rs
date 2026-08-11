@@ -121,7 +121,10 @@ pub struct TlsBumpPreflightResult {
     pub client: Arc<str>,
 }
 
-fn evaluate_policy(policy: &super::model::CompiledPolicy, request: &Request) -> Option<Decision> {
+pub(crate) fn evaluate_policy(
+    policy: &super::model::CompiledPolicy,
+    request: &Request,
+) -> Option<Decision> {
     if request.method == Method::CONNECT {
         return evaluate_connect_policy(policy, request);
     }
@@ -158,7 +161,7 @@ fn evaluate_connect_policy(
     None
 }
 
-fn evaluate_tls_bump_preflight_policy(
+pub(crate) fn evaluate_tls_bump_preflight_policy(
     policy: &super::model::CompiledPolicy,
     request: &Request,
 ) -> bool {
@@ -294,6 +297,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(policy_refs.into_boxed_slice()),
+            authorization_service: None,
             max_connections: 1024,
         }];
         ValidatedConfig::new(Config { clients, policies }).expect("validate config")
@@ -412,6 +416,7 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -477,6 +482,7 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -532,6 +538,7 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -569,24 +576,28 @@ mod tests {
                 name: Arc::<str>::from("exact"),
                 selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("cidr24"),
                 selector: ClientSelector::Cidr("10.0.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("cidr_other"),
                 selector: ClientSelector::Cidr("10.1.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: policy_refs.clone(),
+                authorization_service: None,
                 max_connections: 1024,
             },
         ];
@@ -626,12 +637,14 @@ mod tests {
                 name: Arc::<str>::from("ipv4-client"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: policy_refs.clone(),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: policy_refs,
+                authorization_service: None,
                 max_connections: 1024,
             },
         ];
@@ -697,6 +710,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            authorization_service: None,
             max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {
@@ -746,6 +760,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            authorization_service: None,
             max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {

@@ -1,3 +1,4 @@
+mod authorization;
 mod canonical_path;
 pub mod cli;
 pub mod config;
@@ -104,7 +105,7 @@ async fn run_with_upstream_resolver(
         None
     };
 
-    let app = proxy::AppContext::new(settings, policy_store, tls_context, cache)
+    let app = proxy::AppContext::new(settings, policy_store, tls_context, cache)?
         .with_upstream_resolver(upstream_resolver);
 
     if let Some((addr, path, tls)) = metrics {

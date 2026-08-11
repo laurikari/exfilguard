@@ -10,6 +10,10 @@ use ipnet::IpNet;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 
+pub use crate::authorization::config::{
+    AuthorizationClientCertificateSettings, AuthorizationServiceSettings, AuthorizationSettings,
+};
+
 use crate::cli::{Cli, LogFormat};
 use crate::config as runtime_config;
 use crate::util::normalize_mapped_ip;
@@ -409,6 +413,8 @@ pub struct Settings {
     pub clients_dir: Option<PathBuf>,
     #[serde(default)]
     pub policies_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub authorization: Option<AuthorizationSettings>,
     #[serde(default = "SettingsDefaults::log_format")]
     pub log: LogFormat,
     #[serde(default = "SettingsDefaults::leaf_ttl")]
@@ -506,12 +512,25 @@ impl Settings {
     /// Load and validate the client/policy configuration using the resolved
     /// paths from these settings.
     pub fn load_runtime_config(&self) -> Result<runtime_config::ValidatedConfig> {
-        runtime_config::load_config_with_dirs(
+        let config = runtime_config::load_config_with_dirs(
             &self.clients,
             self.clients_dir.as_deref(),
             &self.policies,
             self.policies_dir.as_deref(),
-        )
+        )?;
+        if let Some(authorization) = &self.authorization {
+            authorization.validate_clients(&config.clients)?;
+        } else if let Some(client) = config
+            .clients
+            .iter()
+            .find(|client| client.authorization_service.is_some())
+        {
+            bail!(
+                "client '{}' references an authorization_service, but [authorization] is not configured",
+                client.name
+            );
+        }
+        Ok(config)
     }
 
     pub fn leaf_ttl(&self) -> Duration {
@@ -711,6 +730,9 @@ impl Settings {
             .policies_dir
             .as_ref()
             .map(|path| absolutize(path, base_dir));
+        if let Some(authorization) = &mut self.authorization {
+            authorization.apply_base_dir(base_dir);
+        }
         if let Some(cert) = self.metrics_tls_cert.clone() {
             self.metrics_tls_cert = Some(absolutize(&cert, base_dir));
         }
@@ -723,6 +745,9 @@ impl Settings {
         self.ca.validate()?;
         if let Some(vault) = &self.vault {
             vault.validate()?;
+        }
+        if let Some(authorization) = &self.authorization {
+            authorization.validate()?;
         }
         let vault_required = matches!(self.ca, CaSettings::Vault(_));
         ensure!(
@@ -958,6 +983,101 @@ dir = "ca-material""#
             };
             assert_eq!(ca_dir, dir.path().join("ca-material"));
         }
+    }
+
+    #[test]
+    fn load_authorization_services_resolves_tls_paths() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"[ca]
+source = "builtin"
+dir = "ca-material"
+
+[authorization]
+max_policy_cache_duration = 15
+
+[[authorization.service]]
+name = "central"
+audience = "integration"
+policy_url = "https://authorization.example.test/policy"
+server_ca_cert = "authorization-ca.pem"
+
+[authorization.service.client_certificate]
+source = "files"
+cert = "authorization-client.pem"
+key = "authorization-client.key""#,
+        );
+
+        let settings = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap();
+        let authorization = settings.authorization.expect("authorization settings");
+        assert_eq!(authorization.max_policy_cache_duration, 15);
+        assert_eq!(authorization.services[0].name, "central");
+        assert_eq!(
+            authorization.services[0].server_ca_cert,
+            dir.path().join("authorization-ca.pem")
+        );
+        let key = match &authorization.services[0].client_certificate {
+            crate::settings::AuthorizationClientCertificateSettings::Files { key, .. } => key,
+        };
+        assert_eq!(key, &dir.path().join("authorization-client.key"));
+    }
+
+    #[test]
+    fn runtime_clients_must_reference_a_configured_authorization_service() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("clients.toml"),
+            r#"[[client]]
+name = "default"
+policies = ["allow"]
+fallback = true
+authorization_service = "missing"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("policies.toml"),
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+"#,
+        )
+        .unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"[ca]
+source = "builtin"
+dir = "ca-material"
+
+[authorization]
+
+[[authorization.service]]
+name = "central"
+audience = "integration"
+policy_url = "https://authorization.example.test/policy"
+server_ca_cert = "authorization-ca.pem"
+
+[authorization.service.client_certificate]
+source = "files"
+cert = "authorization-client.pem"
+key = "authorization-client.key""#,
+        );
+        let settings = Settings::load(&Cli {
+            config: Some(config_path),
+        })
+        .unwrap();
+
+        let error = settings.load_runtime_config().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("references unknown authorization service 'missing'")
+        );
     }
 
     #[test]
@@ -1277,6 +1397,7 @@ policies = "policies.toml"
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
+            authorization: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
             leaf_cache_capacity: 4096,
@@ -1346,6 +1467,7 @@ policies = "policies.toml"
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
+            authorization: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
             leaf_cache_capacity: 4096,
@@ -1404,6 +1526,7 @@ policies = "policies.toml"
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
+            authorization: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
             leaf_cache_capacity: 4096,
@@ -1455,6 +1578,7 @@ policies = "policies.toml"
             policies: PathBuf::from("policies.toml"),
             clients_dir: None,
             policies_dir: None,
+            authorization: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
             leaf_cache_capacity: 4096,

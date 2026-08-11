@@ -45,6 +45,8 @@ where
         header_bytes: _,
         start,
         fallback_scheme,
+        snapshot,
+        authorization_token,
     } = ctx;
     let request_body_timeout = app.settings.request_body_idle_timeout();
     let response_header_timeout = app.settings.response_header_timeout();
@@ -65,6 +67,7 @@ where
                 StatusCode::EXPECTATION_FAILED,
                 None,
                 b"expectation failed\r\n",
+                None,
                 response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
@@ -96,6 +99,7 @@ where
             StatusCode::PAYLOAD_TOO_LARGE,
             None,
             b"request body exceeds configured limit\r\n",
+            None,
             response_body_timeout,
             total_request_bytes,
             start.elapsed(),
@@ -136,6 +140,7 @@ where
                 StatusCode::BAD_REQUEST,
                 None,
                 b"invalid request target\r\n",
+                None,
                 response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
@@ -153,7 +158,7 @@ where
     if let Some(flow_context) = flow_context {
         parsed.set_flow_context(flow_context.clone());
     }
-    let snapshot = app.policies.snapshot();
+    let policy_authorization_token = authorization_token.clone();
     let log_tracker = AllowLogTracker::new(total_request_bytes, start);
     let mut handler = Http1RequestHandler {
         reader,
@@ -176,6 +181,10 @@ where
         peer,
         &parsed,
         &snapshot,
+        app.authorization
+            .as_deref()
+            .map(|authorization| (authorization, policy_authorization_token.as_ref())),
+        request_deadline.instant(),
         app.settings.log_queries,
         PolicyLogConfig::http1(),
         &mut handler,

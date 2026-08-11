@@ -208,7 +208,7 @@ request.
 This keeps policy behavior readable. Operators can put specific rules before
 general rules and know what will happen.
 
-## Client identity from source IP and CIDR
+## Client selection and delegated authorization are separate
 
 ExfilGuard identifies a client from the downstream source address. It uses
 exact IP matches, CIDR ranges, and one fallback client.
@@ -231,7 +231,26 @@ separate pending-connection limit bound resource retention if that
 infrastructure stalls or malfunctions before ExfilGuard learns the logical
 client identity.
 
-Other auth or identity methods may come later.
+An authorization token does not select the client and ExfilGuard does not treat
+it as an identity. ExfilGuard first selects the client from its source address.
+The client configuration then says whether to use an authorization service.
+Clients without one continue to use ordinary static policy on the same
+listener.
+
+A client that uses an authorization service sends its token with proxy
+authentication. ExfilGuard keeps the token with the connection. Policy cache
+entries are separated by service, token hash, source address, and audience. A
+missing, invalid, or changed token denies the request. So does an inactive or
+expired service policy. ExfilGuard never falls back to static policy alone.
+
+For inspected HTTPS, the token from `CONNECT` also applies to the decrypted
+requests. ExfilGuard checks the current service policy for each one. It denies
+raw CONNECT tunnels because it cannot see or check the requests inside them.
+
+Both the local policy and the service policy must allow every request. The
+service cannot change local settings. Clients that use delegated authorization
+bypass the shared response cache because the token is not part of its cache
+key.
 
 ## Block non-public upstreams by default
 

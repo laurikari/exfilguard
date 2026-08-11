@@ -21,6 +21,7 @@ pub struct CompiledConfig {
 pub struct ClientEntry {
     pub name: Arc<str>,
     pub policies: Arc<[usize]>,
+    pub authorization_service: Option<Arc<str>>,
     pub max_connections: usize,
 }
 

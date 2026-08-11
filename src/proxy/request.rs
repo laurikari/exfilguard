@@ -49,6 +49,7 @@ pub struct RequestFlowContext {
     pub session_id: Arc<str>,
     pub outer_method: Arc<str>,
     pub effective_mode: EffectiveMode,
+    pub(crate) authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
 #[derive(Clone, Copy, Debug)]

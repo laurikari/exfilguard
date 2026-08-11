@@ -17,6 +17,7 @@ pub use model::{
 
 use crate::util::cidrs_overlap;
 
+pub(crate) use loader::parse_url_pattern;
 pub(crate) const MAX_CACHE_TTL_SECONDS: u64 = 1 << 31;
 
 fn methods_include_connect(methods: &MethodMatch) -> bool {
@@ -150,7 +151,7 @@ fn validate_rule_constraints(
     }
 }
 
-fn validate_policy_rules(policy: &Policy) -> Result<()> {
+pub(crate) fn validate_policy_rules(policy: &Policy) -> Result<()> {
     if policy.rules.is_empty() {
         bail!("policy '{}' must contain at least one rule", policy.name);
     }
@@ -273,6 +274,16 @@ fn validate_config(config: &Config) -> Result<()> {
                     policy_name
                 );
             }
+        }
+        if client
+            .authorization_service
+            .as_ref()
+            .is_some_and(|service| service.trim().is_empty())
+        {
+            bail!(
+                "client '{}' authorization_service must not be empty",
+                client.name
+            );
         }
     }
 
@@ -445,6 +456,7 @@ mod tests {
             name: Arc::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![Arc::<str>::from(policy_name)].into_boxed_slice()),
+            authorization_service: None,
             max_connections: super::model::DEFAULT_CLIENT_MAX_CONNECTIONS,
         }
     }
@@ -523,6 +535,7 @@ mod tests {
                     name: Arc::from("mapped"),
                     selector,
                     policies: Arc::from([]),
+                    authorization_service: None,
                     max_connections: 1024,
                 },
                 fallback_client("deny"),
@@ -542,6 +555,7 @@ mod tests {
                 name: Arc::from("native-v6"),
                 selector: ClientSelector::Cidr("2001:db8::/32".parse().unwrap()),
                 policies: Arc::from([]),
+                authorization_service: None,
                 max_connections: 1024,
             },
             fallback_client("deny"),

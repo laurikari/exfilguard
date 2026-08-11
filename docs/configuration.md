@@ -21,6 +21,7 @@ These settings are required.
 | `policies` | Path | Yes | Path to policies configuration file |
 | `clients_dir` | Path | No | Directory containing additional client config files (*.toml) |
 | `policies_dir` | Path | No | Directory containing additional policy config files (*.toml) |
+| `authorization` | Table | No | Named services for delegated request policy |
 
 !!! note
     Relative paths are resolved from the directory containing the main config file.
@@ -352,6 +353,82 @@ ca = { source = "builtin", dir = "/var/lib/exfilguard/ca" }
 
 Retain `root.crt`, `intermediate.crt`, and `intermediate.key`, remove
 `root.key`, restore the documented ownership and modes, then restart.
+
+---
+
+## Delegated authorization
+
+ExfilGuard can ask an external authorization service whether a client may call an API. The client
+sends an authorization token, which ExfilGuard passes to the service unchanged. ExfilGuard
+does not interpret the token.
+
+The service returns rules for the token, and ExfilGuard caches them briefly. Both the client's local
+policy and the service's policy must allow a request.
+
+This is configured per client. A client with an `authorization_service` must send a token. Other
+clients on the same listener continue to use ordinary static policy.
+
+Define one or more named services in the main configuration:
+
+```toml
+[[authorization.service]]
+name = "central"
+audience = "deployment-prod"
+policy_url = "https://authorization.example.net/v1/policy"
+server_ca_cert = "/etc/exfilguard/exfilguard-roots.pem"
+
+[authorization.service.client_certificate]
+source = "files"
+cert = "/etc/exfilguard/authorization/client.pem"
+key = "/etc/exfilguard/authorization/client.key"
+```
+
+ExfilGuard supplies secure defaults for all timeouts and resource limits. The following settings
+are optional:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `max_token_header_size` | 1024 bytes | Largest accepted proxy authorization value |
+| `policy_cache_capacity` | 4096 | Cached policy results per service |
+| `max_policy_cache_duration` | 30 seconds | Longest ExfilGuard will reuse a service policy |
+| `negative_cache_duration` | 1 second | How briefly to remember a denied policy lookup |
+| `max_policy_response_size` | 256 KiB | Largest accepted policy response |
+| `max_policy_rules` | 1024 | Most rules accepted in one policy response |
+
+These settings belong under `[authorization]`. Each `[[authorization.service]]` also accepts an
+optional `timeout` (5 seconds by default) and `max_concurrency` (32 simultaneous calls by default).
+
+Then assign the service in the client configuration:
+
+```toml
+[[client]]
+name = "build-client"
+cidr = "192.0.2.0/24"
+policies = ["build-ceiling"]
+authorization_service = "central"
+```
+
+The first request from a client that uses delegated authorization must contain
+`Proxy-Authorization: ExfilGuard <base64url-token>`. ExfilGuard keeps that token with the
+connection. Later requests may omit it but cannot replace it. For inspected HTTPS, the outer
+`CONNECT` carries the token and all decrypted requests use it. Raw CONNECT tunnels are denied
+because ExfilGuard cannot check the requests inside them.
+
+ExfilGuard calls the configured URL directly over HTTPS with the service's client certificate. It
+trusts only `server_ca_cert`, does not follow redirects, and ignores proxy settings from the
+environment. Public CA files must be regular files, not symlinks, owned by root or the ExfilGuard
+process, and not writable by group or other users. A file-backed client key must be owned by the
+ExfilGuard process, must not be a symlink, and must have mode `0400` or `0600`. Relative paths are
+resolved from the main configuration directory.
+
+Each named service has its own policy cache and `max_concurrency` limit. Requests that use delegated
+authorization bypass the shared response cache because the token is not part of its cache key.
+
+Service definitions and limits are read at startup. `SIGHUP` reloads client assignments and local
+policies together. A client that names an unknown service causes the reload to fail, leaving the
+current configuration in place.
+
+See [Authorization Service API](authorization-service.md) for the policy operation.
 
 ---
 

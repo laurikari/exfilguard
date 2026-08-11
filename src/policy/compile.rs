@@ -54,6 +54,7 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         compiled_clients.push(ClientEntry {
             name: client.name.clone(),
             policies: Arc::from(indices.into_boxed_slice()),
+            authorization_service: client.authorization_service.clone(),
             max_connections: client.max_connections,
         });
     }
@@ -91,7 +92,7 @@ fn build_client_trie(clients: &[Client]) -> CidrTrie {
     cidr_trie
 }
 
-fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {
+pub(crate) fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {
     let mut compiled_rules = Vec::with_capacity(policy.rules.len());
     for rule in policy.rules.iter() {
         let methods = compile_methods(&rule.methods);
@@ -132,7 +133,7 @@ fn compile_methods(methods: &MethodMatch) -> MethodMask {
     }
 }
 
-fn compile_url_pattern(pattern: &UrlPattern) -> Result<UrlMatcher> {
+pub(crate) fn compile_url_pattern(pattern: &UrlPattern) -> Result<UrlMatcher> {
     let host_matcher = compile_host_pattern(pattern.host.as_ref())?;
     let path = match pattern.path.as_ref() {
         Some(path) => Some(
@@ -279,6 +280,7 @@ mod tests {
                 vec![Arc::<str>::from("allow-api"), Arc::<str>::from("deny-all")]
                     .into_boxed_slice(),
             ),
+            authorization_service: None,
             max_connections: 1024,
         }];
 
@@ -318,12 +320,14 @@ mod tests {
                 name: Arc::<str>::from("a"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("b"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             },
         ];
@@ -343,12 +347,14 @@ mod tests {
                 name: Arc::<str>::from("finance"),
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("ops"),
                 selector: ClientSelector::Cidr("10.10.1.128/25".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             },
         ];
@@ -365,12 +371,14 @@ mod tests {
                 name: Arc::<str>::from("range"),
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("pin"),
                 selector: ClientSelector::Ip("10.10.1.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
+                authorization_service: None,
                 max_connections: 1024,
             },
         ];

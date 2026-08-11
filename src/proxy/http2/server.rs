@@ -48,7 +48,7 @@ pub async fn serve_bumped_http2<S>(
     stream: TlsStream<S>,
     peer: SocketAddr,
     app: AppContext,
-    connect_binding: Option<ResolvedTarget>,
+    connect_binding: ResolvedTarget,
     primed_upstream: Option<PrimedHttp2Upstream>,
     flow_context: RequestFlowContext,
 ) -> Result<()>
@@ -85,7 +85,7 @@ where
         stream: TlsStream<S>,
         peer: SocketAddr,
         app: AppContext,
-        connect_binding: Option<ResolvedTarget>,
+        connect_binding: ResolvedTarget,
         primed_upstream: Option<PrimedHttp2Upstream>,
         flow_context: RequestFlowContext,
     ) -> Result<Self> {
@@ -260,6 +260,7 @@ async fn process_downstream_request(
             &mut respond,
             http::StatusCode::EXPECTATION_FAILED,
             "expectation failed",
+            None,
         )
         .await?;
         return Ok(());
@@ -280,6 +281,7 @@ async fn process_downstream_request(
                 &mut respond,
                 http::StatusCode::BAD_REQUEST,
                 "invalid request",
+                None,
             )
             .await?;
             return Ok(());
@@ -306,6 +308,8 @@ struct DownstreamRequestCtx {
     log_queries: bool,
     cache: Option<Arc<HttpCache>>,
     log_tracker: AllowLogTracker,
+    authorization: Option<Arc<crate::authorization::AuthorizationServices>>,
+    authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
 impl DownstreamRequestCtx {
@@ -320,6 +324,10 @@ impl DownstreamRequestCtx {
     ) -> Self {
         let log_queries = app.settings.log_queries;
         let request_base = meta.request_line_bytes + meta.header_bytes as u64;
+        let authorization_token = meta
+            .parsed
+            .flow_context()
+            .and_then(|flow| flow.authorization_token.clone());
         Self {
             peer,
             meta,
@@ -337,6 +345,8 @@ impl DownstreamRequestCtx {
             log_queries,
             cache: app.cache.clone(),
             log_tracker: AllowLogTracker::new(request_base, start),
+            authorization: app.authorization.clone(),
+            authorization_token,
         }
     }
 
@@ -345,6 +355,8 @@ impl DownstreamRequestCtx {
         let log_queries = self.log_queries;
         let snapshot = self.snapshot.clone();
         let parsed_for_policy = self.meta.parsed.clone();
+        let authorization = self.authorization.clone();
+        let authorization_token = self.authorization_token.clone();
         let mut handler = Http2RequestHandler {
             ctx: self,
             upstream,
@@ -353,6 +365,10 @@ impl DownstreamRequestCtx {
             peer,
             &parsed_for_policy,
             &snapshot,
+            authorization
+                .as_deref()
+                .map(|authorization| (authorization, authorization_token.as_ref())),
+            handler.ctx.request_deadline.instant(),
             log_queries,
             PolicyLogConfig::http1(),
             &mut handler,
@@ -367,6 +383,7 @@ impl DownstreamRequestCtx {
             &mut self.respond,
             response.spec.status,
             response.spec.body_http2,
+            None,
         )
         .await?;
         response
@@ -391,6 +408,7 @@ impl DownstreamRequestCtx {
             &mut self.respond,
             response.spec.status,
             response.spec.body_http2,
+            None,
         )
         .await?;
         response
@@ -412,7 +430,7 @@ impl DownstreamRequestCtx {
         decision: &AllowDecision,
         error_detail: &str,
     ) -> Result<()> {
-        send_error_response(&mut self.respond, spec.status, spec.body_http2).await?;
+        send_error_response(&mut self.respond, spec.status, spec.body_http2, None).await?;
         self.log_tracker.add_client_bytes(spec.extra_client_bytes);
         policy_response::forward_error_log_builder(
             log.access_log_builder(),
@@ -652,6 +670,72 @@ impl RequestHandler for Http2RequestHandler {
         outcome: policy_eval::DefaultDenyOutcome<'_>,
     ) -> Result<Self::Output> {
         self.ctx.handle_default_deny(outcome).await
+    }
+
+    async fn on_auth_deny(&mut self, log: RequestLogContext<'_>) -> Result<Self::Output> {
+        send_error_response(
+            &mut self.ctx.respond,
+            http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "proxy authentication required",
+            Some("ExfilGuard"),
+        )
+        .await?;
+        log.access_log_builder()
+            .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .decision("DENY")
+            .error_reason("proxy_authentication")
+            .bytes(
+                self.ctx.log_tracker.base_bytes(),
+                "proxy authentication required".len() as u64,
+            )
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+        Ok(())
+    }
+
+    async fn on_authorization_service_error(
+        &mut self,
+        log: RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        send_error_response(
+            &mut self.ctx.respond,
+            http::StatusCode::BAD_GATEWAY,
+            "authorization service failed",
+            None,
+        )
+        .await?;
+        log.access_log_builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .decision("ERROR")
+            .error_reason("authorization_service_failed")
+            .bytes(
+                self.ctx.log_tracker.base_bytes(),
+                "authorization service failed".len() as u64,
+            )
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+        Ok(())
+    }
+
+    async fn on_request_timeout(&mut self, log: RequestLogContext<'_>) -> Result<Self::Output> {
+        send_error_response(
+            &mut self.ctx.respond,
+            http::StatusCode::GATEWAY_TIMEOUT,
+            "request timed out",
+            None,
+        )
+        .await?;
+        log.access_log_builder()
+            .status(http::StatusCode::GATEWAY_TIMEOUT)
+            .decision("ERROR")
+            .error_reason("request_timeout")
+            .bytes(
+                self.ctx.log_tracker.base_bytes(),
+                "request timed out".len() as u64,
+            )
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+        Ok(())
     }
 }
 

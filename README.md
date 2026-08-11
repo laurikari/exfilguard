@@ -4,6 +4,11 @@ ExfilGuard is a Rust egress proxy for outbound HTTP and HTTPS. Clients use it
 as an explicit proxy. ExfilGuard checks each request against the client's
 policy, logs the decision, and then either forwards or denies it.
 
+ExfilGuard can ask an authorization service whether to allow a request. The
+client supplies an opaque authorization token, and both the local policy and
+the service must allow the request. See
+[delegated authorization](docs/configuration.md#delegated-authorization).
+
 For HTTPS, ExfilGuard can either inspect traffic by terminating TLS with its
 built-in CA or tunnel the CONNECT stream untouched. Client and policy data can
 be reloaded without restarting the process.
@@ -98,6 +103,7 @@ environment, such as a minimal container, install the standard CA bundle
 
 - `src/cli.rs` — entry point and runtime flags.
 - `src/config/` — config schema and loaders.
+- `src/authorization/` — delegated request policy.
 - `src/policy/` — policy compiler and matcher.
 - `src/proxy/` — listeners, HTTP handlers, and upstream clients.
 - `src/tls/` — CA lifecycle and the in-memory leaf cache.
@@ -267,8 +273,9 @@ new requests still use the latest client mapping and policies.
 The required `ca` table chooses one explicit source: `builtin` generates a
 long-lived local hierarchy, `files` loads an externally managed hierarchy, and
 `vault` obtains and renews an in-memory intermediate from HashiCorp Vault. The
-two file-backed sources require owner-controlled directories and private keys;
-both reject `root.key` because ExfilGuard never needs the root signing key.
+two file-backed CA sources require owner-controlled directories and private
+keys; both reject `root.key` because ExfilGuard never needs the root signing
+key.
 See `docs/configuration.md` for lifecycle, permission, Vault, and migration
 details. Anyone who can use the intermediate key or Vault signing credential
 can mint certificates, so run ExfilGuard as an unprivileged user. Generated

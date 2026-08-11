@@ -17,6 +17,7 @@ pub struct Client {
     pub name: Arc<str>,
     pub selector: ClientSelector,
     pub policies: Arc<[Arc<str>]>,
+    pub authorization_service: Option<Arc<str>>,
     pub max_connections: usize,
 }
 

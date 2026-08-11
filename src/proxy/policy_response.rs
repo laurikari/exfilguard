@@ -235,6 +235,7 @@ mod tests {
             rule: Arc::<str>::from("rule"),
             https_mode: crate::config::HttpsMode::Inspect,
             cache: None,
+            authorization: None,
         }
     }
 

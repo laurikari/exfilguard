@@ -97,6 +97,7 @@ where
         spec.status,
         None,
         spec.body_http1,
+        None,
         handler.response_body_timeout,
         handler.log_tracker.current_bytes(),
         handler.log_tracker.elapsed(),

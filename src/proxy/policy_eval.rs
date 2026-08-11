@@ -5,6 +5,7 @@ use tracing::Level;
 use uuid::Uuid;
 
 use crate::{
+    authorization::{AuthorizationToken, DelegatedAuthorization, ResolvedAuthorizationPolicy},
     logging::{AccessLogBuilder, log_with_level},
     policy::{
         Decision,
@@ -51,6 +52,7 @@ impl PolicyLogConfig {
 pub enum PolicyOutcome<'a> {
     Allow(AllowOutcome<'a>),
     Deny(DenyOutcome<'a>),
+    TlsBumpPreflight(TlsBumpPreflightOutcome<'a>),
     DefaultDeny(DefaultDenyOutcome<'a>),
 }
 
@@ -61,6 +63,11 @@ pub struct AllowOutcome<'a> {
 
 pub struct DenyOutcome<'a> {
     pub decision: DenyDecision,
+    pub log: RequestLogContext<'a>,
+}
+
+pub struct TlsBumpPreflightOutcome<'a> {
+    pub client: Arc<str>,
     pub log: RequestLogContext<'a>,
 }
 
@@ -197,6 +204,184 @@ pub fn evaluate_request<'a>(
     }
 }
 
+pub(crate) fn evaluate_delegated_request<'a>(
+    peer: SocketAddr,
+    parsed: &'a ParsedRequest,
+    snapshot: &'a PolicySnapshot,
+    authorization: (Arc<AuthorizationToken>, Arc<ResolvedAuthorizationPolicy>),
+    log_queries: bool,
+    log_config: PolicyLogConfig,
+) -> PolicyOutcome<'a> {
+    let (token, authorization_policy) = authorization;
+    let log_ctx = RequestLogContext::new(peer, parsed, log_queries);
+    let policy_request = parsed.as_policy_request();
+    let Some(_client) = snapshot.resolve_client(peer.ip()) else {
+        log_policy_default(
+            log_config.default_level,
+            log_config.default_message,
+            peer,
+            parsed,
+            log_ctx.logged_path(),
+            log_ctx.request_id(),
+        );
+        return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
+    };
+    if parsed.method == http::Method::CONNECT {
+        return evaluate_delegated_connect(
+            peer,
+            parsed,
+            snapshot,
+            token,
+            authorization_policy,
+            log_ctx,
+            log_config,
+        );
+    }
+    let Some(static_result) = snapshot.evaluate_request(peer.ip(), &policy_request) else {
+        log_policy_default(
+            log_config.default_level,
+            log_config.default_message,
+            peer,
+            parsed,
+            log_ctx.logged_path(),
+            log_ctx.request_id(),
+        );
+        return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
+    };
+    let static_client = static_result.client.clone();
+    let mut decision = match into_decision(static_result) {
+        PolicyOutcomeInternal::Allow(decision) => decision,
+        PolicyOutcomeInternal::Deny(decision) => {
+            crate::metrics::record_rule_hit(decision.rule.as_ref());
+            log_policy_deny(
+                log_config.deny_level,
+                log_config.deny_message,
+                peer,
+                parsed,
+                log_ctx.logged_path(),
+                log_ctx.request_id(),
+                &decision,
+            );
+            return PolicyOutcome::Deny(DenyOutcome {
+                decision,
+                log: log_ctx,
+            });
+        }
+    };
+    crate::metrics::record_rule_hit(decision.rule.as_ref());
+
+    let Some(dynamic_decision) = authorization_policy.dynamic.evaluate(&policy_request) else {
+        log_authorization_deny(
+            peer,
+            parsed,
+            &log_ctx,
+            static_client.as_ref(),
+            token.correlation(),
+            authorization_policy.policy_version.as_ref(),
+            None,
+        );
+        return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
+    };
+    let dynamic_rule = match dynamic_decision {
+        crate::policy::Decision::Allow { rule, .. } => rule,
+        crate::policy::Decision::Deny { rule, .. } => {
+            log_authorization_deny(
+                peer,
+                parsed,
+                &log_ctx,
+                static_client.as_ref(),
+                token.correlation(),
+                authorization_policy.policy_version.as_ref(),
+                Some(rule.as_ref()),
+            );
+            return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
+        }
+    };
+    decision.authorization = Some(DelegatedAuthorization {
+        token,
+        policy: authorization_policy,
+        rule: dynamic_rule,
+    });
+    // Delegated requests are isolated from the shared response cache because the authorization
+    // token is not part of that cache key.
+    decision.cache = None;
+    log_policy_allow(
+        log_config.allow_level,
+        log_config.allow_message,
+        peer,
+        parsed,
+        log_ctx.logged_path(),
+        log_ctx.request_id(),
+        &decision,
+    );
+    PolicyOutcome::Allow(AllowOutcome {
+        decision,
+        log: log_ctx,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_delegated_connect<'a>(
+    peer: SocketAddr,
+    parsed: &'a ParsedRequest,
+    snapshot: &'a PolicySnapshot,
+    token: Arc<AuthorizationToken>,
+    authorization_policy: Arc<ResolvedAuthorizationPolicy>,
+    log_ctx: RequestLogContext<'a>,
+    log_config: PolicyLogConfig,
+) -> PolicyOutcome<'a> {
+    let request = parsed.as_policy_request();
+    if let Some(static_result) = snapshot.evaluate_request(peer.ip(), &request) {
+        match into_decision(static_result) {
+            PolicyOutcomeInternal::Deny(decision) => {
+                crate::metrics::record_rule_hit(decision.rule.as_ref());
+                log_policy_deny(
+                    log_config.deny_level,
+                    log_config.deny_message,
+                    peer,
+                    parsed,
+                    log_ctx.logged_path(),
+                    log_ctx.request_id(),
+                    &decision,
+                );
+                return PolicyOutcome::Deny(DenyOutcome {
+                    decision,
+                    log: log_ctx,
+                });
+            }
+            PolicyOutcomeInternal::Allow(decision) => {
+                crate::metrics::record_rule_hit(decision.rule.as_ref());
+            }
+        }
+    } else {
+        log_policy_default(
+            log_config.default_level,
+            log_config.default_message,
+            peer,
+            parsed,
+            log_ctx.logged_path(),
+            log_ctx.request_id(),
+        );
+    }
+
+    tracing::debug!(
+        peer = %peer,
+        authorization_token_id = token.correlation(),
+        policy_version = %authorization_policy.policy_version,
+        "raw CONNECT tunnel disabled for delegated authorization; evaluating TLS inspection preflight"
+    );
+    if let Some(preflight) = snapshot.evaluate_tls_bump_preflight(peer.ip(), &request)
+        && authorization_policy.dynamic.allows_tls_bump(&request)
+    {
+        return PolicyOutcome::TlsBumpPreflight(TlsBumpPreflightOutcome {
+            client: preflight.client,
+            log: log_ctx,
+        });
+    }
+
+    PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx })
+}
+
 enum PolicyOutcomeInternal {
     Allow(AllowDecision),
     Deny(DenyDecision),
@@ -216,6 +401,7 @@ fn into_decision(result: EvaluationResult) -> PolicyOutcomeInternal {
             rule,
             https_mode,
             cache,
+            authorization: None,
         }),
         Decision::Deny {
             policy,
@@ -250,6 +436,18 @@ fn log_policy_allow(
     let effective_mode = flow.map(|flow| flow.effective_mode.as_str()).or_else(|| {
         (parsed.method == http::Method::CONNECT).then_some(decision.https_mode.as_str())
     });
+    let authorization_token_id = decision
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.token.correlation());
+    let authorization_policy_version = decision
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.policy.policy_version.as_ref());
+    let authorization_rule = decision
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.rule.as_ref());
     log_with_level!(
         level,
         peer = %peer,
@@ -266,7 +464,34 @@ fn log_policy_allow(
         outer_method = outer_method,
         inner_method = inner_method,
         effective_mode = effective_mode,
+        authorization_token_id = authorization_token_id,
+        authorization_policy_version = authorization_policy_version,
+        authorization_rule = authorization_rule,
         "{message}"
+    );
+}
+
+fn log_authorization_deny(
+    peer: SocketAddr,
+    parsed: &ParsedRequest,
+    log: &RequestLogContext<'_>,
+    client: &str,
+    authorization_token_id: &str,
+    policy_version: &str,
+    authorization_rule: Option<&str>,
+) {
+    tracing::info!(
+        peer = %peer,
+        client,
+        authorization_token_id,
+        authorization_policy_version = policy_version,
+        authorization_rule,
+        method = %parsed.method,
+        scheme = scheme_name(parsed.scheme),
+        host = %parsed.host,
+        path = log.logged_path(),
+        request_id = log.request_id(),
+        "authorization service deny decision"
     );
 }
 
@@ -342,6 +567,7 @@ pub struct AllowDecision {
     pub rule: Arc<str>,
     pub https_mode: crate::config::HttpsMode,
     pub cache: Option<CompiledCacheConfig>,
+    pub(crate) authorization: Option<DelegatedAuthorization>,
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +618,7 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            authorization_service: None,
             max_connections: 1024,
         }];
         let config = Config {
@@ -401,6 +628,37 @@ mod tests {
         let validated = ValidatedConfig::new(config).expect("validate config");
         let compiled = Arc::new(compile_config(&validated).expect("compile config"));
         PolicySnapshot::new(compiled)
+    }
+
+    fn build_tunnel_snapshot() -> PolicySnapshot {
+        let policy = Policy {
+            name: Arc::from("tunnel"),
+            rules: Arc::from(
+                vec![Rule {
+                    id: Arc::from("tunnel#0"),
+                    action: RuleAction::Allow,
+                    methods: MethodMatch::List(vec![Method::CONNECT]),
+                    url_pattern: Some(
+                        crate::config::parse_url_pattern("https://example.com:443/**").unwrap(),
+                    ),
+                    https_mode: HttpsMode::Tunnel,
+                    cache: None,
+                }]
+                .into_boxed_slice(),
+            ),
+        };
+        let config = Config {
+            clients: vec![Client {
+                name: Arc::from("default"),
+                selector: ClientSelector::Fallback,
+                policies: Arc::from([policy.name.clone()]),
+                authorization_service: None,
+                max_connections: 1024,
+            }],
+            policies: vec![policy],
+        };
+        let validated = ValidatedConfig::new(config).unwrap();
+        PolicySnapshot::new(Arc::new(compile_config(&validated).unwrap()))
     }
 
     #[test]
@@ -443,5 +701,143 @@ mod tests {
             PolicyOutcome::Allow(_) => {}
             _ => panic!("expected allow decision"),
         }
+    }
+
+    #[test]
+    fn authorization_policy_and_static_policy_must_both_allow() {
+        let snapshot = build_snapshot();
+        let token =
+            crate::authorization::AuthorizationToken::parse(b"ExfilGuard test-token", 128).unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let dynamic_post =
+            crate::authorization::ResolvedAuthorizationPolicy::from_test_rules(vec![
+                crate::authorization::policy::make_dynamic_rule(
+                    0,
+                    RuleAction::Allow,
+                    MethodMatch::List(vec![Method::POST]),
+                    Some(crate::config::parse_url_pattern("https://example.com/api/**").unwrap()),
+                ),
+            ]);
+        let static_denies = ParsedRequest {
+            method: Method::POST,
+            scheme: Scheme::Https,
+            authority: "example.com".to_string(),
+            host: "example.com".to_string(),
+            port: None,
+            path: "/api/items".to_string(),
+            policy_path: "/api/items".to_string(),
+            flow: None,
+        };
+        assert!(matches!(
+            evaluate_delegated_request(
+                peer,
+                &static_denies,
+                &snapshot,
+                (token.clone(), dynamic_post),
+                false,
+                PolicyLogConfig::http1(),
+            ),
+            PolicyOutcome::DefaultDeny(_)
+        ));
+
+        let dynamic_other_path =
+            crate::authorization::ResolvedAuthorizationPolicy::from_test_rules(vec![
+                crate::authorization::policy::make_dynamic_rule(
+                    0,
+                    RuleAction::Allow,
+                    MethodMatch::List(vec![Method::GET]),
+                    Some(crate::config::parse_url_pattern("https://example.com/other/**").unwrap()),
+                ),
+            ]);
+        let static_allows = ParsedRequest {
+            method: Method::GET,
+            ..static_denies
+        };
+        assert!(matches!(
+            evaluate_delegated_request(
+                peer,
+                &static_allows,
+                &snapshot,
+                (token, dynamic_other_path),
+                false,
+                PolicyLogConfig::http1(),
+            ),
+            PolicyOutcome::DefaultDeny(_)
+        ));
+    }
+
+    #[test]
+    fn delegated_authorization_never_directly_allows_raw_connect() {
+        let snapshot = build_tunnel_snapshot();
+        let token =
+            crate::authorization::AuthorizationToken::parse(b"ExfilGuard test-token", 128).unwrap();
+        let dynamic = crate::authorization::ResolvedAuthorizationPolicy::from_test_rules(vec![
+            crate::authorization::policy::make_dynamic_rule(
+                0,
+                RuleAction::Allow,
+                MethodMatch::Any,
+                Some(crate::config::parse_url_pattern("https://example.com:443/**").unwrap()),
+            ),
+        ]);
+        let parsed = ParsedRequest {
+            method: Method::CONNECT,
+            scheme: Scheme::Https,
+            authority: "example.com:443".to_string(),
+            host: "example.com".to_string(),
+            port: Some(443),
+            path: "example.com:443".to_string(),
+            policy_path: "example.com:443".to_string(),
+            flow: None,
+        };
+        assert!(matches!(
+            evaluate_delegated_request(
+                "127.0.0.1:12345".parse().unwrap(),
+                &parsed,
+                &snapshot,
+                (token, dynamic),
+                false,
+                PolicyLogConfig::connect_tunnel(),
+            ),
+            PolicyOutcome::DefaultDeny(_)
+        ));
+    }
+
+    #[test]
+    fn delegated_connect_carries_one_resolved_policy_into_tls_preflight() {
+        let snapshot = build_snapshot();
+        let token =
+            crate::authorization::AuthorizationToken::parse(b"ExfilGuard test-token", 128).unwrap();
+        let dynamic = crate::authorization::ResolvedAuthorizationPolicy::from_test_rules(vec![
+            crate::authorization::policy::make_dynamic_rule(
+                0,
+                RuleAction::Allow,
+                MethodMatch::List(vec![Method::GET]),
+                Some(crate::config::parse_url_pattern("https://example.com/api/**").unwrap()),
+            ),
+        ]);
+        let parsed = ParsedRequest {
+            method: Method::CONNECT,
+            scheme: Scheme::Https,
+            authority: "example.com:443".to_string(),
+            host: "example.com".to_string(),
+            port: Some(443),
+            path: "example.com:443".to_string(),
+            policy_path: "example.com:443".to_string(),
+            flow: None,
+        };
+
+        assert!(matches!(
+            evaluate_delegated_request(
+                "127.0.0.1:12345".parse().unwrap(),
+                &parsed,
+                &snapshot,
+                (token, dynamic),
+                Arc::from("test"),
+                false,
+                PolicyLogConfig::connect_tunnel(),
+            ),
+            PolicyOutcome::TlsBumpPreflight(_)
+        ));
     }
 }

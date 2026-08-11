@@ -14,6 +14,7 @@ pub async fn respond_with_access_log<S>(
     status: StatusCode,
     reason: Option<&str>,
     body: &[u8],
+    proxy_authenticate: Option<&str>,
     timeout_dur: Duration,
     bytes_in: u64,
     elapsed: Duration,
@@ -22,7 +23,15 @@ pub async fn respond_with_access_log<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let bytes_out = send_response(stream, status, reason, body, timeout_dur).await?;
+    let bytes_out = send_response(
+        stream,
+        status,
+        reason,
+        body,
+        proxy_authenticate,
+        timeout_dur,
+    )
+    .await?;
     shutdown_stream(stream, timeout_dur).await?;
     log_builder
         .status(status)
@@ -32,11 +41,12 @@ where
     Ok(())
 }
 
-pub async fn send_response<S>(
+async fn send_response<S>(
     stream: &mut S,
     status: StatusCode,
     reason: Option<&str>,
     body: &[u8],
+    proxy_authenticate: Option<&str>,
     timeout_dur: Duration,
 ) -> Result<usize>
 where
@@ -45,10 +55,14 @@ where
     let reason_text = reason
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| status.canonical_reason().unwrap_or("Unknown"));
+    let proxy_authenticate = proxy_authenticate
+        .map(|value| format!("Proxy-Authenticate: {value}\r\n"))
+        .unwrap_or_default();
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
+        "HTTP/1.1 {} {}\r\n{}Content-Length: {}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
         status.as_u16(),
         reason_text,
+        proxy_authenticate,
         body.len()
     );
     write_all_with_timeout(
@@ -76,4 +90,38 @@ where
         "shutting down client stream",
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, duplex};
+
+    async fn response(proxy_authenticate: Option<&str>) -> String {
+        let (mut client, mut server) = duplex(4096);
+        send_response(
+            &mut server,
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            None,
+            b"denied",
+            proxy_authenticate,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        drop(server);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxy_authentication_challenge_is_explicit() {
+        assert!(!response(None).await.contains("Proxy-Authenticate"));
+        assert!(
+            response(Some("ExfilGuard"))
+                .await
+                .contains("Proxy-Authenticate: ExfilGuard\r\n")
+        );
+    }
 }

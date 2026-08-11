@@ -36,6 +36,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         clients_dir: None,
         policies: dirs.policies_path.clone(),
         policies_dir: None,
+        authorization: None,
         log: LogFormat::Text,
         leaf_ttl: 3_600,
         leaf_cache_capacity: 512,
@@ -201,11 +202,11 @@ impl ProxyHarnessBuilder {
             proxy_client_config,
             proxy_client_h2_config,
         ));
+        let app = AppContext::new(settings.clone(), policy_store, tls, cache.clone())?;
         let app = if self.allow_private_test_upstreams {
-            AppContext::new(settings.clone(), policy_store, tls, cache.clone())
-                .with_permissive_test_upstream_resolver()
+            app.with_permissive_test_upstream_resolver()
         } else {
-            AppContext::new(settings.clone(), policy_store, tls, cache.clone())
+            app
         };
 
         let handle = tokio::spawn(async move {

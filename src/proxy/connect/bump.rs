@@ -89,7 +89,7 @@ pub async fn handle_bump(
                 tls_stream,
                 peer,
                 app.clone(),
-                Some(resolved.clone()),
+                resolved.clone(),
                 primed,
                 flow_context.clone(),
             )

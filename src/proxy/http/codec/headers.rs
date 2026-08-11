@@ -3,6 +3,7 @@ use http::{
     HeaderMap,
     header::{HeaderName, HeaderValue},
 };
+use zeroize::Zeroizing;
 
 use crate::proxy::headers::{HeaderAction, RequestHeaderSanitizer};
 
@@ -90,6 +91,7 @@ pub(crate) fn parse_header_line(line: &str) -> Result<Option<(&str, &str)>> {
 pub(crate) struct Http1HeaderAccumulator {
     sanitizer: RequestHeaderSanitizer,
     headers: Vec<Http1HeaderLine>,
+    proxy_authorizations: Vec<Zeroizing<Vec<u8>>>,
 }
 
 impl Http1HeaderAccumulator {
@@ -97,6 +99,7 @@ impl Http1HeaderAccumulator {
         Self {
             sanitizer: RequestHeaderSanitizer::new(max_bytes),
             headers: Vec::new(),
+            proxy_authorizations: Vec::new(),
         }
     }
 
@@ -106,7 +109,12 @@ impl Http1HeaderAccumulator {
             self.sanitizer.reserve(line_len)?;
             return Ok(false);
         };
-        match self.sanitizer.record(name, value, line_len)? {
+        let action = self.sanitizer.record(name, value, line_len)?;
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            self.proxy_authorizations
+                .push(Zeroizing::new(value.as_bytes().to_vec()));
+        }
+        match action {
             HeaderAction::Forward => {
                 self.headers.push(Http1HeaderLine::new(name, value)?);
             }
@@ -141,6 +149,10 @@ impl Http1HeaderAccumulator {
         self.headers
             .iter()
             .any(|header| header.lower_name() == lower_name)
+    }
+
+    pub(crate) fn proxy_authorizations(&self) -> &[Zeroizing<Vec<u8>>] {
+        &self.proxy_authorizations
     }
 
     pub fn has_sensitive_cache_headers(&self) -> bool {
@@ -226,6 +238,24 @@ mod tests {
         assert!(matches!(accumulator.push_line("\r\n"), Ok(false)));
         assert!(accumulator.expect_continue()?);
         Ok(())
+    }
+
+    #[test]
+    fn proxy_authorization_is_captured_but_never_forwarded() {
+        let mut accumulator = Http1HeaderAccumulator::new(256);
+        accumulator
+            .push_line("Proxy-Authorization: ExfilGuard opaque-token\r\n")
+            .unwrap();
+        accumulator.push_line("\r\n").unwrap();
+        assert_eq!(
+            accumulator.proxy_authorizations()[0].as_slice(),
+            b"ExfilGuard opaque-token"
+        );
+        assert!(
+            accumulator
+                .forward_headers()
+                .all(|header| header.lower_name() != "proxy-authorization")
+        );
     }
 
     #[test]

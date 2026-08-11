@@ -663,7 +663,7 @@ fn validate_secret_value(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_secret_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_secret_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let mut file = open_checked_file(path, true)?;
     let metadata = file
         .metadata()
@@ -687,7 +687,7 @@ fn read_public_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn read_public_certificate_bundle(path: &Path) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn read_public_certificate_bundle(path: &Path) -> Result<Vec<Vec<u8>>> {
     let bytes = read_public_file(path)?;
     super::validation::parse_strict_certificate_pem_bundle(
         &bytes,

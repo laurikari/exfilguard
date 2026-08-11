@@ -33,7 +33,7 @@ pub struct PrimedHttp2Upstream {
 
 pub(super) struct Http2Upstream {
     app: AppContext,
-    binding: Option<ResolvedTarget>,
+    binding: ResolvedTarget,
     handle: Option<UpstreamHandle>,
     primed: Option<PrimedHttp2Upstream>,
     closed_tx: watch::Sender<bool>,
@@ -43,9 +43,6 @@ pub(super) struct Http2Upstream {
 pub(super) struct UpstreamHandle {
     pub sender: Arc<Mutex<client::SendRequest<Bytes>>>,
     pub peer: SocketAddr,
-    pub host: String,
-    pub port: u16,
-    pub scheme: Scheme,
     pub reused: bool,
     _metrics: crate::metrics::UpstreamConnectionTracker,
     connection_task: JoinHandle<()>,
@@ -60,7 +57,7 @@ pub(super) struct UpstreamCheckout {
 impl Http2Upstream {
     pub(super) fn new(
         app: AppContext,
-        binding: Option<ResolvedTarget>,
+        binding: ResolvedTarget,
         primed: Option<PrimedHttp2Upstream>,
     ) -> Self {
         let (closed_tx, closed_rx) = watch::channel(false);
@@ -83,13 +80,10 @@ impl Http2Upstream {
         request: &ParsedRequest,
     ) -> Result<UpstreamCheckout> {
         self.reap_finished_handle().await;
+        self.validate_request_target(request)?;
 
         if *self.closed_rx.borrow() {
             return Err(UpstreamClosed.into());
-        }
-
-        if let Some(handle) = self.handle.as_ref() {
-            ensure_request_matches(handle, request)?;
         }
 
         if self.handle.is_none() {
@@ -104,6 +98,23 @@ impl Http2Upstream {
             peer: handle.peer,
             reused_existing,
         })
+    }
+
+    pub(super) fn validate_request_target(&self, request: &ParsedRequest) -> Result<()> {
+        let port = request.port.unwrap_or(request.scheme.default_port());
+        if request.scheme != Scheme::Https
+            || request.host != self.binding.host()
+            || port != self.binding.port()
+        {
+            return Err(MisdirectedRequest::new(
+                self.binding.host().to_string(),
+                self.binding.port(),
+                request.host.clone(),
+                port,
+            )
+            .into());
+        }
+        Ok(())
     }
 
     async fn establish_connection(&mut self, request: &ParsedRequest) -> Result<UpstreamHandle> {
@@ -128,9 +139,6 @@ impl Http2Upstream {
             return make_handle_from_stream(
                 primed.stream,
                 primed.peer,
-                primed.host,
-                primed.port,
-                request.scheme,
                 self.app
                     .settings
                     .max_response_header_size
@@ -144,7 +152,7 @@ impl Http2Upstream {
         let addresses = upstream::resolve_or_use_binding(
             &request.host,
             port,
-            self.binding.as_ref(),
+            Some(&self.binding),
             self.app.upstream_resolver(),
             self.app.settings.dns_resolve_timeout(),
         )
@@ -176,9 +184,6 @@ impl Http2Upstream {
         make_handle_from_stream(
             tls_stream,
             peer,
-            request.host.clone(),
-            port,
-            request.scheme,
             self.app
                 .settings
                 .max_response_header_size
@@ -220,9 +225,6 @@ impl Http2Upstream {
 async fn make_handle_from_stream(
     tls_stream: ClientTlsStream<TcpStream>,
     peer: SocketAddr,
-    host: String,
-    port: u16,
-    scheme: Scheme,
     max_response_header_size: u32,
     closed_tx: watch::Sender<bool>,
 ) -> Result<UpstreamHandle> {
@@ -247,24 +249,7 @@ async fn make_handle_from_stream(
         sender: Arc::new(Mutex::new(sender)),
         connection_task: task,
         peer,
-        host,
-        port,
-        scheme,
         reused: false,
         _metrics: metrics,
     })
-}
-
-fn ensure_request_matches(handle: &UpstreamHandle, request: &ParsedRequest) -> Result<()> {
-    let port = request.port.unwrap_or(request.scheme.default_port());
-    if handle.scheme != request.scheme || handle.host != request.host || handle.port != port {
-        return Err(MisdirectedRequest::new(
-            handle.host.clone(),
-            handle.port,
-            request.host.clone(),
-            port,
-        )
-        .into());
-    }
-    Ok(())
 }

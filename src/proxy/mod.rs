@@ -22,6 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 pub(crate) use self::resolver::{
     UpstreamResolver, default_upstream_resolver, permissive_test_upstream_resolver,
 };
+use crate::authorization::AuthorizationServices;
 use crate::{policy::matcher::PolicySnapshot, settings::Settings, tls::issuer::TlsIssuer};
 use rustls::client::ClientConfig;
 
@@ -46,6 +47,7 @@ pub struct AppContext {
     pub policies: PolicyStore,
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
+    pub(crate) authorization: Option<Arc<AuthorizationServices>>,
     client_connections: Arc<admission::ClientConnectionLimiter>,
     proxy_protocol_pending_connections: Arc<Semaphore>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
@@ -57,19 +59,25 @@ impl AppContext {
         policies: PolicyStore,
         tls: Arc<TlsContext>,
         cache: Option<Arc<cache::HttpCache>>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let authorization = if let Some(authorization) = &settings.authorization {
+            Some(Arc::new(AuthorizationServices::new(authorization)?))
+        } else {
+            None
+        };
         let proxy_protocol_pending_connections = Arc::new(Semaphore::new(
             settings.proxy_protocol_max_pending_connections,
         ));
-        Self {
+        Ok(Self {
             settings,
             policies,
             tls,
             cache,
+            authorization,
             client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
             proxy_protocol_pending_connections,
             upstream_resolver: default_upstream_resolver(),
-        }
+        })
     }
 
     pub(crate) fn with_upstream_resolver(

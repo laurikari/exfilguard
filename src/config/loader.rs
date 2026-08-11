@@ -52,6 +52,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             ip,
             cidr,
             policies: policy_names,
+            authorization_service,
             fallback,
             max_connections,
         } = client;
@@ -68,6 +69,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             name: arc_name,
             selector,
             policies: Arc::from(policy_refs.into_boxed_slice()),
+            authorization_service: authorization_service.map(Arc::from),
             max_connections,
         });
     }
@@ -280,7 +282,7 @@ fn parse_methods(rule: &RawRule) -> Result<MethodMatch> {
     }
 }
 
-fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
+pub(crate) fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
     let (scheme_part, rest) = raw
         .split_once("://")
         .ok_or_else(|| anyhow!("pattern must include scheme"))?;
@@ -371,6 +373,8 @@ struct RawClient {
     cidr: Option<String>,
     #[serde(default)]
     policies: Vec<String>,
+    #[serde(default)]
+    authorization_service: Option<String>,
     #[serde(default)]
     fallback: bool,
     #[serde(default = "default_client_max_connections")]
@@ -978,6 +982,29 @@ name = "allow"
             err.to_string()
                 .contains("CONNECT method must not be combined with other methods")
         );
+    }
+
+    #[test]
+    fn loads_client_authorization_service() {
+        let clients = write_temp(
+            r#"[[client]]
+name = "default"
+policies = ["allow"]
+fallback = true
+authorization_service = "central"
+"#,
+        );
+        let policies = write_temp(
+            r#"[[policy]]
+name = "allow"
+  [[policy.rule]]
+  action = "ALLOW"
+"#,
+        );
+
+        let config = load_config(clients.path(), policies.path()).expect("config should load");
+        let client = &config.clients[0];
+        assert_eq!(client.authorization_service.as_deref(), Some("central"));
     }
 
     #[test]

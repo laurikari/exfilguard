@@ -46,6 +46,7 @@ pub struct ConnectSession {
     bytes_in: u64,
     start: Instant,
     response_timeout: Duration,
+    authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
 impl ConnectSession {
@@ -56,6 +57,7 @@ impl ConnectSession {
         bytes_in: u64,
         start: Instant,
         response_timeout: Duration,
+        authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
     ) -> Self {
         let literal_ip = parsed.host.parse::<IpAddr>().ok();
         Self {
@@ -67,6 +69,7 @@ impl ConnectSession {
             bytes_in,
             start,
             response_timeout,
+            authorization_token,
         }
     }
 
@@ -78,11 +81,20 @@ impl ConnectSession {
         &self.target
     }
 
+    pub fn request_bytes(&self) -> u64 {
+        self.bytes_in
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
     pub fn bump_flow_context(&self) -> RequestFlowContext {
         RequestFlowContext {
             session_id: self.session_id.clone(),
             outer_method: Arc::<str>::from("CONNECT"),
             effective_mode: EffectiveMode::Bump,
+            authorization_token: self.authorization_token.clone(),
         }
     }
 
@@ -405,6 +417,7 @@ impl ConnectSession {
             spec.status,
             None,
             spec.body_http1,
+            None,
             self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),
@@ -520,6 +533,7 @@ impl ConnectSession {
             status,
             reason,
             body,
+            None,
             self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),
