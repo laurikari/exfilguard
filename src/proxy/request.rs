@@ -214,13 +214,28 @@ pub fn parse_host_header(value: &str) -> Result<(String, Option<u16>)> {
     let uri: Uri = format!("http://{trimmed}")
         .parse()
         .with_context(|| format!("invalid Host header '{trimmed}'"))?;
+    // Uri accepts textual ports that port_u16() reports as absent. Validate
+    // the explicit spelling before callers can substitute a default port.
+    let port = if trimmed.ends_with(']') {
+        None
+    } else {
+        trimmed
+            .rsplit_once(':')
+            .map(|(_, port)| {
+                if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                    bail!("authority port must contain only decimal digits");
+                }
+                port.parse::<u16>().context("authority port out of range")
+            })
+            .transpose()?
+    };
     let host = uri
         .host()
         .ok_or_else(|| anyhow!("Host header missing hostname"))?
         .trim_start_matches('[')
         .trim_end_matches(']');
     let host = canonicalize_policy_host(host)?;
-    Ok((host, uri.port_u16()))
+    Ok((host, port))
 }
 
 fn canonicalize_policy_host(host: &str) -> Result<String> {
@@ -333,6 +348,39 @@ fn build_parsed_request(
 mod tests {
     use super::*;
     use http::Method;
+
+    #[test]
+    fn reject_invalid_explicit_ports() {
+        for host in ["example.com", "[::1]"] {
+            for port in ["", "wat", "65536", "+80", "-1", "99999999999999999999"] {
+                let authority = format!("{host}:{port}");
+                assert!(parse_host_header(&authority).is_err(), "{authority}");
+                assert!(
+                    parse_http1_request(Method::GET, "/", Some(&authority), Scheme::Https).is_err()
+                );
+                let target = format!("http://{authority}/");
+                assert!(parse_http1_request(Method::GET, &target, None, Scheme::Http).is_err());
+                if let Ok(uri) = target.parse() {
+                    assert!(parse_uri_request(Method::GET, &uri, Scheme::Http).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_valid_authority_ports() -> Result<()> {
+        for host in ["example.com", "[::1]"] {
+            assert_eq!(parse_host_header(host)?.1, None);
+            for (port, expected) in [("0", 0), ("00080", 80), ("443", 443), ("65535", 65535)] {
+                let authority = format!("{host}:{port}");
+                let parsed =
+                    parse_http1_request(Method::GET, "/", Some(&authority), Scheme::Https)?;
+                assert_eq!(parsed.port, Some(expected));
+                assert_eq!(parsed.authority_host(), authority);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn request_target_logging_redacts_queries_lexically() {

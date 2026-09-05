@@ -322,6 +322,9 @@ body target from its signed-extension and malformed-framing seeds with:
 cargo fuzz run http1_chunked_body fuzz/seeds/http1_chunked_body
 ```
 
+The `connect_target` seeds cover signed, empty, textual, and overflowing ports.
+Their decoded first byte selects the split between the two candidate authorities.
+
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,
 conflicting transfer encoding, and a forged response appended after a 204:

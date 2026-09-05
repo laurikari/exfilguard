@@ -29,6 +29,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_explicit_ports() {
+        for target in [
+            "example.com:",
+            "example.com:+80",
+            "example.com:wat",
+            "[::1]:65536",
+        ] {
+            assert!(parse_connect_target(target).is_err(), "{target}");
+        }
+    }
+
+    #[test]
     fn parses_direct_target() {
         let parsed = parse_connect_target("example.com:8443").expect("parse target");
         assert_eq!(parsed.host, "example.com");

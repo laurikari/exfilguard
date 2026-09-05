@@ -4,7 +4,11 @@ use libfuzzer_sys::fuzz_target;
 
 use exfilguard::proxy::connect::fuzzing::parse_connect_target;
 
+mod corpus;
+use corpus::decode_tracked_seed;
+
 fuzz_target!(|data: &[u8]| {
+    let data = decode_tracked_seed(data);
     if data.is_empty() {
         return;
     }

@@ -2205,6 +2205,28 @@ async fn connect_bump_allows_large_streamed_upload_with_default_unlimited_body_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_rejects_invalid_host_ports() -> Result<()> {
+    for port in ["wat", "65536", "+443", ""] {
+        let policy =
+            PolicySpec::new("invalid-port").rule(RuleSpec::allow_any("https://localhost/**"));
+        let mut fixture =
+            BumpedTlsFixture::new(BumpedTlsOptions::new("localhost", "invalid-port", policy))
+                .await?;
+        let mut client = fixture.http1_client();
+        client
+            .send(format!(
+                "GET / HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+            ))
+            .await?;
+        let response = client.read_response().await?;
+        assert!(response.starts_with("HTTP/1.1 400"), "{port}: {response}");
+        assert_eq!(fixture.request_count(), 0);
+        fixture.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-bump";
