@@ -344,11 +344,26 @@ impl AuthorizationServices {
         self.services.get(name).cloned()
     }
 
-    pub(crate) fn parse_token(
+    pub(crate) fn bind_token<'a>(
         &self,
-        proxy_authorization: &[u8],
+        mut values: impl Iterator<Item = &'a [u8]>,
+        bound: Option<&Arc<AuthorizationToken>>,
     ) -> Result<Arc<AuthorizationToken>, AuthorizationError> {
-        AuthorizationToken::parse(proxy_authorization, self.max_token_header_size)
+        let presented = values.next();
+        if values.next().is_some() {
+            return Err(AuthorizationError::Denied);
+        }
+        let presented = presented
+            .map(|value| AuthorizationToken::parse(value, self.max_token_header_size))
+            .transpose()?;
+        match (bound, presented) {
+            (Some(existing), Some(presented)) if existing.hash() == presented.hash() => {
+                Ok(existing.clone())
+            }
+            (Some(existing), None) => Ok(existing.clone()),
+            (None, Some(presented)) => Ok(presented),
+            _ => Err(AuthorizationError::Denied),
+        }
     }
 
     pub(crate) async fn prepare_headers(
@@ -1197,6 +1212,39 @@ mod tests {
             wait_for_resolution(&mut resolution, None).await,
             Err(AuthorizationError::Denied)
         ));
+    }
+
+    #[test]
+    fn token_binding_validates_headers_and_preserves_the_connection_token() {
+        let services = AuthorizationServices {
+            services: HashMap::new(),
+            max_token_header_size: 128,
+            buffered_body_permits: Arc::new(Semaphore::new(1)),
+            max_buffered_body_size: 1,
+        };
+        let first = b"ExfilGuard first-token".as_slice();
+        let token = services.bind_token([first].into_iter(), None).unwrap();
+        for values in [vec![], vec![first]] {
+            assert_eq!(
+                services
+                    .bind_token(values.into_iter(), Some(&token))
+                    .unwrap()
+                    .hash(),
+                token.hash()
+            );
+        }
+        for values in [
+            vec![b"ExfilGuard second-token".as_slice()],
+            vec![b"malformed".as_slice()],
+            vec![first, first],
+        ] {
+            assert!(
+                services
+                    .bind_token(values.into_iter(), Some(&token))
+                    .is_err()
+            );
+        }
+        assert!(services.bind_token(std::iter::empty(), None).is_err());
     }
 
     #[test]

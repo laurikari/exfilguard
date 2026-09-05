@@ -216,52 +216,15 @@ fn bind_authorization_token(
         return Ok(None);
     }
     let authorization = app.authorization.as_ref().ok_or(())?;
-    let values = headers.proxy_authorizations();
-    if values.len() > 1 {
-        return Err(());
-    }
-    let presented = values
-        .first()
-        .map(|value| authorization.parse_token(value.as_slice()))
-        .transpose()
+    let token = authorization
+        .bind_token(
+            headers
+                .proxy_authorizations()
+                .iter()
+                .map(|value| value.as_slice()),
+            bound.as_ref(),
+        )
         .map_err(|_| ())?;
-    update_bound_authorization_token(bound, presented)
-}
-
-fn update_bound_authorization_token(
-    bound: &mut Option<std::sync::Arc<AuthorizationToken>>,
-    presented: Option<std::sync::Arc<AuthorizationToken>>,
-) -> Result<Option<std::sync::Arc<AuthorizationToken>>, ()> {
-    match (bound.as_ref(), presented) {
-        (Some(existing), Some(presented)) if existing.hash() == presented.hash() => {
-            Ok(Some(existing.clone()))
-        }
-        (Some(existing), None) => Ok(Some(existing.clone())),
-        (Some(_), Some(_)) => Err(()),
-        (None, Some(presented)) => {
-            *bound = Some(presented.clone());
-            Ok(Some(presented))
-        }
-        (None, None) => Err(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::update_bound_authorization_token;
-    use crate::authorization::AuthorizationToken;
-
-    #[test]
-    fn downstream_connection_binds_one_authorization_token_and_rejects_switching() {
-        let first = AuthorizationToken::parse(b"ExfilGuard first-token", 128).unwrap();
-        let same = AuthorizationToken::parse(b"ExfilGuard first-token", 128).unwrap();
-        let second = AuthorizationToken::parse(b"ExfilGuard second-token", 128).unwrap();
-        let mut bound = None;
-
-        update_bound_authorization_token(&mut bound, Some(first.clone())).unwrap();
-        update_bound_authorization_token(&mut bound, None).unwrap();
-        update_bound_authorization_token(&mut bound, Some(same)).unwrap();
-        assert!(update_bound_authorization_token(&mut bound, Some(second)).is_err());
-        assert_eq!(bound.unwrap().hash(), first.hash());
-    }
+    *bound = Some(token.clone());
+    Ok(Some(token))
 }

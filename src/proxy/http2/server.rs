@@ -271,6 +271,25 @@ async fn process_downstream_request(
     }
 
     let snapshot = app.policies.snapshot();
+    // Inner requests inherit the CONNECT token, but must not replace it or
+    // hide malformed/duplicate authentication headers during sanitization.
+    let authorization_token = app.authorization.as_ref().and_then(|authorization| {
+        let bound = flow_context.authorization_token.as_ref()?;
+        authorization
+            .bind_token(
+                request
+                    .headers()
+                    .get_all(http::header::PROXY_AUTHORIZATION)
+                    .iter()
+                    .map(http::HeaderValue::as_bytes),
+                Some(bound),
+            )
+            .ok()
+    });
+    let flow_context = RequestFlowContext {
+        authorization_token,
+        ..flow_context
+    };
     let max_request_header_size = app.settings.max_request_header_size;
     let (meta, body) = match sanitize_request(request, max_request_header_size, &flow_context) {
         Ok(result) => result,

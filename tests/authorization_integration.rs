@@ -1524,3 +1524,116 @@ fn unix_now() -> u64 {
         .unwrap_or(Duration::ZERO)
         .as_secs()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_rejects_changed_malformed_and_duplicate_proxy_tokens() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let interception_ca = Arc::new(CertificateAuthority::load_builtin(&dirs.ca_dir)?);
+    let origin = H2Origin::spawn(&interception_ca).await?;
+    let credential_scope = format!("https://*:{}/credential/**", origin.addr.port());
+    let services = AuthorizationFixture::spawn_with_body_access(
+        credential_scope.clone(),
+        BodyAccess::BoundedPayload,
+    )
+    .await?;
+    let policy_name = "allow-integration-origin";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET"],
+        format!("https://*:{}/**", origin.addr.port()),
+    ));
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&[policy_name])
+        .policy(policy)
+        .render();
+    let clients =
+        with_delegated_authorization(clients, &credential_scope, BodyAccess::BoundedPayload);
+    let mut proxy_roots = RootCertStore::empty();
+    proxy_roots.add(CertificateDer::from(
+        interception_ca.root_certificate_der().to_vec(),
+    ))?;
+    let authorization = services.settings();
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_proxy_root_store(proxy_roots)
+        .with_settings(move |settings| settings.authorization = Some(authorization))
+        .spawn()
+        .await?;
+    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let connect = format!(
+        "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\n\r\n",
+        origin.addr.port(),
+        origin.addr.port(),
+    );
+    downstream.write_all(connect.as_bytes()).await?;
+    downstream.flush().await?;
+    let response = read_until_double_crlf(&mut downstream).await?;
+    ensure!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let mut client_roots = RootCertStore::empty();
+    client_roots.add(CertificateDer::from(
+        interception_ca.root_certificate_der().to_vec(),
+    ))?;
+    let connector = TlsConnector::from(build_client_tls_h2_only(client_roots)?);
+    let tls = connector
+        .connect(ServerName::try_from("localhost")?, downstream)
+        .await?;
+    let (mut sender, connection) = h2::client::handshake(tls).await?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    for supplied in ["ExfilGuard changed-token", "malformed"] {
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "https://localhost:{}/credential/success",
+                origin.addr.port()
+            ))
+            .header(http::header::PROXY_AUTHORIZATION, supplied)
+            .body(())?;
+        let (response, _) = sender.send_request(request, true)?;
+        let response = response.await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "{supplied:?}"
+        );
+        let _ = read_h2_body(response.into_body()).await?;
+    }
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "https://localhost:{}/credential/success",
+            origin.addr.port()
+        ))
+        .header(
+            http::header::PROXY_AUTHORIZATION,
+            "ExfilGuard changed-token",
+        )
+        .header(http::header::PROXY_AUTHORIZATION, "malformed")
+        .body(())?;
+    let (response, _) = sender.send_request(request, true)?;
+    let response = response.await?;
+    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    let _ = read_h2_body(response.into_body()).await?;
+    assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+    // Rejected streams must not change or close the authenticated session.
+    for token in [None, Some(format!("ExfilGuard {AUTHORIZATION_TOKEN}"))] {
+        let mut request = http::Request::builder().method(Method::GET).uri(format!(
+            "https://localhost:{}/credential/success",
+            origin.addr.port()
+        ));
+        if let Some(token) = token {
+            request = request.header(http::header::PROXY_AUTHORIZATION, token);
+        }
+        let (response, _) = sender.send_request(request.body(())?, true)?;
+        let response = response.await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            read_h2_body(response.into_body()).await?,
+            format!("path=/credential/success\nauthorization={PROTECTED_VALUE}")
+        );
+    }
+    assert_eq!(services.credential_calls.load(Ordering::SeqCst), 2);
+    connection_task.abort();
+    let _ = connection_task.await;
+    harness.shutdown().await;
+    Ok(())
+}
