@@ -504,6 +504,11 @@ second partial HTTP/2 frame parser solely to apply a shorter header deadline.
 This keeps setup and idle retention bounded without imposing a lifetime on
 legitimate active or multiplexed sessions.
 
+After the origin connection closes, graceful downstream shutdown also has one
+`client_keepalive_idle_timeout` interval to finish. On expiry, ExfilGuard drops
+the connection and cancels remaining streams. An unanswered shutdown PING must
+not retain the connection indefinitely.
+
 ## HTTP/2 stream admission follows the origin's limit
 
 Each upstream HTTP/2 connection keeps one authoritative request sender.

@@ -4108,3 +4108,65 @@ async fn connect_bump_http2_rejects_truncated_response_during_upload() -> Result
     );
     Ok(())
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_bounds_unacknowledged_graceful_shutdown() -> Result<()> {
+    let policy =
+        PolicySpec::new("review-close").rule(RuleSpec::allow(&["GET"], "https://localhost/**"));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new("localhost", "review-close", policy)
+            .client_protocols(ClientProtocols::Http2Only)
+            .upstream_mode(UpstreamMode::Http2SingleUse)
+            .with_settings(|settings| settings.client_keepalive_idle_timeout = 1),
+    )
+    .await?;
+    let authority = format!("localhost:{}", fixture.upstream_addr().port());
+    let mut tls = fixture.take_tls_stream();
+    // A minimal ordinary GET, using HPACK static entries and a literal authority.
+    let mut headers = vec![0x82, 0x87, 0x84, 0x01, authority.len() as u8];
+    headers.extend_from_slice(authority.as_bytes());
+    tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+    tls.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+    tls.write_all(&[0, 0, headers.len() as u8, 1, 5, 0, 0, 0, 1])
+        .await?;
+    tls.write_all(&headers).await?;
+    tls.flush().await?;
+    let mut saw_shutdown_ping = false;
+    let mut saw_goaway = false;
+    let outcome = tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let mut frame = [0u8; 9];
+            if let Err(err) = tls.read_exact(&mut frame).await {
+                return err;
+            }
+            let len = (usize::from(frame[0]) << 16)
+                | (usize::from(frame[1]) << 8)
+                | usize::from(frame[2]);
+            let mut payload = vec![0; len];
+            if let Err(err) = tls.read_exact(&mut payload).await {
+                return err;
+            }
+            if frame[3] == 4 && frame[4] & 1 == 0 {
+                tls.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+                tls.flush().await.unwrap();
+            }
+            saw_shutdown_ping |= frame[3] == 6 && frame[4] & 1 == 0;
+            saw_goaway |= frame[3] == 7;
+            // Simulate a client that receives frames but no longer answers PING.
+        }
+    })
+    .await;
+    fixture
+        .wait_for_upstream_close(StdDuration::from_secs(1))
+        .await?;
+    drop(tls);
+    fixture.shutdown().await;
+    assert!(
+        saw_shutdown_ping && saw_goaway,
+        "shutdown exchange was not reached"
+    );
+    assert!(
+        outcome.is_ok(),
+        "connection remained open for 3s despite 1s idle timeout after origin closed"
+    );
+    Ok(())
+}

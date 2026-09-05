@@ -130,12 +130,16 @@ where
                                 "closing downstream HTTP/2 session after upstream connection closed"
                             );
                             self.connection.graceful_shutdown();
-                            if let Err(err) = poll_fn(|cx| self.connection.poll_closed(cx)).await {
-                                warn!(
-                                    peer = %self.peer,
-                                    error = %err,
+                            match timeout(keepalive_timeout, poll_fn(|cx| self.connection.poll_closed(cx))).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => warn!(
+                                    peer = %self.peer, error = %err,
                                     "failed to close downstream HTTP/2 connection after upstream shutdown"
-                                );
+                                ),
+                                Err(_) => {
+                                    warn!(peer = %self.peer, "HTTP/2 graceful shutdown timed out");
+                                    tasks.abort_all();
+                                }
                             }
                             break;
                         }
@@ -233,7 +237,9 @@ where
 }
 
 fn log_stream_task_completion(peer: SocketAddr, result: Result<(), tokio::task::JoinError>) {
-    if let Err(err) = result {
+    if let Err(err) = result
+        && !err.is_cancelled()
+    {
         warn!(
             peer = %peer,
             error = %err,
