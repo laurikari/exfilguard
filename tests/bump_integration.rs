@@ -4067,3 +4067,44 @@ fn extract_content_length(head: &str) -> Result<usize> {
     }
     Ok(0)
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_rejects_truncated_response_during_upload() -> Result<()> {
+    let policy_name = "review-truncated-upload";
+    let policy =
+        PolicySpec::new(policy_name).rule(RuleSpec::allow(&["PUT"], "https://localhost/**"));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new("localhost", policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2EarlyResponse)
+            .with_settings(|settings| {
+                settings.request_body_idle_timeout = 5;
+                settings.response_header_timeout = 2;
+            }),
+    )
+    .await?;
+    let authority = format!("localhost:{}", fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+    let request = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("https://{authority}/truncated"))
+        .body(())?;
+    // Retain the upload handle without sending END_STREAM, guaranteeing the
+    // upstream response arrives while the request upload remains active.
+    let (response, upload) = client.start_request_with_open_body(request)?;
+    let outcome = timeout(StdDuration::from_secs(3), async {
+        let response = response.await.context("response head")?;
+        let status = response.status();
+        let body = BumpedH2Client::read_body(response.into_body()).await?;
+        Ok::<_, anyhow::Error>((status, body))
+    })
+    .await
+    .context("waiting for truncated response")?;
+    drop(upload);
+    client.shutdown().await;
+    fixture.shutdown().await;
+    assert!(
+        outcome.is_err(),
+        "Origin sent RST_STREAM(NO_ERROR) without END_STREAM, but proxy completed response: {outcome:?}"
+    );
+    Ok(())
+}

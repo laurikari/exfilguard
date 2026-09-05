@@ -229,7 +229,6 @@ async fn relay_upstream_response(
     request_method: &http::Method,
     upstream_peer: SocketAddr,
     upstream_request_instant: Instant,
-    allow_early_no_error_reset: bool,
 ) -> Result<RelayedResponse> {
     let response_instant = Instant::now();
     let response_time = SystemTime::now();
@@ -308,7 +307,6 @@ async fn relay_upstream_response(
     let mut upstream_body_bytes = 0u64;
     let mut response_body = response.into_body();
     if !end_stream {
-        let mut ended_by_no_error_reset = false;
         while let Some(frame) = with_total_deadline(request_deadline, async {
             timeout(response_body_timeout, response_body.data())
                 .await
@@ -316,18 +314,7 @@ async fn relay_upstream_response(
         })
         .await?
         {
-            let chunk = match frame {
-                Ok(chunk) => chunk,
-                Err(err)
-                    if allow_early_no_error_reset && err.reason() == Some(h2::Reason::NO_ERROR) =>
-                {
-                    ended_by_no_error_reset = true;
-                    break;
-                }
-                Err(err) => {
-                    return Err(err).context("failed to read HTTP/2 response data frame");
-                }
-            };
+            let chunk = frame.context("failed to read HTTP/2 response data frame")?;
             if chunk.is_empty() {
                 continue;
             }
@@ -353,42 +340,34 @@ async fn relay_upstream_response(
                 .context("failed to release HTTP/2 response body flow-control capacity")?;
         }
 
-        if ended_by_no_error_reset {
-            cache_write.discard();
-            send_body
-                .send_data(Bytes::new(), true)
-                .context("failed to terminate downstream HTTP/2 response stream")?;
-        } else {
-            match with_total_deadline(
-                request_deadline,
-                timeout_with_context(
-                    response_body_timeout,
-                    response_body.trailers(),
-                    "reading HTTP/2 response trailers from upstream",
-                ),
-            )
-            .await?
-            {
-                Some(trailers) => {
-                    cache_write.discard();
-                    let sanitized =
-                        sanitize_response_trailer_map(&trailers, max_response_header_bytes)
-                            .context("invalid HTTP/2 response trailers from upstream")?;
-                    if sanitized.is_empty() {
-                        send_body
-                            .send_data(Bytes::new(), true)
-                            .context("failed to terminate downstream HTTP/2 response stream")?;
-                    } else {
-                        send_body
-                            .send_trailers(sanitized)
-                            .context("failed to forward HTTP/2 response trailers to client")?;
-                    }
-                }
-                None => {
+        match with_total_deadline(
+            request_deadline,
+            timeout_with_context(
+                response_body_timeout,
+                response_body.trailers(),
+                "reading HTTP/2 response trailers from upstream",
+            ),
+        )
+        .await?
+        {
+            Some(trailers) => {
+                cache_write.discard();
+                let sanitized = sanitize_response_trailer_map(&trailers, max_response_header_bytes)
+                    .context("invalid HTTP/2 response trailers from upstream")?;
+                if sanitized.is_empty() {
                     send_body
                         .send_data(Bytes::new(), true)
                         .context("failed to terminate downstream HTTP/2 response stream")?;
+                } else {
+                    send_body
+                        .send_trailers(sanitized)
+                        .context("failed to forward HTTP/2 response trailers to client")?;
                 }
+            }
+            None => {
+                send_body
+                    .send_data(Bytes::new(), true)
+                    .context("failed to terminate downstream HTTP/2 response stream")?;
             }
         }
     }
@@ -516,7 +495,6 @@ pub(super) async fn forward_request_to_upstream(
             &request_method,
             upstream_peer,
             upstream_request_instant,
-            false,
         )
         .await?
     } else {
@@ -545,7 +523,6 @@ pub(super) async fn forward_request_to_upstream(
                     &request_method,
                     upstream_peer,
                     upstream_request_instant,
-                    true,
                 );
                 tokio::pin!(relay);
                 tokio::select! {
@@ -581,7 +558,6 @@ pub(super) async fn forward_request_to_upstream(
                     &request_method,
                     upstream_peer,
                     upstream_request_instant,
-                    false,
                 )
                 .await?
             }
@@ -668,7 +644,6 @@ pub(super) async fn forward_finalized_request_to_upstream(
                     &request_method,
                     upstream_peer,
                     upstream_request_instant,
-                    true,
                 )
                 .await?
             }
@@ -693,7 +668,6 @@ pub(super) async fn forward_finalized_request_to_upstream(
                     &request_method,
                     upstream_peer,
                     upstream_request_instant,
-                    false,
                 )
                 .await?
             }
@@ -716,7 +690,6 @@ pub(super) async fn forward_finalized_request_to_upstream(
             &request_method,
             upstream_peer,
             upstream_request_instant,
-            false,
         )
         .await?
     };

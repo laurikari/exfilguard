@@ -1062,6 +1062,9 @@ async fn serve_h2_early_response_request(
                 .context("failed to send truncated HTTP/2 response headers")?;
             send.send_data(Bytes::from_static(b"partial"), false)
                 .context("failed to send truncated HTTP/2 response data")?;
+            // Flush the incomplete response before resetting; an immediate
+            // reset can discard queued headers and miss the body relay path.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             send.send_reset(h2::Reason::NO_ERROR);
         }
         path => {
