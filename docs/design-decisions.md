@@ -64,6 +64,15 @@ the response is committed downstream.
 This is a security choice. ExfilGuard should not quietly “fix” a request into
 a different request or turn a malformed response into a different response.
 
+HTTP/1 origins that send `204 No Content` with one `Content-Length` field whose
+decimal value is zero are a narrow compatibility exception. A 204 ends at the header
+boundary regardless of framing fields, so ExfilGuard removes that redundant
+header before forwarding or caching and sends no body. Nonzero or malformed
+lengths and all `Transfer-Encoding` fields remain errors. The exception closes
+both the upstream and downstream connections, sacrificing keep-alive for this
+nonconforming case so unsolicited origin bytes cannot poison a pooled response.
+Conforming 204 responses retain their existing connection behavior.
+
 ## Close after a committed response fails
 
 Once ExfilGuard has sent a final HTTP response head or `200 Connection

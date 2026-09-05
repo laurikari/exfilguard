@@ -529,6 +529,162 @@ async fn malformed_upstream_header_line_endings_are_rejected_before_forwarding()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_accepts_zero_length_no_content_for_get_and_delete() -> Result<()> {
+    for method in ["GET", "DELETE"] {
+        let mut fixture = no_content_fixture(false).await?;
+        let response = request_no_content_path(&mut fixture, method, "/zero").await?;
+        assert_empty_no_content(&response);
+        assert!(response.contains("ETag: \"kept\""), "{response}");
+        assert!(response.contains("Connection: close"), "{response}");
+        let mut trailing = Vec::new();
+        timeout(
+            StdDuration::from_secs(2),
+            fixture.tls_stream_mut().read_to_end(&mut trailing),
+        )
+        .await??;
+        assert!(
+            trailing.is_empty(),
+            "unexpected response body: {trailing:?}"
+        );
+        assert_eq!(fixture.request_count(), 1);
+        fixture.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_rejects_unsafe_no_content_framing() -> Result<()> {
+    for path in ["/nonzero", "/chunked", "/both"] {
+        for method in ["GET", "DELETE"] {
+            let mut fixture = no_content_fixture(false).await?;
+            let response = request_no_content_path(&mut fixture, method, path).await?;
+            assert!(response.starts_with("HTTP/1.1 502"), "{path}: {response}");
+            assert!(!response.contains("204 No Content"), "{path}: {response}");
+            fixture.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_conforming_no_content_preserves_keepalive() -> Result<()> {
+    let mut fixture = no_content_fixture(false).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/plain").await?;
+    assert_empty_no_content(&response);
+    assert!(!response.to_ascii_lowercase().contains("connection: close"));
+    let connections = fixture.accept_count();
+    let response = request_no_content_path(&mut fixture, "GET", "/after").await?;
+    assert!(response.ends_with("\r\n\r\nreal"), "{response}");
+    assert_eq!(fixture.accept_count(), connections);
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_zero_length_no_content_does_not_poison_next_response() -> Result<()> {
+    let mut fixture = no_content_fixture(false).await?;
+    let response = request_no_content_path(&mut fixture, "DELETE", "/poison").await?;
+    assert_empty_no_content(&response);
+    let mut trailing = Vec::new();
+    timeout(
+        StdDuration::from_secs(2),
+        fixture.tls_stream_mut().read_to_end(&mut trailing),
+    )
+    .await??;
+    assert!(
+        trailing.is_empty(),
+        "injected response escaped: {trailing:?}"
+    );
+    let connections = fixture.accept_count();
+    fixture.reconnect(ClientProtocols::Http1).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/after").await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("\r\n\r\nreal"), "{response}");
+    assert!(!response.contains("poison"), "{response}");
+    assert!(fixture.accept_count() > connections);
+    assert_eq!(fixture.request_count(), 2);
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_caches_normalized_no_content() -> Result<()> {
+    let mut fixture = no_content_fixture(true).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/zero").await?;
+    assert_empty_no_content(&response);
+    // Wait for completion of the cache write and retirement of the connection.
+    let mut trailing = Vec::new();
+    timeout(
+        StdDuration::from_secs(2),
+        fixture.tls_stream_mut().read_to_end(&mut trailing),
+    )
+    .await??;
+    assert!(trailing.is_empty());
+    let uri: Uri = format!("https://localhost:{}/zero", fixture.upstream_addr().port()).parse()?;
+    let cached = fixture
+        .cache()
+        .lookup(&Method::GET, &uri, &http::HeaderMap::new())
+        .await
+        .context("204 was not cached")?;
+    assert_eq!(cached.status, StatusCode::NO_CONTENT);
+    assert_eq!(cached.content_length, 0);
+    assert!(!cached.headers.contains_key(http::header::CONTENT_LENGTH));
+    fixture.reconnect(ClientProtocols::Http1).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/zero").await?;
+    assert_empty_no_content(&response);
+    assert_eq!(
+        fixture.request_count(),
+        1,
+        "second response was not a cache hit"
+    );
+    fixture.shutdown().await;
+    Ok(())
+}
+
+async fn no_content_fixture(cache: bool) -> Result<BumpedTlsFixture> {
+    let rule = RuleSpec::allow(&["GET", "DELETE"], "https://localhost/**");
+    let policy =
+        PolicySpec::new("allow-no-content").rule(if cache { rule.cache_enabled() } else { rule });
+    let mut options = BumpedTlsOptions::new("localhost", "allow-no-content", policy)
+        .upstream_mode(UpstreamMode::Http1NoContent);
+    if cache {
+        options = options.with_cache();
+    }
+    BumpedTlsFixture::new(options).await
+}
+
+async fn request_no_content_path(
+    fixture: &mut BumpedTlsFixture,
+    method: &str,
+    path: &str,
+) -> Result<String> {
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+        fixture.upstream_addr().port()
+    );
+    let mut client = fixture.http1_client();
+    client.send(request).await?;
+    client.read_response_with_length().await
+}
+
+fn assert_empty_no_content(response: &str) {
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content\r\n"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("content-length"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("transfer-encoding"),
+        "{response}"
+    );
+    assert!(response.ends_with("\r\n\r\n"), "{response}");
+    assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forbidden_no_content_framing_is_rejected_before_forwarding() -> Result<()> {
     let cases = [
         (

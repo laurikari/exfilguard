@@ -53,6 +53,7 @@ pub enum UpstreamMode {
     Http1Keepalive,
     Http1Inspect,
     Http1Redirect,
+    Http1NoContent,
     Http2,
     Http2CacheInspect,
     DualProtocolCacheInspect,
@@ -313,6 +314,7 @@ impl BumpedTlsFixture {
         let upstream_config = match upstream_mode {
             UpstreamMode::Http1Keepalive
             | UpstreamMode::Http1Inspect
+            | UpstreamMode::Http1NoContent
             | UpstreamMode::Http1Redirect => build_upstream_tls_config(&ca, upstream_host)?,
             UpstreamMode::Http2
             | UpstreamMode::Http2CacheInspect
@@ -368,6 +370,9 @@ impl BumpedTlsFixture {
                                     }
                                     UpstreamMode::Http1Redirect => {
                                         serve_redirect(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http1NoContent => {
+                                        serve_tls_http1_no_content(stream, acceptor, request_counter).await
                                     }
                                     UpstreamMode::Http2 => {
                                         serve_tls_h2(stream, acceptor, peer).await
@@ -614,6 +619,38 @@ async fn serve_tls_keepalive(
     tls.shutdown()
         .await
         .context("failed to shutdown TLS upstream stream")?;
+    Ok(())
+}
+
+async fn serve_tls_http1_no_content(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let mut tls = acceptor.accept(stream).await?;
+    loop {
+        let request_bytes = read_request(&mut tls).await?;
+        if request_bytes.is_empty() {
+            break;
+        }
+        request_count.fetch_add(1, Ordering::SeqCst);
+        let request = String::from_utf8(request_bytes)?;
+        let response: &[u8] = match request_path(&request) {
+            "/zero" => b"HTTP/1.1 204 No Content\r\ncOnTeNt-LeNgTh: 0\r\nCache-Control: max-age=60\r\nETag: \"kept\"\r\n\r\n",
+            "/plain" => b"HTTP/1.1 204 No Content\r\n\r\n",
+            "/nonzero" => b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx",
+            "/chunked" => b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "/both" => b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "/poison" => b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\npoison",
+            _ => b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal",
+        };
+        tls.write_all(response).await?;
+        tls.flush().await?;
+        if request.to_ascii_lowercase().contains("connection: close") {
+            break;
+        }
+    }
+    tls.shutdown().await?;
     Ok(())
 }
 

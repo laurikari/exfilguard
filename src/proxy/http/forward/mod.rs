@@ -27,6 +27,8 @@ use super::upstream::{UpstreamConnection, UpstreamKey, UpstreamPool};
 pub(crate) use connection::UpstreamIo;
 #[cfg(test)]
 pub(crate) use request::build_upstream_request;
+#[cfg(feature = "fuzzing")]
+pub(crate) use response::normalize_final_response_framing;
 pub(crate) use response::{ResponseBodyPlan, determine_response_body_plan};
 
 pub struct ForwardTimeouts {

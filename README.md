@@ -322,6 +322,14 @@ body target from its signed-extension and malformed-framing seeds with:
 cargo fuzz run http1_chunked_body fuzz/seeds/http1_chunked_body
 ```
 
+The HTTP/1 response target also checks final-response framing normalization.
+Its seeds cover zero-length 204 compatibility, signed-zero rejection,
+conflicting transfer encoding, and a forged response appended after a 204:
+
+```shell
+cargo fuzz run http1_response_head fuzz/seeds/http1_response_head
+```
+
 Parallel workers example:
 
 ```shell

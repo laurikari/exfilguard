@@ -56,8 +56,15 @@ pub mod fuzzing {
     where
         S: AsyncRead + Unpin,
     {
-        let _ =
+        let mut head =
             super::codec::read_http1_response_head(reader, timeout, peer, max_header_bytes).await?;
+        let had_zero_length = head.content_length == Some(0);
+        super::forward::normalize_final_response_framing(&mut head)?;
+        if head.status == http::StatusCode::NO_CONTENT {
+            assert!(head.content_length.is_none());
+            assert!(!head.header_map().contains_key(http::header::CONTENT_LENGTH));
+            assert!(!had_zero_length || head.connection_close);
+        }
         Ok(())
     }
 }

@@ -52,7 +52,7 @@ where
         .saturating_add(timeouts.response_header);
     let read_sequence = async {
         loop {
-            let head = read_http1_response_head_with_budget(
+            let mut head = read_http1_response_head_with_budget(
                 upstream_reader,
                 per_read_timeout,
                 upstream_peer,
@@ -87,7 +87,7 @@ where
                 continue;
             }
 
-            validate_final_response_framing(&head)?;
+            normalize_final_response_framing(&mut head)?;
 
             return Ok(head);
         }
@@ -106,11 +106,28 @@ where
     }
 }
 
-fn validate_final_response_framing(head: &Http1ResponseHead) -> Result<()> {
-    if head.status == StatusCode::NO_CONTENT
-        && (head.transfer_encoding_present || head.content_length.is_some())
-    {
-        bail!("204 response must not include Content-Length or Transfer-Encoding");
+pub(crate) fn normalize_final_response_framing(head: &mut Http1ResponseHead) -> Result<()> {
+    if head.status == StatusCode::NO_CONTENT {
+        if head.transfer_encoding_present
+            || head.content_length.is_some_and(|length| length != 0)
+            || head.headers.iter().any(|header| {
+                header.lower_name() == "content-length"
+                    && !header.value_bytes().iter().all(u8::is_ascii_digit)
+            })
+        {
+            bail!(
+                "204 response must not include nonzero or invalid Content-Length or Transfer-Encoding"
+            );
+        }
+        if head.content_length == Some(0) {
+            // Some origins send this forbidden but unambiguous header. Strip it
+            // from both wire framing and cache metadata. Retire the connection
+            // so unsolicited bytes cannot become a later pooled response.
+            head.content_length = None;
+            head.headers
+                .retain(|header| header.lower_name() != "content-length");
+            head.connection_close = true;
+        }
     }
 
     if head.status == StatusCode::RESET_CONTENT {
@@ -630,10 +647,22 @@ mod tests {
     #[tokio::test]
     async fn read_final_response_head_rejects_forbidden_no_content_framing() -> anyhow::Result<()> {
         for response in [
-            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: +0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: -0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0, 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 18446744073709551616\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: \r\n\r\n".as_slice(),
             b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
             b"HTTP/1.1 205 Reset Content\r\nContent-Length: 1\r\n\r\n".as_slice(),
             b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
         ] {
             let (mut upstream_writer, upstream_reader) = duplex(256);
             let (_client_reader, mut client_writer) = duplex(256);
@@ -653,6 +682,83 @@ mod tests {
             assert!(
                 result.is_err(),
                 "invalid response was accepted: {response:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_final_response_head_normalizes_zero_length_no_content() -> anyhow::Result<()> {
+        for field in ["Content-Length: 0", "cOnTeNt-LeNgTh:\t000 \t"] {
+            let (mut upstream_writer, upstream_reader) = duplex(512);
+            let (mut client_writer, mut client_reader) = duplex(512);
+            upstream_writer
+                .write_all(format!("HTTP/1.1 204 No Content\r\n{field}\r\nETag: \"kept\"\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\npoison").as_bytes())
+                .await?;
+            // Keep the origin open: accepting 204 must not wait for EOF.
+            let mut upstream_reader = BufReader::new(upstream_reader);
+            let (head, informational_bytes) = read_final_response_head(
+                &mut upstream_reader,
+                &mut client_writer,
+                &test_timeouts(Duration::from_secs(1)),
+                "127.0.0.1:8080".parse()?,
+                512,
+            )
+            .await?;
+            assert_eq!(head.status, StatusCode::NO_CONTENT);
+            assert_eq!(informational_bytes, 0);
+            assert_eq!(head.content_length, None);
+            assert!(head.connection_close);
+            assert!(!head.header_map().contains_key(http::header::CONTENT_LENGTH));
+            assert_eq!(head.header_map()[http::header::ETAG], "\"kept\"");
+            assert_eq!(
+                determine_response_body_plan(&Method::GET, head.status, &head),
+                ResponseBodyPlan::Empty
+            );
+            let encoded = String::from_utf8(head.encode(ResponseBodyPlan::Empty, None))?;
+            assert!(!encoded.to_ascii_lowercase().contains("content-length"));
+            assert!(encoded.ends_with("\r\n\r\n"));
+            client_writer.shutdown().await?;
+            let mut forwarded = Vec::new();
+            client_reader.read_to_end(&mut forwarded).await?;
+            assert!(
+                forwarded.is_empty(),
+                "final head reader forwarded origin bytes"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_content_compatibility_preserves_other_bodyless_responses() -> anyhow::Result<()> {
+        for (status, method, length) in [
+            (204, Method::GET, None),
+            (200, Method::HEAD, Some(123)),
+            (304, Method::GET, Some(123)),
+            (205, Method::GET, Some(0)),
+            (205, Method::GET, None),
+        ] {
+            let (mut upstream_writer, upstream_reader) = duplex(256);
+            let (_client_reader, mut client_writer) = duplex(256);
+            let field = length.map_or_else(String::new, |n| format!("Content-Length: {n}\r\n"));
+            upstream_writer
+                .write_all(format!("HTTP/1.1 {status} Test\r\n{field}\r\n").as_bytes())
+                .await?;
+            let mut upstream_reader = BufReader::new(upstream_reader);
+            let (head, _) = read_final_response_head(
+                &mut upstream_reader,
+                &mut client_writer,
+                &test_timeouts(Duration::from_secs(1)),
+                "127.0.0.1:8080".parse()?,
+                256,
+            )
+            .await?;
+            assert_eq!(head.status.as_u16(), status);
+            assert_eq!(head.content_length, length);
+            assert!(!head.connection_close);
+            assert_eq!(
+                determine_response_body_plan(&method, head.status, &head),
+                ResponseBodyPlan::Empty
             );
         }
         Ok(())
