@@ -1,6 +1,5 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::task::{Context as TaskContext, Poll};
 use std::time::SystemTime;
 
@@ -122,7 +121,6 @@ pub(crate) struct CacheWriter {
     current_size: u64,
     key: CacheKey,
     vary: VaryKey,
-    generation: u64,
     reserved_bytes: u64,
     pending_reservation: u64,
     discard: bool,
@@ -144,7 +142,6 @@ impl CacheWriter {
         state: Arc<CacheState>,
         key: CacheKey,
         vary: VaryKey,
-        generation: u64,
     ) -> Self {
         Self {
             file: Some(CacheWriterFile::new(file)),
@@ -154,7 +151,6 @@ impl CacheWriter {
             current_size: 0,
             key,
             vary,
-            generation,
             reserved_bytes: 0,
             pending_reservation: 0,
             discard: false,
@@ -173,7 +169,6 @@ impl CacheWriter {
         vary: VaryKey,
         max_write: usize,
     ) -> Self {
-        let generation = state.generation.load(Ordering::Acquire);
         Self {
             file: Some(CacheWriterFile::new_partial(file, max_write)),
             hasher: Hasher::new(),
@@ -182,7 +177,6 @@ impl CacheWriter {
             current_size: 0,
             key,
             vary,
-            generation,
             reserved_bytes: 0,
             pending_reservation: 0,
             discard: false,
@@ -286,12 +280,6 @@ impl CacheWriter {
             .to_hex()
             .to_string();
         let body_id = format!("{}{}", &key_id[..4], &random_id[4..]);
-        if self.generation != self.state.generation.load(Ordering::Acquire)
-            || self.state.disabled.load(Ordering::Acquire)
-        {
-            self.discard_in_background();
-            return Ok(CacheFinishOutcome::Skipped);
-        }
         let final_path = self.state.body_path(&body_id);
         let shard_dir = final_path
             .parent()
@@ -481,8 +469,6 @@ mod tests {
             max_bytes: 1024 * 1024,
             in_flight_bytes: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
-            generation: AtomicU64::new(0),
-            disabled: std::sync::atomic::AtomicBool::new(false),
             sweep_offset: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -565,7 +551,6 @@ mod tests {
             state.clone(),
             key.clone(),
             VaryKey::new(HeaderMap::new()),
-            0,
         );
         writer.write_all(b"body").await?;
         writer
@@ -601,7 +586,6 @@ mod tests {
             state.clone(),
             key.clone(),
             VaryKey::new(HeaderMap::new()),
-            0,
         );
         writer.write_all(b"body").await?;
         let outcome = writer
@@ -636,7 +620,6 @@ mod tests {
             state.clone(),
             key_a,
             VaryKey::new(HeaderMap::new()),
-            0,
         );
         let mut writer_b = CacheWriter::new(
             async_fs::File::create(&path_b).await?,
@@ -644,7 +627,6 @@ mod tests {
             state.clone(),
             key_b,
             VaryKey::new(HeaderMap::new()),
-            0,
         );
 
         writer_a.write_all(b"aaaaaa").await?;
@@ -687,7 +669,6 @@ mod tests {
             state.clone(),
             key,
             VaryKey::new(HeaderMap::new()),
-            0,
         );
 
         writer.write_all(b"aaaaaa").await?;

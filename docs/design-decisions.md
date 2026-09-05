@@ -387,6 +387,22 @@ allow rule enables caching.
 ExfilGuard does not cache allowed traffic by default. That keeps response
 storage and freshness changes under explicit operator control.
 
+## Cache freshness does not imply mutation coherence
+
+ExfilGuard makes no attempt to invalidate cached responses when resources are
+modified, even when it observes a successful POST, PUT, or DELETE. When a rule
+enables caching and upstream permits it, responses may be reused for their
+declared freshness lifetime. The existing per-rule fallback lifetime applies
+only when upstream freshness metadata is absent.
+
+Multi-node deployments have independent caches, and mutations can also bypass
+ExfilGuard entirely. Local invalidation would not provide deployment-wide
+consistency, so ExfilGuard deliberately does not implement the mutation-driven
+invalidation required by RFC 9111 section 4.4. It offers freshness-based caching,
+not cache coherence. Operators select cacheable traffic through fine-grained
+allow rules and leave caching disabled where this freshness model is unsuitable.
+Expiration, capacity eviction, and corrupt-entry cleanup remain unchanged.
+
 ## Response cache entries are protocol-neutral
 
 Inspected HTTP/1.1 and HTTP/2 traffic uses one shared response cache. Entries
@@ -397,22 +413,6 @@ This keeps cache policy independent of ALPN and allows an entry populated over
 one HTTP version to serve the other. Responses with trailers are forwarded but
 not stored, and HTTP/1 responses with transfer-coding chains other than a sole
 `chunked` coding are not representable and therefore skip storage.
-
-## Successful mutations invalidate stored representations
-
-A 2xx or 3xx response to an unsafe or unknown-safety method invalidates GET and
-HEAD entries for the target cache URI, regardless of whether the mutation's
-rule enables caching. This includes forced-TTL entries and applies across HTTP
-versions. Invalidation removes persistent metadata before forwarding the
-mutation response.
-
-A cache-wide generation counter prevents fills started before an invalidation
-from publishing afterward. This deliberately skips unrelated in-flight fills
-too, while retaining unrelated completed entries; it avoids per-URI generation
-tracking and its lifecycle bookkeeping. Publication and invalidation share one
-lock. If invalidation fails or is cancelled, ExfilGuard continues forwarding but
-disables cache use for that process. It logs that cache storage must be cleared
-before restarting, since failed disk cleanup cannot guarantee persisted freshness.
 
 ## Cache disk limits do not throttle forwarding
 

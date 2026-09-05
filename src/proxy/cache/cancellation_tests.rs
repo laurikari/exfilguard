@@ -73,7 +73,7 @@ fn timed_out_creation_removes_the_late_file() -> Result<()> {
         let gate = FileWorkerGate::hold().await;
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            cache.open_stream(&Method::GET, &uri, &headers, &headers, cache.generation()),
+            cache.open_stream(&Method::GET, &uri, &headers, &headers),
         )
         .await;
         assert!(result.is_err());
@@ -98,7 +98,7 @@ fn timed_out_publication_waiters_do_not_accumulate() -> Result<()> {
         for body in [b"".as_slice(), b"response body".as_slice()] {
             for _ in 0..8 {
                 let mut writer = cache
-                    .open_stream(&Method::GET, &uri, &headers, &headers, cache.generation())
+                    .open_stream(&Method::GET, &uri, &headers, &headers)
                     .await?
                     .unwrap();
                 writer.write_all(body).await?;
@@ -141,7 +141,7 @@ fn timed_out_publication_retains_ownership_until_stored_or_cleaned_up() -> Resul
             let uri: Uri = "http://example.com/test".parse()?;
             let headers = HeaderMap::new();
             let mut writer = cache
-                .open_stream(&Method::GET, &uri, &headers, &headers, cache.generation())
+                .open_stream(&Method::GET, &uri, &headers, &headers)
                 .await?
                 .unwrap();
             let body = b"response body";

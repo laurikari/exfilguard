@@ -98,7 +98,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request_deadline = request_deadline.instant();
-    let cache_generation = app.cache.as_ref().map(|cache| cache.generation());
     let request_bytes = Zeroizing::new(match finalized.as_ref() {
         Some(finalized) => finalized.encode_http1_head(),
         None => {
@@ -206,12 +205,6 @@ where
         client_close = true;
     }
 
-    if let Some(cache) = app.cache.as_ref() {
-        cache
-            .invalidate_after_response(request, head.status, timeouts.response_io)
-            .await;
-    }
-
     let cache_state = prepare_cache_write(
         decision,
         app,
@@ -220,7 +213,6 @@ where
         body_plan,
         CacheResponse {
             head: &head,
-            generation: cache_generation,
             timing: crate::proxy::cache::CacheResponseTiming {
                 response_time,
                 response_delay,

@@ -640,10 +640,26 @@ The cache follows standard HTTP cache headers from upstream servers.
 
 #### Scope
 
-The cache is shared across all clients and across inspected HTTP/1.1 and
-HTTP/2 traffic. Responses are keyed by method and absolute URI. `Vary` headers
+Within one ExfilGuard instance, the cache is shared across all clients and
+inspected HTTP/1.1 and HTTP/2 traffic. Responses are keyed by method and absolute URI. `Vary` headers
 decide which request headers are part of the cache key. Enable caching only if
 cross-client sharing is acceptable in your environment.
+
+Each node in a multi-node deployment has an independent cache; ExfilGuard does
+not coordinate caches between nodes.
+
+#### No Mutation-Driven Invalidation
+
+ExfilGuard makes no attempt to invalidate cached responses after mutations,
+including successful POST, PUT, or DELETE requests that pass through the same
+node. A cached response may continue to be served for its freshness lifetime
+even after the resource changes upstream. Normal expiration and eviction still
+apply.
+
+Operators control caching per allow rule and can restrict it to suitable
+clients, methods, hosts, and paths. Omit the rule's cache configuration where
+freshness-based reuse is unacceptable; such requests bypass existing entries
+as well as cache storage. Caching does not guarantee read-after-write consistency.
 
 #### Supported Headers
 

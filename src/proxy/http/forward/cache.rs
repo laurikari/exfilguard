@@ -35,7 +35,6 @@ pub(super) struct CacheStoreContext {
 pub(super) struct CacheResponse<'a> {
     pub head: &'a Http1ResponseHead,
     pub timing: CacheResponseTiming,
-    pub generation: Option<u64>,
 }
 
 pub(super) async fn prepare_cache_write(
@@ -47,11 +46,7 @@ pub(super) async fn prepare_cache_write(
     response: CacheResponse<'_>,
     peer: SocketAddr,
 ) -> CacheWriteState {
-    let CacheResponse {
-        head,
-        timing,
-        generation,
-    } = response;
+    let CacheResponse { head, timing } = response;
     if !request_body_plan.is_definitely_empty() {
         return CacheWriteState::Bypass;
     }
@@ -109,9 +104,6 @@ pub(super) async fn prepare_cache_write(
             CacheWriteState::Skip
         }
         CacheWritePlan::Store(plan) => {
-            let Some(generation) = generation else {
-                return CacheWriteState::Bypass;
-            };
             let stream = timeout(
                 app.settings.response_body_idle_timeout(),
                 cache.open_stream(
@@ -119,7 +111,6 @@ pub(super) async fn prepare_cache_write(
                     &plan.request.uri,
                     &plan.request.headers,
                     &plan.response_headers,
-                    generation,
                 ),
             )
             .await

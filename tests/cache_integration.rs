@@ -1317,46 +1317,25 @@ async fn test_cache_bypass_on_cookie_header() -> Result<()> {
     )
     .await
 }
-async fn exercise_cache() -> Result<(String, usize)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let origin = listener.local_addr()?;
-    let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let requests = Arc::new(AtomicUsize::new(0));
-    let counter = requests.clone();
-    let upstream = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let deleted = deleted.clone();
-            let counter = counter.clone();
-            tokio::spawn(async move {
-                let mut head = Vec::new();
-                while !head.ends_with(b"\r\n\r\n") {
-                    let mut byte = [0];
-                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
-                        return;
-                    }
-                    head.push(byte[0]);
-                }
-                counter.fetch_add(1, Ordering::SeqCst);
-                let response = if head.starts_with(b"DELETE ") {
-                    deleted.store(true, Ordering::SeqCst);
-                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
-                } else if deleted.load(Ordering::SeqCst) {
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndeleted".to_string()
-                } else {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nCache-Control: public, max-age=300\r\nAge: 30\r\nConnection: close\r\n\r\noriginal".to_string()
-                };
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.shutdown().await.unwrap();
-            });
-        }
-    });
+
+#[tokio::test]
+async fn successful_mutation_does_not_invalidate_a_fresh_response() -> Result<()> {
+    let upstream = MockUpstream::new("Cache-Control: public, max-age=300").await?;
+    let port = upstream.port();
+    let requests = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
     let (clients, policies) = TestConfigBuilder::new()
-        .default_client(&["cache-review"])
+        .default_client(&["cache-freshness"])
         .policy(
-            PolicySpec::new("cache-review")
-                .rule(RuleSpec::allow(&["GET"], format!("http://{origin}/**")).cache_enabled())
-                .rule(RuleSpec::allow(&["DELETE"], format!("http://{origin}/**"))),
+            PolicySpec::new("cache-freshness")
+                .rule(
+                    RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{port}/**"))
+                        .cache_enabled(),
+                )
+                .rule(RuleSpec::allow(
+                    &["DELETE"],
+                    format!("http://127.0.0.1:{port}/**"),
+                )),
         )
         .render();
     let mut dirs = TestDirs::new()?;
@@ -1364,59 +1343,40 @@ async fn exercise_cache() -> Result<(String, usize)> {
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .spawn()
         .await?;
-    let request = |method: &str, extra: &str| {
-        format!(
-            "{method} http://{origin}/resource HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n{extra}\r\n"
-        )
-    };
-    let mut stream = TcpStream::connect(harness.addr).await?;
-    stream.write_all(request("GET", "").as_bytes()).await?;
-    let mut warm = String::new();
-    stream.read_to_string(&mut warm).await?;
-    assert!(warm.ends_with("original"), "{warm:?}");
-    let uri: Uri = format!("http://{origin}/resource").parse()?;
-    tokio::time::timeout(StdDuration::from_secs(3), async {
-        loop {
-            if harness
-                .cache
-                .as_ref()
-                .unwrap()
-                .lookup(&Method::GET, &uri, &HeaderMap::new())
-                .await
-                .is_some()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-    {
+    let uri: Uri = format!("http://127.0.0.1:{port}/resource").parse()?;
+    for (method, expected_requests) in [("GET", 1), ("DELETE", 2), ("GET", 2)] {
         let mut stream = TcpStream::connect(harness.addr).await?;
-        stream.write_all(request("DELETE", "").as_bytes()).await?;
+        stream
+            .write_all(
+                format!(
+                    "{method} {uri} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
         let mut response = String::new();
         stream.read_to_string(&mut response).await?;
-        assert!(response.starts_with("HTTP/1.1 204"), "{response:?}");
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.ends_with("cached-response"));
+        assert_eq!(requests.load(Ordering::SeqCst), expected_requests);
+        if expected_requests == 1 {
+            tokio::time::timeout(StdDuration::from_secs(3), async {
+                while harness
+                    .cache
+                    .as_ref()
+                    .unwrap()
+                    .lookup(&Method::GET, &uri, &HeaderMap::new())
+                    .await
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
     }
-    let mut stream = TcpStream::connect(harness.addr).await?;
-    stream.write_all(request("GET", "").as_bytes()).await?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
-    let count = requests.load(Ordering::SeqCst);
     harness.shutdown().await;
-    upstream.abort();
-    let _ = upstream.await;
-    Ok((response, count))
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn successful_delete_invalidates_cached_get() -> Result<()> {
-    let (response, requests) = exercise_cache().await?;
-    assert!(
-        response.starts_with("HTTP/1.1 404"),
-        "GET after successful DELETE returned stale cache entry; origin requests={requests}, response={response:?}"
-    );
-    assert_eq!(requests, 3);
+    upstream_task.abort();
+    let _ = upstream_task.await;
     Ok(())
 }

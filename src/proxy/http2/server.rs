@@ -602,8 +602,6 @@ impl Http2RequestHandler {
             return forward_finalized_request_to_upstream(
                 checkout,
                 finalized,
-                &forward_meta.parsed,
-                self.ctx.cache.as_deref(),
                 &mut self.ctx.respond,
                 self.ctx.request_body_timeout,
                 self.ctx.response_header_timeout,
@@ -632,7 +630,6 @@ impl Http2RequestHandler {
             self.ctx.max_request_header_bytes,
             self.ctx.max_response_header_bytes,
             cache_miss,
-            self.ctx.cache.as_deref(),
         )
         .await
     }

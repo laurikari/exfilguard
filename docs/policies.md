@@ -292,6 +292,12 @@ Rules can enable caching for matched responses when the shared cache is
 configured globally. The same rule behavior and cache entries apply to
 inspected HTTP/1.1 and HTTP/2 traffic.
 
+Caching is a freshness-based optimization, not a consistency guarantee.
+ExfilGuard does not invalidate cached responses after mutations or synchronize
+caches between nodes. Enable it only on rules where reuse for the upstream's
+declared lifetime (or the configured fallback) is acceptable. Rules without
+cache configuration bypass caching entirely, including existing entries.
+
 ```toml
 [[policy.rule]]
 action = "ALLOW"

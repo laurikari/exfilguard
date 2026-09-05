@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -20,7 +20,6 @@ mod admission;
 mod cancellation_tests;
 mod entry;
 mod index;
-mod invalidation;
 mod key;
 mod lookup;
 mod maintenance;
@@ -70,8 +69,6 @@ struct CacheState {
     max_bytes: u64,
     in_flight_bytes: AtomicU64,
     next_id: AtomicU64,
-    generation: AtomicU64,
-    disabled: AtomicBool,
     sweep_offset: AtomicUsize,
 }
 
@@ -110,8 +107,6 @@ impl HttpCache {
             max_bytes,
             in_flight_bytes: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
-            generation: AtomicU64::new(0),
-            disabled: AtomicBool::new(false),
             sweep_offset: AtomicUsize::new(0),
         });
         spawn_cache_dir_cleanup(cleanup_dirs);
@@ -127,19 +122,12 @@ impl HttpCache {
         Ok(Self { state })
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.state.generation.load(Ordering::Acquire)
-    }
-
     pub async fn lookup(
         &self,
         method: &Method,
         uri: &Uri,
         req_headers: &HeaderMap,
     ) -> Option<CachedResponse> {
-        if self.state.disabled.load(Ordering::Acquire) {
-            return None;
-        }
         CacheReader::new(self.state.clone())
             .lookup(method, uri, req_headers)
             .await
@@ -151,11 +139,7 @@ impl HttpCache {
         uri: &Uri,
         req_headers: &HeaderMap,
         resp_headers: &HeaderMap,
-        generation: u64,
     ) -> Result<Option<CacheWriter>> {
-        if self.state.disabled.load(Ordering::Acquire) || generation != self.generation() {
-            return Ok(None);
-        }
         let cache_key = CacheKey::new(method, uri);
         let vary = match VaryKey::from_response(resp_headers, req_headers) {
             Some(map) => map,
@@ -188,7 +172,6 @@ impl HttpCache {
                 state,
                 cache_key,
                 vary,
-                generation,
             )))
         })
         .await
@@ -207,10 +190,7 @@ impl HttpCache {
         ttl: Duration,
     ) -> Result<()> {
         let response_time = SystemTime::now();
-        if let Some(mut stream) = self
-            .open_stream(method, uri, req_headers, headers, self.generation())
-            .await?
-        {
+        if let Some(mut stream) = self.open_stream(method, uri, req_headers, headers).await? {
             stream.write_all(body).await?;
             let timing = CacheTiming {
                 response_time,
@@ -1607,13 +1587,7 @@ mod tests {
         );
 
         let stream = cache
-            .open_stream(
-                &method,
-                &uri,
-                &req_headers,
-                &resp_headers,
-                cache.generation(),
-            )
+            .open_stream(&method, &uri, &req_headers, &resp_headers)
             .await?;
         assert!(stream.is_none());
         Ok(())
@@ -1633,13 +1607,7 @@ mod tests {
         resp_headers.insert(http::header::VARY, "User-Agent".parse().unwrap());
 
         let stream = cache
-            .open_stream(
-                &method,
-                &uri,
-                &req_headers,
-                &resp_headers,
-                cache.generation(),
-            )
+            .open_stream(&method, &uri, &req_headers, &resp_headers)
             .await?;
         assert!(stream.is_none());
         Ok(())

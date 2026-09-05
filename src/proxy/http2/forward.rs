@@ -15,13 +15,11 @@ use tokio::{sync::Mutex, time::timeout};
 
 use crate::{
     authorization::FinalizedRequestV1,
-    proxy::cache::HttpCache,
     proxy::forward_error::{ClientBodyIdleTimeout, RequestTimeout},
     proxy::forward_limits::{BodySizeTracker, HeaderBudget, RequestDeadline, ResponseProgress},
     proxy::headers::{
         response_header_should_skip, sanitize_request_trailer_map, sanitize_response_trailer_map,
     },
-    proxy::request::ParsedRequest,
     util::timeout_with_context,
 };
 
@@ -228,8 +226,7 @@ async fn relay_upstream_response(
     response_progress: &ResponseProgress,
     max_response_header_bytes: usize,
     cache_miss: Option<Box<CacheMiss>>,
-    parsed: &ParsedRequest,
-    cache: Option<&HttpCache>,
+    request_method: &http::Method,
     upstream_peer: SocketAddr,
     upstream_request_instant: Instant,
 ) -> Result<RelayedResponse> {
@@ -278,14 +275,9 @@ async fn relay_upstream_response(
     }
     let response_header_bytes = normalized_header_budget.used();
 
-    if let Some(cache) = cache {
-        cache
-            .invalidate_after_response(parsed, status, response_body_timeout)
-            .await;
-    }
     let mut cache_write = CacheWriteState::prepare(
         cache_miss,
-        &parsed.method,
+        request_method,
         status,
         response_headers.clone(),
         response_time,
@@ -439,7 +431,6 @@ pub(super) async fn forward_request_to_upstream(
     max_request_header_bytes: usize,
     max_response_header_bytes: usize,
     cache_miss: Option<Box<CacheMiss>>,
-    cache: Option<&HttpCache>,
 ) -> Result<ForwardOutcome> {
     let request_deadline = request_deadline.instant();
     let sender = checkout.sender;
@@ -477,6 +468,7 @@ pub(super) async fn forward_request_to_upstream(
         open_upstream_stream(sender.as_ref(), request, end_of_stream, request_deadline).await?;
 
     let mut body_tracker = BodySizeTracker::new(max_request_body_size);
+    let request_method = meta.parsed.method.clone();
     let mut cache_miss = cache_miss;
     let receive_response = async {
         response_fut
@@ -500,8 +492,7 @@ pub(super) async fn forward_request_to_upstream(
             response_progress,
             max_response_header_bytes,
             cache_miss.take(),
-            &meta.parsed,
-            cache,
+            &request_method,
             upstream_peer,
             upstream_request_instant,
         )
@@ -529,8 +520,7 @@ pub(super) async fn forward_request_to_upstream(
                     response_progress,
                     max_response_header_bytes,
                     cache_miss.take(),
-                    &meta.parsed,
-                    cache,
+                    &request_method,
                     upstream_peer,
                     upstream_request_instant,
                 );
@@ -565,8 +555,7 @@ pub(super) async fn forward_request_to_upstream(
                     response_progress,
                     max_response_header_bytes,
                     cache_miss.take(),
-                    &meta.parsed,
-                    cache,
+                    &request_method,
                     upstream_peer,
                     upstream_request_instant,
                 )
@@ -593,8 +582,6 @@ pub(super) async fn forward_request_to_upstream(
 pub(super) async fn forward_finalized_request_to_upstream(
     checkout: UpstreamCheckout,
     finalized: FinalizedRequestV1,
-    parsed: &ParsedRequest,
-    cache: Option<&HttpCache>,
     respond: &mut SendResponse<Bytes>,
     request_body_timeout: Duration,
     response_header_timeout: Duration,
@@ -606,6 +593,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
     let request_deadline = request_deadline.instant();
     let upstream_peer = checkout.peer;
     let reused_existing = checkout.reused_existing;
+    let request_method = finalized.method().clone();
     let client_body_bytes = finalized.client_body_wire_bytes();
     let (request, body) = finalized.into_http2_parts()?;
     let end_of_stream = body.is_none();
@@ -653,8 +641,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
                     response_progress,
                     max_response_header_bytes,
                     None,
-                    parsed,
-                    cache,
+                    &request_method,
                     upstream_peer,
                     upstream_request_instant,
                 )
@@ -678,8 +665,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
                     response_progress,
                     max_response_header_bytes,
                     None,
-                    parsed,
-                    cache,
+                    &request_method,
                     upstream_peer,
                     upstream_request_instant,
                 )
@@ -701,8 +687,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
             response_progress,
             max_response_header_bytes,
             None,
-            parsed,
-            cache,
+            &request_method,
             upstream_peer,
             upstream_request_instant,
         )
