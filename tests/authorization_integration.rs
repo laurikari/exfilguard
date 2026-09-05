@@ -351,6 +351,54 @@ impl Drop for Http1Origin {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorization_service_rejects_an_untrusted_server_certificate() -> Result<()> {
+    let origin = Http1Origin::spawn().await?;
+    let credential_scope = format!("http://127.0.0.1:{}/credential", origin.addr.port());
+    let services = AuthorizationFixture::spawn(credential_scope.clone()).await?;
+    let unrelated_ca_dir = TempDir::new()?;
+    let unrelated_tls = make_service_tls(&unrelated_ca_dir)?;
+    let mut authorization = services.settings();
+    authorization.services[0].server_ca_cert = unrelated_tls.ca_path;
+
+    let policy_name = "allow-untrusted-service-origin";
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&[policy_name])
+        .policy(PolicySpec::new(policy_name).rule(RuleSpec::allow(
+            &["GET"],
+            format!("http://127.0.0.1:{}/**", origin.addr.port()),
+        )))
+        .render();
+    let clients = with_delegated_authorization(clients, &credential_scope, BodyAccess::None);
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(move |settings| settings.authorization = Some(authorization))
+        .spawn()
+        .await?;
+
+    let mut downstream = TcpStream::connect(harness.addr).await?;
+    downstream
+        .write_all(
+            format!(
+                "GET {credential_scope} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+                origin.addr.port(),
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let response = read_http_response_with_length(&mut downstream).await?;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    assert!(
+        response.contains("authorization service failed"),
+        "{response}"
+    );
+    assert_eq!(services.policy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(origin.requests.load(Ordering::SeqCst), 0);
+
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plain_http_binds_token_applies_credentials_and_bypasses_cache() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
     let mut dirs = TestDirs::new()?;

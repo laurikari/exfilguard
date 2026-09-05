@@ -352,6 +352,13 @@ If the system trust store is empty, startup fails.
 That rule is strict on purpose. If a host has no trust anchors, the fix is to
 install them.
 
+Vault HTTPS also uses platform trust, with optional additional roots from
+`vault.tls_ca_cert`, rather than a bundled public CA list. This lets operators
+manage Vault transport trust through the host. Authorization-service HTTPS
+remains restricted to its configured `server_ca_cert` roots; platform trust
+must not broaden that service-specific boundary. Neither transport trust store
+replaces the pinned roots used to validate certificates issued by Vault PKI.
+
 ## Debian package provisioning is root-aware and declarative
 
 The Debian package provisions the `exfilguard` system account with

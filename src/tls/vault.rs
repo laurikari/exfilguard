@@ -243,10 +243,8 @@ impl VaultClient {
 
         if let Some(ca_path) = &config.tls_ca_cert {
             for cert in read_public_certificate_bundle(ca_path)? {
-                builder = builder.add_root_certificate(
-                    reqwest::Certificate::from_der(&cert)
-                        .context("failed to add Vault TLS trust certificate")?,
-                );
+                builder = builder.tls_certs_merge([reqwest::Certificate::from_der(&cert)
+                    .context("failed to add Vault TLS trust certificate")?]);
             }
         }
 

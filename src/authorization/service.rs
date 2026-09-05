@@ -817,18 +817,14 @@ impl AuthorizationClientConfig {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let identity = reqwest::Identity::from_pem(identity_pem)
             .context("failed to parse authorization-service client identity")?;
-        let mut builder = reqwest::Client::builder()
+        reqwest::Client::builder()
             .https_only(true)
             .no_proxy()
             .redirect(RedirectPolicy::none())
-            .tls_built_in_root_certs(false)
+            .tls_certs_only(self.roots.iter().cloned())
             .identity(identity)
             .timeout(self.timeout)
-            .connect_timeout(self.timeout);
-        for root in self.roots.iter() {
-            builder = builder.add_root_certificate(root.clone());
-        }
-        builder
+            .connect_timeout(self.timeout)
             .build()
             .context("failed to build authorization-service HTTPS client")
     }

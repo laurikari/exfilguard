@@ -218,6 +218,11 @@ ExfilGuard has one shared HashiCorp Vault connection. The inspection CA and
 authorization services can both use it. HCP Vault Secrets is a different
 product and API.
 
+Vault HTTPS uses the platform trust store. `tls_ca_cert` adds certificates to
+that trust store for the Vault connection; it does not replace the platform
+roots. This transport trust is separate from `vault.pki.expected_root_certs`,
+which pins the roots accepted for certificates issued by Vault.
+
 Configure the Vault connection, PKI trust, and authentication once:
 
 ```toml
