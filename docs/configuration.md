@@ -540,9 +540,11 @@ started, ExfilGuard closes or resets the request instead of appending another
 response. Outer CONNECT setup, tunnel lifetime, and cleanup after response
 delivery use their own limits.
 
-For HTTP/2 cacheable responses, `response_body_idle_timeout` also bounds each
-cache file operation on the response path. A storage error or timeout abandons
-the cache copy while response forwarding continues.
+For HTTP/1 and HTTP/2 cacheable responses, `response_body_idle_timeout` also bounds
+each wait for cache file operations on the response path. A storage error or
+timeout lets response forwarding continue without waiting for caching. File
+creation and already-started publication finish or clean up in the background;
+publication may still store the entry after the request stops waiting.
 
 ---
 

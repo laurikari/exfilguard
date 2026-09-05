@@ -6,12 +6,12 @@ use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use crate::io_util::write_all_with_timeout;
+use crate::io_util::{PayloadCopy, write_all_with_timeout};
 use crate::proxy::forward_error::{InformationalResponseStarted, RequestTimeout};
 use crate::proxy::forward_limits::HeaderBudget;
 use crate::util::timeout_with_context;
 
-use super::super::body::{relay_chunked_body, relay_fixed_body, relay_until_close};
+use super::super::body::{relay_chunked_body, relay_unframed_body};
 use super::super::codec::{Http1ResponseHead, read_http1_response_head_with_budget};
 use super::ForwardTimeouts;
 
@@ -178,9 +178,11 @@ pub(crate) fn determine_response_body_plan(
     ResponseBodyPlan::UntilClose
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
+    payload_copy: Option<&mut PayloadCopy<'_>>,
     body_plan: ResponseBodyPlan,
     timeouts: &ForwardTimeouts,
     upstream_peer: SocketAddr,
@@ -193,14 +195,15 @@ where
 {
     match body_plan {
         ResponseBodyPlan::Empty => Ok(ResponseRelayStats::default()),
-        ResponseBodyPlan::Fixed(length) => relay_fixed_body(
+        ResponseBodyPlan::Fixed(length) => relay_unframed_body(
             upstream,
             client,
-            length,
+            Some(length),
             timeouts.response_io,
             timeouts.response_io,
             upstream_peer,
             total_deadline,
+            payload_copy,
         )
         .await
         .map(|bytes| ResponseRelayStats {
@@ -210,6 +213,7 @@ where
         ResponseBodyPlan::Chunked => relay_chunked_body(
             upstream,
             client,
+            payload_copy,
             timeouts.response_io,
             timeouts.response_io,
             upstream_peer,
@@ -221,13 +225,15 @@ where
             bytes: stats.bytes_written,
             had_trailers: stats.had_trailers,
         }),
-        ResponseBodyPlan::UntilClose => relay_until_close(
+        ResponseBodyPlan::UntilClose => relay_unframed_body(
             upstream,
             client,
+            None,
             timeouts.response_io,
             timeouts.response_io,
             upstream_peer,
             total_deadline,
+            payload_copy,
         )
         .await
         .map(|bytes| ResponseRelayStats {
@@ -251,6 +257,50 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_errors_and_stalls_do_not_truncate_response_bodies() {
+        let payload = "x".repeat(16 * 1024);
+        let chunked = format!("4000\r\n{payload}\r\n0\r\n\r\n");
+        let timeout = Duration::from_secs(1);
+        let timeouts = ForwardTimeouts {
+            connect: timeout,
+            request_io: timeout,
+            response_header: timeout,
+            response_io: timeout,
+        };
+        for stall in [false, true] {
+            for (plan, wire) in [
+                (
+                    ResponseBodyPlan::Fixed(payload.len() as u64),
+                    payload.as_bytes(),
+                ),
+                (ResponseBodyPlan::UntilClose, payload.as_bytes()),
+                (ResponseBodyPlan::Chunked, chunked.as_bytes()),
+            ] {
+                let (mut cache_writer, cache_reader) = duplex(1);
+                let _reader = stall.then_some(cache_reader);
+                let mut copy = crate::io_util::PayloadCopy::best_effort(&mut cache_writer);
+                let mut upstream = BufReader::new(wire);
+                let mut client = Vec::new();
+                let stats = super::relay_body(
+                    &mut upstream,
+                    &mut client,
+                    Some(&mut copy),
+                    plan,
+                    &timeouts,
+                    "127.0.0.1:80".parse().unwrap(),
+                    None,
+                    1024,
+                )
+                .await
+                .unwrap();
+                assert_eq!(client, wire, "{plan:?}, stall={stall}");
+                assert_eq!(stats.bytes, wire.len() as u64);
+                assert!(copy.take_error().is_some());
+            }
+        }
+    }
 
     fn head_with_status(status: StatusCode) -> Http1ResponseHead {
         Http1ResponseHead {
@@ -357,6 +407,7 @@ mod tests {
             super::relay_body(
                 &mut upstream_reader,
                 &mut client,
+                None,
                 ResponseBodyPlan::Fixed(4),
                 &timeouts,
                 upstream_peer,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
@@ -16,6 +16,8 @@ use tracing::trace;
 use crate::config::MAX_CACHE_TTL_SECONDS;
 
 mod admission;
+#[cfg(test)]
+mod cancellation_tests;
 mod entry;
 mod index;
 mod key;
@@ -61,7 +63,7 @@ pub struct HttpCache {
 #[derive(Debug)]
 struct CacheState {
     index: Mutex<CacheIndex>,
-    publish_lock: tokio::sync::Mutex<()>,
+    publish_lock: Arc<tokio::sync::Mutex<()>>,
     store: CacheStore,
     max_entry_size: u64,
     max_bytes: u64,
@@ -99,7 +101,7 @@ impl HttpCache {
         let store = CacheStore::new(disk_dir.clone());
         let state = Arc::new(CacheState {
             index: Mutex::new(index),
-            publish_lock: tokio::sync::Mutex::new(()),
+            publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             store,
             max_entry_size,
             max_bytes,
@@ -151,21 +153,29 @@ impl HttpCache {
         let temp_name = format!("tmp_{}", uuid::Uuid::new_v4());
         let temp_path = self.state.store.temp_path(&temp_name);
 
-        let mut options = async_fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        let file = options.open(&temp_path).await?;
-
-        Ok(Some(CacheWriter::new(
-            file,
-            temp_path,
-            self.state.clone(),
-            cache_key,
-            vary,
-        )))
+        let state = self.state.clone();
+        // File creation cannot be cancelled once its blocking syscall starts.
+        // Return an owning writer from that same job so a timed-out caller
+        // still leaves someone responsible for removing the temporary file.
+        task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(&temp_path)?;
+            Ok(Some(CacheWriter::new(
+                async_fs::File::from_std(file),
+                temp_path,
+                state,
+                cache_key,
+                vary,
+            )))
+        })
+        .await
+        .context("cache file creation task failed")?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -259,7 +269,7 @@ impl CacheState {
         self.store.write_metadata_async(entry_id, entry).await
     }
 
-    fn publish_lock(&self) -> &tokio::sync::Mutex<()> {
+    fn publish_lock(&self) -> &Arc<tokio::sync::Mutex<()>> {
         &self.publish_lock
     }
 

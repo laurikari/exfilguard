@@ -407,9 +407,18 @@ metadata and filesystem overhead still require headroom.
 
 When the staging allowance is exhausted, ExfilGuard abandons only the cache
 copy and continues forwarding the response. It does not slow or reject client
-traffic to protect cache population. HTTP/2 cache file operations on the
-response path are likewise bounded by the response-body idle timeout; a storage
-error or timeout abandons caching without failing the forwarded response.
+traffic to protect cache population. HTTP/1 and HTTP/2 waits for cache file operations
+on the response path are bounded by the response-body idle timeout; a storage
+error or timeout does not fail the forwarded response. File creation and final
+publication retain ownership after the caller stops waiting: they finish or clean
+up in the background, retaining staging reservations while publication runs.
+Publication acquires the shared cache lock within the caller's timeout before
+becoming independent of the request. Timed-out waiters discard their fills;
+only one publication per cache can outlive its caller, without an unbounded
+background queue. That publication may still store an entry after the timeout.
+Client writes and cache payload copies have independent deadlines; no cache
+operation runs inside a client-write idle timeout. Payload copies are sequential
+and bounded rather than queued in a separate background buffering pipeline.
 Same-key fills are not coalesced: that is an upstream-load optimization with
 response-variant complexity, not necessary for bounding temporary disk use.
 

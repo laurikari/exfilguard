@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::time::timeout;
 
 use crate::{
-    io_util::write_all_with_timeout,
+    io_util::{PayloadCopy, write_all_with_timeout},
     proxy::{
         forward_error::{ClientBodyIdleTimeout, RequestTimeout},
         forward_limits::BodySizeTracker,
@@ -384,7 +384,7 @@ async fn relay_chunked_body_generic<R, W>(
     max_trailer_bytes: usize,
     trailer_limit_error: &'static str,
     sanitize_trailers: TrailerSanitizer,
-    mut payload_copy: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+    mut payload_copy: Option<&mut PayloadCopy<'_>>,
     read_source: BodyReadSource,
 ) -> Result<ChunkedRelayStats>
 where
@@ -539,11 +539,7 @@ where
             if let Some(payload_copy) = payload_copy.as_deref_mut() {
                 with_total_deadline(
                     total_deadline,
-                    timeout_with_context(
-                        write_timeout,
-                        payload_copy.write_all(&buffer[..read]),
-                        "writing decoded chunk payload copy",
-                    ),
+                    payload_copy.write(&buffer[..read], write_timeout),
                 )
                 .await?;
             }
@@ -669,7 +665,7 @@ where
         max_trailer_bytes,
         "request trailer section exceeds configured limit",
         sanitize_request_trailer_lines,
-        Some(&mut payload),
+        Some(&mut PayloadCopy::required(&mut payload)),
         BodyReadSource::Client,
     )
     .await;
@@ -692,14 +688,16 @@ where
     }
 }
 
-pub async fn relay_fixed_body<S, C>(
+#[allow(clippy::too_many_arguments)]
+pub async fn relay_unframed_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
-    mut remaining: u64,
+    mut remaining: Option<u64>,
     read_timeout: Duration,
     write_timeout: Duration,
     peer: SocketAddr,
     total_deadline: Option<Instant>,
+    mut payload_copy: Option<&mut PayloadCopy<'_>>,
 ) -> Result<u64>
 where
     S: AsyncRead + Unpin,
@@ -707,8 +705,10 @@ where
 {
     let mut transferred = 0u64;
     let mut buffer = [0u8; 8192];
-    while remaining > 0 {
-        let to_read = remaining.min(buffer.len() as u64) as usize;
+    while remaining != Some(0) {
+        let to_read = remaining
+            .unwrap_or(buffer.len() as u64)
+            .min(buffer.len() as u64) as usize;
         let read = with_total_deadline(
             total_deadline,
             timeout_with_context(
@@ -719,9 +719,14 @@ where
         )
         .await?;
         if read == 0 {
-            bail!("upstream closed connection early while sending response body");
+            if remaining.is_some() {
+                bail!("upstream closed connection early while sending response body");
+            }
+            break;
         }
-        remaining -= read as u64;
+        if let Some(remaining) = remaining.as_mut() {
+            *remaining -= read as u64;
+        }
         with_total_deadline(
             total_deadline,
             write_all_with_timeout(
@@ -732,14 +737,19 @@ where
             ),
         )
         .await?;
+        if let Some(copy) = payload_copy.as_deref_mut() {
+            with_total_deadline(total_deadline, copy.write(&buffer[..read], write_timeout)).await?;
+        }
         transferred = transferred.saturating_add(read as u64);
     }
     Ok(transferred)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn relay_chunked_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
+    payload_copy: Option<&mut PayloadCopy<'_>>,
     read_timeout: Duration,
     write_timeout: Duration,
     peer: SocketAddr,
@@ -762,93 +772,17 @@ where
         max_response_trailer_bytes,
         "response trailer section exceeds configured limit",
         sanitize_response_trailer_lines,
-        None,
+        payload_copy,
         BodyReadSource::Upstream,
     )
     .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn relay_chunked_body_with_payload_copy<S, C, P>(
-    upstream: &mut BufReader<S>,
-    client: &mut C,
-    payload_copy: &mut P,
-    read_timeout: Duration,
-    write_timeout: Duration,
-    peer: SocketAddr,
-    total_deadline: Option<Instant>,
-    max_response_trailer_bytes: usize,
-) -> Result<ChunkedRelayStats>
-where
-    S: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-    P: AsyncWrite + Unpin + Send,
-{
-    relay_chunked_body_generic(
-        upstream,
-        client,
-        read_timeout,
-        write_timeout,
-        total_deadline,
-        peer,
-        "to client",
-        None,
-        max_response_trailer_bytes,
-        "response trailer section exceeds configured limit",
-        sanitize_response_trailer_lines,
-        Some(payload_copy),
-        BodyReadSource::Upstream,
-    )
-    .await
-}
-
-pub async fn relay_until_close<S, C>(
-    upstream: &mut BufReader<S>,
-    client: &mut C,
-    read_timeout: Duration,
-    write_timeout: Duration,
-    peer: SocketAddr,
-    total_deadline: Option<Instant>,
-) -> Result<u64>
-where
-    S: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    let mut total = 0u64;
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = with_total_deadline(
-            total_deadline,
-            timeout_with_context(
-                read_timeout,
-                upstream.read(&mut buffer),
-                format!("reading response body from upstream {peer}"),
-            ),
-        )
-        .await?;
-        if read == 0 {
-            break;
-        }
-        with_total_deadline(
-            total_deadline,
-            write_all_with_timeout(
-                client,
-                &buffer[..read],
-                write_timeout,
-                "writing response body to client",
-            ),
-        )
-        .await?;
-        total = total.saturating_add(read as u64);
-    }
-    Ok(total)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         InvalidRequestBody, buffer_chunked_body, parse_chunk_size_line, relay_chunked_body,
-        relay_chunked_body_with_payload_copy, stream_chunked_body,
+        stream_chunked_body,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
@@ -981,6 +915,7 @@ mod tests {
         let err = relay_chunked_body(
             &mut upstream,
             &mut tokio::io::sink(),
+            None,
             Duration::from_secs(1),
             Duration::from_secs(1),
             peer(),
@@ -1001,10 +936,12 @@ mod tests {
         upstream_writer.write_all(body).await.unwrap();
         drop(upstream_writer);
 
-        let stats = relay_chunked_body_with_payload_copy(
+        let stats = relay_chunked_body(
             &mut BufReader::new(upstream_stream),
             &mut client_sink,
-            &mut payload_sink,
+            Some(&mut crate::io_util::PayloadCopy::required(
+                &mut payload_sink,
+            )),
             Duration::from_secs(1),
             Duration::from_secs(1),
             peer(),
@@ -1043,6 +980,7 @@ mod tests {
         let stats = relay_chunked_body(
             &mut upstream,
             &mut client_stream,
+            None,
             Duration::from_secs(1),
             Duration::from_secs(1),
             peer(),
