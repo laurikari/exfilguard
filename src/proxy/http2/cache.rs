@@ -34,6 +34,7 @@ pub(super) struct CacheMiss {
     cache: Arc<HttpCache>,
     request: CacheRequestContext,
     force_cache_duration: Option<std::time::Duration>,
+    generation: u64,
 }
 
 pub(super) async fn evaluate_cache(
@@ -62,10 +63,12 @@ pub(super) async fn evaluate_cache(
         }
     };
 
+    let generation = cache.generation();
     match cache.lookup_for_header_map(&meta.parsed, &headers).await {
         Ok(CacheLookupOutcome::Hit(cached)) => CacheEvaluation::Hit(cached),
         Ok(CacheLookupOutcome::Miss) => CacheEvaluation::Miss(Box::new(CacheMiss {
             cache: cache.clone(),
+            generation,
             request,
             force_cache_duration: config.force_cache_duration,
         })),
@@ -142,6 +145,7 @@ impl CacheWriteState {
             &plan.request.uri,
             &plan.request.headers,
             &plan.response_headers,
+            miss.generation,
         );
         match timeout(cache_io_timeout, open).await {
             Err(_) => {
@@ -369,7 +373,13 @@ mod tests {
         let request_headers = HeaderMap::new();
         let response_headers = HeaderMap::new();
         let mut writer = cache
-            .open_stream(&Method::GET, &uri, &request_headers, &response_headers)
+            .open_stream(
+                &Method::GET,
+                &uri,
+                &request_headers,
+                &response_headers,
+                cache.generation(),
+            )
             .await?
             .expect("cache stream should be available");
         writer.stall_file_operations();

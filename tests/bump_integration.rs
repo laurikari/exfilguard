@@ -4170,3 +4170,73 @@ async fn connect_bump_http2_bounds_unacknowledged_graceful_shutdown() -> Result<
     );
     Ok(())
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bumped_cache_mutations_invalidate_across_http_versions() -> Result<()> {
+    for first_h2 in [false, true] {
+        let policy = PolicySpec::new("cache-mutations")
+            .rule(RuleSpec::allow(&["GET"], "https://localhost/**").cache_force_duration(60))
+            .rule(RuleSpec::allow(&["DELETE"], "https://localhost/**"));
+        let protocol = |h2| {
+            if h2 {
+                ClientProtocols::Http2Only
+            } else {
+                ClientProtocols::Http1
+            }
+        };
+        let mut fixture = BumpedTlsFixture::new(
+            BumpedTlsOptions::new("localhost", "cache-mutations", policy)
+                .client_protocols(protocol(first_h2))
+                .upstream_mode(UpstreamMode::DualProtocolCacheInspect)
+                .with_cache(),
+        )
+        .await?;
+        let authority = format!("localhost:{}", fixture.upstream_addr().port());
+        let uri: Uri = format!("https://{authority}/resource").parse()?;
+        for (index, (method, h2)) in [
+            (Method::GET, first_h2),
+            (Method::DELETE, !first_h2),
+            (Method::GET, !first_h2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index != 0 {
+                fixture.reconnect(protocol(h2)).await?;
+            }
+            if h2 {
+                let mut client = fixture.h2_client().await?;
+                let request = http::Request::builder()
+                    .method(method)
+                    .uri(uri.clone())
+                    .body(())?;
+                let (status, _) = client.request_text(request).await?;
+                assert_eq!(status, StatusCode::OK);
+                client.shutdown().await;
+            } else {
+                let mut client = fixture.http1_client();
+                client.send(format!("{method} /resource HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")).await?;
+                assert!(client.read_response().await?.starts_with("HTTP/1.1 200"));
+            }
+            assert_eq!(
+                fixture.request_count(),
+                index + 1,
+                "phase {index}, first_h2={first_h2}"
+            );
+            if index == 0 {
+                let cache = fixture.cache();
+                timeout(StdDuration::from_secs(3), async {
+                    while cache
+                        .lookup(&Method::GET, &uri, &http::HeaderMap::new())
+                        .await
+                        .is_none()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+            }
+        }
+        fixture.shutdown().await;
+    }
+    Ok(())
+}

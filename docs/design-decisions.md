@@ -398,6 +398,22 @@ one HTTP version to serve the other. Responses with trailers are forwarded but
 not stored, and HTTP/1 responses with transfer-coding chains other than a sole
 `chunked` coding are not representable and therefore skip storage.
 
+## Successful mutations invalidate stored representations
+
+A 2xx or 3xx response to an unsafe or unknown-safety method invalidates GET and
+HEAD entries for the target cache URI, regardless of whether the mutation's
+rule enables caching. This includes forced-TTL entries and applies across HTTP
+versions. Invalidation removes persistent metadata before forwarding the
+mutation response.
+
+A cache-wide generation counter prevents fills started before an invalidation
+from publishing afterward. This deliberately skips unrelated in-flight fills
+too, while retaining unrelated completed entries; it avoids per-URI generation
+tracking and its lifecycle bookkeeping. Publication and invalidation share one
+lock. If invalidation fails or is cancelled, ExfilGuard continues forwarding but
+disables cache use for that process. It logs that cache storage must be cleared
+before restarting, since failed disk cleanup cannot guarantee persisted freshness.
+
 ## Cache disk limits do not throttle forwarding
 
 `cache_total_capacity` bounds completed response bodies, while all in-progress
