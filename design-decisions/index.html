@@ -1,0 +1,1339 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Egress proxy for data exfiltration prevention">
+      
+      
+      
+        <link rel="canonical" href="https://laurikari.github.io/exfilguard/design-decisions/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Design Decisions - ExfilGuard</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="cyan" data-md-color-accent="cyan">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#design-decisions" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="ExfilGuard" class="md-header__button md-logo" aria-label="ExfilGuard" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            ExfilGuard
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Design Decisions
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/laurikari/exfilguard" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    laurikari/exfilguard
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="ExfilGuard" class="md-nav__button md-logo" aria-label="ExfilGuard" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    ExfilGuard
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/laurikari/exfilguard" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    laurikari/exfilguard
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../authorization-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authorization Service API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../policies/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Policies
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../http-framing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP/1.1 Framing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#canonical-request-data-for-policy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Canonical request data for policy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#policy-stops-at-the-application-routing-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Policy stops at the application-routing boundary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reject-ambiguous-syntax" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reject ambiguous syntax
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#close-after-a-committed-response-fails" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Close after a committed response fails
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#response-head-limits-include-informational-responses" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Response-head limits include informational responses
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cache-only-bodyless-requests" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cache only bodyless requests
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retry-only-replayable-idempotent-requests" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retry only replayable idempotent requests
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tls-leaf-certificates-are-cached-only-in-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TLS leaf certificates are cached only in memory
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ca-material-is-controlled-by-the-process-owner" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CA material is controlled by the process owner
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ca-lifecycle-is-selected-explicitly" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CA lifecycle is selected explicitly
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#https-inspect-and-tunnel-modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HTTPS inspect and tunnel modes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ordered-policy-evaluation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ordered policy evaluation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#client-selection-and-delegated-authorization-are-separate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Client selection and delegated authorization are separate
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-non-public-upstreams-by-default" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Block non-public upstreams by default
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#one-policy-path-for-all-front-ends" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One policy path for all front-ends
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#explicit-proxy-traffic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Explicit proxy traffic
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#availability-isolation-combines-client-budgets-with-deployment-controls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Availability isolation combines client budgets with deployment controls
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#request-body-limits-are-opt-in" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Request body limits are opt-in
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#real-trust-store-for-outbound-tls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Real trust store for outbound TLS
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#debian-package-provisioning-is-root-aware-and-declarative" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Debian package provisioning is root-aware and declarative
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#caching-is-opt-in" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Caching is opt-in
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cache-freshness-does-not-imply-mutation-coherence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cache freshness does not imply mutation coherence
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#response-cache-entries-are-protocol-neutral" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Response cache entries are protocol-neutral
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cache-disk-limits-do-not-throttle-forwarding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cache disk limits do not throttle forwarding
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sighup-reloads-policy-data-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SIGHUP reloads policy data only
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#one-semantic-config-validator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One semantic config validator
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#settings-stays-close-to-exfilguardtoml" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Settings stays close to exfilguard.toml
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#client-limits-use-connection-time-accounting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Client limits use connection-time accounting
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#some-protocol-features-stay-out-of-scope" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Some protocol features stay out of scope
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#http2-uses-request-idle-connection-timeouts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HTTP/2 uses request-idle connection timeouts
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#http2-stream-admission-follows-the-origins-limit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HTTP/2 stream admission follows the origin's limit
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#http2-request-and-response-bodies-remain-full-duplex" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HTTP/2 request and response bodies remain full duplex
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-total-request-timeout-is-an-end-to-end-inner-request-budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The total request timeout is an end-to-end inner-request budget
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#upstream-tcp-connection-setup-has-one-multi-address-budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upstream TCP connection setup has one multi-address budget
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#raw-connect-tunnel-idleness-is-bidirectional" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Raw CONNECT tunnel idleness is bidirectional
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="design-decisions">Design Decisions</h1>
+<p>This file explains choices that may otherwise look like missing work.</p>
+<h2 id="canonical-request-data-for-policy">Canonical request data for policy</h2>
+<p>ExfilGuard makes policy decisions from a normalized request view and keeps the
+original request target for forwarding.</p>
+<p>Policy rules should not depend on small syntax differences. ExfilGuard also
+should not rewrite upstream-visible bytes in ways that change request meaning.
+It rejects ambiguous or conflicting syntax first, then canonicalizes requests
+that already have one clear meaning.</p>
+<p>For policy matching, percent-encoded RFC-unreserved characters are decoded and
+the hex digits of retained escapes are uppercased. Dot-segment processing runs
+on that canonical policy path. IP-literal hosts in rules and requests are
+parsed and serialized to one numeric spelling before comparison. The original
+request target remains unchanged for forwarding, logging, cache keys, and
+signature-sensitive traffic.</p>
+<p>Policy path patterns must already be canonical: configurations containing dot
+segments or repeated slash separators are rejected. Rewriting a pattern could
+silently change operator intent, especially when the removed segment contains
+a wildcard. Patterns accept the same literal RFC path characters and retained
+uppercase percent escapes as the canonical request view. Because <code>*</code> is the
+path wildcard, <code>\*</code> is the policy-only spelling for a literal raw asterisk;
+request paths themselves reject backslashes. This keeps raw <code>*</code>, encoded <code>%2A</code>,
+and literal <code>%2A</code> text exactly distinguishable in policy.</p>
+<h2 id="policy-stops-at-the-application-routing-boundary">Policy stops at the application-routing boundary</h2>
+<p>ExfilGuard evaluates the HTTP method and RFC-defined request target that it
+receives on the wire. It does not emulate framework- or origin-specific routing
+transformations. Valid reserved path characters remain part of the canonical
+policy path, retained percent escapes remain encoded, and the original target
+is forwarded unchanged. In particular, semicolon is valid path data, literal
+<code>;</code> remains distinct from <code>%3B</code>, and <code>%2F</code> remains distinct from <code>/</code>.</p>
+<p>Operators are responsible for making policy rules consistent with downstream
+routing semantics. Guessing application transformations here would reject
+standards-compliant traffic without providing a complete model of arbitrary
+origin rewrites.</p>
+<h2 id="reject-ambiguous-syntax">Reject ambiguous syntax</h2>
+<p>ExfilGuard rejects malformed or ambiguous HTTP syntax on both sides of the
+proxy.</p>
+<p>That includes cases such as:</p>
+<ul>
+<li>both <code>Content-Length</code> and <code>Transfer-Encoding</code></li>
+<li>malformed or ambiguously terminated chunk framing</li>
+<li>malformed CONNECT authorities</li>
+<li>raw or encoded backslashes</li>
+<li>encoded dot-segment tricks</li>
+<li>request targets containing URI-fragment delimiters</li>
+</ul>
+<p>Upstream HTTP/1 status lines must use exact CRLF framing and the standard
+<code>HTTP/1.1 SP 3DIGIT SP [reason-phrase]</code> grammar. Valid reason-phrase bytes are
+preserved exactly; nonstandard separators and control bytes are rejected before
+the response is committed downstream.</p>
+<p>This is a security choice. ExfilGuard should not quietly “fix” a request into
+a different request or turn a malformed response into a different response.</p>
+<p>HTTP/1 origins that send <code>204 No Content</code> with one <code>Content-Length</code> field whose
+decimal value is zero are a narrow compatibility exception. A 204 ends at the header
+boundary regardless of framing fields, so ExfilGuard removes that redundant
+header before forwarding or caching and sends no body. Nonzero or malformed
+lengths and all <code>Transfer-Encoding</code> fields remain errors. The exception closes
+both the upstream and downstream connections, sacrificing keep-alive for this
+nonconforming case so unsolicited origin bytes cannot poison a pooled response.
+Conforming 204 responses retain their existing connection behavior.</p>
+<h2 id="close-after-a-committed-response-fails">Close after a committed response fails</h2>
+<p>Once ExfilGuard has sent a final HTTP response head or <code>200 Connection
+Established</code>, a later forwarding failure closes the downstream connection and
+is recorded in logs and metrics. It does not append another HTTP error
+response.</p>
+<p>After commitment, downstream bytes already have a defined protocol meaning;
+inside a CONNECT tunnel they may be arbitrary TLS or application data. A
+second plaintext status line would corrupt that stream and cannot reliably
+communicate the failure. Errors detected before commitment can still receive
+the appropriate HTTP error response.</p>
+<h2 id="response-head-limits-include-informational-responses">Response-head limits include informational responses</h2>
+<p>For upstream HTTP/1, <code>response_header_timeout</code> is one absolute deadline from
+the end of request transmission through the final response head.
+<code>max_response_header_size</code> is one aggregate wire-byte budget across every
+informational response and the final response head. Informational responses do
+not receive fresh limits.</p>
+<p>This bounds both slow header drips and fast informational-response floods using
+the existing operator controls. A separate informational-response count would
+add an arbitrary protocol limit without improving the byte or time bound.</p>
+<h2 id="cache-only-bodyless-requests">Cache only bodyless requests</h2>
+<p>Shared-cache lookup and storage are limited to requests proven to have no body.
+Body-bearing <code>GET</code> and <code>HEAD</code> requests are forwarded normally without using the
+cache. Cache keys do not include bodies, and serving a hit before consuming a
+body would leave request bytes in the downstream connection. Chunked requests
+also bypass the cache because their emptiness is unknown until framing is
+consumed.</p>
+<p>Fields named by <code>Vary</code> are matched using their complete ordered list of parsed
+field-value bytes. ExfilGuard does not generically comma-combine repeated fields
+because whether combination is valid depends on the field grammar. This
+conservative comparison can produce a cache miss for semantically equivalent
+spellings, but it cannot reuse a representation selected using a missing,
+extra, or reordered value. Cache layout changes invalidate entries that lack
+this complete key.</p>
+<h2 id="retry-only-replayable-idempotent-requests">Retry only replayable idempotent requests</h2>
+<p>When reuse of a pooled HTTP/1 upstream connection fails with an error that
+indicates a stale socket, ExfilGuard retries once on a fresh connection only if
+the request is bodyless, no response has started downstream, and it uses a
+standard idempotent method: <code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code>, <code>TRACE</code>, <code>PUT</code>, or <code>DELETE</code>.
+Response commitment is tracked before attempting the final head write, since
+a failed write may already have delivered bytes. Underlying connection errors
+cannot make a committed response retryable.</p>
+<p>The bodyless restriction makes the request locally replayable without buffering.
+The method restriction follows HTTP idempotency semantics when delivery to the
+origin is ambiguous. Non-idempotent methods and extension methods whose
+semantics ExfilGuard cannot establish are not retried automatically.</p>
+<p>Requests with service-supplied authentication headers are never retried, even
+when they are bodyless and idempotent. The service prepared those headers for
+one exact request. A retry would have to ask the service for new headers.</p>
+<h2 id="tls-leaf-certificates-are-cached-only-in-memory">TLS leaf certificates are cached only in memory</h2>
+<p>ExfilGuard does not persist generated TLS leaf certificates or their private
+keys. Leaf minting is cheap enough that reminting after a restart is preferable
+to maintaining an on-disk private-key cache with its own capacity, expiry, and
+filesystem-safety lifecycle.</p>
+<p>The in-memory cache is capacity-bounded. Concurrent requests for the same leaf
+are single-flighted, and globally limited mint jobs run on blocking workers so
+certificate generation cannot stall asynchronous I/O workers.</p>
+<h2 id="ca-material-is-controlled-by-the-process-owner">CA material is controlled by the process owner</h2>
+<p>ExfilGuard loads CA material only from a real owner-controlled directory. The
+directory and all CA files must belong to the process UID; private keys must be
+regular, non-symlink files with owner-only modes. Read-only owner modes are
+supported, but shared ownership and permissive modes are rejected at startup
+instead of being repaired automatically.</p>
+<p>This intentionally excludes shared-volume and sidecar ownership models. A CA
+signing key can impersonate every inspected origin, so deployment convenience
+does not justify accepting material another local principal can replace or
+read.</p>
+<h2 id="ca-lifecycle-is-selected-explicitly">CA lifecycle is selected explicitly</h2>
+<p>ExfilGuard has three CA sources with deliberately different ownership models.
+<code>builtin</code> creates a long-lived root and intermediate once, persists only the
+certificates and intermediate key through a recoverable filesystem transaction,
+and does not renew them. <code>files</code> loads the same three artifacts but never creates
+or changes them. <code>vault</code> generates each intermediate key in memory, has a
+selected Vault PKI issuer sign it, and renews the complete issuer generation
+before expiry.</p>
+<p>The sources never silently fall back to one another. In particular, Vault
+unavailability after a restart prevents inspected HTTPS from starting because
+the previous in-memory issuer key is gone. During a running process, a failed
+renewal retains the current valid generation; after it expires, inspection
+fails closed instead of becoming a CONNECT tunnel. Replacing an issuer also
+replaces its leaf cache atomically so new handshakes cannot receive a leaf from
+the previous generation.</p>
+<p>CA hierarchies must support arbitrary leaf names selected by policy. ExfilGuard
+therefore rejects name constraints and any critical extension other than the
+<code>basicConstraints</code> and <code>keyUsage</code> semantics it explicitly enforces, rather than
+accepting an issuer whose additional constraints are ignored during leaf
+minting.</p>
+<p>ExfilGuard never loads or stores a root private key. File mode makes external
+ownership explicit, while Vault mode keeps CA and leaf private keys off disk.
+This separation is preferable to accepting partially managed directories or
+guessing an operator's intended lifecycle from whichever files happen to be
+present.</p>
+<p>Vault connection, PKI trust, and login settings are global rather than owned by
+the inspection CA. The inspection CA and authorization services use the same
+Vault connection and AppRole because both uses happen inside the same
+ExfilGuard process; separate logins would not isolate them. Vault permissions
+still name separate signing paths: one for the inspection intermediate and one
+leaf-certificate role for each authorization service.</p>
+<h2 id="https-inspect-and-tunnel-modes">HTTPS inspect and tunnel modes</h2>
+<p>In <code>inspect</code> mode, only a matching <code>ALLOW</code> rule may authorize the CONNECT host
+and port preflight that lets ExfilGuard start a bumped TLS session. A matching
+<code>DENY</code> rule does not authorize transport setup by itself, so deny-only
+authorities fail at the outer CONNECT without opening an upstream connection.
+Preflight does not allow arbitrary inner methods or paths. ExfilGuard checks
+those only after decryption.</p>
+<p>In <code>tunnel</code> mode, ExfilGuard may open a CONNECT tunnel and leave the payload
+alone.</p>
+<p>HTTP/1 clients may pipeline tunnel bytes immediately after the CONNECT header
+section. The HTTP parser can prefetch some of those bytes while finding the
+header boundary, so ExfilGuard preserves that bounded prefix across the mode
+switch. An allowed tunnel forwards it before later socket bytes; an inspected
+connection feeds it into the TLS handshake. A denied or failed CONNECT drops
+the prefix and never forwards it.</p>
+<p>This split makes the operator’s intent clear. It also keeps logs and metrics
+tied to the decision that actually mattered.</p>
+<h2 id="ordered-policy-evaluation">Ordered policy evaluation</h2>
+<p>ExfilGuard evaluates policies in order. Inside each policy, it evaluates rules
+in order. The first match wins. If nothing matches, ExfilGuard denies the
+request.</p>
+<p>This keeps policy behavior readable. Operators can put specific rules before
+general rules and know what will happen.</p>
+<h2 id="client-selection-and-delegated-authorization-are-separate">Client selection and delegated authorization are separate</h2>
+<p>ExfilGuard identifies a client from the downstream source address. It uses
+exact IP matches, CIDR ranges, and one fallback client.</p>
+<p>IPv4-mapped IPv6 peer addresses are treated as their underlying IPv4 address.
+Configuration must therefore use the ordinary IPv4 address or CIDR; mapped-only
+selectors are rejected rather than accepted as rules that can never match.</p>
+<p>The fallback client has no address selector and is considered only after exact
+IP and CIDR matching finds nothing. Configurations that set <code>ip</code> or <code>cidr</code> on
+the fallback are rejected.</p>
+<p>By default, it trusts the immediate peer address. If you enable PROXY protocol
+and trust the sender, it may use the address from that header instead. It does
+not use <code>X-Forwarded-For</code> or similar HTTP headers for client identity.</p>
+<p>Allowlisted PROXY peers are trusted infrastructure and must send their complete
+header promptly as the first bytes on the backend connection. A timeout and a
+separate pending-connection limit bound resource retention if that
+infrastructure stalls or malfunctions before ExfilGuard learns the logical
+client identity.</p>
+<p>An authorization token does not select the client and ExfilGuard does not treat
+it as an identity. ExfilGuard first selects the client from its source address.
+The client configuration then says whether to use an authorization service.
+Clients without one continue to use ordinary static policy on the same
+listener.</p>
+<p>A client that uses an authorization service sends its token with proxy
+authentication. ExfilGuard keeps the token with the connection. Policy cache
+entries are separated by service, token hash, source address, and audience. A
+missing, invalid, or changed token denies the request. So does an inactive or
+expired service policy. ExfilGuard never falls back to static policy alone.</p>
+<p>For inspected HTTPS, the token from <code>CONNECT</code> also applies to the decrypted
+requests. ExfilGuard checks the current service policy for each one. It denies
+raw CONNECT tunnels because it cannot see or check the requests inside them.</p>
+<p>Both the local policy and the service policy must allow every request. The
+service cannot change local settings. If it asks ExfilGuard to use a credential,
+the reference, destination, headers, and body access must fit a local
+<code>credential_limit</code> on the selected client.</p>
+<p>Before asking for authentication headers, ExfilGuard resolves and checks the
+destination and builds the exact request it will send. The service may fill only
+the header positions approved by the client configuration. A unique ID and a
+hash of the request tie the reply to that request. ExfilGuard sends nothing to
+the API until this succeeds. A body may be buffered and dechunked only when
+allowed; trailers and <code>Expect: 100-continue</code> are rejected.</p>
+<p>HTTP/1 connections are pooled separately for each token. Connections used for
+authenticated requests are not returned to the pool. Within one inspected
+HTTP/2 session, authenticated and unauthenticated streams for the same token may
+share one API connection. Service-supplied headers are marked sensitive so
+HTTP/2 header compression does not store their values. Credentials that
+authenticate an entire connection rather than one request are not supported.</p>
+<p>Clients that use delegated authorization bypass the shared response cache.
+Requests with service-supplied authentication are also never retried.</p>
+<p>An authorization service may use a client certificate loaded from files or a
+client certificate signed by Vault. For Vault, ExfilGuard creates the private
+key and CSR in memory, verifies the returned client-only certificate against
+the globally pinned PKI roots, and renews it halfway through its actual
+lifetime. It builds the replacement HTTPS client before switching new service
+requests to it. Requests already in flight may finish with the previous
+certificate, but no new service request starts with an expired one. The
+inspection intermediate is never reused as a client identity.</p>
+<h2 id="block-non-public-upstreams-by-default">Block non-public upstreams by default</h2>
+<p>By default, ExfilGuard blocks upstream addresses that are not globally routable
+on the public Internet.</p>
+<p>This reduces SSRF risk. If a client is compromised or misconfigured,
+ExfilGuard should not let it reach internal or special-purpose network space
+unless an operator makes an explicit exception.</p>
+<h2 id="one-policy-path-for-all-front-ends">One policy path for all front-ends</h2>
+<p>HTTP/1, HTTP/2, and CONNECT all go through the same policy code.</p>
+<p>This keeps policy meaning consistent across front-ends. A request should not
+get a different result just because it came in through a different HTTP stack.</p>
+<h2 id="explicit-proxy-traffic">Explicit proxy traffic</h2>
+<p>Clients are expected to know they are talking to a proxy.</p>
+<p>This keeps request meaning, client intent, and logging straightforward.
+Transparent proxying may come later.</p>
+<h2 id="availability-isolation-combines-client-budgets-with-deployment-controls">Availability isolation combines client budgets with deployment controls</h2>
+<p>ExfilGuard assumes its proxy and metrics listeners are reachable only by the
+authorized clients and monitoring systems an operator intends to serve. It is
+not a complete denial-of-service isolation or multi-tenant fairness boundary,
+but an authorized or compromised client must not retain unbounded downstream
+connections.</p>
+<p>Each configured client therefore has a default budget of 1,024 simultaneous
+downstream TCP connections, with an explicit per-client override. The count
+includes ordinary HTTP keep-alive connections, raw CONNECT tunnels, and
+inspected CONNECT sessions. A CIDR identity deliberately shares one budget
+across all matching machines. Admission uses the client identity after trusted
+PROXY protocol processing; excess new connections are closed without evicting
+established ones. Before that identity is available, connections from
+allowlisted PROXY peers use a separate, configurable pending budget; the permit
+is released as soon as ordinary per-client admission succeeds.</p>
+<p>There is no separate global lifetime, per-IP, or per-rule ceiling. Client
+limits remain stable across policy reloads and are observable through bounded
+per-client metrics. Deployments that need broader availability isolation should
+still use firewall, load-balancer, or equivalent network-edge controls. A
+future adaptive overload controller would require real resource-pressure
+signals and hysteresis; it is separate from deterministic client budgets.</p>
+<h2 id="request-body-limits-are-opt-in">Request body limits are opt-in</h2>
+<p>By default, ExfilGuard does not cap inspected request body size.</p>
+<p>It streams request bodies incrementally and relies on backpressure plus timeout
+controls for transport safety. Body size alone does not make a request invalid
+for policy purposes. Operators can still opt into a global request-body cap
+with <code>max_request_body_size</code> when that tradeoff fits their environment.</p>
+<p>When that cap is enabled, a request whose declared <code>Content-Length</code> already
+exceeds it is rejected before ExfilGuard opens an upstream request. Bodies
+without a declared length are still streamed and enforced incrementally.</p>
+<h2 id="real-trust-store-for-outbound-tls">Real trust store for outbound TLS</h2>
+<p>If the system trust store is empty, startup fails.</p>
+<p>That rule is strict on purpose. If a host has no trust anchors, the fix is to
+install them.</p>
+<p>Vault HTTPS also uses platform trust, with optional additional roots from
+<code>vault.tls_ca_cert</code>, rather than a bundled public CA list. This lets operators
+manage Vault transport trust through the host. Authorization-service HTTPS
+remains restricted to its configured <code>server_ca_cert</code> roots; platform trust
+must not broaden that service-specific boundary. Neither transport trust store
+replaces the pinned roots used to validate certificates issued by Vault PKI.</p>
+<h2 id="debian-package-provisioning-is-root-aware-and-declarative">Debian package provisioning is root-aware and declarative</h2>
+<p>The Debian package provisions the <code>exfilguard</code> system account with
+<code>systemd-sysusers</code> and its owned directories with <code>systemd-tmpfiles</code>. Both tools
+operate against <code>DPKG_ROOT</code> when dpkg explicitly runs maintainer scripts without
+a chroot, so image construction cannot mutate the build host.</p>
+<p>Purge removes ExfilGuard's state directory but retains the system account. This
+avoids reassigning its numeric UID to unrelated files that might remain outside
+the package-owned state tree.</p>
+<h2 id="caching-is-opt-in">Caching is opt-in</h2>
+<p>Response caching works only when global cache storage is configured and the
+allow rule enables caching.</p>
+<p>ExfilGuard does not cache allowed traffic by default. That keeps response
+storage and freshness changes under explicit operator control.</p>
+<h2 id="cache-freshness-does-not-imply-mutation-coherence">Cache freshness does not imply mutation coherence</h2>
+<p>ExfilGuard makes no attempt to invalidate cached responses when resources are
+modified, even when it observes a successful POST, PUT, or DELETE. When a rule
+enables caching and upstream permits it, responses may be reused for their
+declared freshness lifetime. The existing per-rule fallback lifetime applies
+only when upstream freshness metadata is absent.</p>
+<p>Multi-node deployments have independent caches, and mutations can also bypass
+ExfilGuard entirely. Local invalidation would not provide deployment-wide
+consistency, so ExfilGuard deliberately does not implement the mutation-driven
+invalidation required by RFC 9111 section 4.4. It offers freshness-based caching,
+not cache coherence. Operators select cacheable traffic through fine-grained
+allow rules and leave caching disabled where this freshness model is unsuitable.
+Expiration, capacity eviction, and corrupt-entry cleanup remain unchanged.</p>
+<h2 id="response-cache-entries-are-protocol-neutral">Response cache entries are protocol-neutral</h2>
+<p>Inspected HTTP/1.1 and HTTP/2 traffic uses one shared response cache. Entries
+store canonical response headers and decoded payload bytes, not HTTP/1 chunk
+framing or HTTP/2 frames. A hit is framed for the downstream protocol.</p>
+<p>This keeps cache policy independent of ALPN and allows an entry populated over
+one HTTP version to serve the other. Responses with trailers are forwarded but
+not stored, and HTTP/1 responses with transfer-coding chains other than a sole
+<code>chunked</code> coding are not representable and therefore skip storage.</p>
+<h2 id="cache-disk-limits-do-not-throttle-forwarding">Cache disk limits do not throttle forwarding</h2>
+<p><code>cache_total_capacity</code> bounds completed response bodies, while all in-progress
+cache fills share one additional <code>cache_max_entry_size</code> staging allowance.
+These are advisory cache-storage bounds rather than a filesystem quota; normal
+metadata and filesystem overhead still require headroom.</p>
+<p>When the staging allowance is exhausted, ExfilGuard abandons only the cache
+copy and continues forwarding the response. It does not slow or reject client
+traffic to protect cache population. HTTP/1 and HTTP/2 waits for cache file operations
+on the response path are bounded by the response-body idle timeout; a storage
+error or timeout does not fail the forwarded response. File creation and final
+publication retain ownership after the caller stops waiting: they finish or clean
+up in the background, retaining staging reservations while publication runs.
+Publication acquires the shared cache lock within the caller's timeout before
+becoming independent of the request. Timed-out waiters discard their fills;
+only one publication per cache can outlive its caller, without an unbounded
+background queue. That publication may still store an entry after the timeout.
+Client writes and cache payload copies have independent deadlines; no cache
+operation runs inside a client-write idle timeout. Payload copies are sequential
+and bounded rather than queued in a separate background buffering pipeline.
+Same-key fills are not coalesced: that is an upstream-load optimization with
+response-variant complexity, not necessary for bounding temporary disk use.</p>
+<h2 id="sighup-reloads-policy-data-only"><code>SIGHUP</code> reloads policy data only</h2>
+<p><code>SIGHUP</code> reloads clients and policies. It does not reload listener settings,
+TLS material, cache settings, metrics settings, or timeout settings.</p>
+<p>That keeps reload simple. Policy data changes decisions. The other settings
+change long-lived runtime state. Restart handles those cases more clearly than
+live reload does.</p>
+<p>The configured client and policy files are one operator-managed generation.
+Deployment tooling must finish replacing the complete generation before it
+sends <code>SIGHUP</code>, and must leave those files unchanged while ExfilGuard reads
+them. ExfilGuard does not attempt to infer filesystem transactions, coordinate
+independent file updates, or defend against signals sent during an incomplete
+deployment.</p>
+<p>Each completed reload is still validated as a whole and published atomically
+in memory. A failed reload leaves the previous snapshot active. Filesystem I/O,
+TOML parsing, validation, and policy compilation run on Tokio's blocking pool
+so a legitimate reload does not stall proxy I/O or timers.</p>
+<h2 id="one-semantic-config-validator">One semantic config validator</h2>
+<p>The loader reads files, parses TOML, and builds config structs. One validator
+decides whether the config is valid.</p>
+<p>This keeps the rules the same across startup, reloads, and any code that builds
+config in memory. The validator runs on the full in-memory config.</p>
+<h2 id="settings-stays-close-to-exfilguardtoml"><code>Settings</code> stays close to <code>exfilguard.toml</code></h2>
+<p><code>Settings</code> is a plain Rust model of <code>exfilguard.toml</code>.</p>
+<p>This keeps tests simple. Test code can build settings directly without builders
+or helper layers. The config is still checked strictly. Deserialization checks
+basic structure and types. Validation checks cross-field rules. Startup checks
+settings again before we start serving traffic.</p>
+<p>Startup layers the main file, lexically ordered <code>config.d/*.toml</code> fragments,
+and environment overrides in that order. Fragments are partial global settings;
+all relative paths retain the main file's directory as their base. Global
+settings remain restart-only, while SIGHUP reload stays limited to client and
+policy data.</p>
+<h2 id="client-limits-use-connection-time-accounting">Client limits use connection-time accounting</h2>
+<p>Per-client <code>max_connections</code> is an operational resource guard, not a strict
+tenant quota. A connection acquires its permit using the client identity
+resolved when it is accepted, and that permit is not transferred if a later
+reload maps the peer address to another client. New connections use the new
+mapping and limits immediately.</p>
+<p>Requests on established HTTP and inspected HTTPS connections still use the
+latest policy snapshot, including any new client mapping. Reconciling their
+connection permits retroactively would add disruptive cross-generation
+accounting for an administrator-controlled transition without improving the
+normal steady-state resource bound. Established opaque CONNECT tunnels retain
+their setup-time decision until they close or reach their configured lifetime.</p>
+<h2 id="some-protocol-features-stay-out-of-scope">Some protocol features stay out of scope</h2>
+<p>ExfilGuard does not currently support some protocol features, including
+HTTP/1.0 and upgrade-style flows such as WebSocket over HTTP/1.1.</p>
+<p>We leave them out because that keeps the code easier to reason about.</p>
+<p>Inspected live forwarding also preserves the HTTP version across the client
+and upstream legs instead of translating between HTTP/1.1 and HTTP/2. The
+upstream ALPN preflight prevents ExfilGuard from advertising H2 unless the
+origin selected H2. Each live request uses the downstream-selected version
+upstream and fails rather than translating if that version is unavailable.
+This limits semantic changes and protocol-conversion attack surface. The opt-in
+response cache remains protocol-neutral because a cache hit has no live
+upstream leg to translate.</p>
+<h2 id="http2-uses-request-idle-connection-timeouts">HTTP/2 uses request-idle connection timeouts</h2>
+<p>The downstream HTTP/2 connection preface must arrive within
+<code>request_header_timeout</code>. After setup, <code>client_keepalive_idle_timeout</code> applies
+only while there are no active request streams. A client must produce its next
+complete request within that window; control traffic such as PING does not
+keep a request-idle connection alive. Active streams continue to use their
+phase-specific body, response, and optional total-request timeouts.</p>
+<p>The <code>h2</code> library does not expose when an individual HEADERS/CONTINUATION block
+starts. ExfilGuard therefore bounds an incomplete header block on an otherwise
+idle connection with the connection-idle timeout instead of maintaining a
+second partial HTTP/2 frame parser solely to apply a shorter header deadline.
+This keeps setup and idle retention bounded without imposing a lifetime on
+legitimate active or multiplexed sessions.</p>
+<p>After the origin connection closes, graceful downstream shutdown also has one
+<code>client_keepalive_idle_timeout</code> interval to finish. On expiry, ExfilGuard drops
+the connection and cancels remaining streams. An unanswered shutdown PING must
+not retain the connection indefinitely.</p>
+<h2 id="http2-stream-admission-follows-the-origins-limit">HTTP/2 stream admission follows the origin's limit</h2>
+<p>Each upstream HTTP/2 connection keeps one authoritative request sender.
+ExfilGuard waits for that sender to become ready and opens the stream while
+holding the same admission lock, so concurrent downstream requests cannot
+bypass the origin's advertised <code>MAX_CONCURRENT_STREAMS</code> state by using cloned
+senders. Only readiness and stream creation are serialized; request bodies and
+responses remain multiplexed independently after their streams are open.</p>
+<p>Waiting for upstream stream capacity is part of the optional end-to-end
+<code>request_total_timeout</code>. Without that timeout, downstream HTTP/2 stream
+admission still bounds the number of waiting requests on the connection.</p>
+<h2 id="http2-request-and-response-bodies-remain-full-duplex">HTTP/2 request and response bodies remain full duplex</h2>
+<p>After opening an upstream HTTP/2 stream, ExfilGuard polls request upload and
+the origin response concurrently. An origin may send a final response before
+the request body is complete, so ExfilGuard forwards that response immediately
+and continues driving both directions while they remain active. If the
+response completes first, the unfinished upload is canceled on that stream;
+other streams and the shared HTTP/2 connection remain usable.</p>
+<p>The response-header phase timeout starts after request upload completes, as it
+does for ordinary request/response exchanges, but an early response is still
+observed during upload. The optional total-request deadline continues to cover
+both directions throughout. A standards-defined <code>RST_STREAM(NO_ERROR)</code> after a
+complete early response terminates only the unused request side and does not
+discard the response.</p>
+<h2 id="the-total-request-timeout-is-an-end-to-end-inner-request-budget">The total request timeout is an end-to-end inner-request budget</h2>
+<p>When enabled, <code>request_total_timeout</code> starts after ExfilGuard accepts a complete
+inner HTTP request head. One absolute deadline covers policy and cache work,
+upstream resolution and connection setup, retries, request upload, and complete
+response delivery. Phase-specific timeouts remain nested within that budget.</p>
+<p>If the deadline expires before a final response starts, ExfilGuard returns a
+504. Once a final response has started, it closes or resets the request rather
+than writing a second response. Outer CONNECT setup and tunnel lifetime have
+separate controls, and cleanup after response delivery does not consume the
+request budget.</p>
+<h2 id="upstream-tcp-connection-setup-has-one-multi-address-budget">Upstream TCP connection setup has one multi-address budget</h2>
+<p><code>upstream_connect_timeout</code> bounds one complete TCP connection operation across
+all resolved addresses, rather than granting a fresh timeout to each address.
+ExfilGuard preserves resolver preference within each address family, alternates
+IPv6 and IPv4 candidates, and starts attempts 250 milliseconds apart. The first
+success wins and cancels the remaining attempts.</p>
+<p>There is no fixed address-count cutoff. The total deadline and stagger bound the
+work naturally; candidates whose turn falls beyond the deadline remain
+unattempted. DNS resolution and TLS handshakes retain their own phase-specific
+timeouts.</p>
+<h2 id="raw-connect-tunnel-idleness-is-bidirectional">Raw CONNECT tunnel idleness is bidirectional</h2>
+<p>A raw CONNECT tunnel is idle only when no bytes have been successfully relayed
+in either direction for <code>connect_tunnel_idle_timeout</code>. Continuous upload or
+download traffic therefore keeps the tunnel active even when the reverse
+direction is silent. Successful half-close propagation refreshes the shared
+activity deadline so the surviving direction receives a full idle interval.</p>
+<p>Individual tunnel writes remain bounded by the same timeout, preventing a peer
+that stops reading from blocking one relay half indefinitely. The optional
+<code>connect_tunnel_max_lifetime</code> remains an independent absolute lifetime limit,
+including for continuously active tunnels.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/laurikari/exfilguard" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.sections", "navigation.top", "search.highlight", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
