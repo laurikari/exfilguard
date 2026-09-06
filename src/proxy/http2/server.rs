@@ -507,22 +507,6 @@ impl Http2RequestHandler {
         )
     }
 
-    fn forward_error_decision(kind: &ForwardErrorKind<'_>) -> &'static str {
-        match kind {
-            ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
-            ForwardErrorKind::CredentialRequestRejected(_) => "DENY",
-            ForwardErrorKind::ResponseAlreadyStarted(_)
-            | ForwardErrorKind::Http2StreamReset
-            | ForwardErrorKind::RequestTimeout
-            | ForwardErrorKind::ClientBodyIdleTimeout
-            | ForwardErrorKind::CredentialPreparationFailed
-            | ForwardErrorKind::InvalidRequestBody(_)
-            | ForwardErrorKind::MisdirectedRequest(_)
-            | ForwardErrorKind::UpstreamClosed
-            | ForwardErrorKind::Other => "ERROR",
-        }
-    }
-
     async fn forward_request(
         &mut self,
         decision: &AllowDecision,
@@ -689,16 +673,14 @@ impl Http2RequestHandler {
         kind: &ForwardErrorKind<'_>,
         error_detail: &str,
     ) {
-        log.access_log_builder()
-            .client(decision.client.as_ref())
-            .decision(Self::forward_error_decision(kind))
-            .policy(decision.policy.as_ref())
-            .rule(decision.rule.as_ref())
-            .error_reason(kind.as_metric_label())
-            .error_detail(error_detail)
-            .bytes(self.ctx.log_tracker.current_bytes(), 0)
-            .elapsed(self.ctx.log_tracker.elapsed())
-            .log();
+        policy_response::forward_disconnect_log_builder(
+            log.access_log_builder(),
+            decision,
+            kind,
+            error_detail,
+            &self.ctx.log_tracker,
+        )
+        .log();
     }
 }
 

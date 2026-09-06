@@ -119,8 +119,11 @@ this complete key.
 
 When reuse of a pooled HTTP/1 upstream connection fails with an error that
 indicates a stale socket, ExfilGuard retries once on a fresh connection only if
-the request is bodyless and uses a standard idempotent method: `GET`, `HEAD`,
-`OPTIONS`, `TRACE`, `PUT`, or `DELETE`.
+the request is bodyless, no response has started downstream, and it uses a
+standard idempotent method: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, or `DELETE`.
+Response commitment is tracked before attempting the final head write, since
+a failed write may already have delivered bytes. Underlying connection errors
+cannot make a committed response retryable.
 
 The bodyless restriction makes the request locally replayable without buffering.
 The method restriction follows HTTP idempotency semantics when delivery to the

@@ -4,6 +4,7 @@ use http::StatusCode;
 use crate::logging::AccessLogBuilder;
 use crate::proxy::{
     forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
+    forward_limits::AllowLogTracker,
     policy_eval::{AllowDecision, DenyDecision, RequestLogContext},
 };
 
@@ -139,6 +140,26 @@ pub fn forward_error_log_builder(
         .rule(allow.rule.as_ref())
         .error_reason(spec.log_reason)
         .error_detail(error_detail)
+}
+
+/// Log a forwarding failure without inventing a new downstream response.
+pub fn forward_disconnect_log_builder(
+    builder: AccessLogBuilder,
+    allow: &AllowDecision,
+    kind: &ForwardErrorKind<'_>,
+    error_detail: &str,
+    tracker: &AllowLogTracker,
+) -> AccessLogBuilder {
+    let spec = forward_error_spec(kind);
+    let builder = forward_error_log_builder(builder, allow, &spec, error_detail)
+        .bytes(tracker.current_bytes(), 0)
+        .elapsed(tracker.elapsed());
+    match kind {
+        ForwardErrorKind::ResponseAlreadyStarted(started) => builder
+            .status(started.status)
+            .bytes(tracker.current_bytes(), started.bytes_to_client),
+        _ => builder,
+    }
 }
 
 /// Indicates whether forwarding completed successfully or the protocol already
@@ -298,6 +319,60 @@ mod tests {
     fn sample_log(parsed: &ParsedRequest) -> RequestLogContext<'_> {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         RequestLogContext::new(peer, parsed, false)
+    }
+
+    #[test]
+    fn disconnect_log_preserves_committed_response_status_and_bytes() {
+        let decision = sample_decision();
+        let parsed = sample_request();
+        let log = sample_log(&parsed);
+        let tracker = AllowLogTracker::new(42, std::time::Instant::now());
+        let error = crate::proxy::forward_error::ResponseAlreadyStarted::new(
+            StatusCode::PARTIAL_CONTENT,
+            123,
+            anyhow!("origin reset"),
+        )
+        .into();
+        let event = forward_disconnect_log_builder(
+            log.access_log_builder(),
+            &decision,
+            &classify_forward_error(&error),
+            &error.to_string(),
+            &tracker,
+        )
+        .build();
+
+        assert_eq!(event.status, 206);
+        assert_eq!(event.bytes_in, 42);
+        assert_eq!(event.bytes_out, 123);
+        assert_eq!(event.decision, "ERROR");
+        assert_eq!(event.error_reason.as_deref(), Some("response_body_failed"));
+        assert_eq!(event.client.as_deref(), Some("client"));
+        assert_eq!(event.policy.as_deref(), Some("policy"));
+        assert_eq!(event.rule.as_deref(), Some("rule"));
+        assert!(event.error_detail.unwrap().contains("origin reset"));
+    }
+
+    #[test]
+    fn disconnect_log_does_not_invent_an_unsent_response_status() {
+        let decision = sample_decision();
+        let parsed = sample_request();
+        let log = sample_log(&parsed);
+        let tracker = AllowLogTracker::new(42, std::time::Instant::now());
+        let event = forward_disconnect_log_builder(
+            log.access_log_builder(),
+            &decision,
+            &ForwardErrorKind::Http2StreamReset,
+            "origin reset",
+            &tracker,
+        )
+        .build();
+
+        assert_eq!(event.status, 0);
+        assert_eq!(event.bytes_in, 42);
+        assert_eq!(event.bytes_out, 0);
+        assert_eq!(event.decision, "ERROR");
+        assert_eq!(event.error_reason.as_deref(), Some("http2_stream_reset"));
     }
 
     #[tokio::test]

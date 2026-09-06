@@ -41,6 +41,7 @@ where
     C: AsyncWrite + Unpin,
 {
     let mut informational_bytes = 0u64;
+    let mut informational_started = false;
     let mut budget = HeaderBudget::new(
         max_header_bytes,
         "upstream response headers exceed configured limit",
@@ -70,6 +71,8 @@ where
                     bail!("informational response must not include body framing");
                 }
                 let encoded = head.encode(ResponseBodyPlan::Empty, None);
+                // A failed write may have sent a prefix, which also forbids retry.
+                informational_started = true;
                 write_all_with_timeout(
                     client,
                     &encoded,
@@ -99,7 +102,7 @@ where
     };
     match result {
         Ok(head) => Ok((head, informational_bytes)),
-        Err(source) if informational_bytes > 0 => {
+        Err(source) if informational_started => {
             Err(InformationalResponseStarted::new(source).into())
         }
         Err(source) => Err(source),
@@ -375,6 +378,7 @@ mod tests {
             true,
             &Method::GET,
             BodyPlan::Empty,
+            &crate::proxy::forward_limits::ResponseProgress::default(),
             &err,
         ));
 
@@ -462,6 +466,48 @@ mod tests {
         let mut buf = Vec::new();
         client_reader.read_to_end(&mut buf).await?;
         assert!(buf.starts_with(b"HTTP/1.1 100"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_informational_head_write_prevents_retry() -> anyhow::Result<()> {
+        let mut upstream = BufReader::new(&b"HTTP/1.1 103 Early Hints\r\n\r\n"[..]);
+        let (mut writer, mut reader) = duplex(1);
+        let timeouts = ForwardTimeouts {
+            connect: Duration::from_secs(1),
+            request_io: Duration::from_secs(1),
+            response_header: Duration::from_secs(1),
+            response_io: Duration::from_secs(1),
+        };
+        let (result, client_result) = tokio::join!(
+            read_final_response_head(
+                &mut upstream,
+                &mut writer,
+                &timeouts,
+                "127.0.0.1:8080".parse()?,
+                256,
+            ),
+            async move {
+                assert_eq!(reader.read_u8().await?, b'H');
+                // Close after a prefix so write_all fails with BrokenPipe.
+                drop(reader);
+                Ok::<_, std::io::Error>(())
+            },
+        );
+        client_result?;
+        let error = result.err().expect("partial head write should fail");
+        assert!(
+            error
+                .downcast_ref::<InformationalResponseStarted>()
+                .is_some()
+        );
+        assert!(!super::super::should_retry_reused_connection(
+            true,
+            &Method::GET,
+            BodyPlan::Empty,
+            &crate::proxy::forward_limits::ResponseProgress::default(),
+            &error,
+        ));
         Ok(())
     }
 

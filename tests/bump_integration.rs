@@ -1874,6 +1874,89 @@ async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_keepalive_does_not_retry_after_response_body_reset() -> Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let origin = listener.local_addr()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(
+            PolicySpec::new("allow-local")
+                .rule(RuleSpec::allow(&["GET"], format!("http://{origin}/**"))),
+        )
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(TestDirs::new()?, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let (reset_tx, reset_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let warm = read_until_double_crlf(&mut stream).await?;
+        assert!(warm.starts_with("GET /warm "), "{warm}");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nwarm")
+            .await?;
+        let request = read_until_double_crlf(&mut stream).await?;
+        assert!(request.starts_with("GET /reset "), "{request}");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+            .await?;
+
+        // Wait until the client has received the prefix, so the reset cannot
+        // discard the response head and accidentally exercise a stale socket.
+        reset_rx.await?;
+        #[allow(deprecated)]
+        stream.set_linger(Some(StdDuration::ZERO))?;
+        drop(stream);
+
+        let retried = tokio::select! {
+            _ = stop_rx => false,
+            accepted = listener.accept() => {
+                let (mut stream, _) = accepted?;
+                let _ = read_until_double_crlf(&mut stream).await?;
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nretry"
+                ).await?;
+                true
+            }
+        };
+        Ok::<_, anyhow::Error>(retried)
+    });
+
+    let mut client = TcpStream::connect(harness.addr).await?;
+    client
+        .write_all(
+            format!("GET http://{origin}/warm HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    let warm = read_http_response(&mut client).await?;
+    assert!(warm.ends_with("warm"), "{warm}");
+    client
+        .write_all(
+            format!("GET http://{origin}/reset HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    let head = read_until_double_crlf(&mut client).await?;
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    let mut prefix = [0; 7];
+    timeout(StdDuration::from_secs(3), client.read_exact(&mut prefix)).await??;
+    assert_eq!(&prefix, b"partial");
+    reset_tx
+        .send(())
+        .expect("upstream should be waiting to reset");
+
+    let tail = read_tunnel_tail(&mut client).await?;
+    let _ = stop_tx.send(());
+    let retried = timeout(StdDuration::from_secs(3), upstream_task).await???;
+    harness.shutdown().await;
+
+    assert!(!retried, "a committed response must not be retried");
+    assert!(tail.is_empty(), "a second response was appended: {tail:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_keepalive_does_not_retry_ambiguous_empty_post() -> Result<()> {
     let upstream_host = "localhost";
     let dirs = TestDirs::new()?;

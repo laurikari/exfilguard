@@ -167,6 +167,7 @@ where
                 reused_existing,
                 &request.method,
                 body_plan,
+                response_progress,
                 &err,
             ) =>
         {
@@ -427,11 +428,13 @@ fn should_retry_reused_connection(
     reused_existing: bool,
     method: &Method,
     body_plan: BodyPlan,
+    response_progress: &ResponseProgress,
     err: &anyhow::Error,
 ) -> bool {
     if !reused_existing
         || !is_standard_idempotent_method(method)
         || !matches!(body_plan, BodyPlan::Empty)
+        || response_progress.has_started()
         || err.downcast_ref::<InformationalResponseStarted>().is_some()
     {
         return false;
@@ -466,7 +469,8 @@ fn is_standard_idempotent_method(method: &Method) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{BodyPlan, should_retry_reused_connection};
-    use crate::proxy::forward_error::UpstreamClosed;
+    use crate::proxy::forward_error::{ResponseAlreadyStarted, UpstreamClosed};
+    use crate::proxy::forward_limits::ResponseProgress;
     use http::Method;
 
     #[test]
@@ -482,7 +486,13 @@ mod tests {
             Method::DELETE,
         ] {
             assert!(
-                should_retry_reused_connection(true, &method, BodyPlan::Empty, &stale),
+                should_retry_reused_connection(
+                    true,
+                    &method,
+                    BodyPlan::Empty,
+                    &ResponseProgress::default(),
+                    &stale
+                ),
                 "expected {method} to be retryable"
             );
         }
@@ -499,7 +509,13 @@ mod tests {
             Method::from_bytes(b"CUSTOM").unwrap(),
         ] {
             assert!(
-                !should_retry_reused_connection(true, &method, BodyPlan::Empty, &stale),
+                !should_retry_reused_connection(
+                    true,
+                    &method,
+                    BodyPlan::Empty,
+                    &ResponseProgress::default(),
+                    &stale
+                ),
                 "expected {method} not to be retryable"
             );
         }
@@ -512,12 +528,14 @@ mod tests {
             false,
             &Method::GET,
             BodyPlan::Empty,
+            &ResponseProgress::default(),
             &stale
         ));
         assert!(!should_retry_reused_connection(
             true,
             &Method::GET,
             BodyPlan::Fixed(1),
+            &ResponseProgress::default(),
             &stale,
         ));
 
@@ -526,7 +544,43 @@ mod tests {
             true,
             &Method::GET,
             BodyPlan::Empty,
+            &ResponseProgress::default(),
             &unrelated,
         ));
+    }
+
+    #[test]
+    fn do_not_retry_after_final_response_starts() {
+        let reset = || {
+            anyhow::Error::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            ))
+        };
+
+        // Head writes can fail before an error wrapper is constructed. Body
+        // failures carry the same I/O cause inside ResponseAlreadyStarted.
+        for error in [
+            reset(),
+            ResponseAlreadyStarted::new(http::StatusCode::OK, 128, reset()).into(),
+        ] {
+            let progress = ResponseProgress::default();
+            progress.mark_started(http::StatusCode::OK, 128);
+            assert!(!should_retry_reused_connection(
+                true,
+                &Method::GET,
+                BodyPlan::Empty,
+                &progress,
+                &error,
+            ));
+            progress.mark_complete();
+            assert!(!should_retry_reused_connection(
+                true,
+                &Method::GET,
+                BodyPlan::Empty,
+                &progress,
+                &error,
+            ));
+        }
     }
 }
