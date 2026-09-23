@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "exfilguard"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "assert_matches",
