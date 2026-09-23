@@ -101,20 +101,7 @@ impl Http2Upstream {
     }
 
     pub(super) fn validate_request_target(&self, request: &ParsedRequest) -> Result<()> {
-        let port = request.port.unwrap_or(request.scheme.default_port());
-        if request.scheme != Scheme::Https
-            || request.host != self.binding.host()
-            || port != self.binding.port()
-        {
-            return Err(MisdirectedRequest::new(
-                self.binding.host().to_string(),
-                self.binding.port(),
-                request.host.clone(),
-                port,
-            )
-            .into());
-        }
-        Ok(())
+        self.binding.validate_request(request)
     }
 
     async fn establish_connection(&mut self, request: &ParsedRequest) -> Result<UpstreamHandle> {
@@ -127,6 +114,7 @@ impl Http2Upstream {
             && (primed.host != request.host || primed.port != port)
         {
             return Err(MisdirectedRequest::new(
+                crate::proxy::request::scheme_name(request.scheme),
                 primed.host.clone(),
                 primed.port,
                 request.host.clone(),

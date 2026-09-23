@@ -217,6 +217,11 @@ Each HTTPS policy rule declares an explicit mode:
   this for pinned TLS or non-HTTP payloads that cannot tolerate TLS
   interception.
 
+Inspected HTTP/1.1 requests may use origin-form (`/path?query`) or an absolute
+HTTPS URI matching the CONNECT destination. ExfilGuard checks that destination
+before policy evaluation and cache lookup, rejects conflicting Host headers,
+and preserves the original path/query bytes when forwarding upstream.
+
 Example from `examples/full/policies.toml`:
 
 ```toml
@@ -324,6 +329,10 @@ cargo fuzz run http1_chunked_body fuzz/seeds/http1_chunked_body
 
 The `connect_target` seeds cover signed, empty, textual, and overflowing ports.
 Their decoded first byte selects the split between the two candidate authorities.
+
+The HTTP/1 request seeds include absolute HTTPS targets, signed object requests,
+conflicting authorities, and non-HTTPS schemes. The target exercises ordinary
+proxy parsing and inspected-request validation against `example.com:443`.
 
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,

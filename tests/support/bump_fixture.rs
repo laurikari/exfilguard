@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::{
@@ -14,6 +14,7 @@ use h2::{client as h2_client, server as h2_server};
 use http::{HeaderValue, StatusCode};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
@@ -269,6 +270,13 @@ pub struct BumpedTlsFixture {
     upstream_close_count: Arc<AtomicUsize>,
     upstream_close_notify: Arc<Notify>,
     request_count: Arc<AtomicUsize>,
+    captured_requests: Arc<Mutex<Vec<CapturedHttp1Request>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapturedHttp1Request {
+    pub head: String,
+    pub body_sha256: [u8; 32],
 }
 
 impl BumpedTlsFixture {
@@ -341,6 +349,8 @@ impl BumpedTlsFixture {
         let upstream_close_counter = upstream_close_count.clone();
         let upstream_close_notifier = upstream_close_notify.clone();
         let request_counter = request_count.clone();
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = captured_requests.clone();
         let upstream_task = {
             let upstream_config = upstream_config.clone();
             tokio::spawn(async move {
@@ -360,13 +370,14 @@ impl BumpedTlsFixture {
                             let close_counter = upstream_close_counter.clone();
                             let close_notify = upstream_close_notifier.clone();
                             let request_counter = request_counter.clone();
+                            let captured = captured.clone();
                             tokio::spawn(async move {
                                 let result = match upstream_mode {
                                     UpstreamMode::Http1Keepalive => {
-                                        serve_tls_keepalive(stream, acceptor, peer).await
+                                        serve_tls_keepalive(stream, acceptor, peer, request_counter).await
                                     }
                                     UpstreamMode::Http1Inspect => {
-                                        serve_tls_http1_inspect(stream, acceptor, peer).await
+                                        serve_tls_http1_inspect(stream, acceptor, request_counter, captured).await
                                     }
                                     UpstreamMode::Http1Redirect => {
                                         serve_redirect(stream, acceptor, peer).await
@@ -458,6 +469,7 @@ impl BumpedTlsFixture {
             upstream_close_count,
             upstream_close_notify,
             request_count,
+            captured_requests,
         })
     }
 
@@ -541,6 +553,10 @@ impl BumpedTlsFixture {
         self.request_count.load(Ordering::SeqCst)
     }
 
+    pub fn captured_requests(&self) -> Vec<CapturedHttp1Request> {
+        self.captured_requests.lock().unwrap().clone()
+    }
+
     pub fn cache(&self) -> Arc<HttpCache> {
         self.harness
             .cache
@@ -586,6 +602,7 @@ async fn serve_tls_keepalive(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
 ) -> Result<()> {
     let mut tls = acceptor
         .accept(stream)
@@ -596,6 +613,7 @@ async fn serve_tls_keepalive(
         if request_bytes.is_empty() {
             break;
         }
+        request_count.fetch_add(1, Ordering::SeqCst);
         let request = String::from_utf8(request_bytes)?;
         let path = request_path(&request);
         let close = request.to_ascii_lowercase().contains("connection: close");
@@ -657,7 +675,8 @@ async fn serve_tls_http1_no_content(
 async fn serve_tls_http1_inspect(
     stream: TcpStream,
     acceptor: TlsAcceptor,
-    _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+    captured: Arc<Mutex<Vec<CapturedHttp1Request>>>,
 ) -> Result<()> {
     let mut tls = acceptor
         .accept(stream)
@@ -677,6 +696,7 @@ async fn serve_tls_http1_inspect(
             .context("invalid content-length in inspected upstream request")?;
 
         let mut remaining = content_length;
+        let mut body_hash = Sha256::new();
         let mut body_len = 0usize;
         let mut buffer = [0u8; 8192];
         while remaining > 0 {
@@ -686,10 +706,20 @@ async fn serve_tls_http1_inspect(
                 .context("failed to read inspected upstream request body")?;
             remaining -= to_read;
             body_len += to_read;
+            body_hash.update(&buffer[..to_read]);
         }
 
-        let response_body =
-            format!("path={path}\ncontent-length={content_length}\nbody-len={body_len}");
+        captured.lock().unwrap().push(CapturedHttp1Request {
+            head: request.clone(),
+            body_sha256: body_hash.finalize().into(),
+        });
+        request_count.fetch_add(1, Ordering::SeqCst);
+
+        let response_body = if request.starts_with("HEAD ") {
+            String::new()
+        } else {
+            format!("path={path}\ncontent-length={content_length}\nbody-len={body_len}")
+        };
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}",
             response_body.len(),

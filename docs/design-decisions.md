@@ -204,6 +204,16 @@ authorities fail at the outer CONNECT without opening an upstream connection.
 Preflight does not allow arbitrary inner methods or paths. ExfilGuard checks
 those only after decryption.
 
+Inspected HTTP/1 accepts both origin-form targets and absolute HTTPS URIs.
+Every inspected HTTP/1 or HTTP/2 request must match the CONNECT host and
+effective port and retain the HTTPS scheme before policy evaluation or cache
+lookup. Host comparison uses the canonical destination identity, while
+forwarding preserves the original authority and path/query spelling; absolute
+HTTP/1 targets are sent upstream in origin-form. A conflicting Host header is
+rejected instead of silently changing its meaning. This supports signed
+requests from clients that send absolute-form inside TLS without allowing the
+session to change destinations or bypass inner method/path policy.
+
 In `tunnel` mode, ExfilGuard may open a CONNECT tunnel and leave the payload
 alone.
 

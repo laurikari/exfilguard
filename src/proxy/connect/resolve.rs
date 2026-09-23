@@ -4,7 +4,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::proxy::resolver::UpstreamResolver;
+use crate::{
+    config::Scheme,
+    proxy::{
+        forward_error::MisdirectedRequest, request::ParsedRequest, resolver::UpstreamResolver,
+    },
+};
 
 use super::target::ConnectTarget;
 
@@ -37,6 +42,22 @@ impl ResolvedTarget {
     pub fn addresses(&self) -> &[SocketAddr] {
         self.addresses.as_ref()
     }
+
+    /// Check every inspected request before policy, cache, or forwarding work.
+    pub(crate) fn validate_request(&self, request: &ParsedRequest) -> Result<()> {
+        let port = request.port.unwrap_or(request.scheme.default_port());
+        if request.scheme != Scheme::Https || request.host != self.host() || port != self.port() {
+            return Err(MisdirectedRequest::new(
+                crate::proxy::request::scheme_name(request.scheme),
+                self.host().to_string(),
+                self.port(),
+                request.host.clone(),
+                port,
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 pub async fn resolve_connect_target(
@@ -66,6 +87,71 @@ mod tests {
             host: host.to_string(),
             port: 443,
         }
+    }
+
+    #[test]
+    fn inspected_requests_match_canonical_host_and_effective_https_port() -> Result<()> {
+        use crate::proxy::request::parse_http1_request;
+        use http::Method;
+
+        for (host, targets) in [
+            (
+                "example.com",
+                vec![
+                    "https://EXAMPLE.com/",
+                    "https://example.com:443/",
+                    "https://example.com.:0443/",
+                ],
+            ),
+            (
+                "2001:db8::10",
+                vec![
+                    "https://[2001:0DB8:0:0:0:0:0:10]/",
+                    "https://[2001:db8::10]:443/",
+                ],
+            ),
+        ] {
+            let binding =
+                ResolvedTarget::from_addresses(host.into(), 443, vec!["192.0.2.1:443".parse()?]);
+            for target in targets {
+                let parsed = parse_http1_request(Method::GET, target, None, Scheme::Https)?;
+                binding.validate_request(&parsed)?;
+                assert_eq!(
+                    parsed.authority_host(),
+                    target
+                        .strip_prefix("https://")
+                        .unwrap()
+                        .trim_end_matches('/')
+                );
+            }
+        }
+        let binding = ResolvedTarget::from_addresses(
+            "example.com".into(),
+            8443,
+            vec!["192.0.2.1:8443".parse()?],
+        );
+        for target in [
+            "https://example.com/",
+            "http://example.com:8443/",
+            "https://other.test:8443/",
+        ] {
+            let parsed = parse_http1_request(Method::GET, target, None, Scheme::Https)?;
+            assert!(
+                binding
+                    .validate_request(&parsed)
+                    .unwrap_err()
+                    .is::<MisdirectedRequest>(),
+                "{target}"
+            );
+        }
+        let parsed = parse_http1_request(
+            Method::GET,
+            "https://example.com:8443/",
+            None,
+            Scheme::Https,
+        )?;
+        binding.validate_request(&parsed)?;
+        Ok(())
     }
 
     #[tokio::test]

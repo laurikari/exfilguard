@@ -2310,39 +2310,6 @@ async fn connect_bump_rejects_invalid_host_ports() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
-    let upstream_host = "localhost";
-    let policy_name = "allow-bump";
-    let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
-    let mut fixture =
-        BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
-    let upstream_addr = fixture.upstream_addr();
-    let mut client = fixture.http1_client();
-    let request = format!(
-        "GET http://{host}:{port}/absolute HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
-        host = upstream_host,
-        port = upstream_addr.port()
-    );
-    client.send(request.as_bytes()).await?;
-
-    let response = client.read_response().await?;
-    assert!(
-        response.starts_with("HTTP/1.1 400"),
-        "unexpected bumped response: {response}"
-    );
-    assert!(
-        response.contains("invalid request target"),
-        "expected target rejection body, got: {response}"
-    );
-
-    client.stream_mut().shutdown().await.ok();
-    fixture.shutdown().await;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-canonical-path";

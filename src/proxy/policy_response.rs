@@ -426,6 +426,7 @@ mod tests {
     #[test]
     fn misdirected_request_maps_to_421() {
         let err = anyhow::Error::new(MisdirectedRequest::new(
+            "https",
             "upstream.test".to_string(),
             443,
             "requested.test".to_string(),

@@ -110,6 +110,9 @@ fn sanitize_request_parts(
         }
     }
 
+    if let Some(host) = sanitizer.host() {
+        parsed.validate_host_header(host)?;
+    }
     let request_line_bytes = (parsed.method.as_str().len() + parsed.path.len()) as u64;
 
     Ok(SanitizedRequest {

@@ -52,51 +52,12 @@ pub struct RequestFlowContext {
     pub(crate) authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Http1TargetMode {
-    Proxy,
-    OriginOnly,
-}
-
-/// Parse an HTTP/1.1 request target into a [`ParsedRequest`] with separate raw
-/// forwarding and canonical policy paths.
+/// Parse an HTTP/1.1 request target with separate raw forwarding and canonical policy paths.
 pub fn parse_http1_request(
     method: Method,
     target: &str,
     host_header: Option<&str>,
     fallback_scheme: Scheme,
-) -> Result<ParsedRequest> {
-    parse_http1_request_with_mode(
-        method,
-        target,
-        host_header,
-        fallback_scheme,
-        Http1TargetMode::Proxy,
-    )
-}
-
-/// Parse an HTTP/1.1 request target that must be origin-form (no absolute-form).
-pub(crate) fn parse_http1_request_origin_form(
-    method: Method,
-    target: &str,
-    host_header: Option<&str>,
-    fallback_scheme: Scheme,
-) -> Result<ParsedRequest> {
-    parse_http1_request_with_mode(
-        method,
-        target,
-        host_header,
-        fallback_scheme,
-        Http1TargetMode::OriginOnly,
-    )
-}
-
-fn parse_http1_request_with_mode(
-    method: Method,
-    target: &str,
-    host_header: Option<&str>,
-    fallback_scheme: Scheme,
-    mode: Http1TargetMode,
 ) -> Result<ParsedRequest> {
     if target.contains('#') {
         bail!("request target must not contain a URI fragment");
@@ -105,14 +66,7 @@ fn parse_http1_request_with_mode(
     let uri: Uri = target.parse().context("invalid request target")?;
 
     if uri.scheme().is_some() {
-        match mode {
-            Http1TargetMode::Proxy => return parse_uri_request(method, &uri, fallback_scheme),
-            Http1TargetMode::OriginOnly => {
-                bail!(
-                    "absolute-form request targets are not allowed over bumped HTTPS connections"
-                );
-            }
-        }
+        return parse_uri_request(method, &uri, fallback_scheme);
     }
 
     if target == "*" {
@@ -260,6 +214,18 @@ pub fn scheme_name(scheme: Scheme) -> &'static str {
 }
 
 impl ParsedRequest {
+    /// Validate redundant Host information without changing the forwarding authority.
+    pub(crate) fn validate_host_header(&self, value: &str) -> Result<()> {
+        let (host, port) = parse_host_header(value)?;
+        if host != self.host
+            || port.unwrap_or(self.scheme.default_port())
+                != self.port.unwrap_or(self.scheme.default_port())
+        {
+            bail!("Host header does not match request authority");
+        }
+        Ok(())
+    }
+
     pub fn as_policy_request(&self) -> PolicyRequest<'_> {
         PolicyRequest {
             method: &self.method,
@@ -450,18 +416,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_http1_request_origin_form_rejects_absolute_form() {
-        let err = parse_http1_request_origin_form(
+    fn parse_http1_request_preserves_absolute_https_target() -> Result<()> {
+        let parsed = parse_http1_request(
             Method::GET,
-            "http://example.com/resource",
-            Some("example.com"),
+            "https://EXAMPLE.com:443/objects/a%2fb?z=2&x=%252F&x=+",
+            Some("EXAMPLE.com:443"),
             Scheme::Https,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("absolute-form"),
-            "unexpected error: {err:?}"
-        );
+        )?;
+        assert_eq!(parsed.scheme, Scheme::Https);
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, Some(443));
+        assert_eq!(parsed.authority_host(), "EXAMPLE.com:443");
+        assert_eq!(parsed.path, "/objects/a%2fb?z=2&x=%252F&x=+");
+        assert_eq!(parsed.policy_path(), "/objects/a%2Fb");
+        for host in ["example.com", "EXAMPLE.com:443", "example.com."] {
+            parsed.validate_host_header(host)?;
+        }
+        for host in ["other.test", "example.com:80", "example.com:wat", ""] {
+            assert!(parsed.validate_host_header(host).is_err(), "{host}");
+        }
+        Ok(())
     }
 
     #[test]

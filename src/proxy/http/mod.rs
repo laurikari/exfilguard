@@ -41,6 +41,22 @@ pub mod fuzzing {
                 host,
                 crate::config::Scheme::Http,
             );
+            if let Ok(parsed) = crate::proxy::request::parse_http1_request(
+                head.method.clone(),
+                &head.target,
+                host,
+                crate::config::Scheme::Https,
+            ) {
+                let binding = crate::proxy::connect::ResolvedTarget::from_addresses(
+                    "example.com".into(),
+                    443,
+                    vec!["192.0.2.1:443".parse().unwrap()],
+                );
+                if let Some(host) = host {
+                    let _ = parsed.validate_host_header(host);
+                }
+                let _ = binding.validate_request(&parsed);
+            }
             let _ = head.headers.expect_continue();
             let _ = head.headers.content_length();
         }

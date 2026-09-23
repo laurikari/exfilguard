@@ -107,9 +107,10 @@ impl ResponseAlreadyStarted {
 
 #[derive(Debug, Error)]
 #[error(
-    "HTTP/2 request for {requested_host}:{requested_port} does not match upstream {upstream_host}:{upstream_port}"
+    "request for {requested_scheme}://{requested_host}:{requested_port} does not match HTTPS CONNECT target {upstream_host}:{upstream_port}"
 )]
 pub struct MisdirectedRequest {
+    pub requested_scheme: &'static str,
     pub upstream_host: String,
     pub upstream_port: u16,
     pub requested_host: String,
@@ -118,12 +119,14 @@ pub struct MisdirectedRequest {
 
 impl MisdirectedRequest {
     pub fn new(
+        requested_scheme: &'static str,
         upstream_host: String,
         upstream_port: u16,
         requested_host: String,
         requested_port: u16,
     ) -> Self {
         Self {
+            requested_scheme,
             upstream_host,
             upstream_port,
             requested_host,
@@ -328,7 +331,8 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             upstream_port = misdirected.upstream_port,
             requested_host = %misdirected.requested_host,
             requested_port = misdirected.requested_port,
-            "HTTP/2 request did not match existing upstream connection"
+            requested_scheme = misdirected.requested_scheme,
+            "request did not match HTTPS CONNECT target"
         ),
         ForwardErrorKind::UpstreamClosed => warn!(
             peer = %peer,
@@ -378,6 +382,7 @@ mod tests {
         let invalid = InvalidRequestBody::new(4, "bad chunk");
         let private = PrivateAddressError::new("example.com", 443, "connect target");
         let misdirected = MisdirectedRequest::new(
+            "https",
             "upstream.test".to_string(),
             443,
             "requested.test".to_string(),

@@ -77,6 +77,7 @@ struct Http2BumpService<S> {
     connection: server::Connection<TlsStream<S>, Bytes>,
     upstream: Arc<Mutex<Http2Upstream>>,
     upstream_closed: watch::Receiver<bool>,
+    connect_binding: ResolvedTarget,
     flow_context: RequestFlowContext,
     request_slots: Arc<Semaphore>,
 }
@@ -100,7 +101,7 @@ where
             app.settings.request_header_timeout(),
         )
         .await?;
-        let upstream = Http2Upstream::new(app.clone(), connect_binding, primed_upstream);
+        let upstream = Http2Upstream::new(app.clone(), connect_binding.clone(), primed_upstream);
         let upstream_closed = upstream.closed_receiver();
         let request_slots = Arc::new(Semaphore::new(
             app.settings.http2_max_concurrent_streams_usize(),
@@ -111,6 +112,7 @@ where
             connection,
             upstream: Arc::new(Mutex::new(upstream)),
             upstream_closed,
+            connect_binding,
             flow_context,
             request_slots,
         })
@@ -162,6 +164,7 @@ where
                             let app = self.app.clone();
                             let upstream = self.upstream.clone();
                             let flow_context = self.flow_context.clone();
+                            let connect_binding = self.connect_binding.clone();
                             let permit = self
                                 .request_slots
                                 .clone()
@@ -178,6 +181,7 @@ where
                                         app,
                                         upstream,
                                         flow_context,
+                                        connect_binding,
                                     )
                                     .await
                                 {
@@ -255,6 +259,7 @@ async fn process_downstream_request(
     app: AppContext,
     upstream: Arc<Mutex<Http2Upstream>>,
     flow_context: RequestFlowContext,
+    connect_binding: ResolvedTarget,
 ) -> Result<()> {
     let _stream_guard = crate::metrics::track_http2_stream();
     let start = Instant::now();
@@ -317,7 +322,7 @@ async fn process_downstream_request(
         }
     };
     let ctx = DownstreamRequestCtx::new(meta, body, respond, peer, snapshot, start, &app);
-    ctx.handle(upstream).await
+    ctx.handle(upstream, &connect_binding).await
 }
 
 struct DownstreamRequestCtx {
@@ -379,7 +384,33 @@ impl DownstreamRequestCtx {
         }
     }
 
-    async fn handle(self, upstream: Arc<Mutex<Http2Upstream>>) -> Result<()> {
+    async fn handle(
+        mut self,
+        upstream: Arc<Mutex<Http2Upstream>>,
+        connect_binding: &ResolvedTarget,
+    ) -> Result<()> {
+        if let Err(err) = connect_binding.validate_request(&self.meta.parsed) {
+            let status = http::StatusCode::MISDIRECTED_REQUEST;
+            let body = "misdirected request";
+            warn!(peer = %self.peer, error = %err, "HTTP/2 request does not match CONNECT target");
+            send_error_response(&mut self.respond, status, body, None).await?;
+            self.meta
+                .parsed
+                .access_log_builder(
+                    self.peer,
+                    crate::proxy::request::request_target_for_log(
+                        &self.meta.parsed.path,
+                        self.log_queries,
+                    ),
+                )
+                .status(status)
+                .decision("ERROR")
+                .error_reason("misdirected_request")
+                .bytes(self.log_tracker.base_bytes(), body.len() as u64)
+                .elapsed(self.log_tracker.elapsed())
+                .log();
+            return Ok(());
+        }
         let peer = self.peer;
         let log_queries = self.log_queries;
         let snapshot = self.snapshot.clone();
