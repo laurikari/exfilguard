@@ -7,3 +7,9 @@ clients = "clients.toml"
 policies = "policies.toml"
 
 log = "text"
+
+# HTTP/2 receive-window sizes in bytes. Larger windows can improve throughput
+# on high-latency links and increase memory use with slow receivers.
+# Changes require a restart.
+http2_stream_window_size = 33554432
+http2_connection_window_size = 67108864

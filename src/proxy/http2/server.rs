@@ -98,6 +98,8 @@ where
             stream,
             app.settings.max_request_header_size,
             app.settings.http2_max_concurrent_streams,
+            app.settings.http2_stream_window_size,
+            app.settings.http2_connection_window_size,
             app.settings.request_header_timeout(),
         )
         .await?;
@@ -225,6 +227,8 @@ async fn handshake_downstream<T>(
     stream: T,
     max_header_size: usize,
     max_concurrent_streams: u32,
+    stream_window_size: u32,
+    connection_window_size: u32,
     setup_timeout: Duration,
 ) -> Result<server::Connection<T, Bytes>>
 where
@@ -233,7 +237,9 @@ where
     let mut builder = server::Builder::new();
     builder
         .max_header_list_size(max_header_size.min(u32::MAX as usize) as u32)
-        .max_concurrent_streams(max_concurrent_streams);
+        .max_concurrent_streams(max_concurrent_streams)
+        .initial_window_size(stream_window_size)
+        .initial_connection_window_size(connection_window_size);
     timeout(setup_timeout, builder.handshake(stream))
         .await
         .context("timed out waiting for downstream HTTP/2 connection preface")?
@@ -886,6 +892,34 @@ mod tests {
     use tokio::io::duplex;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn downstream_advertises_configured_receive_windows() {
+        use tokio::io::AsyncWriteExt;
+        for (stream, connection) in [(65_535, 65_535), (131_072, 262_144), (262_144, 131_072)] {
+            let (mut peer, io) = duplex(4096);
+            let task = tokio::spawn(async move {
+                let mut conn = handshake_downstream(
+                    io,
+                    32_768,
+                    100,
+                    stream,
+                    connection,
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                while let Some(request) = conn.accept().await {
+                    request.unwrap();
+                }
+            });
+            peer.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+                .await
+                .unwrap();
+            super::super::test_support::assert_receive_windows(&mut peer, stream, connection).await;
+            task.abort();
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn downstream_handshake_times_out_without_connection_preface() {
         let (_client, server) = duplex(1024);
@@ -893,6 +927,8 @@ mod tests {
             server,
             32 * 1024,
             100,
+            65_535,
+            65_535,
             Duration::from_secs(1),
         ));
         tokio::task::yield_now().await;
@@ -905,6 +941,116 @@ mod tests {
                 .contains("timed out waiting for downstream HTTP/2 connection preface"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn receive_credit_stops_and_recovers_without_buffering_the_whole_body() {
+        use super::super::forward::send_data_with_backpressure;
+        use std::task::Poll;
+
+        for (stream_window, connection_window) in [(131_072, 262_144), (262_144, 131_072)] {
+            timeout(Duration::from_secs(3), async {
+                let (client_io, server_io) = duplex(4096);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let server_task = tokio::spawn(async move {
+                    let mut conn = handshake_downstream(
+                        server_io,
+                        32_768,
+                        100,
+                        stream_window,
+                        connection_window,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                    while let Some(request) = conn.accept().await {
+                        tx.send(request.unwrap()).unwrap();
+                    }
+                });
+                let (mut client, driver) = h2::client::handshake(client_io).await.unwrap();
+                let client_task = tokio::spawn(driver);
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.test/upload")
+                    .body(())
+                    .unwrap();
+                let (_response, mut send) = client.send_request(request, false).unwrap();
+                let budget = stream_window.min(connection_window) as usize;
+                let body_size = budget * 4;
+                let send_task = tokio::spawn(async move {
+                    send_data_with_backpressure(
+                        &mut send,
+                        Bytes::from(vec![b'x'; body_size]),
+                        Duration::from_secs(2),
+                        None,
+                        "sending test body",
+                    )
+                    .await
+                    .unwrap();
+                    send.send_data(Bytes::new(), true).unwrap();
+                });
+                let (request, _respond) = rx.recv().await.unwrap();
+                let mut body = request.into_body();
+                let mut received = 0;
+                while received < budget {
+                    received += body.data().await.unwrap().unwrap().len();
+                }
+                assert_eq!(received, budget);
+                assert_eq!(body.flow_control().used_capacity(), budget);
+                assert!(!send_task.is_finished(), "sender bypassed receive credit");
+                assert!(matches!(
+                    futures::poll!(std::pin::pin!(body.data())),
+                    Poll::Pending
+                ));
+
+                // A stalled DATA stream must not prevent another request's headers.
+                let request = http::Request::builder()
+                    .uri("https://example.test/control")
+                    .body(())
+                    .unwrap();
+                let (_response, mut control_send) = client.send_request(request, false).unwrap();
+                let (control, _respond) = rx.recv().await.unwrap();
+                assert_eq!(control.uri().path(), "/control");
+                if connection_window > stream_window {
+                    // There is connection credit left: another stream's DATA must
+                    // progress even though the first stream has no credit at all.
+                    send_data_with_backpressure(
+                        &mut control_send,
+                        Bytes::from(vec![b'y'; budget]),
+                        Duration::from_secs(2),
+                        None,
+                        "sending independent stream",
+                    )
+                    .await
+                    .unwrap();
+                    let mut control_body = control.into_body();
+                    let mut control_received = 0;
+                    while control_received < budget {
+                        let chunk = control_body.data().await.unwrap().unwrap();
+                        assert!(chunk.iter().all(|byte| *byte == b'y'));
+                        control_received += chunk.len();
+                    }
+                    assert_eq!(control_received, budget);
+                    assert!(!send_task.is_finished());
+                    // Reset/drop returns the aggregate credit held by this stream.
+                    drop(control_body);
+                }
+
+                body.flow_control().release_capacity(budget).unwrap();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.unwrap();
+                    assert!(chunk.iter().all(|byte| *byte == b'x'));
+                    received += chunk.len();
+                    body.flow_control().release_capacity(chunk.len()).unwrap();
+                }
+                assert_eq!(received, body_size);
+                send_task.await.unwrap();
+                client_task.abort();
+                server_task.abort();
+            })
+            .await
+            .expect("flow control failed to recover");
+        }
     }
 
     #[tokio::test]

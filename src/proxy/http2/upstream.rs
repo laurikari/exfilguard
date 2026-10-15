@@ -132,6 +132,8 @@ impl Http2Upstream {
                     .max_response_header_size
                     .min(u32::MAX as usize) as u32,
                 self.closed_tx.clone(),
+                self.app.settings.http2_stream_window_size,
+                self.app.settings.http2_connection_window_size,
             )
             .await;
         }
@@ -177,6 +179,8 @@ impl Http2Upstream {
                 .max_response_header_size
                 .min(u32::MAX as usize) as u32,
             self.closed_tx.clone(),
+            self.app.settings.http2_stream_window_size,
+            self.app.settings.http2_connection_window_size,
         )
         .await
     }
@@ -215,9 +219,14 @@ async fn make_handle_from_stream(
     peer: SocketAddr,
     max_response_header_size: u32,
     closed_tx: watch::Sender<bool>,
+    stream_window_size: u32,
+    connection_window_size: u32,
 ) -> Result<UpstreamHandle> {
-    let mut builder = client::Builder::new();
-    builder.max_header_list_size(max_response_header_size);
+    let builder = client_builder(
+        max_response_header_size,
+        stream_window_size,
+        connection_window_size,
+    );
     let metrics = crate::metrics::track_upstream_connection();
     let task_metrics = metrics.clone();
     let (sender, connection) = builder
@@ -240,4 +249,40 @@ async fn make_handle_from_stream(
         reused: false,
         _metrics: metrics,
     })
+}
+
+fn client_builder(
+    max_response_header_size: u32,
+    stream_window_size: u32,
+    connection_window_size: u32,
+) -> client::Builder {
+    let mut builder = client::Builder::new();
+    builder
+        .max_header_list_size(max_response_header_size)
+        .initial_window_size(stream_window_size)
+        .initial_connection_window_size(connection_window_size);
+    builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, duplex};
+
+    #[tokio::test]
+    async fn upstream_advertises_configured_receive_windows() {
+        for (stream, connection) in [(65_535, 65_535), (131_072, 262_144), (262_144, 131_072)] {
+            let (io, mut peer) = duplex(4096);
+            let (_sender, connection_driver) = client_builder(32_768, stream, connection)
+                .handshake::<_, Bytes>(io)
+                .await
+                .unwrap();
+            let task = tokio::spawn(connection_driver);
+            let mut preface = [0; 24];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            super::super::test_support::assert_receive_windows(&mut peer, stream, connection).await;
+            task.abort();
+        }
+    }
 }

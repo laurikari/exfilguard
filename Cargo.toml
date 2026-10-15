@@ -47,9 +47,13 @@ sha2 = "0.11"
 [features]
 fuzzing = []
 
+[[example]]
+name = "h2-perf"
+path = "perf/h2/main.rs"
+
 [dev-dependencies]
 assert_matches = "1.5"
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["signal", "time"] }
 tokio = { version = "1.53", features = ["rt", "macros", "test-util"] }
 tempfile = "3.27"
 

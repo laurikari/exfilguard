@@ -55,6 +55,8 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         connect_tunnel_max_lifetime: 0,
         upstream_pool_capacity: 32,
         http2_max_concurrent_streams: 100,
+        http2_stream_window_size: 32 * 1024 * 1024,
+        http2_connection_window_size: 64 * 1024 * 1024,
         max_request_header_size: 32 * 1024,
         max_response_header_size: 4096,
         max_request_body_size: 0,

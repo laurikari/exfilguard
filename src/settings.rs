@@ -115,6 +115,14 @@ impl SettingsDefaults {
         100
     }
 
+    const fn http2_stream_window_size() -> u32 {
+        32 * 1024 * 1024
+    }
+
+    const fn http2_connection_window_size() -> u32 {
+        64 * 1024 * 1024
+    }
+
     const fn max_request_header_size() -> usize {
         32 * 1024
     }
@@ -451,6 +459,10 @@ pub struct Settings {
     pub upstream_pool_capacity: usize,
     #[serde(default = "SettingsDefaults::http2_max_concurrent_streams")]
     pub http2_max_concurrent_streams: u32,
+    #[serde(default = "SettingsDefaults::http2_stream_window_size")]
+    pub http2_stream_window_size: u32,
+    #[serde(default = "SettingsDefaults::http2_connection_window_size")]
+    pub http2_connection_window_size: u32,
     #[serde(default = "SettingsDefaults::max_request_header_size")]
     pub max_request_header_size: usize,
     #[serde(default = "SettingsDefaults::max_response_header_size")]
@@ -784,6 +796,18 @@ impl Settings {
             "http2_max_concurrent_streams must be at least 1 (got {})",
             self.http2_max_concurrent_streams
         );
+        for (name, value) in [
+            ("http2_stream_window_size", self.http2_stream_window_size),
+            (
+                "http2_connection_window_size",
+                self.http2_connection_window_size,
+            ),
+        ] {
+            ensure!(
+                (65_535..=0x7fff_ffff).contains(&value),
+                "{name} must be between 65535 and 2147483647 bytes (got {value})"
+            );
+        }
         ensure!(
             self.max_request_header_size > 0,
             "max_request_header_size must be greater than 0 (got {})",
@@ -953,6 +977,53 @@ policies = "policies.toml"
             },
             auth,
         }
+    }
+
+    #[test]
+    fn http2_receive_window_defaults_and_bounds() {
+        let dir = TempDir::new().unwrap();
+        let config = write_settings_config(&dir, "[ca]\nsource='builtin'\ndir='ca'");
+        let defaults = Settings::load(&Cli {
+            config: Some(config),
+        })
+        .unwrap();
+        assert_eq!(defaults.http2_stream_window_size, 32 * 1024 * 1024);
+        assert_eq!(defaults.http2_connection_window_size, 64 * 1024 * 1024);
+        for name in ["http2_stream_window_size", "http2_connection_window_size"] {
+            for value in [
+                0,
+                65_534,
+                65_535,
+                1_048_576,
+                2_147_483_647,
+                2_147_483_648,
+                u32::MAX,
+            ] {
+                let mut settings = defaults.clone();
+                if name == "http2_stream_window_size" {
+                    settings.http2_stream_window_size = value;
+                } else {
+                    settings.http2_connection_window_size = value;
+                }
+                let result = settings.validate();
+                if (65_535..=2_147_483_647).contains(&value) {
+                    result.unwrap();
+                } else {
+                    assert!(result.unwrap_err().to_string().contains(name));
+                }
+            }
+        }
+        // The connection window may be smaller than the stream window.
+        let config = write_settings_config(
+            &dir,
+            "http2_stream_window_size=2097152\nhttp2_connection_window_size=1048576\n[ca]\nsource='builtin'\ndir='ca'",
+        );
+        let settings = Settings::load(&Cli {
+            config: Some(config),
+        })
+        .unwrap();
+        assert_eq!(settings.http2_stream_window_size, 2_097_152);
+        assert_eq!(settings.http2_connection_window_size, 1_048_576);
     }
 
     fn valid_vault_ca_settings() -> VaultCaSettings {
@@ -1518,6 +1589,8 @@ policies = "policies.toml"
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             http2_max_concurrent_streams: 100,
+            http2_stream_window_size: 32 * 1024 * 1024,
+            http2_connection_window_size: 64 * 1024 * 1024,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -1588,6 +1661,8 @@ policies = "policies.toml"
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             http2_max_concurrent_streams: 100,
+            http2_stream_window_size: 32 * 1024 * 1024,
+            http2_connection_window_size: 64 * 1024 * 1024,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -1647,6 +1722,8 @@ policies = "policies.toml"
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             http2_max_concurrent_streams: 100,
+            http2_stream_window_size: 32 * 1024 * 1024,
+            http2_connection_window_size: 64 * 1024 * 1024,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -1699,6 +1776,8 @@ policies = "policies.toml"
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 32,
             http2_max_concurrent_streams: 100,
+            http2_stream_window_size: 32 * 1024 * 1024,
+            http2_connection_window_size: 64 * 1024 * 1024,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,

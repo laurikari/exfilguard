@@ -43,26 +43,33 @@ requests once, apply the same policy rules everywhere, and keep forwarding
 separate from policy matching.
 
 ### 1. The Listener Layer (`src/proxy/listener.rs`)
+
 Accepts raw TCP connections and hands them to the dispatcher.
 
 ### 2. The Dispatcher Layer (`src/proxy/http/dispatch.rs`)
+
 Figures out whether the connection is HTTP/1.1, HTTP/2, or CONNECT. If a
 `CONNECT` request has matching HTTPS inspect `ALLOW` rules, it starts the TLS
 bump flow.
 
 ### 3. The Policy Engine (`src/policy/`)
+
 Takes a request view with scheme, host, port, path, and method, then returns
 allow or deny.
+
 - TOML is compiled up front into matcher structures.
 - Client resolution happens from the source IP before policy checks.
 
 ### 4. The Request Pipeline (`src/proxy/request_pipeline.rs`)
+
 Shares the same policy evaluation logic across:
+
 - Plain HTTP requests.
 - CONNECT tunnels.
 - HTTPS requests inside a bumped tunnel.
 
 ### 5. Upstream Handling (`src/proxy/http/forward.rs`)
+
 Maintains pooled outbound connections for HTTP/1.1 and HTTP/2.
 
 ### Full example lab
@@ -123,48 +130,40 @@ environment, such as a minimal container, install the standard CA bundle
 
 ### Forwarding vs. Policy Matching
 
-ExfilGuard keeps the raw request target for upstream forwarding, logging, cache
-keys, and signature-sensitive traffic. Policy evaluation uses a separate
-canonical path view so rule matching does not depend on origin-specific path
-normalization.
+ExfilGuard preserves the raw request target for upstream forwarding, logging,
+cache keys, and signed requests. Policy evaluation uses a separate, normalized
+path.
 
 - Query strings are ignored for path matching.
 - Percent-encoded RFC-unreserved characters are decoded. Other valid escapes
   remain encoded and use uppercase hex in the policy view, so `%2F` remains
   distinct from `/`.
 - Literal `.` and `..` path segments are normalized before policy evaluation.
-- Ambiguous path syntax is rejected with `400 Bad Request` instead of being
-  silently rewritten. This includes characters outside RFC 3986 path syntax,
-  invalid escapes, raw or encoded backslashes, and encoded dot-segments such
-  as `%2e%2e`.
+- Ambiguous path syntax is rejected with `400 Bad Request`. This includes
+  characters outside RFC 3986 path syntax, invalid escapes, raw or encoded
+  backslashes, and encoded dot-segments such as `%2e%2e`.
 
 ## Security
 
-ExfilGuard controls what outbound traffic is allowed and logs everything for
-review. It blocks requests to destinations not on your allow list and records
-any blocked attempts.
+ExfilGuard enforces an outbound allow list and logs allowed and blocked requests.
+Timeouts close slow or stalled connections.
 
-### What it does and doesn't do
+### Scope
 
-**Does:**
-- Block outbound requests to hosts/paths you haven't allowed
-- Log all traffic (allowed and blocked)
-- Drop slow or stalled connections via timeouts
+Policy rules control request destinations and methods. ExfilGuard forwards
+request and response bodies without interpreting their application content.
+Clients can send sensitive data to allowed destinations, so policies must
+account for that risk.
 
-**Doesn't:**
-- Interpret request or response bodies as application data
-- Stop data from leaving through allowed destinations
-- Detect compromised clients misusing allowed routes
-
-When explicitly allowed, delegated authorization may buffer a request body so
-the authorization service can sign it. ExfilGuard does not interpret the body,
-and both per-request and total memory limits apply.
+When configured, delegated authorization can buffer a request body for signing.
+Per-request and total memory limits apply to this buffering.
 
 ### Defense in depth
 
-ExfilGuard does not fully trust clients or upstreams. It rejects malformed
-requests, slow connections, and oversized headers or bodies early. Parsing is
-strict, and policy checks run before any upstream connection is made.
+ExfilGuard rejects malformed requests and enforces configured size limits.
+For inspected HTTPS, it establishes the upstream TLS connection during CONNECT
+handling, then evaluates each HTTP request received inside the client's TLS
+connection.
 
 ### Hardening tips
 
@@ -172,17 +171,14 @@ strict, and policy checks run before any upstream connection is made.
   sane defaults.
 - Run as a non-root user and only listen on the interfaces you need. Put a
   firewall in front.
-- Expose the proxy only to authorized clients. ExfilGuard enforces egress
-  policy; it is not a denial-of-service isolation or per-client fairness
-  boundary. Apply connection or rate controls at the network edge if clients
-  must be isolated from one another for availability.
+- Expose the proxy only to authorized clients. Use connection and rate controls
+  at the network edge to protect availability and isolate clients sharing the
+  proxy.
 - Choose an explicit `builtin`, `files`, or `vault` CA source. For file-backed
   sources, startup enforces owner-only directory/key modes and rejects
   symlinks. Vault mode keeps inspection and authorization-service private keys
   in memory.
-- Review timeout and size limits for your setup (see `docs/configuration.md`).
-- Set `max_request_body_size`, `max_request_header_size`, and
-  `max_response_header_size` to reasonable values.
+- Review timeout and size limits in [docs/configuration.md](docs/configuration.md).
 - ExfilGuard blocks private upstreams by default, including loopback and
   RFC1918/RFC4193 space. This reduces SSRF risk and keeps clients from
   reaching internal address space through the proxy.
@@ -193,11 +189,8 @@ strict, and policy checks run before any upstream connection is made.
 
 - Use ExfilGuard as an explicit proxy. Transparent interception is not
   documented or supported for deployment.
-- ExfilGuard does not impose arbitrary global or per-IP connection ceilings.
-  Operators are responsible for preventing abusive clients from exhausting a
-  shared node or cluster.
-- ExfilGuard does not support WebSocket or HTTP/1.1 Upgrade flows. It rejects
-  upstream `101 Switching Protocols` responses instead of tunneling them.
+- WebSocket and HTTP/1.1 Upgrade flows are unsupported. Upstream
+  `101 Switching Protocols` responses are rejected.
 - ExfilGuard rejects HTTP/1.0 requests and upstream HTTP/1.0 responses. It
   only supports HTTP/1.1 framing.
 
@@ -306,6 +299,9 @@ leaf keys are cached only in process memory.
   ```shell
   cargo test
   ```
+
+See [perf/h2/README.md](perf/h2/README.md) for HTTP/2 throughput and slow-reader
+benchmarks.
 
 ### Fuzzing
 

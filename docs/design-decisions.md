@@ -2,6 +2,28 @@
 
 This file explains choices that may otherwise look like missing work.
 
+## Fixed HTTP/2 receive windows
+
+ExfilGuard uses configurable HTTP/2 receive windows with per-stream and
+connection-wide limits. Larger windows improve throughput on high-bandwidth,
+high-latency links, but allow more data to accumulate when the receiving
+application is slow.
+
+`proxy::http2::server` configures the windows for receiving client uploads.
+`proxy::http2::upstream` configures them for receiving upstream responses,
+including connections opened during CONNECT preflight.
+
+In `proxy::http2::forward`, `send_data_with_backpressure` waits for capacity on
+the outgoing stream. After forwarding a chunk, the caller releases the
+corresponding capacity on the incoming stream. When the receiver stops reading,
+this eventually stops the sender.
+
+The windows have fixed sizes to keep configuration and flow-control behavior
+simple. ExfilGuard does not estimate bandwidth and latency to adjust them
+automatically. Operators can tune the sizes using the
+[configuration settings](configuration.md#http2). The benchmarks in `perf/h2/`
+measure throughput and memory use with slow readers.
+
 ## Canonical request data for policy
 
 ExfilGuard makes policy decisions from a normalized request view and keeps the
