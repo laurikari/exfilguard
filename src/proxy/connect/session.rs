@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use http::StatusCode;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{Level, warn};
 use uuid::Uuid;
 
@@ -94,9 +94,9 @@ impl ConnectSession {
         }
     }
 
-    pub async fn process_tunnel_allow(
+    pub async fn process_tunnel_allow<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: TcpStream,
+        stream: S,
         prefetched: Vec<u8>,
         allow: AllowDecision,
         log: RequestLogContext<'_>,
@@ -126,9 +126,9 @@ impl ConnectSession {
             .await
     }
 
-    pub async fn process_tls_bump_preflight(
+    pub async fn process_tls_bump_preflight<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: TcpStream,
+        stream: S,
         prefetched: Vec<u8>,
         client: Arc<str>,
         log: RequestLogContext<'_>,
@@ -157,9 +157,9 @@ impl ConnectSession {
             .await
     }
 
-    pub async fn respond_policy_deny(
+    pub async fn respond_policy_deny<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         deny: &DenyDecision,
         log: &RequestLogContext<'_>,
     ) -> Result<()> {
@@ -182,9 +182,9 @@ impl ConnectSession {
         .await
     }
 
-    pub async fn respond_default_denial(
+    pub async fn respond_default_denial<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         log: &RequestLogContext<'_>,
     ) -> Result<()> {
         warn!(
@@ -210,9 +210,9 @@ impl ConnectSession {
         .await
     }
 
-    async fn run_splice(
+    async fn run_splice<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         prefetched: &[u8],
         resolved: &ResolvedTarget,
         allow: &AllowDecision,
@@ -240,9 +240,9 @@ impl ConnectSession {
         Ok(())
     }
 
-    async fn run_bump(
+    async fn run_bump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: TcpStream,
+        stream: S,
         prefetched: Vec<u8>,
         resolved: ResolvedTarget,
         client: &str,
@@ -272,9 +272,9 @@ impl ConnectSession {
         Ok(())
     }
 
-    async fn handle_splice_path(
+    async fn handle_splice_path<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: TcpStream,
+        stream: S,
         prefetched: Vec<u8>,
         allow: AllowDecision,
         log: RequestLogContext<'_>,
@@ -347,9 +347,9 @@ impl ConnectSession {
         }
     }
 
-    async fn handle_bump_preflight_path(
+    async fn handle_bump_preflight_path<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: TcpStream,
+        stream: S,
         prefetched: Vec<u8>,
         client: Arc<str>,
         log: RequestLogContext<'_>,
@@ -376,9 +376,9 @@ impl ConnectSession {
         }
     }
 
-    async fn respond_forward_error(
+    async fn respond_forward_error<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         spec: ForwardErrorSpec,
         log: RequestLogContext<'_>,
         allow: AllowDecision,
@@ -431,9 +431,9 @@ impl ConnectSession {
         Ok(())
     }
 
-    async fn respond_resolution_error<F>(
+    async fn respond_resolution_error<S: AsyncRead + AsyncWrite + Unpin + Send + 'static, F>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         err: anyhow::Error,
         log: &RequestLogContext<'_>,
         build: F,
@@ -498,9 +498,9 @@ impl ConnectSession {
             .session_id(self.session_id.as_ref())
     }
 
-    async fn respond_with_builder<F>(
+    async fn respond_with_builder<S: AsyncRead + AsyncWrite + Unpin + Send + 'static, F>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         status: StatusCode,
         reason: Option<&str>,
         body: &[u8],

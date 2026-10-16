@@ -12,6 +12,7 @@ These settings are required.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `listen` | String | Yes | Listen address and port (e.g., `"127.0.0.1:3128"`) |
+| `proxy_tls` | Table | No | TLS server certificate for the proxy listener: `files` or `vault` |
 | `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
 | `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
 | `proxy_protocol_max_pending_connections` | usize | 1024 | Maximum connections from allowlisted peers concurrently awaiting PROXY header processing |
@@ -51,8 +52,9 @@ These settings are required.
 
 !!! note
     ExfilGuard reads `exfilguard.toml` and `config.d/*.toml` only at startup.
-    `SIGHUP` reloads only the client and policy data read from the configured `clients`,
-    `clients_dir`, `policies`, and `policies_dir` paths. If you change fields
+    `SIGHUP` reloads client and policy data from the configured `clients`,
+    `clients_dir`, `policies`, and `policies_dir` paths, and the proxy server
+    certificate when `proxy_tls.source = "files"`. If you change fields
     in `exfilguard.toml` itself, including `listen`, metrics, cache, TLS,
     logging, and timeout settings, restart the server.
 
@@ -62,6 +64,78 @@ These settings are required.
     in-memory snapshot; if loading fails, the previous snapshot remains active.
 
 ---
+
+## HTTPS Proxy Listener
+
+Configure `[proxy_tls]` to encrypt the application-to-proxy connection from its
+first byte. Clients must use an `https://` proxy URL and validate the proxy's
+server certificate. The configured `listen` address then accepts TLS only.
+Without `[proxy_tls]`, it accepts plaintext HTTP.
+
+Load a PEM certificate chain and private key from files:
+
+```toml
+[proxy_tls]
+source = "files"
+cert = "/etc/exfilguard/proxy.pem"
+key = "/etc/exfilguard/proxy.key"
+```
+
+Put the server certificate first, followed by its issuing certificates. Both
+files must belong to the process UID and be regular files. The key must match
+the certificate and have owner-only permissions; the certificate must have no
+group or other write permission. Symlinks are rejected. Replace both files
+before sending SIGHUP. Existing connections can
+finish with the previous certificate. A failed certificate reload retains the
+previous certificate independently of policy reload results.
+
+To have Vault issue and renew the certificate directly:
+
+```toml
+[proxy_tls]
+source = "vault"
+role = "exfilguard-proxy"
+server_name = "proxy.example.com"
+```
+
+This uses the global `[vault]` settings. ExfilGuard generates a private key in
+memory and submits a CSR to `/v1/<vault.pki.mount>/sign/<role>`. Configure the
+role with `key_type = "ec"` and `key_bits = 256` to accept the generated P-256
+key. Allow the proxy's DNS name or IP address, enable `use_csr_sans` and
+`server_flag`, and set its certificate lifetime. Grant signing permission on
+that role's path. Returned certificates must cover `server_name` and chain to
+`vault.pki.expected_root_certs`. Clients can trust the same Vault root used for
+inspection if both certificates chain to it.
+
+Vault renewal starts halfway through the certificate lifetime. Failed attempts
+retry with jitter and increasing delays, up to 15 minutes. ExfilGuard requires
+a usable certificate at startup and rejects new TLS connections after expiry.
+Renewal continues during an outage; a successful renewal restores service.
+Existing connections survive certificate replacement and expiry.
+
+The outer connection uses HTTP/1.1. CONNECT supports pass-through tunnels and
+inspected HTTPS, including HTTP/2 inside the inspected TLS session. PROXY
+protocol headers from trusted peers precede the TLS handshake. Handshakes use
+`tls_handshake_timeout` and count against the client's `max_connections`.
+
+TLS is optional for clients with `authorization_service`. Use `[proxy_tls]` to
+protect lease tokens in transit. With an `http://` proxy URL, CONNECT headers
+carry the token in plaintext even when the destination uses HTTPS.
+
+For curl, proxy trust and inspected-destination trust are separate options:
+
+```sh
+curl --proxy https://proxy.example.com:3128 \
+  --proxy-cacert vault-root.pem --cacert inspection-root.pem \
+  https://example.com/
+```
+
+Use the same root file for both options when appropriate. The proxy certificate
+must cover the hostname in the proxy URL. Certificate source and path changes
+require a restart.
+
+Metrics include `proxy_tls_certificate_not_after_timestamp_seconds` and
+`proxy_tls_vault_renewal_attempts_total{result,reason}`.
 
 ## Private Upstream Exceptions
 

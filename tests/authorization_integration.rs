@@ -377,10 +377,11 @@ async fn authorization_service_rejects_an_untrusted_server_certificate() -> Resu
     let clients = with_delegated_authorization(clients, &credential_scope, BodyAccess::None);
     let harness = ProxyHarnessBuilder::new(&clients, &policies)?
         .with_settings(move |settings| settings.authorization = Some(authorization))
+        .with_tls_proxy()
         .spawn()
         .await?;
 
-    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let mut downstream = harness.connect_tls().await?;
     downstream
         .write_all(
             format!(
@@ -405,7 +406,7 @@ async fn authorization_service_rejects_an_untrusted_server_certificate() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn plain_http_binds_token_applies_credentials_and_bypasses_cache() -> Result<()> {
+async fn http_proxy_binds_token_applies_credentials_and_bypasses_cache() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
     let mut dirs = TestDirs::new()?;
     dirs.enable_cache_dir()?;
@@ -439,7 +440,7 @@ async fn plain_http_binds_token_applies_credentials_and_bypasses_cache() -> Resu
             "HTTP/1.1 501",
         ),
     ] {
-        let mut client = harness.connect().await?;
+        let mut client = TcpStream::connect(harness.addr).await?;
         client.write_all(format!(
             "GET http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{token_header}Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
             origin.addr.port(), origin.addr.port(),
@@ -552,11 +553,12 @@ async fn vault_issued_client_certificate_authenticates_to_authorization_service(
             settings.vault = Some(vault);
             settings.authorization = Some(authorization);
         })
+        .with_tls_proxy()
         .spawn()
         .await?;
     vault_task.await??;
 
-    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let mut downstream = harness.connect_tls().await?;
     let request = format!(
         "GET http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
         origin.addr.port(),
@@ -611,6 +613,7 @@ fallback = true
             settings.proxy_protocol = ProxyProtocolMode::Required;
             settings.proxy_protocol_allowed_cidrs = Some(vec!["127.0.0.0/8".parse().unwrap()]);
         })
+        .with_tls_proxy()
         .spawn()
         .await?;
 
@@ -620,9 +623,8 @@ fallback = true
         origin.addr.port(),
     );
 
-    let mut static_client = TcpStream::connect(harness.addr).await?;
-    static_client
-        .write_all(b"PROXY TCP4 198.51.100.10 192.0.2.1 5555 3128\r\n")
+    let mut static_client = harness
+        .connect_tls_with_proxy_header(b"PROXY TCP4 198.51.100.10 192.0.2.1 5555 3128\r\n")
         .await?;
     static_client.write_all(request.as_bytes()).await?;
     let response = read_http_response_with_length(&mut static_client).await?;
@@ -630,9 +632,8 @@ fallback = true
     assert!(response.contains("authorization=<missing>"), "{response}");
     assert_eq!(services.policy_calls.load(Ordering::SeqCst), 0);
 
-    let mut missing_token = TcpStream::connect(harness.addr).await?;
-    missing_token
-        .write_all(b"PROXY TCP4 192.0.2.10 192.0.2.1 5555 3128\r\n")
+    let mut missing_token = harness
+        .connect_tls_with_proxy_header(b"PROXY TCP4 192.0.2.10 192.0.2.1 5555 3128\r\n")
         .await?;
     missing_token.write_all(request.as_bytes()).await?;
     let response = read_http_response_with_length(&mut missing_token).await?;
@@ -643,9 +644,8 @@ fallback = true
     );
     assert_eq!(services.policy_calls.load(Ordering::SeqCst), 0);
 
-    let mut delegated_client = TcpStream::connect(harness.addr).await?;
-    delegated_client
-        .write_all(b"PROXY TCP4 192.0.2.10 192.0.2.1 5555 3128\r\n")
+    let mut delegated_client = harness
+        .connect_tls_with_proxy_header(b"PROXY TCP4 192.0.2.10 192.0.2.1 5555 3128\r\n")
         .await?;
     let delegated_request = request.replacen(
         "Connection: close",
@@ -716,6 +716,7 @@ protected_headers = ["authorization"]
             settings.proxy_protocol = ProxyProtocolMode::Required;
             settings.proxy_protocol_allowed_cidrs = Some(vec!["127.0.0.0/8".parse().unwrap()]);
         })
+        .with_tls_proxy()
         .spawn()
         .await?;
 
@@ -725,9 +726,10 @@ protected_headers = ["authorization"]
         origin.addr.port(),
     );
     for source in ["192.0.2.10", "198.51.100.10"] {
-        let mut client = TcpStream::connect(harness.addr).await?;
-        client
-            .write_all(format!("PROXY TCP4 {source} 192.0.2.1 5555 3128\r\n").as_bytes())
+        let mut client = harness
+            .connect_tls_with_proxy_header(
+                format!("PROXY TCP4 {source} 192.0.2.1 5555 3128\r\n").as_bytes(),
+            )
             .await?;
         client.write_all(request.as_bytes()).await?;
         let response = read_http_response_with_length(&mut client).await?;
@@ -764,10 +766,11 @@ async fn malformed_policy_response_does_not_log_the_token() -> Result<()> {
     let authorization = services.settings();
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_settings(move |settings| settings.authorization = Some(authorization))
+        .with_tls_proxy()
         .spawn()
         .await?;
 
-    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let mut downstream = harness.connect_tls().await?;
     let request = format!(
         "GET http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {REFLECTED_TOKEN}\r\nConnection: close\r\n\r\n",
         origin.addr.port(),
@@ -782,7 +785,9 @@ async fn malformed_policy_response_does_not_log_the_token() -> Result<()> {
     assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
     assert_eq!(origin.requests.load(Ordering::SeqCst), 0);
 
-    let logs = log_capture.text();
+    let logs = log_capture
+        .wait_for("error_reason=\"authorization_service_failed\"")
+        .await?;
     assert!(logs.contains("invalid_policy_response"), "{logs}");
     assert!(logs.contains("authorization_service_failed"), "{logs}");
     assert!(!logs.contains(REFLECTED_TOKEN), "{logs}");
@@ -819,10 +824,11 @@ async fn chunked_body_is_finalized_for_signing_and_forwarded_with_credentials() 
             settings.authorization = Some(authorization);
             settings.max_request_body_size = 64;
         })
+        .with_tls_proxy()
         .spawn()
         .await?;
 
-    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let mut downstream = harness.connect_tls().await?;
     let request = format!(
         "POST http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nsigned\r\n8\r\n payload\r\n0\r\n\r\n",
         origin.addr.port(),
@@ -874,10 +880,11 @@ async fn body_limit_and_credential_failure_deny_before_origin_request() -> Resul
             settings.authorization = Some(authorization);
             settings.max_request_body_size = 8;
         })
+        .with_tls_proxy()
         .spawn()
         .await?;
 
-    let mut oversized = TcpStream::connect(harness.addr).await?;
+    let mut oversized = harness.connect_tls().await?;
     let request = format!(
         "POST http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\ne\r\nsigned payload\r\n0\r\n\r\n",
         origin.addr.port(),
@@ -890,7 +897,7 @@ async fn body_limit_and_credential_failure_deny_before_origin_request() -> Resul
     assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
     assert_eq!(origin.requests.load(Ordering::SeqCst), 0);
 
-    let mut credential_failure = TcpStream::connect(harness.addr).await?;
+    let mut credential_failure = harness.connect_tls().await?;
     let request = format!(
         "POST http://127.0.0.1:{}/credential-failure HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsigned",
         origin.addr.port(),
@@ -909,8 +916,10 @@ async fn body_limit_and_credential_failure_deny_before_origin_request() -> Resul
     assert_eq!(services.credential_calls.load(Ordering::SeqCst), 1);
     assert_eq!(origin.requests.load(Ordering::SeqCst), 0);
 
+    let logs = log_capture
+        .wait_for("error_reason=\"credential_preparation_failed\"")
+        .await?;
     harness.shutdown().await;
-    let logs = log_capture.text();
     let access_log = logs
         .lines()
         .find(|line| {
@@ -1620,9 +1629,10 @@ async fn h2_rejects_changed_malformed_and_duplicate_proxy_tokens() -> Result<()>
     let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
         .with_proxy_root_store(proxy_roots)
         .with_settings(move |settings| settings.authorization = Some(authorization))
+        .with_tls_proxy()
         .spawn()
         .await?;
-    let mut downstream = TcpStream::connect(harness.addr).await?;
+    let mut downstream = harness.connect_tls().await?;
     let connect = format!(
         "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\n\r\n",
         origin.addr.port(),

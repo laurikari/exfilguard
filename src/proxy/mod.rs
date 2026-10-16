@@ -48,6 +48,7 @@ pub struct AppContext {
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
     pub(crate) authorization: Option<Arc<AuthorizationServices>>,
+    pub(crate) proxy_tls: Option<Arc<crate::tls::proxy::ProxyTls>>,
     client_connections: Arc<admission::ClientConnectionLimiter>,
     proxy_protocol_pending_connections: Arc<Semaphore>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
@@ -60,7 +61,13 @@ impl AppContext {
         tls: Arc<TlsContext>,
         cache: Option<Arc<cache::HttpCache>>,
     ) -> Result<Self> {
+        settings.validate()?;
+        settings.load_runtime_config()?;
         let vault = crate::build_vault_client(settings.vault.as_ref())?;
+        let proxy_tls = match &settings.proxy_tls {
+            Some(source) => Some(crate::tls::proxy::ProxyTls::new(source, vault.clone()).await?),
+            None => None,
+        };
         let authorization = if let Some(authorization) = &settings.authorization {
             Some(Arc::new(
                 AuthorizationServices::new(authorization, vault).await?,
@@ -74,6 +81,7 @@ impl AppContext {
             tls,
             cache,
             authorization,
+            proxy_tls,
         ))
     }
 
@@ -83,6 +91,7 @@ impl AppContext {
         tls: Arc<TlsContext>,
         cache: Option<Arc<cache::HttpCache>>,
         authorization: Option<Arc<AuthorizationServices>>,
+        proxy_tls: Option<Arc<crate::tls::proxy::ProxyTls>>,
     ) -> Self {
         let proxy_protocol_pending_connections = Arc::new(Semaphore::new(
             settings.proxy_protocol_max_pending_connections,
@@ -95,6 +104,7 @@ impl AppContext {
             tls,
             cache,
             authorization,
+            proxy_tls,
             client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
             proxy_protocol_pending_connections,
             upstream_resolver,

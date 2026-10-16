@@ -22,6 +22,89 @@ fn send_sighup() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sighup_reloads_proxy_certificates_independently_of_policy() -> Result<()> {
+    use exfilguard::settings::ProxyTlsSettings;
+    use rustls::{RootCertStore, pki_types::ServerName};
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use tokio_rustls::TlsConnector;
+    let logs = LogCapture::new("info").await;
+    let dirs = TestDirs::new()?;
+    let first = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let second = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert = dirs.config_dir.join("proxy.pem");
+    let key = dirs.config_dir.join("proxy.key");
+    fs::write(&cert, first.cert.pem())?;
+    fs::write(&key, first.signing_key.serialize_pem())?;
+    fs::set_permissions(&cert, fs::Permissions::from_mode(0o644))?;
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["deny"])
+        .policy(PolicySpec::new("deny").rule(RuleSpec::deny(&["ANY"], "http://**/**").status(403)))
+        .render();
+    write_clients_and_policies(&dirs, &clients, &policies)?;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, find_free_port()?));
+    let mut settings = load_settings(&dirs, addr)?;
+    settings.proxy_tls = Some(ProxyTlsSettings::Files {
+        cert: cert.clone(),
+        key: key.clone(),
+    });
+    let proxy = tokio::spawn(exfilguard::run_for_tests(settings));
+    wait_for_listener(addr).await?;
+    let mut roots = RootCertStore::empty();
+    roots.add(first.cert.der().clone())?;
+    roots.add(second.cert.der().clone())?;
+    let connector = TlsConnector::from(build_client_tls(roots)?);
+    let connect = || async {
+        Ok::<_, anyhow::Error>(
+            connector
+                .connect(
+                    ServerName::try_from("localhost")?,
+                    TcpStream::connect(addr).await?,
+                )
+                .await?,
+        )
+    };
+    let tls = connect().await?;
+    assert_eq!(
+        &tls.get_ref().1.peer_certificates().unwrap()[0],
+        first.cert.der()
+    );
+    drop(tls);
+    fs::write(&cert, second.cert.pem())?;
+    fs::write(&key, second.signing_key.serialize_pem())?;
+    fs::write(&dirs.policies_path, "invalid policy TOML")?;
+    send_sighup()?;
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let tls = connect().await?;
+            if &tls.get_ref().1.peer_certificates().unwrap()[0] == second.cert.der()
+                && logs.text().contains("runtime policy reload failed")
+            {
+                break Ok::<_, anyhow::Error>(());
+            }
+            sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    fs::write(&cert, "invalid certificate PEM")?;
+    send_sighup()?;
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        while !logs.text().contains("proxy TLS certificate reload failed") {
+            sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let tls = connect().await?;
+    assert_eq!(
+        &tls.get_ref().1.peer_certificates().unwrap()[0],
+        second.cert.der()
+    );
+    proxy.abort();
+    let _ = proxy.await;
+    Ok(())
+}
+
 async fn send_proxy_request(addr: SocketAddr, upstream_port: u16) -> Result<u16> {
     let mut stream = TcpStream::connect(addr).await?;
     let request = format!(

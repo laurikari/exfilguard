@@ -151,7 +151,7 @@ struct SignedCertificate {
 }
 
 #[derive(Serialize)]
-struct SignClientCertificateRequest<'a> {
+struct SignCertificateRequest<'a> {
     csr: &'a str,
     common_name: &'a str,
     exclude_cn_from_sans: bool,
@@ -160,7 +160,7 @@ struct SignClientCertificateRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct SignClientCertificateResponse {
+struct SignCertificateResponse {
     data: SignedCertificate,
 }
 
@@ -171,7 +171,12 @@ struct ParsedSignedChain {
 
 pub(crate) struct VaultClientCertificate {
     pub identity_pem: Zeroizing<Vec<u8>>,
-    pub validity: super::validation::ClientCertificateValidity,
+    pub validity: super::validation::CertificateValidity,
+}
+
+pub(crate) struct VaultServerCertificate {
+    pub chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    pub key: rustls::pki_types::PrivateKeyDer<'static>,
 }
 
 #[derive(Deserialize)]
@@ -360,32 +365,12 @@ impl VaultClient {
         role: &str,
         common_name: &str,
     ) -> Result<VaultClientCertificate> {
-        let role = validate_single_api_segment(role, "Vault PKI role")?;
         let common_name = common_name.to_string();
         let csr_name = common_name.clone();
         let (key, csr) = tokio::task::spawn_blocking(move || build_client_csr(&csr_name))
             .await
             .context("client certificate CSR worker failed")??;
-        let token = self.authenticate().await?;
-        let mut segments: Vec<&str> = self.pki_mount.split('/').collect();
-        segments.extend(["sign", role.as_str()]);
-        let url = api_url(&self.base_url, &segments)?;
-        let body = SignClientCertificateRequest {
-            csr: &csr,
-            common_name: &common_name,
-            exclude_cn_from_sans: true,
-            format: "pem",
-            remove_roots_from_chain: false,
-        };
-        let response: SignClientCertificateResponse = self
-            .post_json(url, token.as_deref().map(|value| value.as_str()), &body)
-            .await
-            .map_err(|err| vault_failure("signing", err))?;
-        drop(token);
-
-        let chain = self
-            .parse_signed_chain(response.data, "Vault client certificate")
-            .map_err(|err| vault_failure("validation", err))?;
+        let chain = self.sign_certificate(role, &common_name, &csr).await?;
         let chain_refs: Vec<&[u8]> = chain.der.iter().map(Vec::as_slice).collect();
         let validity = super::validation::validate_client_certificate_chain(
             &chain_refs,
@@ -406,6 +391,82 @@ impl VaultClient {
             identity_pem,
             validity,
         })
+    }
+
+    pub(crate) async fn issue_server_certificate(
+        &self,
+        role: &str,
+        server_name: &str,
+    ) -> Result<VaultServerCertificate> {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+        let name =
+            ServerName::try_from(server_name.to_owned()).context("invalid proxy server name")?;
+        let csr_name = server_name.to_owned();
+        let (key, csr) = tokio::task::spawn_blocking(move || {
+            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+            let mut params = CertificateParams::new(vec![csr_name.clone()])?;
+            params.distinguished_name = DistinguishedName::new();
+            params.distinguished_name.push(DnType::CommonName, csr_name);
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            let csr = params.serialize_request(&key)?.pem()?;
+            Ok::<_, anyhow::Error>((key, csr))
+        })
+        .await
+        .context("server certificate CSR worker failed")??;
+        let signed = self.sign_certificate(role, server_name, &csr).await?;
+        let mut chain: Vec<_> = signed.der.into_iter().map(CertificateDer::from).collect();
+        let mut roots = rustls::RootCertStore::empty();
+        for root in self.expected_roots.iter() {
+            roots.add(CertificateDer::from(root.clone()))?;
+        }
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .build()?;
+        verifier
+            .verify_server_cert(&chain[0], &chain[1..], &name, &[], UnixTime::now())
+            .map_err(|err| vault_failure("validation", err))?;
+        super::validation::validate_server_certificate_chain(&chain)
+            .map_err(|err| vault_failure("validation", err))?;
+        chain.pop(); // Omit the pinned root from the served chain.
+        Ok(VaultServerCertificate {
+            chain,
+            key: PrivateKeyDer::try_from(key.serialize_der())
+                .map_err(|err| anyhow!("invalid generated server key: {err}"))?,
+        })
+    }
+
+    async fn sign_certificate(
+        &self,
+        role: &str,
+        common_name: &str,
+        csr: &str,
+    ) -> Result<ParsedSignedChain> {
+        let role = validate_single_api_segment(role, "Vault PKI role")?;
+        let token = self.authenticate().await?;
+        let mut segments: Vec<&str> = self.pki_mount.split('/').collect();
+        segments.extend(["sign", role.as_str()]);
+        let request = SignCertificateRequest {
+            csr,
+            common_name,
+            exclude_cn_from_sans: true,
+            format: "pem",
+            remove_roots_from_chain: false,
+        };
+        let response: SignCertificateResponse = self
+            .post_json(
+                api_url(&self.base_url, &segments)?,
+                token.as_deref().map(|value| value.as_str()),
+                &request,
+            )
+            .await
+            .map_err(|err| vault_failure("signing", err))?;
+        drop(token);
+        self.parse_signed_chain(response.data, "Vault certificate")
+            .map_err(|err| vault_failure("validation", err))
     }
 
     fn parse_signed_chain(
@@ -869,7 +930,7 @@ fn validate_checked_metadata(path: &Path, metadata: &Metadata, secret: bool) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::fs::Permissions;
@@ -1124,6 +1185,112 @@ mod tests {
         (address, server)
     }
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum ServerReply {
+        Valid,
+        Unavailable,
+        WrongName,
+        ClientOnly,
+        WrongRoot,
+        Expired,
+    }
+
+    pub(crate) async fn spawn_fake_server_signer(
+        server_name: &'static str,
+        replies: Vec<ServerReply>,
+    ) -> (String, String, tokio::task::JoinHandle<()>) {
+        let (root, _, issuer_pem, _, issuer) = generate_vault_signing_hierarchy();
+        let trust = root.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for reply in replies {
+                let (mut login, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut login).await;
+                assert_eq!(request.target, "/v1/auth/team-approle/login");
+                respond_json(&mut login, json!({"auth":{"client_token":"server-token"}})).await;
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request.target, "/v1/team/pki/sign/proxy-server");
+                assert_eq!(
+                    request.headers.get("x-vault-token").unwrap(),
+                    "server-token"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["common_name"], server_name);
+                assert!(body.get("private_key").is_none());
+                let mut csr =
+                    CertificateSigningRequestParams::from_pem(body["csr"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(
+                    csr.params.extended_key_usages,
+                    vec![ExtendedKeyUsagePurpose::ServerAuth]
+                );
+                assert_eq!(
+                    csr.params.subject_alt_names,
+                    CertificateParams::new(vec![server_name.into()])
+                        .unwrap()
+                        .subject_alt_names
+                );
+                if matches!(reply, ServerReply::Unavailable) {
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let now = OffsetDateTime::now_utc();
+                csr.params.not_before = now - time::Duration::minutes(1);
+                csr.params.not_after = now + time::Duration::hours(12);
+                csr.params.is_ca = IsCa::NoCa;
+                csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+                if matches!(reply, ServerReply::WrongName) {
+                    csr.params.subject_alt_names =
+                        CertificateParams::new(vec!["wrong.example".into()])
+                            .unwrap()
+                            .subject_alt_names;
+                }
+                if matches!(reply, ServerReply::ClientOnly) {
+                    csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+                }
+                if matches!(reply, ServerReply::Expired) {
+                    csr.params.not_before = now - time::Duration::hours(2);
+                    csr.params.not_after = now - time::Duration::hours(1);
+                }
+                let root = if matches!(reply, ServerReply::WrongRoot) {
+                    generate_root("Unpinned Root").0
+                } else {
+                    root.clone()
+                };
+                let certificate = csr.signed_by(&issuer).unwrap();
+                respond_json(
+                    &mut stream,
+                    json!({"data":{
+                        "certificate": certificate.pem(), "issuing_ca": issuer_pem,
+                        "ca_chain": [issuer_pem, root]
+                    }}),
+                )
+                .await;
+            }
+        });
+        (address, trust, task)
+    }
+
+    #[tokio::test]
+    async fn server_signing_preserves_dns_and_ip_subject_alternative_names() {
+        for name in ["proxy.example.com", "127.0.0.1", "::1"] {
+            let dir = TempDir::new().unwrap();
+            let (address, root, server) =
+                spawn_fake_server_signer(name, vec![ServerReply::Valid]).await;
+            let roots = write_file(&dir, "roots.pem", root.as_bytes());
+            let secret = write_file(&dir, "secret", b"test-secret");
+            let vault = VaultClient::new(vault_config(address, roots, secret)).unwrap();
+            let certificate = vault
+                .issue_server_certificate("proxy-server", name)
+                .await
+                .unwrap();
+            assert_eq!(certificate.chain.len(), 2);
+            server.await.unwrap();
+        }
+    }
+
     fn write_file(directory: &TempDir, name: &str, contents: &[u8]) -> PathBuf {
         let path = directory.path().join(name);
         std::fs::write(&path, contents).unwrap();
@@ -1131,7 +1298,11 @@ mod tests {
         path
     }
 
-    fn vault_config(address: String, roots: PathBuf, secret_id_file: PathBuf) -> VaultConfig {
+    pub(crate) fn vault_config(
+        address: String,
+        roots: PathBuf,
+        secret_id_file: PathBuf,
+    ) -> VaultConfig {
         VaultConfig {
             address,
             tls_ca_cert: None,

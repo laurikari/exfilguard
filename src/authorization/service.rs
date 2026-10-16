@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::{MethodMatch, RuleAction},
-    tls::validation::ClientCertificateValidity,
+    tls::validation::CertificateValidity,
     util::normalize_mapped_ip,
 };
 
@@ -263,11 +263,11 @@ pub(super) struct AuthorizationHttpClient {
 
 struct ClientGeneration {
     client: reqwest::Client,
-    validity: Option<ClientCertificateValidity>,
+    validity: Option<CertificateValidity>,
 }
 
 impl AuthorizationHttpClient {
-    fn new(client: reqwest::Client, validity: Option<ClientCertificateValidity>) -> Self {
+    fn new(client: reqwest::Client, validity: Option<CertificateValidity>) -> Self {
         Self {
             current: Arc::new(RwLock::new(ClientGeneration { client, validity })),
         }
@@ -285,7 +285,7 @@ impl AuthorizationHttpClient {
         Ok(generation.client.clone())
     }
 
-    async fn replace(&self, client: reqwest::Client, validity: ClientCertificateValidity) {
+    async fn replace(&self, client: reqwest::Client, validity: CertificateValidity) {
         *self.current.write().await = ClientGeneration {
             client,
             validity: Some(validity),
@@ -873,7 +873,7 @@ struct VaultAuthorizationClientSource {
 }
 
 impl VaultAuthorizationClientSource {
-    async fn issue(&self) -> Result<(reqwest::Client, ClientCertificateValidity)> {
+    async fn issue(&self) -> Result<(reqwest::Client, CertificateValidity)> {
         let certificate = self
             .vault
             .issue_client_certificate(&self.role, &self.common_name)
@@ -886,7 +886,7 @@ impl VaultAuthorizationClientSource {
     fn spawn_renewal(
         self: Arc<Self>,
         client: AuthorizationHttpClient,
-        initial_validity: ClientCertificateValidity,
+        initial_validity: CertificateValidity,
     ) {
         tokio::spawn(async move {
             self.renewal_loop(client, initial_validity).await;
@@ -896,7 +896,7 @@ impl VaultAuthorizationClientSource {
     async fn renewal_loop(
         &self,
         client: AuthorizationHttpClient,
-        mut validity: ClientCertificateValidity,
+        mut validity: CertificateValidity,
     ) {
         let mut retry_delay = crate::tls::vault::INITIAL_RETRY_DELAY;
         loop {
@@ -952,13 +952,13 @@ impl VaultAuthorizationClientSource {
     }
 }
 
-fn renewal_threshold(validity: ClientCertificateValidity) -> time::Duration {
+fn renewal_threshold(validity: CertificateValidity) -> time::Duration {
     let lifetime = validity.not_after - validity.not_before;
     time::Duration::seconds((lifetime.whole_seconds() / 2).max(1))
 }
 
 fn ensure_client_certificate_is_renewable(
-    validity: ClientCertificateValidity,
+    validity: CertificateValidity,
     now: OffsetDateTime,
 ) -> Result<()> {
     ensure!(
@@ -1134,7 +1134,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let client = AuthorizationHttpClient::new(
             reqwest::Client::new(),
-            Some(ClientCertificateValidity {
+            Some(CertificateValidity {
                 not_before: now - time::Duration::hours(2),
                 not_after: now - time::Duration::hours(1),
             }),
@@ -1144,7 +1144,7 @@ mod tests {
         client
             .replace(
                 reqwest::Client::new(),
-                ClientCertificateValidity {
+                CertificateValidity {
                     not_before: now - time::Duration::minutes(1),
                     not_after: now + time::Duration::hours(1),
                 },
@@ -1158,7 +1158,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         assert!(
             ensure_client_certificate_is_renewable(
-                ClientCertificateValidity {
+                CertificateValidity {
                     not_before: now - time::Duration::minutes(1),
                     not_after: now + time::Duration::hours(1),
                 },
@@ -1168,7 +1168,7 @@ mod tests {
         );
         assert!(
             ensure_client_certificate_is_renewable(
-                ClientCertificateValidity {
+                CertificateValidity {
                     not_before: now - time::Duration::hours(2),
                     not_after: now + time::Duration::hours(1),
                 },
