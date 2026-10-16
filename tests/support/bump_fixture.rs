@@ -74,6 +74,7 @@ pub struct BumpedTlsOptions<'a> {
     client_protocols: ClientProtocols,
     upstream_mode: UpstreamMode,
     cache_enabled: bool,
+    allow_private_test_upstreams: bool,
     settings_override: Option<Box<dyn FnOnce(&mut Settings) + Send>>,
 }
 
@@ -86,6 +87,7 @@ impl<'a> BumpedTlsOptions<'a> {
             client_protocols: ClientProtocols::Http1,
             upstream_mode: UpstreamMode::Http1Keepalive,
             cache_enabled: false,
+            allow_private_test_upstreams: true,
             settings_override: None,
         }
     }
@@ -97,6 +99,11 @@ impl<'a> BumpedTlsOptions<'a> {
 
     pub fn upstream_mode(mut self, mode: UpstreamMode) -> Self {
         self.upstream_mode = mode;
+        self
+    }
+
+    pub fn with_private_test_upstreams(mut self, allow: bool) -> Self {
+        self.allow_private_test_upstreams = allow;
         self
     }
 
@@ -288,6 +295,7 @@ impl BumpedTlsFixture {
             client_protocols,
             upstream_mode,
             cache_enabled,
+            allow_private_test_upstreams,
             settings_override,
         } = options;
         let mut dirs = super::TestDirs::new()?;
@@ -311,6 +319,7 @@ impl BumpedTlsFixture {
         let mut settings_override = settings_override;
         let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
             .with_proxy_root_store(proxy_root_store)
+            .with_private_test_upstreams(allow_private_test_upstreams)
             .with_settings(move |settings| {
                 if let Some(override_fn) = settings_override.take() {
                     override_fn(settings);

@@ -39,7 +39,7 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 :   Shared HTTP response cache that follows standard cache headers. Enable it globally and opt in per rule.
 
 **Private Upstream Blocking**
-:   Blocks upstream connections to non-public addresses to reduce SSRF risk.
+:   Blocks non-public upstream addresses by default, with explicit CIDR exceptions for internal services.
 
 **Runtime Policy Reload**
 :   `SIGHUP` reloads client and policy data from the configured files without restarting the process. If you change listener, metrics, cache, TLS, logging, or timeout settings, restart the server.

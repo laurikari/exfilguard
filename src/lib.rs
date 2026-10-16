@@ -22,7 +22,7 @@ use tracing::warn;
 
 use crate::{
     policy::matcher::PolicySnapshot,
-    proxy::{default_upstream_resolver, permissive_test_upstream_resolver},
+    proxy::{configured_upstream_resolver, permissive_test_upstream_resolver},
     settings::{CaSettings, Settings, VaultAuth, VaultSettings},
     tls::{
         ca::CertificateAuthority,
@@ -33,7 +33,8 @@ use crate::{
 };
 
 pub async fn run(settings: Settings) -> Result<()> {
-    run_with_upstream_resolver(settings, default_upstream_resolver()).await
+    let resolver = configured_upstream_resolver(&settings.allow_private_upstream_cidrs);
+    run_with_upstream_resolver(settings, resolver).await
 }
 
 #[doc(hidden)]

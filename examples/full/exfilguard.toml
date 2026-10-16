@@ -8,6 +8,10 @@ policies = "policies.toml"
 
 log = "text"
 
+# Private upstream exceptions; request policies still apply. Restart to change.
+# Use /32 or /128 for a single address.
+allow_private_upstream_cidrs = []
+
 # HTTP/2 receive-window sizes in bytes. Larger windows can improve throughput
 # on high-latency links and increase memory use with slow receivers.
 # Changes require a restart.

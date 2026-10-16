@@ -500,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_reuses_validated_private_target() -> Result<()> {
-        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let resolver = crate::proxy::resolver::ConfiguredUpstreamResolver::default();
         let binding = ResolvedTarget::from_addresses(
             "internal.test".to_string(),
             443,
@@ -520,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_resolution_rejects_private_targets_when_disallowed() {
-        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let resolver = crate::proxy::resolver::ConfiguredUpstreamResolver::default();
         let err = resolve_or_use_binding("10.0.0.5", 443, None, &resolver, Duration::from_secs(1))
             .await
             .expect_err("private upstream should be rejected");

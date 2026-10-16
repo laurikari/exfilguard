@@ -156,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_private_ip_when_disallowed() {
-        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let resolver = crate::proxy::resolver::ConfiguredUpstreamResolver::default();
         let err = resolve_connect_target(&target("10.0.0.5"), Duration::from_secs(1), &resolver)
             .await
             .expect_err("private IP should be rejected");

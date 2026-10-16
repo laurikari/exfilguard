@@ -179,9 +179,9 @@ connection.
   symlinks. Vault mode keeps inspection and authorization-service private keys
   in memory.
 - Review timeout and size limits in [docs/configuration.md](docs/configuration.md).
-- ExfilGuard blocks private upstreams by default, including loopback and
-  RFC1918/RFC4193 space. This reduces SSRF risk and keeps clients from
-  reaching internal address space through the proxy.
+- ExfilGuard blocks private upstream addresses by default. Use
+  `allow_private_upstream_cidrs` to allow specific address ranges. Requests to
+  those addresses must still pass the configured policies.
 - Treat logs and metrics as sensitive—they contain internal hostnames and can
   reveal unusual traffic patterns.
 

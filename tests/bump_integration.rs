@@ -232,8 +232,8 @@ async fn http_private_ip_blocked_by_default() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("request blocked by policy"),
-        "expected policy block body, got: {response}"
+        response.contains("upstream address blocked (private_address)"),
+        "expected address block body, got: {response}"
     );
 
     client.shutdown().await;
@@ -1443,7 +1443,7 @@ async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("CONNECT to private networks is not allowed"),
+        response.contains("upstream address blocked (private_address)"),
         "expected private network denial message, got: {response}"
     );
 
@@ -1483,7 +1483,7 @@ async fn connect_bumped_private_resolution_is_blocked() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("CONNECT to private networks is not allowed"),
+        response.contains("upstream address blocked (private_address)"),
         "expected private network denial message, got: {response}"
     );
 
@@ -1568,7 +1568,7 @@ async fn connect_splice_preserves_pipelined_payload() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_blocks_private_ip_targets() -> Result<()> {
+async fn connect_private_ip_without_policy_reports_default_denial() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
@@ -1593,13 +1593,13 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
         "unexpected private IP response: {response}"
     );
     assert!(
-        response.contains("CONNECT to private networks is not allowed"),
-        "missing private network warning body: {response}"
+        response.contains("request blocked by policy"),
+        "missing policy denial body: {response}"
     );
     let logs = log_capture.text();
     assert!(
-        logs.contains("CONNECT target is private network; blocking"),
-        "expected private CONNECT block log entry, got: {logs}"
+        logs.contains("default deny"),
+        "expected default denial log entry, got: {logs}"
     );
 
     stream.shutdown().await.ok();
