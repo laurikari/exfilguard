@@ -4,7 +4,7 @@ use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,6 +58,7 @@ struct AuthorizationFixture {
     signing_issuer: Option<Issuer<'static, KeyPair>>,
     policy_calls: Arc<AtomicUsize>,
     credential_calls: Arc<AtomicUsize>,
+    credential_requests: Arc<Mutex<Vec<Value>>>,
     task: JoinHandle<()>,
 }
 
@@ -82,8 +83,10 @@ impl AuthorizationFixture {
         let addr = listener.local_addr()?;
         let policy_calls = Arc::new(AtomicUsize::new(0));
         let credential_calls = Arc::new(AtomicUsize::new(0));
+        let credential_requests = Arc::new(Mutex::new(Vec::new()));
         let policy_counter = policy_calls.clone();
         let credential_counter = credential_calls.clone();
+        let captured_requests = credential_requests.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -93,6 +96,7 @@ impl AuthorizationFixture {
                 let credential_scope = credential_scope.clone();
                 let policy_counter = policy_counter.clone();
                 let credential_counter = credential_counter.clone();
+                let captured_requests = captured_requests.clone();
                 tokio::spawn(async move {
                     if let Err(error) = serve_authorization_request(
                         stream,
@@ -101,6 +105,7 @@ impl AuthorizationFixture {
                         body_access,
                         policy_counter,
                         credential_counter,
+                        captured_requests,
                     )
                     .await
                     {
@@ -118,6 +123,7 @@ impl AuthorizationFixture {
             signing_issuer: Some(signing_issuer),
             policy_calls,
             credential_calls,
+            credential_requests,
             task,
         })
     }
@@ -968,9 +974,12 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
         .body(())?;
     let (credential_response, _) = sender.send_request(credential_request, true)?;
     let credential_body = read_h2_body(credential_response.await?.into_body()).await?;
+    let authority = format!("localhost:{}", origin.addr.port());
     assert_eq!(
         credential_body,
-        format!("path=/credential/success\nauthorization={PROTECTED_VALUE}")
+        format!(
+            "path=/credential/success\nauthorization={PROTECTED_VALUE}\nauthority={authority}\nhost-present=false"
+        )
     );
 
     let early_request = http::Request::builder()
@@ -985,7 +994,9 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
     let early_body = read_h2_body(early_response.into_body()).await?;
     assert_eq!(
         early_body,
-        format!("path=/credential/success\nauthorization={PROTECTED_VALUE}")
+        format!(
+            "path=/credential/success\nauthorization={PROTECTED_VALUE}\nauthority={authority}\nhost-present=false"
+        )
     );
 
     let misdirected_uri: Uri = format!(
@@ -1058,10 +1069,32 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
         .body(())?;
     let (plain_response, _) = sender.send_request(plain_request, true)?;
     let plain_body = read_h2_body(plain_response.await?.into_body()).await?;
-    assert_eq!(plain_body, "path=/plain\nauthorization=<missing>");
+    assert_eq!(
+        plain_body,
+        format!("path=/plain\nauthorization=<missing>\nauthority={authority}\nhost-present=false")
+    );
 
     assert_eq!(services.policy_calls.load(Ordering::SeqCst), 1);
     assert_eq!(services.credential_calls.load(Ordering::SeqCst), 3);
+    {
+        let requests = services.credential_requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            let finalized = &request["finalized_request"];
+            assert_eq!(finalized["authority"], authority);
+            assert!(
+                finalized["headers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|header| header["name"] != "host")
+            );
+            assert_eq!(
+                finalized_fingerprint(request)?,
+                json_bytes(&request["request_fingerprint"])?
+            );
+        }
+    }
     assert_eq!(
         origin.accepts.load(Ordering::SeqCst),
         1,
@@ -1081,6 +1114,7 @@ async fn serve_authorization_request(
     body_access: BodyAccess,
     policy_calls: Arc<AtomicUsize>,
     credential_calls: Arc<AtomicUsize>,
+    credential_requests: Arc<Mutex<Vec<Value>>>,
 ) -> Result<()> {
     let mut tls = acceptor.accept(stream).await?;
     let (path, body) = read_json_request(&mut tls).await?;
@@ -1143,6 +1177,7 @@ async fn serve_authorization_request(
         }
         "/credential" => {
             credential_calls.fetch_add(1, Ordering::SeqCst);
+            credential_requests.lock().unwrap().push(request.clone());
             let fingerprint_valid = finalized_fingerprint(&request).is_ok_and(|fingerprint| {
                 json_bytes(&request["request_fingerprint"])
                     .is_ok_and(|claimed| claimed == fingerprint)
@@ -1337,7 +1372,14 @@ async fn serve_h2_origin_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("<missing>")
         .to_string();
-    let body = format!("path={path}\nauthorization={authorization}");
+    let authority = request
+        .uri()
+        .authority()
+        .map_or("<missing>", |a| a.as_str());
+    let host_present = request.headers().contains_key(http::header::HOST);
+    let body = format!(
+        "path={path}\nauthorization={authorization}\nauthority={authority}\nhost-present={host_present}"
+    );
     let response = http::Response::builder().status(StatusCode::OK).body(())?;
     let mut send = respond.send_response(response, false)?;
     send.send_data(Bytes::from(body), true)?;
@@ -1615,6 +1657,7 @@ async fn h2_rejects_changed_malformed_and_duplicate_proxy_tokens() -> Result<()>
     let _ = read_h2_body(response.into_body()).await?;
     assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
     // Rejected streams must not change or close the authenticated session.
+    let authority = format!("localhost:{}", origin.addr.port());
     for token in [None, Some(format!("ExfilGuard {AUTHORIZATION_TOKEN}"))] {
         let mut request = http::Request::builder().method(Method::GET).uri(format!(
             "https://localhost:{}/credential/success",
@@ -1628,7 +1671,9 @@ async fn h2_rejects_changed_malformed_and_duplicate_proxy_tokens() -> Result<()>
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             read_h2_body(response.into_body()).await?,
-            format!("path=/credential/success\nauthorization={PROTECTED_VALUE}")
+            format!(
+                "path=/credential/success\nauthorization={PROTECTED_VALUE}\nauthority={authority}\nhost-present=false"
+            )
         );
     }
     assert_eq!(services.credential_calls.load(Ordering::SeqCst), 2);

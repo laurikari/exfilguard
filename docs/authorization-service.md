@@ -63,7 +63,8 @@ is an identifier containing 1 to 128 visible ASCII bytes.
 ## Authentication headers
 
 After both policies allow the request, ExfilGuard resolves and checks the destination and builds the
-exact outgoing request. It then sends this JSON to the same authorization service:
+exact outgoing request. It then sends this JSON to the same authorization service. This example
+describes an outgoing HTTP/1.1 request:
 
 ```json
 {
@@ -97,6 +98,11 @@ exact outgoing request. It then sends this JSON to the same authorization servic
 
 Byte strings and the 32-byte fingerprint are JSON arrays of unsigned byte values. Header order and
 duplicate headers matter. Headers that the service must fill have empty values at this stage.
+
+For HTTP/1.1, `headers` includes a generated `host` field. For HTTP/2, `headers` omits `host`;
+ExfilGuard sends `authority` as the `:authority` pseudo-header. Use `authority` when preparing
+credentials that depend on the destination authority. The fingerprint covers the header list
+for the outgoing protocol.
 
 The service returns:
 

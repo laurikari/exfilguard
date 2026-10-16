@@ -1329,6 +1329,16 @@ async fn serve_h2_inspect_request(
     request: http::Request<h2::RecvStream>,
     mut respond: h2_server::SendResponse<Bytes>,
 ) -> Result<()> {
+    let authority = request
+        .uri()
+        .authority()
+        .map_or("<missing>", |a| a.as_str());
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("<missing>", |p| p.as_str());
+    let host_present = request.headers().contains_key(http::header::HOST);
+    let request_head = format!("authority={authority}\npath={path}\nhost-present={host_present}");
     let content_length = request
         .headers()
         .get(http::header::CONTENT_LENGTH)
@@ -1348,7 +1358,7 @@ async fn serve_h2_inspect_request(
     }
 
     let response_body = format!(
-        "content-length={content_length}\nbody-len={}\nbody={}",
+        "{request_head}\ncontent-length={content_length}\nbody-len={}\nbody={}",
         body.len(),
         String::from_utf8_lossy(&body)
     );

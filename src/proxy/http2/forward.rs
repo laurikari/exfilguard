@@ -437,7 +437,6 @@ pub(super) async fn forward_request_to_upstream(
     let upstream_peer = checkout.peer;
     let reused_existing = checkout.reused_existing;
 
-    let authority_host = meta.parsed.authority_host();
     let uri = build_upstream_uri(&meta.parsed)?;
     let mut builder = http::Request::builder()
         .method(meta.parsed.method.clone())
@@ -454,10 +453,6 @@ pub(super) async fn forward_request_to_upstream(
                 .context("invalid content-length header value")?;
             headers.insert(http::header::CONTENT_LENGTH, value);
         }
-        headers.insert(
-            http::header::HOST,
-            HeaderValue::from_str(authority_host).context("invalid host header value")?,
-        );
     }
     let request = builder
         .body(())
