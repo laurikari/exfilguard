@@ -613,16 +613,15 @@ request budget.
 
 ## Upstream TCP connection setup has one multi-address budget
 
-`upstream_connect_timeout` bounds one complete TCP connection operation across
-all resolved addresses, rather than granting a fresh timeout to each address.
-ExfilGuard preserves resolver preference within each address family, alternates
-IPv6 and IPv4 candidates, and starts attempts 250 milliseconds apart. The first
-success wins and cancels the remaining attempts.
+`upstream_connect_timeout` sets one deadline for connecting across all resolved
+addresses. ExfilGuard preserves resolver preference within each address family
+and alternates IPv6 and IPv4 candidates. While an attempt is pending,
+`proxy::upstream::race_connection_attempts` starts further attempts 250 milliseconds
+apart. If a failure leaves no attempt pending, it tries the next address
+immediately. The first success cancels the remaining attempts.
 
-There is no fixed address-count cutoff. The total deadline and stagger bound the
-work naturally; candidates whose turn falls beyond the deadline remain
-unattempted. DNS resolution and TLS handshakes retain their own phase-specific
-timeouts.
+All resolved candidates remain eligible until the deadline. DNS resolution and
+TLS handshakes have separate timeouts.
 
 ## Raw CONNECT tunnel idleness is bidirectional
 

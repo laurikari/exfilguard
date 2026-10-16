@@ -119,6 +119,24 @@ fn bumped_h2_request(authority: &str, method: Method, path: &str) -> Result<http
         .body(())?)
 }
 
+async fn wait_for_bumped_cache_entry(fixture: &BumpedTlsFixture, uri: &Uri) -> Result<()> {
+    let cache = fixture.cache();
+    timeout(StdDuration::from_secs(2), async {
+        loop {
+            if cache
+                .lookup(&Method::GET, uri, &http::HeaderMap::new())
+                .await
+                .is_some()
+            {
+                return;
+            }
+            sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for cache entry: {uri}"))
+}
+
 async fn proxy_response_for_raw_upstream_response(upstream_response: Vec<u8>) -> Result<String> {
     let upstream = TestUpstream::http_response(upstream_response).await?;
     let upstream_port = upstream.port();
@@ -2844,7 +2862,7 @@ async fn connect_bump_http2_cache_miss_then_hit() -> Result<()> {
     assert_eq!(first_status, StatusCode::OK);
     assert_eq!(first_body, "request=1\npath=/h2/cached\nbody=");
 
-    sleep(StdDuration::from_millis(50)).await;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     let second = http::Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -2897,18 +2915,13 @@ async fn bumped_cache_reuses_http1_chunk_payload_for_http2() -> Result<()> {
     }
     assert_eq!(fixture.request_count(), 1);
 
-    sleep(StdDuration::from_millis(50)).await;
+    let uri: Uri = format!("https://{authority}/cross/h1-to-h2").parse()?;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     fixture.reconnect(ClientProtocols::Http2Preferred).await?;
     let mut client = fixture.h2_client().await?;
     let request = http::Request::builder()
         .method(Method::GET)
-        .uri(
-            Uri::builder()
-                .scheme("https")
-                .authority(authority.as_str())
-                .path_and_query("/cross/h1-to-h2")
-                .build()?,
-        )
+        .uri(uri)
         .body(())?;
     let (status, body) = client.request_text(request).await?;
     assert_eq!(status, StatusCode::OK);
@@ -2952,7 +2965,7 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
     let mut h2_client = fixture.h2_client().await?;
     let first = http::Request::builder()
         .method(Method::GET)
-        .uri(uri)
+        .uri(uri.clone())
         .body(())?;
     let (status, body) = h2_client.request_text(first).await?;
     assert_eq!(status, StatusCode::OK);
@@ -2960,7 +2973,7 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
     assert_eq!(fixture.request_count(), 1);
     h2_client.shutdown().await;
 
-    sleep(StdDuration::from_millis(50)).await;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     fixture.reconnect(ClientProtocols::Http1).await?;
     let mut client = fixture.http1_client();
     let request =
@@ -3037,7 +3050,7 @@ async fn connect_bump_http2_body_requests_bypass_cache() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(cached_body, "request=3\npath=/h2/body\nbody=");
 
-    sleep(StdDuration::from_millis(50)).await;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     let second_bodyless = http::Request::builder()
         .method(Method::GET)
         .uri(uri)
