@@ -17,7 +17,25 @@ pub struct Client {
     pub name: Arc<str>,
     pub selector: ClientSelector,
     pub policies: Arc<[Arc<str>]>,
+    pub authorization_service: Option<Arc<str>>,
+    pub credential_limits: Arc<[CredentialLimit]>,
     pub max_connections: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialLimit {
+    pub credential_reference: Arc<str>,
+    pub origin_scope: UrlPattern,
+    pub protected_headers: Arc<[Arc<str>]>,
+    pub body_access: BodyAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyAccess {
+    #[default]
+    None,
+    BoundedPayload,
 }
 
 #[derive(Debug, Clone)]

@@ -44,17 +44,19 @@ async fn serve_plain_http(stream: TcpStream, peer: SocketAddr, app: AppContext) 
     {
         LoopOutcome::Completed => Ok(()),
         LoopOutcome::Connect(connect) => {
-            let snapshot = app.policies.snapshot();
-            connect::handle_connect(connect::ConnectRequest {
-                stream: connect.stream,
-                prefetched: connect.prefetched,
-                peer,
-                target: connect.target.as_str(),
-                snapshot,
-                app: &app,
-                request_bytes: connect.request_bytes,
-                start: connect.start,
-            })
+            connect::handle_connect(
+                connect::ConnectRequest {
+                    stream: connect.stream,
+                    prefetched: connect.prefetched,
+                    peer,
+                    target: connect.target.as_str(),
+                    snapshot: connect.snapshot,
+                    app: &app,
+                    request_bytes: connect.request_bytes,
+                    start: connect.start,
+                },
+                connect.authorization_token,
+            )
             .await
         }
     }

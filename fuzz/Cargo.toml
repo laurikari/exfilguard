@@ -9,9 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-tokio = { version = "1.52", features = ["rt", "time", "io-util"] }
+tokio = { version = "1.53", features = ["rt", "time", "io-util"] }
 exfilguard = { path = "..", features = ["fuzzing"] }
-http = "1.4"
+http = "1.5"
 
 [[bin]]
 name = "http1_request_head"

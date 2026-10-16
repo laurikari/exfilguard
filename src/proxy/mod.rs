@@ -20,8 +20,9 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 pub(crate) use self::resolver::{
-    UpstreamResolver, default_upstream_resolver, permissive_test_upstream_resolver,
+    UpstreamResolver, configured_upstream_resolver, permissive_test_upstream_resolver,
 };
+use crate::authorization::AuthorizationServices;
 use crate::{policy::matcher::PolicySnapshot, settings::Settings, tls::issuer::TlsIssuer};
 use rustls::client::ClientConfig;
 
@@ -46,29 +47,57 @@ pub struct AppContext {
     pub policies: PolicyStore,
     pub tls: Arc<TlsContext>,
     pub cache: Option<Arc<cache::HttpCache>>,
+    pub(crate) authorization: Option<Arc<AuthorizationServices>>,
     client_connections: Arc<admission::ClientConnectionLimiter>,
     proxy_protocol_pending_connections: Arc<Semaphore>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
 }
 
 impl AppContext {
-    pub fn new(
+    pub async fn new(
         settings: Arc<Settings>,
         policies: PolicyStore,
         tls: Arc<TlsContext>,
         cache: Option<Arc<cache::HttpCache>>,
+    ) -> Result<Self> {
+        let vault = crate::build_vault_client(settings.vault.as_ref())?;
+        let authorization = if let Some(authorization) = &settings.authorization {
+            Some(Arc::new(
+                AuthorizationServices::new(authorization, vault).await?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self::from_preflight(
+            settings,
+            policies,
+            tls,
+            cache,
+            authorization,
+        ))
+    }
+
+    pub(crate) fn from_preflight(
+        settings: Arc<Settings>,
+        policies: PolicyStore,
+        tls: Arc<TlsContext>,
+        cache: Option<Arc<cache::HttpCache>>,
+        authorization: Option<Arc<AuthorizationServices>>,
     ) -> Self {
         let proxy_protocol_pending_connections = Arc::new(Semaphore::new(
             settings.proxy_protocol_max_pending_connections,
         ));
+        let upstream_resolver =
+            configured_upstream_resolver(&settings.allow_private_upstream_cidrs);
         Self {
             settings,
             policies,
             tls,
             cache,
+            authorization,
             client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
             proxy_protocol_pending_connections,
-            upstream_resolver: default_upstream_resolver(),
+            upstream_resolver,
         }
     }
 

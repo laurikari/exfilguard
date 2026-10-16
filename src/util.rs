@@ -56,9 +56,9 @@ pub fn normalize_mapped_ip(addr: IpAddr) -> IpAddr {
 /// space. ExfilGuard blocks upstream addresses that are not valid public-Internet destinations by
 /// default.
 ///
-/// Keep this aligned with the current unstable `std::net::IpAddr::is_global()` logic until that
-/// API stabilizes. The stdlib logic is based on the IANA special-purpose registries, but we also
-/// reject multicast here because ExfilGuard only makes unicast upstream TCP connections.
+/// Keep the baseline aligned with the current unstable `std::net::IpAddr::is_global()` logic until
+/// that API stabilizes. The stdlib logic is based on the IANA special-purpose registries, but we
+/// also reject multicast and translation forms that could reach non-global IPv4 destinations.
 pub fn is_private_ip(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => ipv4_is_non_global_upstream(v4),
@@ -101,6 +101,7 @@ fn ipv4_is_non_global_upstream(addr: Ipv4Addr) -> bool {
         || addr.is_loopback()
         || addr.is_link_local()
         || ipv4_is_protocol_assignment(addr)
+        || ipv4_is_6to4_relay_anycast(addr)
         || addr.is_documentation()
         || ipv4_is_benchmarking(addr)
         || ipv4_is_reserved(addr)
@@ -118,6 +119,10 @@ fn ipv4_is_protocol_assignment(addr: Ipv4Addr) -> bool {
     octets[0] == 192 && octets[1] == 0 && octets[2] == 0 && octets[3] != 9 && octets[3] != 10
 }
 
+fn ipv4_is_6to4_relay_anycast(addr: Ipv4Addr) -> bool {
+    addr.octets() == [192, 88, 99, 2]
+}
+
 fn ipv4_is_benchmarking(addr: Ipv4Addr) -> bool {
     let octets = addr.octets();
     octets[0] == 198 && (octets[1] & 0xfe) == 18
@@ -132,8 +137,9 @@ fn ipv6_is_non_global_upstream(addr: Ipv6Addr) -> bool {
     addr.is_unspecified()
         || addr.is_loopback()
         || addr.to_ipv4_mapped().is_some()
-        || ipv6_is_ipv4_ipv6_translation(addr)
+        || ipv6_is_non_global_translation(addr)
         || ipv6_is_discard_only(addr)
+        || ipv6_is_dummy(addr)
         || ipv6_is_protocol_assignment(addr)
         || ipv6_is_6to4(addr)
         || ipv6_is_documentation(addr)
@@ -143,12 +149,29 @@ fn ipv6_is_non_global_upstream(addr: Ipv6Addr) -> bool {
         || addr.is_multicast()
 }
 
-fn ipv6_is_ipv4_ipv6_translation(addr: Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0x64, 0xff9b, 1, _, _, _, _, _])
+fn ipv6_is_non_global_translation(addr: Ipv6Addr) -> bool {
+    if matches!(addr.segments(), [0x64, 0xff9b, 1, _, _, _, _, _]) {
+        return true;
+    }
+
+    if !matches!(addr.segments(), [0x64, 0xff9b, 0, 0, 0, 0, _, _]) {
+        return false;
+    }
+
+    // The NAT64 well-known prefix exposes an IPv4 destination in its low 32 bits. Apply the same
+    // public-Internet check so translation cannot disguise a private or otherwise special target.
+    let octets = addr.octets();
+    ipv4_is_non_global_upstream(Ipv4Addr::new(
+        octets[12], octets[13], octets[14], octets[15],
+    ))
 }
 
 fn ipv6_is_discard_only(addr: Ipv6Addr) -> bool {
     matches!(addr.segments(), [0x100, 0, 0, 0, _, _, _, _])
+}
+
+fn ipv6_is_dummy(addr: Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0x100, 0, 0, 1, _, _, _, _])
 }
 
 fn ipv6_is_protocol_assignment(addr: Ipv6Addr) -> bool {
@@ -252,9 +275,11 @@ mod tests {
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 10, 10))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 8))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 2))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 5))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 9))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 10))));
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 1))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
@@ -279,6 +304,9 @@ mod tests {
             "100::1".parse::<Ipv6Addr>().unwrap()
         )));
         assert!(is_private_ip(IpAddr::V6(
+            "100:0:0:1::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_private_ip(IpAddr::V6(
             "2002::1".parse::<Ipv6Addr>().unwrap()
         )));
         assert!(is_private_ip(IpAddr::V6(
@@ -288,10 +316,24 @@ mod tests {
             "ff02::1".parse::<Ipv6Addr>().unwrap()
         )));
         assert!(!is_private_ip(IpAddr::V6(
-            "64:ff9b::1".parse::<Ipv6Addr>().unwrap()
-        )));
-        assert!(!is_private_ip(IpAddr::V6(
             "2001:4860::1".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    #[test]
+    fn filters_nat64_well_known_prefix_by_embedded_ipv4() {
+        for address in [
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::169.254.169.254",
+        ] {
+            assert!(is_private_ip(IpAddr::V6(
+                address.parse::<Ipv6Addr>().unwrap()
+            )));
+        }
+
+        assert!(!is_private_ip(IpAddr::V6(
+            "64:ff9b::8.8.8.8".parse::<Ipv6Addr>().unwrap()
         )));
     }
 

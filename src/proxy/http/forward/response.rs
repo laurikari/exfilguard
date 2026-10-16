@@ -6,12 +6,12 @@ use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use crate::io_util::write_all_with_timeout;
+use crate::io_util::{PayloadCopy, write_all_with_timeout};
 use crate::proxy::forward_error::{InformationalResponseStarted, RequestTimeout};
 use crate::proxy::forward_limits::HeaderBudget;
 use crate::util::timeout_with_context;
 
-use super::super::body::{relay_chunked_body, relay_fixed_body, relay_until_close};
+use super::super::body::{relay_chunked_body, relay_unframed_body};
 use super::super::codec::{Http1ResponseHead, read_http1_response_head_with_budget};
 use super::ForwardTimeouts;
 
@@ -41,6 +41,7 @@ where
     C: AsyncWrite + Unpin,
 {
     let mut informational_bytes = 0u64;
+    let mut informational_started = false;
     let mut budget = HeaderBudget::new(
         max_header_bytes,
         "upstream response headers exceed configured limit",
@@ -52,7 +53,7 @@ where
         .saturating_add(timeouts.response_header);
     let read_sequence = async {
         loop {
-            let head = read_http1_response_head_with_budget(
+            let mut head = read_http1_response_head_with_budget(
                 upstream_reader,
                 per_read_timeout,
                 upstream_peer,
@@ -70,6 +71,8 @@ where
                     bail!("informational response must not include body framing");
                 }
                 let encoded = head.encode(ResponseBodyPlan::Empty, None);
+                // A failed write may have sent a prefix, which also forbids retry.
+                informational_started = true;
                 write_all_with_timeout(
                     client,
                     &encoded,
@@ -87,7 +90,7 @@ where
                 continue;
             }
 
-            validate_final_response_framing(&head)?;
+            normalize_final_response_framing(&mut head)?;
 
             return Ok(head);
         }
@@ -99,18 +102,35 @@ where
     };
     match result {
         Ok(head) => Ok((head, informational_bytes)),
-        Err(source) if informational_bytes > 0 => {
+        Err(source) if informational_started => {
             Err(InformationalResponseStarted::new(source).into())
         }
         Err(source) => Err(source),
     }
 }
 
-fn validate_final_response_framing(head: &Http1ResponseHead) -> Result<()> {
-    if head.status == StatusCode::NO_CONTENT
-        && (head.transfer_encoding_present || head.content_length.is_some())
-    {
-        bail!("204 response must not include Content-Length or Transfer-Encoding");
+pub(crate) fn normalize_final_response_framing(head: &mut Http1ResponseHead) -> Result<()> {
+    if head.status == StatusCode::NO_CONTENT {
+        if head.transfer_encoding_present
+            || head.content_length.is_some_and(|length| length != 0)
+            || head.headers.iter().any(|header| {
+                header.lower_name() == "content-length"
+                    && !header.value_bytes().iter().all(u8::is_ascii_digit)
+            })
+        {
+            bail!(
+                "204 response must not include nonzero or invalid Content-Length or Transfer-Encoding"
+            );
+        }
+        if head.content_length == Some(0) {
+            // Some origins send this forbidden but unambiguous header. Strip it
+            // from both wire framing and cache metadata. Retire the connection
+            // so unsolicited bytes cannot become a later pooled response.
+            head.content_length = None;
+            head.headers
+                .retain(|header| header.lower_name() != "content-length");
+            head.connection_close = true;
+        }
     }
 
     if head.status == StatusCode::RESET_CONTENT {
@@ -161,9 +181,11 @@ pub(crate) fn determine_response_body_plan(
     ResponseBodyPlan::UntilClose
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_body<S, C>(
     upstream: &mut BufReader<S>,
     client: &mut C,
+    payload_copy: Option<&mut PayloadCopy<'_>>,
     body_plan: ResponseBodyPlan,
     timeouts: &ForwardTimeouts,
     upstream_peer: SocketAddr,
@@ -176,14 +198,15 @@ where
 {
     match body_plan {
         ResponseBodyPlan::Empty => Ok(ResponseRelayStats::default()),
-        ResponseBodyPlan::Fixed(length) => relay_fixed_body(
+        ResponseBodyPlan::Fixed(length) => relay_unframed_body(
             upstream,
             client,
-            length,
+            Some(length),
             timeouts.response_io,
             timeouts.response_io,
             upstream_peer,
             total_deadline,
+            payload_copy,
         )
         .await
         .map(|bytes| ResponseRelayStats {
@@ -193,6 +216,7 @@ where
         ResponseBodyPlan::Chunked => relay_chunked_body(
             upstream,
             client,
+            payload_copy,
             timeouts.response_io,
             timeouts.response_io,
             upstream_peer,
@@ -204,13 +228,15 @@ where
             bytes: stats.bytes_written,
             had_trailers: stats.had_trailers,
         }),
-        ResponseBodyPlan::UntilClose => relay_until_close(
+        ResponseBodyPlan::UntilClose => relay_unframed_body(
             upstream,
             client,
+            None,
             timeouts.response_io,
             timeouts.response_io,
             upstream_peer,
             total_deadline,
+            payload_copy,
         )
         .await
         .map(|bytes| ResponseRelayStats {
@@ -234,6 +260,50 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_errors_and_stalls_do_not_truncate_response_bodies() {
+        let payload = "x".repeat(16 * 1024);
+        let chunked = format!("4000\r\n{payload}\r\n0\r\n\r\n");
+        let timeout = Duration::from_secs(1);
+        let timeouts = ForwardTimeouts {
+            connect: timeout,
+            request_io: timeout,
+            response_header: timeout,
+            response_io: timeout,
+        };
+        for stall in [false, true] {
+            for (plan, wire) in [
+                (
+                    ResponseBodyPlan::Fixed(payload.len() as u64),
+                    payload.as_bytes(),
+                ),
+                (ResponseBodyPlan::UntilClose, payload.as_bytes()),
+                (ResponseBodyPlan::Chunked, chunked.as_bytes()),
+            ] {
+                let (mut cache_writer, cache_reader) = duplex(1);
+                let _reader = stall.then_some(cache_reader);
+                let mut copy = crate::io_util::PayloadCopy::best_effort(&mut cache_writer);
+                let mut upstream = BufReader::new(wire);
+                let mut client = Vec::new();
+                let stats = super::relay_body(
+                    &mut upstream,
+                    &mut client,
+                    Some(&mut copy),
+                    plan,
+                    &timeouts,
+                    "127.0.0.1:80".parse().unwrap(),
+                    None,
+                    1024,
+                )
+                .await
+                .unwrap();
+                assert_eq!(client, wire, "{plan:?}, stall={stall}");
+                assert_eq!(stats.bytes, wire.len() as u64);
+                assert!(copy.take_error().is_some());
+            }
+        }
+    }
 
     fn head_with_status(status: StatusCode) -> Http1ResponseHead {
         Http1ResponseHead {
@@ -308,6 +378,7 @@ mod tests {
             true,
             &Method::GET,
             BodyPlan::Empty,
+            &crate::proxy::forward_limits::ResponseProgress::default(),
             &err,
         ));
 
@@ -340,6 +411,7 @@ mod tests {
             super::relay_body(
                 &mut upstream_reader,
                 &mut client,
+                None,
                 ResponseBodyPlan::Fixed(4),
                 &timeouts,
                 upstream_peer,
@@ -394,6 +466,48 @@ mod tests {
         let mut buf = Vec::new();
         client_reader.read_to_end(&mut buf).await?;
         assert!(buf.starts_with(b"HTTP/1.1 100"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_informational_head_write_prevents_retry() -> anyhow::Result<()> {
+        let mut upstream = BufReader::new(&b"HTTP/1.1 103 Early Hints\r\n\r\n"[..]);
+        let (mut writer, mut reader) = duplex(1);
+        let timeouts = ForwardTimeouts {
+            connect: Duration::from_secs(1),
+            request_io: Duration::from_secs(1),
+            response_header: Duration::from_secs(1),
+            response_io: Duration::from_secs(1),
+        };
+        let (result, client_result) = tokio::join!(
+            read_final_response_head(
+                &mut upstream,
+                &mut writer,
+                &timeouts,
+                "127.0.0.1:8080".parse()?,
+                256,
+            ),
+            async move {
+                assert_eq!(reader.read_u8().await?, b'H');
+                // Close after a prefix so write_all fails with BrokenPipe.
+                drop(reader);
+                Ok::<_, std::io::Error>(())
+            },
+        );
+        client_result?;
+        let error = result.err().expect("partial head write should fail");
+        assert!(
+            error
+                .downcast_ref::<InformationalResponseStarted>()
+                .is_some()
+        );
+        assert!(!super::super::should_retry_reused_connection(
+            true,
+            &Method::GET,
+            BodyPlan::Empty,
+            &crate::proxy::forward_limits::ResponseProgress::default(),
+            &error,
+        ));
         Ok(())
     }
 
@@ -630,10 +744,22 @@ mod tests {
     #[tokio::test]
     async fn read_final_response_head_rejects_forbidden_no_content_framing() -> anyhow::Result<()> {
         for response in [
-            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: +0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: -0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0, 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 18446744073709551616\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: \r\n\r\n".as_slice(),
             b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
             b"HTTP/1.1 205 Reset Content\r\nContent-Length: 1\r\n\r\n".as_slice(),
             b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
         ] {
             let (mut upstream_writer, upstream_reader) = duplex(256);
             let (_client_reader, mut client_writer) = duplex(256);
@@ -653,6 +779,83 @@ mod tests {
             assert!(
                 result.is_err(),
                 "invalid response was accepted: {response:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_final_response_head_normalizes_zero_length_no_content() -> anyhow::Result<()> {
+        for field in ["Content-Length: 0", "cOnTeNt-LeNgTh:\t000 \t"] {
+            let (mut upstream_writer, upstream_reader) = duplex(512);
+            let (mut client_writer, mut client_reader) = duplex(512);
+            upstream_writer
+                .write_all(format!("HTTP/1.1 204 No Content\r\n{field}\r\nETag: \"kept\"\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\npoison").as_bytes())
+                .await?;
+            // Keep the origin open: accepting 204 must not wait for EOF.
+            let mut upstream_reader = BufReader::new(upstream_reader);
+            let (head, informational_bytes) = read_final_response_head(
+                &mut upstream_reader,
+                &mut client_writer,
+                &test_timeouts(Duration::from_secs(1)),
+                "127.0.0.1:8080".parse()?,
+                512,
+            )
+            .await?;
+            assert_eq!(head.status, StatusCode::NO_CONTENT);
+            assert_eq!(informational_bytes, 0);
+            assert_eq!(head.content_length, None);
+            assert!(head.connection_close);
+            assert!(!head.header_map().contains_key(http::header::CONTENT_LENGTH));
+            assert_eq!(head.header_map()[http::header::ETAG], "\"kept\"");
+            assert_eq!(
+                determine_response_body_plan(&Method::GET, head.status, &head),
+                ResponseBodyPlan::Empty
+            );
+            let encoded = String::from_utf8(head.encode(ResponseBodyPlan::Empty, None))?;
+            assert!(!encoded.to_ascii_lowercase().contains("content-length"));
+            assert!(encoded.ends_with("\r\n\r\n"));
+            client_writer.shutdown().await?;
+            let mut forwarded = Vec::new();
+            client_reader.read_to_end(&mut forwarded).await?;
+            assert!(
+                forwarded.is_empty(),
+                "final head reader forwarded origin bytes"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_content_compatibility_preserves_other_bodyless_responses() -> anyhow::Result<()> {
+        for (status, method, length) in [
+            (204, Method::GET, None),
+            (200, Method::HEAD, Some(123)),
+            (304, Method::GET, Some(123)),
+            (205, Method::GET, Some(0)),
+            (205, Method::GET, None),
+        ] {
+            let (mut upstream_writer, upstream_reader) = duplex(256);
+            let (_client_reader, mut client_writer) = duplex(256);
+            let field = length.map_or_else(String::new, |n| format!("Content-Length: {n}\r\n"));
+            upstream_writer
+                .write_all(format!("HTTP/1.1 {status} Test\r\n{field}\r\n").as_bytes())
+                .await?;
+            let mut upstream_reader = BufReader::new(upstream_reader);
+            let (head, _) = read_final_response_head(
+                &mut upstream_reader,
+                &mut client_writer,
+                &test_timeouts(Duration::from_secs(1)),
+                "127.0.0.1:8080".parse()?,
+                256,
+            )
+            .await?;
+            assert_eq!(head.status.as_u16(), status);
+            assert_eq!(head.content_length, length);
+            assert!(!head.connection_close);
+            assert_eq!(
+                determine_response_body_plan(&method, head.status, &head),
+                ResponseBodyPlan::Empty
             );
         }
         Ok(())

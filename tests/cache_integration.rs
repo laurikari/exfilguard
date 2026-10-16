@@ -1317,3 +1317,66 @@ async fn test_cache_bypass_on_cookie_header() -> Result<()> {
     )
     .await
 }
+
+#[tokio::test]
+async fn successful_mutation_does_not_invalidate_a_fresh_response() -> Result<()> {
+    let upstream = MockUpstream::new("Cache-Control: public, max-age=300").await?;
+    let port = upstream.port();
+    let requests = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache-freshness"])
+        .policy(
+            PolicySpec::new("cache-freshness")
+                .rule(
+                    RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{port}/**"))
+                        .cache_enabled(),
+                )
+                .rule(RuleSpec::allow(
+                    &["DELETE"],
+                    format!("http://127.0.0.1:{port}/**"),
+                )),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let uri: Uri = format!("http://127.0.0.1:{port}/resource").parse()?;
+    for (method, expected_requests) in [("GET", 1), ("DELETE", 2), ("GET", 2)] {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream
+            .write_all(
+                format!(
+                    "{method} {uri} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.ends_with("cached-response"));
+        assert_eq!(requests.load(Ordering::SeqCst), expected_requests);
+        if expected_requests == 1 {
+            tokio::time::timeout(StdDuration::from_secs(3), async {
+                while harness
+                    .cache
+                    .as_ref()
+                    .unwrap()
+                    .lookup(&Method::GET, &uri, &HeaderMap::new())
+                    .await
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
+    }
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}

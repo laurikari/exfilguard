@@ -14,6 +14,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use tokio::{sync::Mutex, time::timeout};
 
 use crate::{
+    authorization::FinalizedRequestV1,
     proxy::forward_error::{ClientBodyIdleTimeout, RequestTimeout},
     proxy::forward_limits::{BodySizeTracker, HeaderBudget, RequestDeadline, ResponseProgress},
     proxy::headers::{
@@ -169,6 +170,46 @@ async fn upload_request_body(
     Ok(())
 }
 
+pub(super) async fn buffer_request_body(
+    body: &mut RecvStream,
+    request_body_timeout: Duration,
+    request_deadline: Option<Instant>,
+    max_request_body_size: usize,
+) -> Result<(Vec<u8>, u64)> {
+    let mut tracker = BodySizeTracker::new(max_request_body_size);
+    let mut buffered = Vec::with_capacity(max_request_body_size);
+    while let Some(frame) = with_total_deadline(request_deadline, async {
+        timeout(request_body_timeout, body.data())
+            .await
+            .map_err(|_| anyhow::Error::new(ClientBodyIdleTimeout))
+    })
+    .await?
+    {
+        let chunk = frame.context("failed to read credential-bearing HTTP/2 request body")?;
+        let chunk_len = chunk.len();
+        tracker.record(chunk_len)?;
+        buffered.extend_from_slice(&chunk);
+        body.flow_control()
+            .release_capacity(chunk_len)
+            .context("failed to release HTTP/2 request body flow-control capacity")?;
+    }
+    let trailers = with_total_deadline(request_deadline, async {
+        timeout(request_body_timeout, body.trailers())
+            .await
+            .map_err(|_| anyhow::Error::new(ClientBodyIdleTimeout))?
+            .context("failed while reading credential-bearing HTTP/2 request trailers")
+    })
+    .await?;
+    if trailers.is_some() {
+        return Err(crate::proxy::http::InvalidRequestBody::new(
+            tracker.total(),
+            "credential-bearing requests must not contain trailers",
+        )
+        .into());
+    }
+    Ok((buffered, tracker.total()))
+}
+
 struct RelayedResponse {
     status: StatusCode,
     response_body_bytes: u64,
@@ -188,7 +229,6 @@ async fn relay_upstream_response(
     request_method: &http::Method,
     upstream_peer: SocketAddr,
     upstream_request_instant: Instant,
-    allow_early_no_error_reset: bool,
 ) -> Result<RelayedResponse> {
     let response_instant = Instant::now();
     let response_time = SystemTime::now();
@@ -267,7 +307,6 @@ async fn relay_upstream_response(
     let mut upstream_body_bytes = 0u64;
     let mut response_body = response.into_body();
     if !end_stream {
-        let mut ended_by_no_error_reset = false;
         while let Some(frame) = with_total_deadline(request_deadline, async {
             timeout(response_body_timeout, response_body.data())
                 .await
@@ -275,18 +314,7 @@ async fn relay_upstream_response(
         })
         .await?
         {
-            let chunk = match frame {
-                Ok(chunk) => chunk,
-                Err(err)
-                    if allow_early_no_error_reset && err.reason() == Some(h2::Reason::NO_ERROR) =>
-                {
-                    ended_by_no_error_reset = true;
-                    break;
-                }
-                Err(err) => {
-                    return Err(err).context("failed to read HTTP/2 response data frame");
-                }
-            };
+            let chunk = frame.context("failed to read HTTP/2 response data frame")?;
             if chunk.is_empty() {
                 continue;
             }
@@ -312,42 +340,34 @@ async fn relay_upstream_response(
                 .context("failed to release HTTP/2 response body flow-control capacity")?;
         }
 
-        if ended_by_no_error_reset {
-            cache_write.discard();
-            send_body
-                .send_data(Bytes::new(), true)
-                .context("failed to terminate downstream HTTP/2 response stream")?;
-        } else {
-            match with_total_deadline(
-                request_deadline,
-                timeout_with_context(
-                    response_body_timeout,
-                    response_body.trailers(),
-                    "reading HTTP/2 response trailers from upstream",
-                ),
-            )
-            .await?
-            {
-                Some(trailers) => {
-                    cache_write.discard();
-                    let sanitized =
-                        sanitize_response_trailer_map(&trailers, max_response_header_bytes)
-                            .context("invalid HTTP/2 response trailers from upstream")?;
-                    if sanitized.is_empty() {
-                        send_body
-                            .send_data(Bytes::new(), true)
-                            .context("failed to terminate downstream HTTP/2 response stream")?;
-                    } else {
-                        send_body
-                            .send_trailers(sanitized)
-                            .context("failed to forward HTTP/2 response trailers to client")?;
-                    }
-                }
-                None => {
+        match with_total_deadline(
+            request_deadline,
+            timeout_with_context(
+                response_body_timeout,
+                response_body.trailers(),
+                "reading HTTP/2 response trailers from upstream",
+            ),
+        )
+        .await?
+        {
+            Some(trailers) => {
+                cache_write.discard();
+                let sanitized = sanitize_response_trailer_map(&trailers, max_response_header_bytes)
+                    .context("invalid HTTP/2 response trailers from upstream")?;
+                if sanitized.is_empty() {
                     send_body
                         .send_data(Bytes::new(), true)
                         .context("failed to terminate downstream HTTP/2 response stream")?;
+                } else {
+                    send_body
+                        .send_trailers(sanitized)
+                        .context("failed to forward HTTP/2 response trailers to client")?;
                 }
+            }
+            None => {
+                send_body
+                    .send_data(Bytes::new(), true)
+                    .context("failed to terminate downstream HTTP/2 response stream")?;
             }
         }
     }
@@ -417,7 +437,6 @@ pub(super) async fn forward_request_to_upstream(
     let upstream_peer = checkout.peer;
     let reused_existing = checkout.reused_existing;
 
-    let authority_host = meta.parsed.authority_host();
     let uri = build_upstream_uri(&meta.parsed)?;
     let mut builder = http::Request::builder()
         .method(meta.parsed.method.clone())
@@ -434,10 +453,6 @@ pub(super) async fn forward_request_to_upstream(
                 .context("invalid content-length header value")?;
             headers.insert(http::header::CONTENT_LENGTH, value);
         }
-        headers.insert(
-            http::header::HOST,
-            HeaderValue::from_str(authority_host).context("invalid host header value")?,
-        );
     }
     let request = builder
         .body(())
@@ -461,7 +476,7 @@ pub(super) async fn forward_request_to_upstream(
         let response = with_total_deadline(request_deadline, async {
             timeout(response_header_timeout, &mut receive_response)
                 .await
-                .map_err(|_| anyhow!("timed out receiving HTTP/2 response from upstream"))?
+                .map_err(|_| anyhow::Error::new(RequestTimeout))?
         })
         .await?;
         relay_upstream_response(
@@ -475,7 +490,6 @@ pub(super) async fn forward_request_to_upstream(
             &request_method,
             upstream_peer,
             upstream_request_instant,
-            false,
         )
         .await?
     } else {
@@ -504,7 +518,6 @@ pub(super) async fn forward_request_to_upstream(
                     &request_method,
                     upstream_peer,
                     upstream_request_instant,
-                    true,
                 );
                 tokio::pin!(relay);
                 tokio::select! {
@@ -526,7 +539,7 @@ pub(super) async fn forward_request_to_upstream(
                 let response = with_total_deadline(request_deadline, async {
                     timeout(response_header_timeout, &mut receive_response)
                         .await
-                        .map_err(|_| anyhow!("timed out receiving HTTP/2 response from upstream"))?
+                        .map_err(|_| anyhow::Error::new(RequestTimeout))?
                 })
                 .await?;
                 relay_upstream_response(
@@ -540,7 +553,6 @@ pub(super) async fn forward_request_to_upstream(
                     &request_method,
                     upstream_peer,
                     upstream_request_instant,
-                    false,
                 )
                 .await?
             }
@@ -561,16 +573,151 @@ pub(super) async fn forward_request_to_upstream(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn forward_finalized_request_to_upstream(
+    checkout: UpstreamCheckout,
+    finalized: FinalizedRequestV1,
+    respond: &mut SendResponse<Bytes>,
+    request_body_timeout: Duration,
+    response_header_timeout: Duration,
+    response_body_timeout: Duration,
+    request_deadline: RequestDeadline,
+    response_progress: &ResponseProgress,
+    max_response_header_bytes: usize,
+) -> Result<ForwardOutcome> {
+    let request_deadline = request_deadline.instant();
+    let upstream_peer = checkout.peer;
+    let reused_existing = checkout.reused_existing;
+    let request_method = finalized.method().clone();
+    let client_body_bytes = finalized.client_body_wire_bytes();
+    let (request, body) = finalized.into_http2_parts()?;
+    let end_of_stream = body.is_none();
+    let (response_fut, mut send_stream, upstream_request_instant) = open_upstream_stream(
+        checkout.sender.as_ref(),
+        request,
+        end_of_stream,
+        request_deadline,
+    )
+    .await?;
+    let receive_response = async {
+        response_fut
+            .await
+            .context("failed while receiving HTTP/2 response from upstream")
+    };
+    tokio::pin!(receive_response);
+
+    let relayed = if let Some(body) = body {
+        let mut upload = Box::pin(async {
+            let payload = Bytes::copy_from_slice(body.bytes());
+            send_data_with_backpressure(
+                &mut send_stream,
+                payload,
+                request_body_timeout,
+                request_deadline,
+                "forwarding finalized HTTP/2 request body upstream",
+            )
+            .await?;
+            send_stream
+                .send_data(Bytes::new(), true)
+                .context("failed to terminate finalized HTTP/2 request stream")
+        });
+
+        tokio::select! {
+            biased;
+            response = &mut receive_response => {
+                let response = response?;
+                drop(upload);
+                drop(body);
+                relay_upstream_response(
+                    response,
+                    respond,
+                    response_body_timeout,
+                    request_deadline,
+                    response_progress,
+                    max_response_header_bytes,
+                    None,
+                    &request_method,
+                    upstream_peer,
+                    upstream_request_instant,
+                )
+                .await?
+            }
+            upload_result = &mut upload => {
+                upload_result?;
+                drop(upload);
+                drop(body);
+                let response = with_total_deadline(request_deadline, async {
+                    timeout(response_header_timeout, &mut receive_response)
+                        .await
+                        .map_err(|_| anyhow::Error::new(RequestTimeout))?
+                })
+                .await?;
+                relay_upstream_response(
+                    response,
+                    respond,
+                    response_body_timeout,
+                    request_deadline,
+                    response_progress,
+                    max_response_header_bytes,
+                    None,
+                    &request_method,
+                    upstream_peer,
+                    upstream_request_instant,
+                )
+                .await?
+            }
+        }
+    } else {
+        let response = with_total_deadline(request_deadline, async {
+            timeout(response_header_timeout, &mut receive_response)
+                .await
+                .map_err(|_| anyhow::Error::new(RequestTimeout))?
+        })
+        .await?;
+        relay_upstream_response(
+            response,
+            respond,
+            response_body_timeout,
+            request_deadline,
+            response_progress,
+            max_response_header_bytes,
+            None,
+            &request_method,
+            upstream_peer,
+            upstream_request_instant,
+        )
+        .await?
+    };
+    Ok(ForwardOutcome {
+        log: ForwardLog {
+            status: relayed.status,
+            client_body_bytes,
+            response_body_bytes: relayed.response_body_bytes,
+            response_header_bytes: relayed.response_header_bytes,
+            upstream_addr: upstream_peer,
+            upstream_reused: reused_existing,
+            cache_store: relayed.cache_store,
+        },
+    })
+}
+
 pub(super) async fn send_error_response(
     respond: &mut SendResponse<Bytes>,
     status: StatusCode,
     message: &str,
+    proxy_authenticate: Option<&str>,
 ) -> Result<()> {
     let mut builder = http::Response::builder().status(status);
     {
         let headers = builder
             .headers_mut()
             .expect("headers_mut available before body");
+        if let Some(value) = proxy_authenticate {
+            headers.insert(
+                http::header::PROXY_AUTHENTICATE,
+                HeaderValue::from_str(value).context("invalid proxy authentication challenge")?,
+            );
+        }
         headers.insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),

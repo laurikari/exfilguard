@@ -26,6 +26,7 @@ pub(super) struct UpstreamKey {
     scheme: Scheme,
     host: String,
     port: u16,
+    authorization_context: Option<[u8; 32]>,
 }
 
 pub(super) struct UpstreamConnection {
@@ -92,7 +93,10 @@ impl UpstreamPool {
 }
 
 impl UpstreamKey {
-    pub(super) fn from_request(request: &ParsedRequest) -> Self {
+    pub(super) fn from_request(
+        request: &ParsedRequest,
+        authorization_context: Option<[u8; 32]>,
+    ) -> Self {
         let port = request
             .port
             .unwrap_or_else(|| request.scheme.default_port());
@@ -100,6 +104,7 @@ impl UpstreamKey {
             scheme: request.scheme,
             host: request.host.clone(),
             port,
+            authorization_context,
         }
     }
 }
@@ -136,7 +141,19 @@ impl UpstreamConnection {
             app.settings.dns_resolve_timeout(),
         )
         .await?;
-        let (upstream_tcp, peer) = upstream::connect_to_addrs(&addresses, connect_timeout).await?;
+        Self::connect_resolved(request, app, connect_timeout, &addresses).await
+    }
+
+    pub(super) async fn connect_resolved(
+        request: &ParsedRequest,
+        app: &AppContext,
+        connect_timeout: Duration,
+        addresses: &[SocketAddr],
+    ) -> Result<Self> {
+        let port = request
+            .port
+            .unwrap_or_else(|| request.scheme.default_port());
+        let (upstream_tcp, peer) = upstream::connect_to_addrs(addresses, connect_timeout).await?;
         let metrics = crate::metrics::track_upstream_connection();
         let stream = if request.scheme == Scheme::Https {
             let server_name = ServerName::try_from(request.host.as_str())
@@ -203,12 +220,33 @@ mod tests {
             flow: None,
         };
 
-        let first = UpstreamKey::from_request(&request);
-        let second = UpstreamKey::from_request(&ParsedRequest {
-            path: "/other".to_string(),
-            ..request
-        });
+        let first = UpstreamKey::from_request(&request, None);
+        let second = UpstreamKey::from_request(
+            &ParsedRequest {
+                path: "/other".to_string(),
+                ..request
+            },
+            None,
+        );
 
         assert_eq!(first, second, "upstream key should ignore request path");
+    }
+
+    #[test]
+    fn upstream_key_separates_authorization_contexts() {
+        let request = ParsedRequest {
+            method: http::Method::GET,
+            scheme: Scheme::Https,
+            authority: "example.com".to_string(),
+            host: "example.com".to_string(),
+            port: Some(443),
+            path: "/".to_string(),
+            policy_path: "/".to_string(),
+            flow: None,
+        };
+        assert_ne!(
+            UpstreamKey::from_request(&request, Some([1; 32])),
+            UpstreamKey::from_request(&request, Some([2; 32]))
+        );
     }
 }

@@ -4,6 +4,7 @@ use http::StatusCode;
 use crate::logging::AccessLogBuilder;
 use crate::proxy::{
     forward_error::{ForwardErrorKind, classify_forward_error, log_forward_error},
+    forward_limits::AllowLogTracker,
     policy_eval::{AllowDecision, DenyDecision, RequestLogContext},
 };
 
@@ -27,6 +28,14 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             extra_client_bytes: 0,
             log_reason: "response_body_failed",
         },
+        ForwardErrorKind::Http2StreamReset => ForwardErrorSpec {
+            status: StatusCode::BAD_GATEWAY,
+            body_http1: b"HTTP/2 stream reset\r\n",
+            body_http2: "HTTP/2 stream reset",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "http2_stream_reset",
+        },
         ForwardErrorKind::RequestTimeout => ForwardErrorSpec {
             status: StatusCode::GATEWAY_TIMEOUT,
             body_http1: b"request timed out\r\n",
@@ -42,6 +51,30 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
             decision: "ERROR",
             extra_client_bytes: 0,
             log_reason: "request_body_timeout",
+        },
+        ForwardErrorKind::CredentialPreparationFailed => ForwardErrorSpec {
+            status: StatusCode::BAD_GATEWAY,
+            body_http1: b"credential preparation failed\r\n",
+            body_http2: "credential preparation failed",
+            decision: "ERROR",
+            extra_client_bytes: 0,
+            log_reason: "credential_preparation_failed",
+        },
+        ForwardErrorKind::CredentialRequestRejected(rejected) => ForwardErrorSpec {
+            status: rejected.status,
+            body_http1: if rejected.status == StatusCode::EXPECTATION_FAILED {
+                b"expectation failed\r\n"
+            } else {
+                b"request blocked by credential policy\r\n"
+            },
+            body_http2: if rejected.status == StatusCode::EXPECTATION_FAILED {
+                "expectation failed"
+            } else {
+                "request blocked by credential policy"
+            },
+            decision: "DENY",
+            extra_client_bytes: 0,
+            log_reason: "credential_request_rejected",
         },
         ForwardErrorKind::InvalidRequestBody(body) => ForwardErrorSpec {
             status: StatusCode::BAD_REQUEST,
@@ -61,8 +94,8 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
         },
         ForwardErrorKind::PrivateAddress(_) => ForwardErrorSpec {
             status: StatusCode::FORBIDDEN,
-            body_http1: b"request blocked by policy\r\n",
-            body_http2: "request blocked by policy",
+            body_http1: b"upstream address blocked (private_address)\r\n",
+            body_http2: "upstream address blocked (private_address)",
             decision: "DENY",
             extra_client_bytes: 0,
             log_reason: "private_address",
@@ -107,6 +140,26 @@ pub fn forward_error_log_builder(
         .rule(allow.rule.as_ref())
         .error_reason(spec.log_reason)
         .error_detail(error_detail)
+}
+
+/// Log a forwarding failure without inventing a new downstream response.
+pub fn forward_disconnect_log_builder(
+    builder: AccessLogBuilder,
+    allow: &AllowDecision,
+    kind: &ForwardErrorKind<'_>,
+    error_detail: &str,
+    tracker: &AllowLogTracker,
+) -> AccessLogBuilder {
+    let spec = forward_error_spec(kind);
+    let builder = forward_error_log_builder(builder, allow, &spec, error_detail)
+        .bytes(tracker.current_bytes(), 0)
+        .elapsed(tracker.elapsed());
+    match kind {
+        ForwardErrorKind::ResponseAlreadyStarted(started) => builder
+            .status(started.status)
+            .bytes(tracker.current_bytes(), started.bytes_to_client),
+        _ => builder,
+    }
 }
 
 /// Indicates whether forwarding completed successfully or the protocol already
@@ -235,6 +288,7 @@ mod tests {
             rule: Arc::<str>::from("rule"),
             https_mode: crate::config::HttpsMode::Inspect,
             cache: None,
+            authorization: None,
         }
     }
 
@@ -267,6 +321,60 @@ mod tests {
         RequestLogContext::new(peer, parsed, false)
     }
 
+    #[test]
+    fn disconnect_log_preserves_committed_response_status_and_bytes() {
+        let decision = sample_decision();
+        let parsed = sample_request();
+        let log = sample_log(&parsed);
+        let tracker = AllowLogTracker::new(42, std::time::Instant::now());
+        let error = crate::proxy::forward_error::ResponseAlreadyStarted::new(
+            StatusCode::PARTIAL_CONTENT,
+            123,
+            anyhow!("origin reset"),
+        )
+        .into();
+        let event = forward_disconnect_log_builder(
+            log.access_log_builder(),
+            &decision,
+            &classify_forward_error(&error),
+            &error.to_string(),
+            &tracker,
+        )
+        .build();
+
+        assert_eq!(event.status, 206);
+        assert_eq!(event.bytes_in, 42);
+        assert_eq!(event.bytes_out, 123);
+        assert_eq!(event.decision, "ERROR");
+        assert_eq!(event.error_reason.as_deref(), Some("response_body_failed"));
+        assert_eq!(event.client.as_deref(), Some("client"));
+        assert_eq!(event.policy.as_deref(), Some("policy"));
+        assert_eq!(event.rule.as_deref(), Some("rule"));
+        assert!(event.error_detail.unwrap().contains("origin reset"));
+    }
+
+    #[test]
+    fn disconnect_log_does_not_invent_an_unsent_response_status() {
+        let decision = sample_decision();
+        let parsed = sample_request();
+        let log = sample_log(&parsed);
+        let tracker = AllowLogTracker::new(42, std::time::Instant::now());
+        let event = forward_disconnect_log_builder(
+            log.access_log_builder(),
+            &decision,
+            &ForwardErrorKind::Http2StreamReset,
+            "origin reset",
+            &tracker,
+        )
+        .build();
+
+        assert_eq!(event.status, 0);
+        assert_eq!(event.bytes_in, 42);
+        assert_eq!(event.bytes_out, 0);
+        assert_eq!(event.decision, "ERROR");
+        assert_eq!(event.error_reason.as_deref(), Some("http2_stream_reset"));
+    }
+
     #[tokio::test]
     async fn forward_result_passes_success_through() -> Result<()> {
         let decision = sample_decision();
@@ -297,6 +405,23 @@ mod tests {
     }
 
     #[test]
+    fn private_address_response_identifies_address_filtering() {
+        let error = crate::proxy::resolver::PrivateAddressError::new("internal.test", 443, "test");
+        let spec = forward_error_spec(&ForwardErrorKind::PrivateAddress(&error));
+        assert_eq!(spec.status, StatusCode::FORBIDDEN);
+        assert_eq!(spec.decision, "DENY");
+        assert_eq!(spec.log_reason, "private_address");
+        assert_eq!(
+            spec.body_http1,
+            b"upstream address blocked (private_address)\r\n"
+        );
+        assert_eq!(
+            spec.body_http2,
+            "upstream address blocked (private_address)"
+        );
+    }
+
+    #[test]
     fn builds_policy_deny_spec() {
         let deny = sample_deny();
         let spec = policy_deny_spec(&deny);
@@ -318,6 +443,7 @@ mod tests {
     #[test]
     fn misdirected_request_maps_to_421() {
         let err = anyhow::Error::new(MisdirectedRequest::new(
+            "https",
             "upstream.test".to_string(),
             443,
             "requested.test".to_string(),

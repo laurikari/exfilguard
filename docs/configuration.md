@@ -15,11 +15,13 @@ These settings are required.
 | `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
 | `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
 | `proxy_protocol_max_pending_connections` | usize | 1024 | Maximum connections from allowlisted peers concurrently awaiting PROXY header processing |
+| `vault` | Table | When used | Shared Vault connection, PKI trust, and authentication settings |
 | `ca` | Table | Yes | Explicit TLS interception CA source: `builtin`, `files`, or `vault` |
 | `clients` | Path | Yes | Path to clients configuration file |
 | `policies` | Path | Yes | Path to policies configuration file |
 | `clients_dir` | Path | No | Directory containing additional client config files (*.toml) |
 | `policies_dir` | Path | No | Directory containing additional policy config files (*.toml) |
+| `authorization` | Table | No | Named services for delegated request policy and authentication |
 
 !!! note
     Relative paths are resolved from the directory containing the main config file.
@@ -58,6 +60,39 @@ These settings are required.
     replacing every file before sending `SIGHUP`, and do not modify them during
     the reload. ExfilGuard validates and atomically publishes the resulting
     in-memory snapshot; if loading fails, the previous snapshot remains active.
+
+---
+
+## Private Upstream Exceptions
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow_private_upstream_cidrs` | Array of CIDRs | `[]` | Non-public upstream address ranges eligible for connections |
+
+ExfilGuard blocks non-public upstream addresses by default. To reach selected
+internal services through the proxy, add their addresses or networks:
+
+```toml
+allow_private_upstream_cidrs = ["10.0.201.6/32", "100.64.0.0/10", "fd00:1234::/48"]
+```
+
+Use CIDR notation, including `/32` for a single IPv4 address or `/128` for a
+single IPv6 address. Invalid entries prevent startup. Changes require a restart.
+
+Exceptions apply to all clients and to plain HTTP, CONNECT tunnels, and inspected
+HTTPS. Existing request policies still determine which clients, methods, URLs,
+and ports are allowed. Prefer narrow exceptions: broad ranges expand the
+destinations reachable under every existing policy.
+
+The resolver checks literal addresses and each DNS result. Connections use only
+eligible addresses; blocked results are discarded even when other results are
+allowed. IPv4 CIDRs do not implicitly include IPv4-mapped IPv6 or NAT64
+representations. Loopback, link-local, and other non-public ranges require
+explicit inclusion.
+
+An address rejection returns HTTP 403 with
+`upstream address blocked (private_address)`. Access logs record
+`error_reason="private_address"`.
 
 ---
 
@@ -212,42 +247,58 @@ do not rewrite operator-provisioned files.
 
 #### `vault`
 
-This integration is for HashiCorp Vault's PKI secrets engine, including Vault
-Enterprise namespaces. HCP Vault Secrets is a different product and API.
+ExfilGuard has one shared HashiCorp Vault connection. The inspection CA and
+authorization services can both use it. HCP Vault Secrets is a different
+product and API.
 
-Vault mode generates a fresh intermediate key in process memory and submits
-its CSR to the configured selected Vault PKI issuer. The intermediate key and
-all generated leaf keys remain in memory. ExfilGuard authenticates only when
-it needs a signing operation, discards direct-auth tokens after that request,
-and renews the whole issuer generation before expiry. The immutable issuer and
-its empty leaf cache become active in one atomic switch.
+Vault HTTPS uses the platform trust store. `tls_ca_cert` adds certificates to
+that trust store for the Vault connection; it does not replace the platform
+roots. This transport trust is separate from `vault.pki.expected_root_certs`,
+which pins the roots accepted for certificates issued by Vault.
+
+Configure the Vault connection, PKI trust, and authentication once:
 
 ```toml
-[ca]
-source = "vault"
+[vault]
 address = "https://vault.internal.example:8200"
 tls_ca_cert = "/etc/exfilguard/vault-tls-ca.crt"
 # namespace = "team-a"
-pki_mount = "pki"
-issuer = "exfilguard-parent"
-expected_root_certs = "/etc/exfilguard/exfilguard-roots.pem"
-intermediate_ttl = 2592000       # 30 days
-renewal_threshold = 1296000      # renew with 15 days remaining
-request_timeout = 10
+# tls_server_name = "vault.internal.example"
+# request_timeout = 10
 # tls_client_cert = "/etc/exfilguard/vault-client.crt"
 # tls_client_key = "/etc/exfilguard/vault-client.key"
 
-[ca.auth]
+[vault.pki]
+mount = "pki"
+expected_root_certs = "/etc/exfilguard/exfilguard-roots.pem"
+
+[vault.auth]
 method = "approle"
 mount = "approle"
 role_id = "00000000-0000-0000-0000-000000000000"
 secret_id_file = "/etc/exfilguard/vault-secret-id"
 ```
 
-`pki_mount` defaults to `pki`, `intermediate_ttl` to 30 days,
-`renewal_threshold` to 15 days, and `request_timeout` to 10 seconds. The
-threshold must be shorter than the requested lifetime. Set it early enough to
-cover a realistic Vault outage and operator response window.
+Then select Vault for the inspection CA:
+
+```toml
+[ca]
+source = "vault"
+issuer = "exfilguard-parent"
+# intermediate_ttl = 2592000
+# renewal_threshold = 1296000
+```
+
+ExfilGuard generates the intermediate private key and CSR in memory. Vault
+signs the CSR using the selected issuer. Before the intermediate expires,
+ExfilGuard generates a new key, obtains a new certificate, and switches the
+complete issuer generation atomically. Generated origin keys also remain in
+memory.
+
+`vault.pki.mount` defaults to `pki` and `vault.request_timeout` to 10 seconds.
+`ca.intermediate_ttl` defaults to 30 days and `ca.renewal_threshold` to 15
+days. The threshold must be shorter than the requested lifetime and should
+leave enough time to recover from a Vault outage.
 
 The renewal scheduler rechecks certificate expiry against wall-clock time at
 least hourly rather than sleeping for the complete multi-day interval. This
@@ -258,10 +309,10 @@ Set `tls_server_name` when `address` uses an IP literal but the Vault server
 certificate names a DNS host. It controls certificate verification while the
 client still connects to the configured IP.
 
-ExfilGuard calls only:
+For the inspection CA, ExfilGuard calls only:
 
 ```text
-POST /v1/<pki_mount>/issuer/<issuer>/sign-intermediate
+POST /v1/<mount>/issuer/<issuer>/sign-intermediate
 ```
 
 Vault must support selected issuers. ExfilGuard does not fall back to the
@@ -270,12 +321,13 @@ hierarchy. Give the AppRole or token `update` permission only on that exact
 path. If possible, use a selected signing issuer constrained to `pathlen:1` so
 the ExfilGuard intermediate is cryptographically limited to `pathlen:0`.
 
-`expected_root_certs` is a PEM bundle independent of the TLS CA used to reach
-Vault. ExfilGuard accepts the returned issuer only when it chains to one of
-these explicitly pinned roots and passes the same key, constraint, usage, and
-validity checks as file mode. Put old and new roots in the bundle during a
-planned root rotation, switch the Vault issuer, then remove the old root after
-the overlap period. Changing the bundle requires restarting ExfilGuard.
+`vault.pki.expected_root_certs` is a PEM bundle independent of the TLS CA used
+to reach Vault. ExfilGuard accepts the returned issuer only when it chains to
+one of these explicitly pinned roots and passes the same key, constraint,
+usage, and validity checks as file mode. Put old and new roots in the bundle
+during a planned root rotation, switch the Vault issuer, then remove the old
+root after the overlap period. Changing the bundle requires restarting
+ExfilGuard.
 
 Vault supports three authentication transports:
 
@@ -289,16 +341,16 @@ Vault supports three authentication transports:
 - `token_file` reads a token supplied and renewed by another component:
 
   ```toml
-  [ca.auth]
+  [vault.auth]
   method = "token_file"
   token_file = "/run/exfilguard/vault-token"
   ```
 
 - `proxy` sends the request without a token so a local Vault Proxy can attach
-  its auto-auth token. Point `ca.address` at its restricted listener:
+  its auto-auth token. Point `vault.address` at its restricted listener:
 
   ```toml
-  [ca.auth]
+  [vault.auth]
   method = "proxy"
   ```
 
@@ -310,16 +362,15 @@ being forwarded to another origin or back through ExfilGuard itself. Vault
 connections must use HTTPS; plaintext HTTP is accepted only for a loopback IP
 listener such as a local Vault Proxy.
 
-Vault mode has a deliberate availability dependency: after every process
-restart, Vault must be reachable because the old intermediate key was never
-persisted. If a renewal fails while the active issuer is still valid,
-ExfilGuard keeps serving with it, retries with bounded backoff, and exposes the
-failure to Prometheus. An invalid Vault response never replaces the issuer. If
-no usable issuer exists, inspected HTTPS fails closed; it never falls back to
-`builtin`, `files`, direct forwarding, or CONNECT tunneling. Renewal failures
-do not crash a process that still has a valid issuer.
+ExfilGuard generates Vault-backed private keys in memory and does not save
+them. It must therefore reach Vault after each restart to obtain certificates
+for the new keys. A failed renewal leaves the current valid certificate in
+place and triggers bounded retries. An invalid Vault response never replaces
+it. Once no valid certificate remains, the affected operation fails closed.
+Inspection never falls back to another CA, direct forwarding, or CONNECT
+tunneling.
 
-### Migrating from `ca_dir`
+### Configuration migration
 
 The old top-level `ca_dir` setting is not accepted. Replace it with one of the
 explicit configurations above. Existing installations must also remove
@@ -327,6 +378,12 @@ explicit configurations above. Existing installations must also remove
 a real root key that must be retained, move it to appropriately protected
 offline storage; ExfilGuard never reads it. Remove the older compatibility
 workaround that copied `intermediate.key` to `root.key`.
+
+Vault connection settings that were previously nested under `[ca]` now belong
+under `[vault]`, `[vault.pki]`, and `[vault.auth]`. Keep only `source`, `issuer`,
+`intermediate_ttl`, and `renewal_threshold` under `[ca]`. This makes the same
+Vault connection available to authorization services without coupling them to
+the inspection CA source.
 
 For an existing locally generated directory, the direct migration is:
 
@@ -336,6 +393,138 @@ ca = { source = "builtin", dir = "/var/lib/exfilguard/ca" }
 
 Retain `root.crt`, `intermediate.crt`, and `intermediate.key`, remove
 `root.key`, restore the documented ownership and modes, then restart.
+
+---
+
+## Delegated authorization
+
+ExfilGuard can ask an external authorization service whether a client may call an API. The client
+sends an authorization token, which ExfilGuard passes to the service unchanged. ExfilGuard
+does not interpret the token.
+
+The service returns rules for the token, and ExfilGuard caches them briefly. Both the client's local
+policy and the service's policy must allow a request.
+
+The service can also provide authentication headers for an allowed request. A policy rule names the
+credential with a reference that only the service understands. ExfilGuard sends the token, the
+reference, and the exact outgoing request to the service, then adds the returned headers before
+forwarding it. The client can therefore call the API without ever having the credential.
+
+This is configured per client. A client with an `authorization_service` must send a token. Other
+clients on the same listener continue to use ordinary static policy.
+
+Define one or more named services in the main configuration:
+
+```toml
+[[authorization.service]]
+name = "central"
+audience = "deployment-prod"
+policy_url = "https://authorization.example.net/v1/policy"
+credential_url = "https://authorization.example.net/v1/credential"
+server_ca_cert = "/etc/exfilguard/exfilguard-roots.pem"
+
+[authorization.service.client_certificate]
+source = "vault"
+role = "exfilguard-authorization-client"
+common_name = "exfilguard-production"
+```
+
+This uses the shared `[vault]` configuration described above. ExfilGuard generates the client
+private key and CSR in memory, sends the CSR to
+`POST /v1/<mount>/sign/<role>`, and accepts the result only if it is a client-only certificate for
+the configured common name and chains to `vault.pki.expected_root_certs`. The Vault role chooses
+the issuer and certificate lifetime. ExfilGuard renews the certificate halfway through its actual
+lifetime and switches new service requests to it atomically. Requests already in flight may finish
+using the previous certificate.
+
+Give the AppRole `update` permission on the exact signing-role path. Configure the Vault PKI role
+to permit only the intended common name, issue client certificates rather than CA or server
+certificates, and impose an appropriate maximum lifetime. When Vault manages both the inspection
+CA and these client certificates, the one AppRole policy contains both exact signing paths.
+
+File-backed client certificates remain available as an explicit alternative:
+
+```toml
+[authorization.service.client_certificate]
+source = "files"
+cert = "/etc/exfilguard/authorization/client.pem"
+key = "/etc/exfilguard/authorization/client.key"
+```
+
+ExfilGuard supplies secure defaults for all timeouts and resource limits. The following settings
+are optional:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `max_token_header_size` | 1024 bytes | Largest accepted proxy authorization value |
+| `policy_cache_capacity` | 4096 | Cached policy results per service |
+| `max_policy_cache_duration` | 30 seconds | Longest ExfilGuard will reuse a service policy |
+| `negative_cache_duration` | 1 second | How briefly to remember a denied policy lookup |
+| `max_policy_response_size` | 256 KiB | Largest accepted policy response |
+| `max_policy_rules` | 1024 | Most rules accepted in one policy response |
+| `max_credential_response_size` | 32 KiB | Largest accepted authentication-header response |
+| `max_protected_headers` | 16 | Most authentication headers allowed on one request |
+| `max_buffered_body_size` | 1 MiB | Largest request body the service may receive |
+| `max_buffered_body_capacity` | 16 MiB | Total memory available for bodies and their JSON copies |
+
+These settings belong under `[authorization]`. Each `[[authorization.service]]` also accepts an
+optional `timeout` (5 seconds by default) and `max_concurrency` (32 simultaneous calls by default).
+Both policy and credential calls use these values.
+
+Then assign the service in the client configuration:
+
+```toml
+[[client]]
+name = "build-client"
+cidr = "192.0.2.0/24"
+policies = ["build-ceiling"]
+authorization_service = "central"
+
+[[client.credential_limit]]
+credential_reference = "build-api"
+origin_scope = "https://api.example.net/v1/**"
+protected_headers = ["authorization"]
+body_access = "bounded_payload"
+```
+
+A `credential_limit` is a local safety rule, not a credential. It says where the named reference may
+be used, which headers the service may return, and whether the service may receive the request body.
+A rule that does not ask for credentials does not need a matching limit. If a rule asks for
+credentials outside the limit, ExfilGuard denies the request.
+
+The first request from a client that uses delegated authorization must contain
+`Proxy-Authorization: ExfilGuard <base64url-token>`. ExfilGuard keeps that token with the
+connection. Later requests may omit it but cannot replace it. For inspected HTTPS, the outer
+`CONNECT` carries the token and all decrypted requests use it. Raw CONNECT tunnels are denied
+because ExfilGuard cannot check the requests inside them.
+
+ExfilGuard calls the configured URLs directly over HTTPS with the service's client certificate. It
+trusts only `server_ca_cert`, does not follow redirects, and ignores proxy settings from the
+environment. Public CA files must be regular files, not symlinks, owned by root or the ExfilGuard
+process, and not writable by group or other users. A file-backed client key must be owned by the
+ExfilGuard process, must not be a symlink, and must have mode `0400` or `0600`. Relative paths are
+resolved from the main configuration directory. Vault-backed client keys are never written to
+disk.
+
+Each named service has its own policy cache. Policy and credential calls to that service share its
+`max_concurrency` limit.
+
+`body_access = "none"` permits credentials only on requests without a body. `"bounded_payload"`
+lets the service receive a size-limited body, for example to sign it. Requests that use credentials
+cannot have trailers or `Expect: 100-continue`. If the service does not return valid headers,
+ExfilGuard sends nothing to the API. The request is not retried or cached. All requests that use
+delegated authorization bypass the shared response cache, even when no credential is needed.
+
+`max_buffered_body_size` limits one body. `max_buffered_body_capacity` limits the total memory used
+by all buffered bodies and their JSON copies. It must be at least
+`5 * max_buffered_body_size + 2`; ExfilGuard rejects a smaller value.
+
+Service definitions and limits are read at startup. `SIGHUP` reloads client assignments, credential
+limits, and local policies together. A client that names an unknown service causes the reload to
+fail, leaving the current configuration in place.
+
+See [Authorization Service API](authorization-service.md) for the two JSON operations and the exact
+request format.
 
 ---
 
@@ -384,9 +573,11 @@ started, ExfilGuard closes or resets the request instead of appending another
 response. Outer CONNECT setup, tunnel lifetime, and cleanup after response
 delivery use their own limits.
 
-For HTTP/2 cacheable responses, `response_body_idle_timeout` also bounds each
-cache file operation on the response path. A storage error or timeout abandons
-the cache copy while response forwarding continues.
+For HTTP/1 and HTTP/2 cacheable responses, `response_body_idle_timeout` also bounds
+each wait for cache file operations on the response path. A storage error or
+timeout lets response forwarding continue without waiting for caching. File
+creation and already-started publication finish or clean up in the background;
+publication may still store the entry after the request stops waiting.
 
 ---
 
@@ -416,6 +607,31 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http2_max_concurrent_streams` | u32 | 100 | Maximum concurrent bumped downstream HTTP/2 streams per connection (must be >= 1) |
+| `http2_stream_window_size` | u32 | 33554432 (32 MiB) | Receive window per HTTP/2 stream, in bytes; 65535–2147483647 |
+| `http2_connection_window_size` | u32 | 67108864 (64 MiB) | Combined receive window for all streams on an HTTP/2 connection, in bytes; 65535–2147483647 |
+
+An HTTP/2 receive window limits how much DATA a sender may send before the
+receiver grants more capacity. Both the stream and connection limits apply.
+The connection window may be smaller than the stream window; in that
+configuration, one stalled stream can use all available connection capacity
+and delay other streams.
+
+ExfilGuard applies these settings to client connections receiving uploads and
+upstream connections receiving responses, including connections opened during
+CONNECT preflight. Changes require a restart. These settings leave HTTP/1
+forwarding and CONNECT tunnels unchanged. The peer's receive windows govern
+outgoing DATA.
+
+Larger windows improve throughput on high-bandwidth, high-latency links and can
+increase memory use when the receiver is slow. Memory is allocated as data
+arrives. Each connection has its own limits, and inspected HTTPS uses separate
+client and upstream connections. Total process memory also includes frame
+bookkeeping, TLS/TCP buffers, outgoing queues, headers, caching, and request
+bodies buffered for delegated authorization.
+
+For deployments with limited memory, reduce the windows and measure throughput
+using [the local benchmarks](../perf/h2/README.md). Setting both values to 65535
+restores the previous receive-window sizes.
 
 ---
 
@@ -449,6 +665,10 @@ CA lifecycle metrics are intentionally low-cardinality:
 | `ca_vault_renewal_attempts_total{result,reason}` | Vault renewal outcomes with bounded reason labels |
 | `ca_vault_last_renewal_attempt_timestamp_seconds` | Last Vault renewal attempt time |
 | `ca_vault_last_renewal_success_timestamp_seconds` | Last successful Vault renewal time |
+| `authorization_service_client_certificate_not_after_timestamp_seconds{service}` | Expiry of a Vault-backed authorization-service client certificate |
+| `authorization_service_vault_renewal_attempts_total{service,result,reason}` | Client-certificate renewal outcomes |
+| `authorization_service_vault_last_renewal_attempt_timestamp_seconds{service}` | Last client-certificate renewal attempt |
+| `authorization_service_vault_last_renewal_success_timestamp_seconds{service}` | Last successful client-certificate renewal |
 
 Scrape these metrics in every CA mode: certificate expiry matters for
 `builtin` and `files` even though ExfilGuard does not renew those sources. See
@@ -478,10 +698,26 @@ The cache follows standard HTTP cache headers from upstream servers.
 
 #### Scope
 
-The cache is shared across all clients and across inspected HTTP/1.1 and
-HTTP/2 traffic. Responses are keyed by method and absolute URI. `Vary` headers
+Within one ExfilGuard instance, the cache is shared across all clients and
+inspected HTTP/1.1 and HTTP/2 traffic. Responses are keyed by method and absolute URI. `Vary` headers
 decide which request headers are part of the cache key. Enable caching only if
 cross-client sharing is acceptable in your environment.
+
+Each node in a multi-node deployment has an independent cache; ExfilGuard does
+not coordinate caches between nodes.
+
+#### No Mutation-Driven Invalidation
+
+ExfilGuard makes no attempt to invalidate cached responses after mutations,
+including successful POST, PUT, or DELETE requests that pass through the same
+node. A cached response may continue to be served for its freshness lifetime
+even after the resource changes upstream. Normal expiration and eviction still
+apply.
+
+Operators control caching per allow rule and can restrict it to suitable
+clients, methods, hosts, and paths. Omit the rule's cache configuration where
+freshness-based reuse is unacceptable; such requests bypass existing entries
+as well as cache storage. Caching does not guarantee read-after-write consistency.
 
 #### Supported Headers
 
@@ -616,6 +852,8 @@ upstream_pool_capacity = 32
 
 # HTTP/2
 http2_max_concurrent_streams = 100
+http2_stream_window_size = 33554432
+http2_connection_window_size = 67108864
 
 # Size limits (bytes)
 max_request_header_size = 32768

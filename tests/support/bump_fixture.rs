@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::{
@@ -14,9 +14,10 @@ use h2::{client as h2_client, server as h2_server};
 use http::{HeaderValue, StatusCode};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -53,12 +54,14 @@ pub enum UpstreamMode {
     Http1Keepalive,
     Http1Inspect,
     Http1Redirect,
+    Http1NoContent,
     Http2,
     Http2CacheInspect,
     DualProtocolCacheInspect,
     Http2CloseBeforeResponse,
     Http2HeadersThenStallBody,
     Http2EarlyResponse,
+    Http2StreamIsolation,
     Http2NoResponse,
     Http2SingleUse,
     Http2Inspect,
@@ -71,6 +74,7 @@ pub struct BumpedTlsOptions<'a> {
     client_protocols: ClientProtocols,
     upstream_mode: UpstreamMode,
     cache_enabled: bool,
+    allow_private_test_upstreams: bool,
     settings_override: Option<Box<dyn FnOnce(&mut Settings) + Send>>,
 }
 
@@ -83,6 +87,7 @@ impl<'a> BumpedTlsOptions<'a> {
             client_protocols: ClientProtocols::Http1,
             upstream_mode: UpstreamMode::Http1Keepalive,
             cache_enabled: false,
+            allow_private_test_upstreams: true,
             settings_override: None,
         }
     }
@@ -94,6 +99,11 @@ impl<'a> BumpedTlsOptions<'a> {
 
     pub fn upstream_mode(mut self, mode: UpstreamMode) -> Self {
         self.upstream_mode = mode;
+        self
+    }
+
+    pub fn with_private_test_upstreams(mut self, allow: bool) -> Self {
+        self.allow_private_test_upstreams = allow;
         self
     }
 
@@ -264,7 +274,16 @@ pub struct BumpedTlsFixture {
     upstream_task: tokio::task::JoinHandle<Result<()>>,
     harness: ProxyHarness,
     accept_count: Arc<AtomicUsize>,
+    upstream_close_count: Arc<AtomicUsize>,
+    upstream_close_notify: Arc<Notify>,
     request_count: Arc<AtomicUsize>,
+    captured_requests: Arc<Mutex<Vec<CapturedHttp1Request>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapturedHttp1Request {
+    pub head: String,
+    pub body_sha256: [u8; 32],
 }
 
 impl BumpedTlsFixture {
@@ -276,6 +295,7 @@ impl BumpedTlsFixture {
             client_protocols,
             upstream_mode,
             cache_enabled,
+            allow_private_test_upstreams,
             settings_override,
         } = options;
         let mut dirs = super::TestDirs::new()?;
@@ -299,6 +319,7 @@ impl BumpedTlsFixture {
         let mut settings_override = settings_override;
         let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
             .with_proxy_root_store(proxy_root_store)
+            .with_private_test_upstreams(allow_private_test_upstreams)
             .with_settings(move |settings| {
                 if let Some(override_fn) = settings_override.take() {
                     override_fn(settings);
@@ -310,12 +331,14 @@ impl BumpedTlsFixture {
         let upstream_config = match upstream_mode {
             UpstreamMode::Http1Keepalive
             | UpstreamMode::Http1Inspect
+            | UpstreamMode::Http1NoContent
             | UpstreamMode::Http1Redirect => build_upstream_tls_config(&ca, upstream_host)?,
             UpstreamMode::Http2
             | UpstreamMode::Http2CacheInspect
             | UpstreamMode::Http2CloseBeforeResponse
             | UpstreamMode::Http2HeadersThenStallBody
             | UpstreamMode::Http2EarlyResponse
+            | UpstreamMode::Http2StreamIsolation
             | UpstreamMode::Http2NoResponse
             | UpstreamMode::Http2SingleUse
             | UpstreamMode::Http2Inspect => build_upstream_h2_tls_config(&ca, upstream_host)?,
@@ -327,10 +350,16 @@ impl BumpedTlsFixture {
         };
 
         let accept_count = Arc::new(AtomicUsize::new(0));
+        let upstream_close_count = Arc::new(AtomicUsize::new(0));
+        let upstream_close_notify = Arc::new(Notify::new());
         let request_count = Arc::new(AtomicUsize::new(0));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let accept_counter = accept_count.clone();
+        let upstream_close_counter = upstream_close_count.clone();
+        let upstream_close_notifier = upstream_close_notify.clone();
         let request_counter = request_count.clone();
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = captured_requests.clone();
         let upstream_task = {
             let upstream_config = upstream_config.clone();
             tokio::spawn(async move {
@@ -347,17 +376,23 @@ impl BumpedTlsFixture {
                             };
                             accept_counter.fetch_add(1, Ordering::SeqCst);
                             let acceptor = TlsAcceptor::from(upstream_config.clone());
+                            let close_counter = upstream_close_counter.clone();
+                            let close_notify = upstream_close_notifier.clone();
                             let request_counter = request_counter.clone();
+                            let captured = captured.clone();
                             tokio::spawn(async move {
                                 let result = match upstream_mode {
                                     UpstreamMode::Http1Keepalive => {
-                                        serve_tls_keepalive(stream, acceptor, peer).await
+                                        serve_tls_keepalive(stream, acceptor, peer, request_counter).await
                                     }
                                     UpstreamMode::Http1Inspect => {
-                                        serve_tls_http1_inspect(stream, acceptor, peer).await
+                                        serve_tls_http1_inspect(stream, acceptor, request_counter, captured).await
                                     }
                                     UpstreamMode::Http1Redirect => {
                                         serve_redirect(stream, acceptor, peer).await
+                                    }
+                                    UpstreamMode::Http1NoContent => {
+                                        serve_tls_http1_no_content(stream, acceptor, request_counter).await
                                     }
                                     UpstreamMode::Http2 => {
                                         serve_tls_h2(stream, acceptor, peer).await
@@ -387,6 +422,14 @@ impl BumpedTlsFixture {
                                     UpstreamMode::Http2EarlyResponse => {
                                         serve_tls_h2_early_response(stream, acceptor, peer).await
                                     }
+                                    UpstreamMode::Http2StreamIsolation => {
+                                        serve_tls_h2_stream_isolation(
+                                            stream,
+                                            acceptor,
+                                            peer,
+                                            request_counter,
+                                        ).await
+                                    }
                                     UpstreamMode::Http2NoResponse => {
                                         serve_tls_h2_no_response(stream, acceptor, peer).await
                                     }
@@ -397,6 +440,8 @@ impl BumpedTlsFixture {
                                         serve_tls_h2_inspect(stream, acceptor, peer).await
                                     }
                                 };
+                                close_counter.fetch_add(1, Ordering::SeqCst);
+                                close_notify.notify_one();
                                 if let Err(err) = result {
                                     tracing::warn!(error = %err, "tls upstream handler error");
                                 }
@@ -430,7 +475,10 @@ impl BumpedTlsFixture {
             upstream_task,
             harness,
             accept_count,
+            upstream_close_count,
+            upstream_close_notify,
             request_count,
+            captured_requests,
         })
     }
 
@@ -495,8 +543,27 @@ impl BumpedTlsFixture {
         self.accept_count.load(Ordering::SeqCst)
     }
 
+    pub async fn wait_for_upstream_close(&self, timeout_duration: Duration) -> Result<()> {
+        timeout(timeout_duration, async {
+            loop {
+                let notified = self.upstream_close_notify.notified();
+                if self.upstream_close_count.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .context("timed out waiting for an upstream connection to close")?;
+        Ok(())
+    }
+
     pub fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
+    }
+
+    pub fn captured_requests(&self) -> Vec<CapturedHttp1Request> {
+        self.captured_requests.lock().unwrap().clone()
     }
 
     pub fn cache(&self) -> Arc<HttpCache> {
@@ -544,6 +611,7 @@ async fn serve_tls_keepalive(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
 ) -> Result<()> {
     let mut tls = acceptor
         .accept(stream)
@@ -554,6 +622,7 @@ async fn serve_tls_keepalive(
         if request_bytes.is_empty() {
             break;
         }
+        request_count.fetch_add(1, Ordering::SeqCst);
         let request = String::from_utf8(request_bytes)?;
         let path = request_path(&request);
         let close = request.to_ascii_lowercase().contains("connection: close");
@@ -580,10 +649,43 @@ async fn serve_tls_keepalive(
     Ok(())
 }
 
+async fn serve_tls_http1_no_content(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let mut tls = acceptor.accept(stream).await?;
+    loop {
+        let request_bytes = read_request(&mut tls).await?;
+        if request_bytes.is_empty() {
+            break;
+        }
+        request_count.fetch_add(1, Ordering::SeqCst);
+        let request = String::from_utf8(request_bytes)?;
+        let response: &[u8] = match request_path(&request) {
+            "/zero" => b"HTTP/1.1 204 No Content\r\ncOnTeNt-LeNgTh: 0\r\nCache-Control: max-age=60\r\nETag: \"kept\"\r\n\r\n",
+            "/plain" => b"HTTP/1.1 204 No Content\r\n\r\n",
+            "/nonzero" => b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx",
+            "/chunked" => b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "/both" => b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "/poison" => b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\npoison",
+            _ => b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal",
+        };
+        tls.write_all(response).await?;
+        tls.flush().await?;
+        if request.to_ascii_lowercase().contains("connection: close") {
+            break;
+        }
+    }
+    tls.shutdown().await?;
+    Ok(())
+}
+
 async fn serve_tls_http1_inspect(
     stream: TcpStream,
     acceptor: TlsAcceptor,
-    _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+    captured: Arc<Mutex<Vec<CapturedHttp1Request>>>,
 ) -> Result<()> {
     let mut tls = acceptor
         .accept(stream)
@@ -603,6 +705,7 @@ async fn serve_tls_http1_inspect(
             .context("invalid content-length in inspected upstream request")?;
 
         let mut remaining = content_length;
+        let mut body_hash = Sha256::new();
         let mut body_len = 0usize;
         let mut buffer = [0u8; 8192];
         while remaining > 0 {
@@ -612,10 +715,20 @@ async fn serve_tls_http1_inspect(
                 .context("failed to read inspected upstream request body")?;
             remaining -= to_read;
             body_len += to_read;
+            body_hash.update(&buffer[..to_read]);
         }
 
-        let response_body =
-            format!("path={path}\ncontent-length={content_length}\nbody-len={body_len}");
+        captured.lock().unwrap().push(CapturedHttp1Request {
+            head: request.clone(),
+            body_sha256: body_hash.finalize().into(),
+        });
+        request_count.fetch_add(1, Ordering::SeqCst);
+
+        let response_body = if request.starts_with("HEAD ") {
+            String::new()
+        } else {
+            format!("path={path}\ncontent-length={content_length}\nbody-len={body_len}")
+        };
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}",
             response_body.len(),
@@ -988,6 +1101,9 @@ async fn serve_h2_early_response_request(
                 .context("failed to send truncated HTTP/2 response headers")?;
             send.send_data(Bytes::from_static(b"partial"), false)
                 .context("failed to send truncated HTTP/2 response data")?;
+            // Flush the incomplete response before resetting; an immediate
+            // reset can discard queued headers and miss the body relay path.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             send.send_reset(h2::Reason::NO_ERROR);
         }
         path => {
@@ -1006,6 +1122,98 @@ async fn serve_h2_early_response_request(
     Ok(())
 }
 
+async fn serve_tls_h2_stream_isolation(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    _peer: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    let tls = acceptor
+        .accept(stream)
+        .await
+        .context("tls handshake with proxy failed")?;
+    let mut connection = h2_server::handshake(tls)
+        .await
+        .context("failed to establish HTTP/2 handshake with proxy")?;
+    let client_reset_seen = Arc::new(Notify::new());
+    let survivor_release = Arc::new(Notify::new());
+    let mut handlers = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) = result.context("failed to accept HTTP/2 request")?;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    handlers.spawn(serve_h2_stream_isolation_request(
+                        request,
+                        respond,
+                        client_reset_seen.clone(),
+                        survivor_release.clone(),
+                    ));
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 handler available")
+                    .context("HTTP/2 stream-isolation handler task failed")??;
+            }
+        }
+    }
+
+    handlers.abort_all();
+    while handlers.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn serve_h2_stream_isolation_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2_server::SendResponse<Bytes>,
+    client_reset_seen: Arc<Notify>,
+    survivor_release: Arc<Notify>,
+) -> Result<()> {
+    let path = request.uri().path().to_string();
+    match path.as_str() {
+        "/client-reset" => {
+            let _body = request.into_body();
+            poll_fn(|cx| respond.poll_reset(cx))
+                .await
+                .context("failed while waiting for client HTTP/2 stream reset")?;
+            client_reset_seen.notify_one();
+        }
+        "/survivor" => {
+            survivor_release.notified().await;
+            send_h2_ok(respond, &path)?;
+        }
+        "/release-after-client-reset" => {
+            client_reset_seen.notified().await;
+            survivor_release.notify_one();
+            send_h2_ok(respond, &path)?;
+        }
+        "/origin-reset" => respond.send_reset(h2::Reason::CANCEL),
+        "/release" => {
+            survivor_release.notify_one();
+            send_h2_ok(respond, &path)?;
+        }
+        _ => send_h2_ok(respond, &path)?,
+    }
+    Ok(())
+}
+
+fn send_h2_ok(mut respond: h2_server::SendResponse<Bytes>, body: &str) -> Result<()> {
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
+    let mut send = respond
+        .send_response(response, false)
+        .context("failed to send HTTP/2 response headers")?;
+    send.send_data(Bytes::copy_from_slice(body.as_bytes()), true)
+        .context("failed to send HTTP/2 response body")?;
+    Ok(())
+}
+
 async fn serve_tls_h2_no_response(
     stream: TcpStream,
     acceptor: TlsAcceptor,
@@ -1018,12 +1226,36 @@ async fn serve_tls_h2_no_response(
     let mut connection = h2_server::handshake(tls)
         .await
         .context("failed to establish HTTP/2 handshake with proxy")?;
+    let mut handlers = tokio::task::JoinSet::new();
 
-    let Some(result) = connection.accept().await else {
-        return Ok(());
-    };
-    let (_request, _respond) = result.context("failed to accept HTTP/2 request")?;
-    sleep(Duration::from_secs(5)).await;
+    loop {
+        tokio::select! {
+            result = connection.accept() => match result {
+                Some(result) => {
+                    let (request, respond) =
+                        result.context("failed to accept HTTP/2 request")?;
+                    handlers.spawn(async move {
+                        let path = request.uri().path().to_string();
+                        if path == "/h2/after-timeout" {
+                            send_h2_ok(respond, &path)?;
+                        } else {
+                            sleep(Duration::from_secs(5)).await;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    });
+                }
+                None => break,
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                result
+                    .expect("HTTP/2 no-response handler available")
+                    .context("HTTP/2 no-response handler task failed")??;
+            }
+        }
+    }
+    handlers.abort_all();
+    while handlers.join_next().await.is_some() {}
+
     Ok(())
 }
 
@@ -1106,6 +1338,16 @@ async fn serve_h2_inspect_request(
     request: http::Request<h2::RecvStream>,
     mut respond: h2_server::SendResponse<Bytes>,
 ) -> Result<()> {
+    let authority = request
+        .uri()
+        .authority()
+        .map_or("<missing>", |a| a.as_str());
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("<missing>", |p| p.as_str());
+    let host_present = request.headers().contains_key(http::header::HOST);
+    let request_head = format!("authority={authority}\npath={path}\nhost-present={host_present}");
     let content_length = request
         .headers()
         .get(http::header::CONTENT_LENGTH)
@@ -1125,7 +1367,7 @@ async fn serve_h2_inspect_request(
     }
 
     let response_body = format!(
-        "content-length={content_length}\nbody-len={}\nbody={}",
+        "{request_head}\ncontent-length={content_length}\nbody-len={}\nbody={}",
         body.len(),
         String::from_utf8_lossy(&body)
     );

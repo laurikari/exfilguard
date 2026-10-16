@@ -130,7 +130,7 @@ impl RequestHeaderSanitizer {
                     anyhow::bail!("duplicate Host header");
                 }
                 ensure!(!value.is_empty(), "Host header must not be empty");
-                self.host = Some(value.to_ascii_lowercase());
+                self.host = Some(value.to_string());
                 Ok(HeaderAction::Skip)
             }
             HeaderDisposition::ContentLength => {

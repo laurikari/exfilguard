@@ -16,6 +16,12 @@ pub(crate) struct CaValidity {
     pub intermediate_not_after: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClientCertificateValidity {
+    pub not_before: OffsetDateTime,
+    pub not_after: OffsetDateTime,
+}
+
 #[cfg(test)]
 pub(crate) fn validate_ca_chain(
     root_der: &[u8],
@@ -51,7 +57,7 @@ pub(crate) fn validate_ca_hierarchy(
         .collect::<Result<_>>()?;
 
     for (label, certificate) in &certificates {
-        validate_extensions(certificate, label)?;
+        validate_extensions(certificate, label, false)?;
         validate_current_time(certificate, label, now)?;
     }
 
@@ -91,6 +97,98 @@ pub(crate) fn validate_ca_hierarchy(
         root_not_after,
         intermediate_not_before,
         intermediate_not_after,
+    })
+}
+
+pub(crate) fn validate_client_certificate_chain(
+    chain: &[&[u8]],
+    key: &KeyPair,
+    expected_common_name: &str,
+    now: OffsetDateTime,
+) -> Result<ClientCertificateValidity> {
+    ensure!(
+        chain.len() >= 2,
+        "client certificate chain must contain a leaf and a trust anchor"
+    );
+    let certificates: Vec<_> = chain
+        .iter()
+        .enumerate()
+        .map(|(index, der)| {
+            let label = match index {
+                0 => "client leaf".to_string(),
+                index if index + 1 == chain.len() => "root".to_string(),
+                _ => format!("parent CA {index}"),
+            };
+            parse_certificate_exact(der, &label).map(|certificate| (label, certificate))
+        })
+        .collect::<Result<_>>()?;
+
+    for (index, (label, certificate)) in certificates.iter().enumerate() {
+        validate_extensions(certificate, label, index == 0)?;
+        validate_current_time(certificate, label, now)?;
+    }
+
+    let (leaf_label, leaf) = &certificates[0];
+    ensure!(
+        leaf.basic_constraints()
+            .with_context(|| format!("invalid {leaf_label} basicConstraints extension"))?
+            .is_none_or(|constraints| !constraints.value.ca),
+        "{leaf_label} basicConstraints must not set CA=true"
+    );
+    let key_usage = leaf
+        .key_usage()
+        .with_context(|| format!("invalid {leaf_label} keyUsage extension"))?
+        .ok_or_else(|| anyhow!("{leaf_label} certificate is missing keyUsage"))?;
+    ensure!(
+        key_usage.value.digital_signature(),
+        "{leaf_label} keyUsage must include digitalSignature"
+    );
+    let extended_key_usage = leaf
+        .extended_key_usage()
+        .with_context(|| format!("invalid {leaf_label} extendedKeyUsage extension"))?
+        .ok_or_else(|| anyhow!("{leaf_label} certificate is missing extendedKeyUsage"))?;
+    let usage = extended_key_usage.value;
+    ensure!(
+        usage.client_auth
+            && !usage.any
+            && !usage.server_auth
+            && !usage.code_signing
+            && !usage.email_protection
+            && !usage.time_stamping
+            && !usage.ocsp_signing
+            && usage.other.is_empty(),
+        "{leaf_label} extendedKeyUsage must contain only clientAuth"
+    );
+    let common_names = leaf.subject().iter_common_name().collect::<Vec<_>>();
+    ensure!(
+        common_names.len() == 1 && common_names[0].as_str().ok() == Some(expected_common_name),
+        "{leaf_label} common name does not match the configured identity"
+    );
+    ensure!(
+        leaf.public_key().raw == key.subject_public_key_info().as_slice(),
+        "client private key does not match certificate"
+    );
+
+    for parent_index in 1..certificates.len() {
+        let (child_label, child) = &certificates[parent_index - 1];
+        let (parent_label, parent) = &certificates[parent_index];
+        validate_ca_extensions(parent, parent_label, None, Some((parent_index - 1) as u32))?;
+        ensure!(
+            child.issuer() == parent.subject(),
+            "{child_label} issuer does not match {parent_label} subject"
+        );
+        child
+            .verify_signature(Some(parent.public_key()))
+            .map_err(|err| anyhow!("{child_label} signature verification failed: {err}"))?;
+        ensure!(
+            child.validity().not_after.to_datetime() <= parent.validity().not_after.to_datetime(),
+            "{child_label} certificate expires after {parent_label} certificate"
+        );
+    }
+
+    Ok(ClientCertificateValidity {
+        not_before: leaf.validity().not_before.to_datetime(),
+        not_after: leaf.validity().not_after.to_datetime(),
     })
 }
 
@@ -159,7 +257,11 @@ fn parse_certificate_exact<'a>(der: &'a [u8], label: &str) -> Result<X509Certifi
     Ok(certificate)
 }
 
-fn validate_extensions(certificate: &X509Certificate<'_>, label: &str) -> Result<()> {
+fn validate_extensions(
+    certificate: &X509Certificate<'_>,
+    label: &str,
+    allow_critical_extended_key_usage: bool,
+) -> Result<()> {
     let mut extension_oids = HashSet::new();
     for extension in certificate.extensions() {
         let parsed = extension.parsed_extension();
@@ -185,7 +287,9 @@ fn validate_extensions(certificate: &X509Certificate<'_>, label: &str) -> Result
                 || matches!(
                     parsed,
                     ParsedExtension::BasicConstraints(_) | ParsedExtension::KeyUsage(_)
-                ),
+                )
+                || allow_critical_extended_key_usage
+                    && matches!(parsed, ParsedExtension::ExtendedKeyUsage(_)),
             "{label} certificate contains unsupported critical extension {}",
             extension.oid
         );
@@ -258,7 +362,8 @@ mod tests {
     use anyhow::Result;
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, CustomExtension, DistinguishedName,
-        DnType, GeneralSubtree, IsCa, KeyUsagePurpose, NameConstraints, PKCS_ECDSA_P256_SHA256,
+        DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyUsagePurpose, NameConstraints,
+        PKCS_ECDSA_P256_SHA256,
     };
     use time::Duration;
 
@@ -303,6 +408,131 @@ mod tests {
             IsCa::Ca(BasicConstraints::Constrained(0)),
             vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign],
         )
+    }
+
+    fn client_params(common_name: &str) -> CertificateParams {
+        let mut params = ca_params(
+            common_name,
+            IsCa::NoCa,
+            vec![KeyUsagePurpose::DigitalSignature],
+        );
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+    }
+
+    fn critical_client_auth_extension() -> CustomExtension {
+        let mut extension = CustomExtension::from_oid_content(
+            &[2, 5, 29, 37],
+            vec![
+                0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02,
+            ],
+        );
+        extension.set_criticality(true);
+        extension
+    }
+
+    fn generate_client_chain(client_params: CertificateParams) -> Result<(Vec<Vec<u8>>, KeyPair)> {
+        let root_params = root_params("Test Root");
+        let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let root = root_params.self_signed(&root_key)?;
+        let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+
+        let intermediate_params = intermediate_params();
+        let intermediate_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let intermediate = intermediate_params.signed_by(&intermediate_key, &root_issuer)?;
+        let intermediate_issuer =
+            rcgen::Issuer::from_params(&intermediate_params, &intermediate_key);
+
+        let client_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let client = client_params.signed_by(&client_key, &intermediate_issuer)?;
+        Ok((
+            vec![
+                client.der().as_ref().to_vec(),
+                intermediate.der().as_ref().to_vec(),
+                root.der().as_ref().to_vec(),
+            ],
+            client_key,
+        ))
+    }
+
+    #[test]
+    fn validates_client_certificate_identity_key_usage_and_chain() -> Result<()> {
+        let (chain, key) = generate_client_chain(client_params("exfilguard-production"))?;
+        let chain_refs = chain.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let validity = validate_client_certificate_chain(
+            &chain_refs,
+            &key,
+            "exfilguard-production",
+            validation_time(),
+        )?;
+        assert!(validity.not_before < validity.not_after);
+
+        assert!(
+            validate_client_certificate_chain(
+                &chain_refs,
+                &key,
+                "different-identity",
+                validation_time(),
+            )
+            .is_err()
+        );
+        let wrong_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        assert!(
+            validate_client_certificate_chain(
+                &chain_refs,
+                &wrong_key,
+                "exfilguard-production",
+                validation_time(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_client_certificate_without_client_only_usage() -> Result<()> {
+        let mut params = client_params("exfilguard-production");
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        let (chain, key) = generate_client_chain(params)?;
+        let chain_refs = chain.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(
+            validate_client_certificate_chain(
+                &chain_refs,
+                &key,
+                "exfilguard-production",
+                validation_time(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_critical_client_auth_on_client_leaf_only() -> Result<()> {
+        let mut params = client_params("exfilguard-production");
+        params.extended_key_usages.clear();
+        params
+            .custom_extensions
+            .push(critical_client_auth_extension());
+        let (chain, key) = generate_client_chain(params)?;
+        let chain_refs = chain.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        validate_client_certificate_chain(
+            &chain_refs,
+            &key,
+            "exfilguard-production",
+            validation_time(),
+        )?;
+
+        let mut intermediate = intermediate_params();
+        intermediate
+            .custom_extensions
+            .push(critical_client_auth_extension());
+        let chain = generate_chain(root_params("Test Root"), intermediate)?;
+        assert!(validate(&chain).is_err());
+        Ok(())
     }
 
     fn generate_chain(

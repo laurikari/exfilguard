@@ -19,6 +19,7 @@ use tokio_rustls::server::TlsStream;
 use tracing::warn;
 
 use crate::{
+    authorization::{BodyAccess, BufferedBody, FinalizedProtocol, FinalizedRequestV1},
     policy::matcher::PolicySnapshot,
     proxy::{
         AppContext,
@@ -39,7 +40,10 @@ use async_trait::async_trait;
 
 use super::{
     cache::{CacheEvaluation, CacheMiss, evaluate_cache, send_cached_response},
-    forward::{forward_request_to_upstream, send_error_response},
+    forward::{
+        buffer_request_body, forward_finalized_request_to_upstream, forward_request_to_upstream,
+        send_error_response,
+    },
     request::{SanitizedRequest, reject_expect_header, sanitize_request},
     upstream::{Http2Upstream, PrimedHttp2Upstream},
 };
@@ -48,7 +52,7 @@ pub async fn serve_bumped_http2<S>(
     stream: TlsStream<S>,
     peer: SocketAddr,
     app: AppContext,
-    connect_binding: Option<ResolvedTarget>,
+    connect_binding: ResolvedTarget,
     primed_upstream: Option<PrimedHttp2Upstream>,
     flow_context: RequestFlowContext,
 ) -> Result<()>
@@ -73,6 +77,7 @@ struct Http2BumpService<S> {
     connection: server::Connection<TlsStream<S>, Bytes>,
     upstream: Arc<Mutex<Http2Upstream>>,
     upstream_closed: watch::Receiver<bool>,
+    connect_binding: ResolvedTarget,
     flow_context: RequestFlowContext,
     request_slots: Arc<Semaphore>,
 }
@@ -85,7 +90,7 @@ where
         stream: TlsStream<S>,
         peer: SocketAddr,
         app: AppContext,
-        connect_binding: Option<ResolvedTarget>,
+        connect_binding: ResolvedTarget,
         primed_upstream: Option<PrimedHttp2Upstream>,
         flow_context: RequestFlowContext,
     ) -> Result<Self> {
@@ -93,10 +98,12 @@ where
             stream,
             app.settings.max_request_header_size,
             app.settings.http2_max_concurrent_streams,
+            app.settings.http2_stream_window_size,
+            app.settings.http2_connection_window_size,
             app.settings.request_header_timeout(),
         )
         .await?;
-        let upstream = Http2Upstream::new(app.clone(), connect_binding, primed_upstream);
+        let upstream = Http2Upstream::new(app.clone(), connect_binding.clone(), primed_upstream);
         let upstream_closed = upstream.closed_receiver();
         let request_slots = Arc::new(Semaphore::new(
             app.settings.http2_max_concurrent_streams_usize(),
@@ -107,6 +114,7 @@ where
             connection,
             upstream: Arc::new(Mutex::new(upstream)),
             upstream_closed,
+            connect_binding,
             flow_context,
             request_slots,
         })
@@ -126,12 +134,16 @@ where
                                 "closing downstream HTTP/2 session after upstream connection closed"
                             );
                             self.connection.graceful_shutdown();
-                            if let Err(err) = poll_fn(|cx| self.connection.poll_closed(cx)).await {
-                                warn!(
-                                    peer = %self.peer,
-                                    error = %err,
+                            match timeout(keepalive_timeout, poll_fn(|cx| self.connection.poll_closed(cx))).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => warn!(
+                                    peer = %self.peer, error = %err,
                                     "failed to close downstream HTTP/2 connection after upstream shutdown"
-                                );
+                                ),
+                                Err(_) => {
+                                    warn!(peer = %self.peer, "HTTP/2 graceful shutdown timed out");
+                                    tasks.abort_all();
+                                }
                             }
                             break;
                         }
@@ -154,6 +166,7 @@ where
                             let app = self.app.clone();
                             let upstream = self.upstream.clone();
                             let flow_context = self.flow_context.clone();
+                            let connect_binding = self.connect_binding.clone();
                             let permit = self
                                 .request_slots
                                 .clone()
@@ -170,6 +183,7 @@ where
                                         app,
                                         upstream,
                                         flow_context,
+                                        connect_binding,
                                     )
                                     .await
                                 {
@@ -213,6 +227,8 @@ async fn handshake_downstream<T>(
     stream: T,
     max_header_size: usize,
     max_concurrent_streams: u32,
+    stream_window_size: u32,
+    connection_window_size: u32,
     setup_timeout: Duration,
 ) -> Result<server::Connection<T, Bytes>>
 where
@@ -221,7 +237,9 @@ where
     let mut builder = server::Builder::new();
     builder
         .max_header_list_size(max_header_size.min(u32::MAX as usize) as u32)
-        .max_concurrent_streams(max_concurrent_streams);
+        .max_concurrent_streams(max_concurrent_streams)
+        .initial_window_size(stream_window_size)
+        .initial_connection_window_size(connection_window_size);
     timeout(setup_timeout, builder.handshake(stream))
         .await
         .context("timed out waiting for downstream HTTP/2 connection preface")?
@@ -229,7 +247,9 @@ where
 }
 
 fn log_stream_task_completion(peer: SocketAddr, result: Result<(), tokio::task::JoinError>) {
-    if let Err(err) = result {
+    if let Err(err) = result
+        && !err.is_cancelled()
+    {
         warn!(
             peer = %peer,
             error = %err,
@@ -245,6 +265,7 @@ async fn process_downstream_request(
     app: AppContext,
     upstream: Arc<Mutex<Http2Upstream>>,
     flow_context: RequestFlowContext,
+    connect_binding: ResolvedTarget,
 ) -> Result<()> {
     let _stream_guard = crate::metrics::track_http2_stream();
     let start = Instant::now();
@@ -260,12 +281,32 @@ async fn process_downstream_request(
             &mut respond,
             http::StatusCode::EXPECTATION_FAILED,
             "expectation failed",
+            None,
         )
         .await?;
         return Ok(());
     }
 
     let snapshot = app.policies.snapshot();
+    // Inner requests inherit the CONNECT token, but must not replace it or
+    // hide malformed/duplicate authentication headers during sanitization.
+    let authorization_token = app.authorization.as_ref().and_then(|authorization| {
+        let bound = flow_context.authorization_token.as_ref()?;
+        authorization
+            .bind_token(
+                request
+                    .headers()
+                    .get_all(http::header::PROXY_AUTHORIZATION)
+                    .iter()
+                    .map(http::HeaderValue::as_bytes),
+                Some(bound),
+            )
+            .ok()
+    });
+    let flow_context = RequestFlowContext {
+        authorization_token,
+        ..flow_context
+    };
     let max_request_header_size = app.settings.max_request_header_size;
     let (meta, body) = match sanitize_request(request, max_request_header_size, &flow_context) {
         Ok(result) => result,
@@ -280,13 +321,14 @@ async fn process_downstream_request(
                 &mut respond,
                 http::StatusCode::BAD_REQUEST,
                 "invalid request",
+                None,
             )
             .await?;
             return Ok(());
         }
     };
     let ctx = DownstreamRequestCtx::new(meta, body, respond, peer, snapshot, start, &app);
-    ctx.handle(upstream).await
+    ctx.handle(upstream, &connect_binding).await
 }
 
 struct DownstreamRequestCtx {
@@ -306,6 +348,8 @@ struct DownstreamRequestCtx {
     log_queries: bool,
     cache: Option<Arc<HttpCache>>,
     log_tracker: AllowLogTracker,
+    authorization: Option<Arc<crate::authorization::AuthorizationServices>>,
+    authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
 impl DownstreamRequestCtx {
@@ -320,6 +364,10 @@ impl DownstreamRequestCtx {
     ) -> Self {
         let log_queries = app.settings.log_queries;
         let request_base = meta.request_line_bytes + meta.header_bytes as u64;
+        let authorization_token = meta
+            .parsed
+            .flow_context()
+            .and_then(|flow| flow.authorization_token.clone());
         Self {
             peer,
             meta,
@@ -337,14 +385,44 @@ impl DownstreamRequestCtx {
             log_queries,
             cache: app.cache.clone(),
             log_tracker: AllowLogTracker::new(request_base, start),
+            authorization: app.authorization.clone(),
+            authorization_token,
         }
     }
 
-    async fn handle(self, upstream: Arc<Mutex<Http2Upstream>>) -> Result<()> {
+    async fn handle(
+        mut self,
+        upstream: Arc<Mutex<Http2Upstream>>,
+        connect_binding: &ResolvedTarget,
+    ) -> Result<()> {
+        if let Err(err) = connect_binding.validate_request(&self.meta.parsed) {
+            let status = http::StatusCode::MISDIRECTED_REQUEST;
+            let body = "misdirected request";
+            warn!(peer = %self.peer, error = %err, "HTTP/2 request does not match CONNECT target");
+            send_error_response(&mut self.respond, status, body, None).await?;
+            self.meta
+                .parsed
+                .access_log_builder(
+                    self.peer,
+                    crate::proxy::request::request_target_for_log(
+                        &self.meta.parsed.path,
+                        self.log_queries,
+                    ),
+                )
+                .status(status)
+                .decision("ERROR")
+                .error_reason("misdirected_request")
+                .bytes(self.log_tracker.base_bytes(), body.len() as u64)
+                .elapsed(self.log_tracker.elapsed())
+                .log();
+            return Ok(());
+        }
         let peer = self.peer;
         let log_queries = self.log_queries;
         let snapshot = self.snapshot.clone();
         let parsed_for_policy = self.meta.parsed.clone();
+        let authorization = self.authorization.clone();
+        let authorization_token = self.authorization_token.clone();
         let mut handler = Http2RequestHandler {
             ctx: self,
             upstream,
@@ -353,6 +431,10 @@ impl DownstreamRequestCtx {
             peer,
             &parsed_for_policy,
             &snapshot,
+            authorization
+                .as_deref()
+                .map(|authorization| (authorization, authorization_token.as_ref())),
+            handler.ctx.request_deadline.instant(),
             log_queries,
             PolicyLogConfig::http1(),
             &mut handler,
@@ -367,6 +449,7 @@ impl DownstreamRequestCtx {
             &mut self.respond,
             response.spec.status,
             response.spec.body_http2,
+            None,
         )
         .await?;
         response
@@ -391,6 +474,7 @@ impl DownstreamRequestCtx {
             &mut self.respond,
             response.spec.status,
             response.spec.body_http2,
+            None,
         )
         .await?;
         response
@@ -412,8 +496,9 @@ impl DownstreamRequestCtx {
         decision: &AllowDecision,
         error_detail: &str,
     ) -> Result<()> {
-        send_error_response(&mut self.respond, spec.status, spec.body_http2).await?;
-        self.log_tracker.add_client_bytes(spec.extra_client_bytes);
+        send_error_response(&mut self.respond, spec.status, spec.body_http2, None).await?;
+        self.log_tracker
+            .record_client_body_bytes(spec.extra_client_bytes);
         policy_response::forward_error_log_builder(
             log.access_log_builder(),
             decision,
@@ -447,8 +532,11 @@ impl Http2RequestHandler {
     fn should_disconnect_on_forward_error(kind: &ForwardErrorKind<'_>) -> bool {
         !matches!(
             kind,
-            ForwardErrorKind::InvalidRequestBody(_)
+            ForwardErrorKind::Http2StreamReset
+                | ForwardErrorKind::InvalidRequestBody(_)
                 | ForwardErrorKind::BodyTooLarge(_)
+                | ForwardErrorKind::CredentialPreparationFailed
+                | ForwardErrorKind::CredentialRequestRejected(_)
                 | ForwardErrorKind::PrivateAddress(_)
                 | ForwardErrorKind::RequestTimeout
                 | ForwardErrorKind::ClientBodyIdleTimeout
@@ -456,24 +544,95 @@ impl Http2RequestHandler {
         )
     }
 
-    fn forward_error_decision(kind: &ForwardErrorKind<'_>) -> &'static str {
-        match kind {
-            ForwardErrorKind::BodyTooLarge(_) | ForwardErrorKind::PrivateAddress(_) => "DENY",
-            ForwardErrorKind::ResponseAlreadyStarted(_)
-            | ForwardErrorKind::RequestTimeout
-            | ForwardErrorKind::ClientBodyIdleTimeout
-            | ForwardErrorKind::InvalidRequestBody(_)
-            | ForwardErrorKind::MisdirectedRequest(_)
-            | ForwardErrorKind::UpstreamClosed
-            | ForwardErrorKind::Other => "ERROR",
-        }
-    }
-
     async fn forward_request(
         &mut self,
+        decision: &AllowDecision,
         cache_miss: Option<Box<CacheMiss>>,
     ) -> Result<super::forward::ForwardOutcome> {
         let forward_meta = self.ctx.meta.clone();
+        if let Some(credential) = decision
+            .authorization
+            .as_ref()
+            .and_then(|authorization| authorization.credential.as_ref())
+        {
+            if credential.body_access == BodyAccess::None
+                && (!self.ctx.body.is_end_stream()
+                    || self.ctx.meta.content_length.unwrap_or(0) != 0)
+            {
+                return Err(
+                    crate::proxy::forward_error::CredentialRequestRejected::body_not_allowed()
+                        .into(),
+                );
+            }
+            {
+                let upstream = self.upstream.lock().await;
+                upstream.validate_request_target(&forward_meta.parsed)?;
+            }
+            let buffered_body = if self.ctx.body.is_end_stream() {
+                None
+            } else {
+                let authorization = self
+                    .ctx
+                    .authorization
+                    .as_ref()
+                    .expect("credential decision requires authorization services");
+                let max_body_size =
+                    authorization.buffered_body_limit(self.ctx.max_request_body_size);
+                let buffer_limit =
+                    credential_body_buffer_limit(self.ctx.meta.content_length, max_body_size)?;
+                let permit = authorization.reserve_buffered_body(buffer_limit).await?;
+                let (bytes, wire_bytes) = buffer_request_body(
+                    &mut self.ctx.body,
+                    self.ctx.request_body_timeout,
+                    self.ctx.request_deadline.instant(),
+                    buffer_limit,
+                )
+                .await?;
+                Some(BufferedBody::new(bytes, wire_bytes, permit))
+            };
+            let client_body_bytes = buffered_body.as_ref().map_or(0, BufferedBody::wire_bytes);
+            self.ctx
+                .log_tracker
+                .record_client_body_bytes(client_body_bytes);
+            let mut finalized = FinalizedRequestV1::new(
+                &forward_meta.parsed,
+                forward_meta.forward_headers,
+                forward_meta.content_length,
+                buffered_body,
+                credential.protected_headers.clone(),
+                FinalizedProtocol::Http2,
+                self.ctx.max_request_header_bytes,
+            )
+            .map_err(crate::proxy::forward_error::credential_finalization_failed)?;
+            self.ctx
+                .authorization
+                .as_ref()
+                .expect("credential decision requires authorization services")
+                .prepare_headers(
+                    credential,
+                    &mut finalized,
+                    self.ctx.peer,
+                    self.ctx.max_request_header_bytes,
+                )
+                .await
+                .map_err(crate::proxy::forward_error::credential_preparation_failed)?;
+            let checkout = {
+                let mut upstream = self.upstream.lock().await;
+                upstream.checkout_sender(&forward_meta.parsed).await?
+            };
+            return forward_finalized_request_to_upstream(
+                checkout,
+                finalized,
+                &mut self.ctx.respond,
+                self.ctx.request_body_timeout,
+                self.ctx.response_header_timeout,
+                self.ctx.response_body_timeout,
+                self.ctx.request_deadline,
+                &self.ctx.response_progress,
+                self.ctx.max_response_header_bytes,
+            )
+            .await;
+        }
         let checkout = {
             let mut upstream = self.upstream.lock().await;
             upstream.checkout_sender(&forward_meta.parsed).await?
@@ -499,7 +658,7 @@ impl Http2RequestHandler {
     fn build_allow_log_stats(&mut self, success: &super::forward::ForwardOutcome) -> AllowLogStats {
         self.ctx
             .log_tracker
-            .add_client_bytes(success.client_body_bytes());
+            .record_client_body_bytes(success.client_body_bytes());
         self.ctx.log_tracker.build_allow_log_stats(
             success.status(),
             success.bytes_to_client(),
@@ -521,7 +680,10 @@ impl Http2RequestHandler {
         crate::metrics::record_upstream_error(kind.as_metric_label());
         log_forward_error(&kind, &log, &err);
 
-        if matches!(kind, ForwardErrorKind::ResponseAlreadyStarted(_)) {
+        if matches!(
+            kind,
+            ForwardErrorKind::ResponseAlreadyStarted(_) | ForwardErrorKind::Http2StreamReset
+        ) {
             // Dropping the affected H2 stream resets it. Other multiplexed streams and the
             // shared upstream session remain usable.
             self.log_disconnect_forward_error(decision, log, &kind, &error_detail);
@@ -548,17 +710,20 @@ impl Http2RequestHandler {
         kind: &ForwardErrorKind<'_>,
         error_detail: &str,
     ) {
-        log.access_log_builder()
-            .client(decision.client.as_ref())
-            .decision(Self::forward_error_decision(kind))
-            .policy(decision.policy.as_ref())
-            .rule(decision.rule.as_ref())
-            .error_reason(kind.as_metric_label())
-            .error_detail(error_detail)
-            .bytes(self.ctx.log_tracker.current_bytes(), 0)
-            .elapsed(self.ctx.log_tracker.elapsed())
-            .log();
+        policy_response::forward_disconnect_log_builder(
+            log.access_log_builder(),
+            decision,
+            kind,
+            error_detail,
+            &self.ctx.log_tracker,
+        )
+        .log();
     }
+}
+
+fn credential_body_buffer_limit(declared: Option<usize>, maximum: usize) -> Result<usize> {
+    validate_declared_body_size(declared, maximum)?;
+    Ok(declared.unwrap_or(maximum))
 }
 
 #[async_trait]
@@ -602,7 +767,7 @@ impl RequestHandler for Http2RequestHandler {
                     CacheEvaluation::Bypass => ("bypass", None),
                 };
 
-                let success = self.forward_request(cache_miss).await?;
+                let success = self.forward_request(&decision, cache_miss).await?;
                 Ok(AllowedRequestResult::Forwarded {
                     success,
                     cache_lookup,
@@ -653,6 +818,72 @@ impl RequestHandler for Http2RequestHandler {
     ) -> Result<Self::Output> {
         self.ctx.handle_default_deny(outcome).await
     }
+
+    async fn on_auth_deny(&mut self, log: RequestLogContext<'_>) -> Result<Self::Output> {
+        send_error_response(
+            &mut self.ctx.respond,
+            http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "proxy authentication required",
+            Some("ExfilGuard"),
+        )
+        .await?;
+        log.access_log_builder()
+            .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .decision("DENY")
+            .error_reason("proxy_authentication")
+            .bytes(
+                self.ctx.log_tracker.base_bytes(),
+                "proxy authentication required".len() as u64,
+            )
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+        Ok(())
+    }
+
+    async fn on_authorization_service_error(
+        &mut self,
+        log: RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        send_error_response(
+            &mut self.ctx.respond,
+            http::StatusCode::BAD_GATEWAY,
+            "authorization service failed",
+            None,
+        )
+        .await?;
+        log.access_log_builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .decision("ERROR")
+            .error_reason("authorization_service_failed")
+            .bytes(
+                self.ctx.log_tracker.base_bytes(),
+                "authorization service failed".len() as u64,
+            )
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+        Ok(())
+    }
+
+    async fn on_request_timeout(&mut self, log: RequestLogContext<'_>) -> Result<Self::Output> {
+        send_error_response(
+            &mut self.ctx.respond,
+            http::StatusCode::GATEWAY_TIMEOUT,
+            "request timed out",
+            None,
+        )
+        .await?;
+        log.access_log_builder()
+            .status(http::StatusCode::GATEWAY_TIMEOUT)
+            .decision("ERROR")
+            .error_reason("request_timeout")
+            .bytes(
+                self.ctx.log_tracker.base_bytes(),
+                "request timed out".len() as u64,
+            )
+            .elapsed(self.ctx.log_tracker.elapsed())
+            .log();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +892,34 @@ mod tests {
     use tokio::io::duplex;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn downstream_advertises_configured_receive_windows() {
+        use tokio::io::AsyncWriteExt;
+        for (stream, connection) in [(65_535, 65_535), (131_072, 262_144), (262_144, 131_072)] {
+            let (mut peer, io) = duplex(4096);
+            let task = tokio::spawn(async move {
+                let mut conn = handshake_downstream(
+                    io,
+                    32_768,
+                    100,
+                    stream,
+                    connection,
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                while let Some(request) = conn.accept().await {
+                    request.unwrap();
+                }
+            });
+            peer.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+                .await
+                .unwrap();
+            super::super::test_support::assert_receive_windows(&mut peer, stream, connection).await;
+            task.abort();
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn downstream_handshake_times_out_without_connection_preface() {
         let (_client, server) = duplex(1024);
@@ -668,6 +927,8 @@ mod tests {
             server,
             32 * 1024,
             100,
+            65_535,
+            65_535,
             Duration::from_secs(1),
         ));
         tokio::task::yield_now().await;
@@ -680,6 +941,116 @@ mod tests {
                 .contains("timed out waiting for downstream HTTP/2 connection preface"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn receive_credit_stops_and_recovers_without_buffering_the_whole_body() {
+        use super::super::forward::send_data_with_backpressure;
+        use std::task::Poll;
+
+        for (stream_window, connection_window) in [(131_072, 262_144), (262_144, 131_072)] {
+            timeout(Duration::from_secs(3), async {
+                let (client_io, server_io) = duplex(4096);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let server_task = tokio::spawn(async move {
+                    let mut conn = handshake_downstream(
+                        server_io,
+                        32_768,
+                        100,
+                        stream_window,
+                        connection_window,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                    while let Some(request) = conn.accept().await {
+                        tx.send(request.unwrap()).unwrap();
+                    }
+                });
+                let (mut client, driver) = h2::client::handshake(client_io).await.unwrap();
+                let client_task = tokio::spawn(driver);
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.test/upload")
+                    .body(())
+                    .unwrap();
+                let (_response, mut send) = client.send_request(request, false).unwrap();
+                let budget = stream_window.min(connection_window) as usize;
+                let body_size = budget * 4;
+                let send_task = tokio::spawn(async move {
+                    send_data_with_backpressure(
+                        &mut send,
+                        Bytes::from(vec![b'x'; body_size]),
+                        Duration::from_secs(2),
+                        None,
+                        "sending test body",
+                    )
+                    .await
+                    .unwrap();
+                    send.send_data(Bytes::new(), true).unwrap();
+                });
+                let (request, _respond) = rx.recv().await.unwrap();
+                let mut body = request.into_body();
+                let mut received = 0;
+                while received < budget {
+                    received += body.data().await.unwrap().unwrap().len();
+                }
+                assert_eq!(received, budget);
+                assert_eq!(body.flow_control().used_capacity(), budget);
+                assert!(!send_task.is_finished(), "sender bypassed receive credit");
+                assert!(matches!(
+                    futures::poll!(std::pin::pin!(body.data())),
+                    Poll::Pending
+                ));
+
+                // A stalled DATA stream must not prevent another request's headers.
+                let request = http::Request::builder()
+                    .uri("https://example.test/control")
+                    .body(())
+                    .unwrap();
+                let (_response, mut control_send) = client.send_request(request, false).unwrap();
+                let (control, _respond) = rx.recv().await.unwrap();
+                assert_eq!(control.uri().path(), "/control");
+                if connection_window > stream_window {
+                    // There is connection credit left: another stream's DATA must
+                    // progress even though the first stream has no credit at all.
+                    send_data_with_backpressure(
+                        &mut control_send,
+                        Bytes::from(vec![b'y'; budget]),
+                        Duration::from_secs(2),
+                        None,
+                        "sending independent stream",
+                    )
+                    .await
+                    .unwrap();
+                    let mut control_body = control.into_body();
+                    let mut control_received = 0;
+                    while control_received < budget {
+                        let chunk = control_body.data().await.unwrap().unwrap();
+                        assert!(chunk.iter().all(|byte| *byte == b'y'));
+                        control_received += chunk.len();
+                    }
+                    assert_eq!(control_received, budget);
+                    assert!(!send_task.is_finished());
+                    // Reset/drop returns the aggregate credit held by this stream.
+                    drop(control_body);
+                }
+
+                body.flow_control().release_capacity(budget).unwrap();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.unwrap();
+                    assert!(chunk.iter().all(|byte| *byte == b'x'));
+                    received += chunk.len();
+                    body.flow_control().release_capacity(chunk.len()).unwrap();
+                }
+                assert_eq!(received, body_size);
+                send_task.await.unwrap();
+                client_task.abort();
+                server_task.abort();
+            })
+            .await
+            .expect("flow control failed to recover");
+        }
     }
 
     #[tokio::test]
@@ -708,5 +1079,12 @@ mod tests {
 
         assert_eq!(tasks.len(), 0);
         assert!(!accept_source.is_closed());
+    }
+
+    #[test]
+    fn credential_body_buffer_uses_declared_size() {
+        assert_eq!(credential_body_buffer_limit(Some(7), 1024).unwrap(), 7);
+        assert_eq!(credential_body_buffer_limit(None, 1024).unwrap(), 1024);
+        assert!(credential_body_buffer_limit(Some(1025), 1024).is_err());
     }
 }

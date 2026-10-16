@@ -657,6 +657,23 @@ async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unframed_reset_content_does_not_poison_upstream_pool() -> Result<()> {
+    empty_response_does_not_poison_upstream_pool(b"HTTP/1.1 205 Reset Content\r\n\r\nhello", 205)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_length_no_content_does_not_poison_upstream_pool() -> Result<()> {
+    empty_response_does_not_poison_upstream_pool(
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\npoison",
+        204,
+    )
+    .await
+}
+
+async fn empty_response_does_not_poison_upstream_pool(
+    first_response: &'static [u8],
+    first_status: u16,
+) -> Result<()> {
     let dirs = TestDirs::new()?;
 
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -683,7 +700,7 @@ async fn unframed_reset_content_does_not_poison_upstream_pool() -> Result<()> {
                     }
                     let request_number = upstream_requests.fetch_add(1, Ordering::SeqCst);
                     let response = if request_number == 0 {
-                        b"HTTP/1.1 205 Reset Content\r\n\r\nhello" as &[u8]
+                        first_response
                     } else {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
                     };
@@ -711,7 +728,13 @@ async fn unframed_reset_content_does_not_poison_upstream_pool() -> Result<()> {
     );
     first.get_mut().write_all(first_request.as_bytes()).await?;
     first.get_mut().flush().await?;
-    assert_eq!(read_response_status(&mut first).await?, 205);
+    assert_eq!(read_response_status(&mut first).await?, first_status);
+    let mut trailing = Vec::new();
+    timeout(StdDuration::from_secs(2), first.read_to_end(&mut trailing)).await??;
+    assert!(
+        trailing.is_empty(),
+        "unexpected response bytes: {trailing:?}"
+    );
     drop(first);
 
     let mut second = BufReader::new(TcpStream::connect(harness.addr).await?);
@@ -724,11 +747,17 @@ async fn unframed_reset_content_does_not_poison_upstream_pool() -> Result<()> {
         .await?;
     second.get_mut().flush().await?;
     assert_eq!(read_response_status(&mut second).await?, 200);
+    let mut body = Vec::new();
+    timeout(StdDuration::from_secs(2), second.read_to_end(&mut body)).await??;
+    assert_eq!(
+        body, b"ok",
+        "received a forged response instead of the origin response"
+    );
 
     assert_eq!(upstream_requests.load(Ordering::SeqCst), 2);
     assert!(
         upstream_connections.load(Ordering::SeqCst) >= 2,
-        "unframed 205 connection was returned to the upstream pool"
+        "empty response connection was returned to the upstream pool"
     );
 
     upstream_task.abort();

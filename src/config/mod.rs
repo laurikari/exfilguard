@@ -9,10 +9,11 @@ use anyhow::{Context, Result, bail, ensure};
 use http::Method;
 use ipnet::IpNet;
 
+pub(crate) use loader::parse_url_pattern;
 pub use loader::{load_config, load_config_with_dirs};
 pub use model::{
-    Client, ClientSelector, Config, HttpsMode, MethodMatch, Policy, Rule, RuleAction, Scheme,
-    UrlPattern,
+    BodyAccess, Client, ClientSelector, Config, CredentialLimit, HttpsMode, MethodMatch, Policy,
+    Rule, RuleAction, Scheme, UrlPattern,
 };
 
 use crate::util::cidrs_overlap;
@@ -150,7 +151,7 @@ fn validate_rule_constraints(
     }
 }
 
-fn validate_policy_rules(policy: &Policy) -> Result<()> {
+pub(crate) fn validate_policy_rules(policy: &Policy) -> Result<()> {
     if policy.rules.is_empty() {
         bail!("policy '{}' must contain at least one rule", policy.name);
     }
@@ -271,6 +272,50 @@ fn validate_config(config: &Config) -> Result<()> {
                     "client '{}' references unknown policy '{}'",
                     client.name,
                     policy_name
+                );
+            }
+        }
+        if client
+            .authorization_service
+            .as_ref()
+            .is_some_and(|service| service.trim().is_empty())
+        {
+            bail!(
+                "client '{}' authorization_service must not be empty",
+                client.name
+            );
+        }
+        if client.authorization_service.is_none() && !client.credential_limits.is_empty() {
+            bail!(
+                "client '{}' defines credential limits without an authorization_service",
+                client.name
+            );
+        }
+        for (index, limit) in client.credential_limits.iter().enumerate() {
+            ensure!(
+                !limit.credential_reference.trim().is_empty(),
+                "client '{}' credential_limit[{index}].credential_reference must not be empty",
+                client.name
+            );
+            ensure!(
+                !limit.protected_headers.is_empty(),
+                "client '{}' credential_limit[{index}].protected_headers must not be empty",
+                client.name
+            );
+            let mut names = HashSet::new();
+            for name in limit.protected_headers.iter() {
+                let parsed = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!(
+                        "client '{}' credential_limit[{index}] contains invalid protected header name '{}'",
+                        client.name,
+                        name
+                    )
+                })?;
+                ensure!(
+                    names.insert(parsed),
+                    "client '{}' credential_limit[{index}] contains duplicate protected header '{}'",
+                    client.name,
+                    name
                 );
             }
         }
@@ -445,6 +490,8 @@ mod tests {
             name: Arc::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![Arc::<str>::from(policy_name)].into_boxed_slice()),
+            authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: super::model::DEFAULT_CLIENT_MAX_CONNECTIONS,
         }
     }
@@ -523,6 +570,8 @@ mod tests {
                     name: Arc::from("mapped"),
                     selector,
                     policies: Arc::from([]),
+                    authorization_service: None,
+                    credential_limits: Arc::from([]),
                     max_connections: 1024,
                 },
                 fallback_client("deny"),
@@ -542,6 +591,8 @@ mod tests {
                 name: Arc::from("native-v6"),
                 selector: ClientSelector::Cidr("2001:db8::/32".parse().unwrap()),
                 policies: Arc::from([]),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             fallback_client("deny"),
@@ -607,6 +658,7 @@ mod tests {
             "/files/.*",
             "/users/*/objects/**",
             "/users/~name:@/%3A/%2A/%252A",
+            "/@scope%2F*",
             "/all/!$&'()+,;=:@",
             r"/files/\*",
             r"/files/\*\*",
@@ -622,7 +674,6 @@ mod tests {
             r"/files/\",
             "/files/%7E",
             "/files/%2a",
-            "/files/%2F",
             "/files/%5C",
             "/files/%00",
         ] {

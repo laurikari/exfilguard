@@ -9,11 +9,10 @@
   `https://{bucket_name}-backups.s3.aws.com/**`, reducing duplicate policies.
 
 ## Identity & Secrets
-- Support for authenticating clients via proxy auth credentials or mTLS instead
-  of just source IPs, so multi-tenant deployments can bind policies to
-  people/services directly.
-- Additional secret-manager integrations for policy variables and providers
-  beyond the built-in Vault CA lifecycle.
+- Let the authorization service receive an authenticated client identity.
+  Today it receives only the source IP and configured audience.
+- Support secret managers other than Vault for externally managed certificates
+  and policy values.
 
 ## Body Inspection
 - Inspect request and response bodies for sensitive patterns (credit card numbers,

@@ -107,6 +107,9 @@ where
                                 .with_context(|| format!("failed to connect to {addr}"))
                                 .unwrap_err(),
                         );
+                        if attempts.is_empty() {
+                            next_attempt_at = Instant::now();
+                        }
                     }
                 }
             }
@@ -354,6 +357,116 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn refused_attempt_starts_next_address_without_waiting() -> Result<()> {
+        let first = addr("[2001:db8::1]:443");
+        let second = addr("192.0.2.1:443");
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::NetworkUnreachable,
+        ] {
+            let start = Instant::now();
+            let (stream, peer) = connect_to_addrs_with(
+                &[first, second],
+                Duration::from_secs(1),
+                |candidate| async move {
+                    if candidate == first {
+                        Err(io::Error::new(kind, "failed"))
+                    } else {
+                        Ok(candidate)
+                    }
+                },
+            )
+            .await?;
+            assert_eq!(stream, second);
+            assert_eq!(peer, second);
+            assert_eq!(Instant::now() - start, Duration::ZERO);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_pending_failure_starts_next_address_without_waiting() -> Result<()> {
+        let first = addr("192.0.2.1:443");
+        let second = addr("192.0.2.2:443");
+        let failure_delay = Duration::from_millis(50);
+        let start = Instant::now();
+        let (_, peer) = connect_to_addrs_with(
+            &[first, second],
+            Duration::from_secs(1),
+            |candidate| async move {
+                if candidate == first {
+                    tokio::time::sleep(failure_delay).await;
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+                } else {
+                    Ok(candidate)
+                }
+            },
+        )
+        .await?;
+        assert_eq!(peer, second);
+        assert_eq!(Instant::now() - start, failure_delay);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_keeps_stagger_while_another_attempt_is_pending() -> Result<()> {
+        let first = addr("192.0.2.1:443");
+        let second = addr("192.0.2.2:443");
+        let third = addr("192.0.2.3:443");
+        let active = Arc::new(AtomicUsize::new(0));
+        let start = Instant::now();
+        let (_, peer) = connect_to_addrs_with(
+            &[first, second, third],
+            Duration::from_secs(1),
+            |candidate| {
+                let active = active.clone();
+                async move {
+                    let _active = ActiveAttempt::new(active);
+                    if candidate == first {
+                        pending::<io::Result<SocketAddr>>().await
+                    } else if candidate == second {
+                        Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+                    } else {
+                        Ok(candidate)
+                    }
+                }
+            },
+        )
+        .await?;
+        assert_eq!(peer, third);
+        assert_eq!(Instant::now() - start, CONNECTION_ATTEMPT_DELAY * 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0, "losing attempt leaked");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attempt_does_not_restart_connect_timeout() {
+        let first = addr("192.0.2.1:443");
+        let second = addr("192.0.2.2:443");
+        let start = Instant::now();
+        let err = connect_to_addrs_with(
+            &[first, second],
+            Duration::from_millis(100),
+            |candidate| async move {
+                if candidate == first {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+                } else {
+                    pending::<io::Result<()>>().await
+                }
+            },
+        )
+        .await
+        .expect_err("second attempt should remain pending");
+        assert_eq!(Instant::now() - start, Duration::from_millis(100));
+        assert!(
+            err.to_string()
+                .contains("attempted 2 of 2 resolved addresses"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn immediate_failures_retain_last_address_context() {
         let first = addr("192.0.2.1:443");
         let second = addr("192.0.2.2:443");
@@ -365,7 +478,7 @@ mod tests {
         .await
         .expect_err("all connection attempts should fail");
 
-        assert_eq!(Instant::now() - start, CONNECTION_ATTEMPT_DELAY);
+        assert_eq!(Instant::now() - start, Duration::ZERO);
         assert!(
             err.to_string().contains(&second.to_string()),
             "last address missing from error: {err:#}"
@@ -387,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_reuses_validated_private_target() -> Result<()> {
-        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let resolver = crate::proxy::resolver::ConfiguredUpstreamResolver::default();
         let binding = ResolvedTarget::from_addresses(
             "internal.test".to_string(),
             443,
@@ -407,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_resolution_rejects_private_targets_when_disallowed() {
-        let resolver = crate::proxy::resolver::PublicInternetResolver;
+        let resolver = crate::proxy::resolver::ConfiguredUpstreamResolver::default();
         let err = resolve_or_use_binding("10.0.0.5", 443, None, &resolver, Duration::from_secs(1))
             .await
             .expect_err("private upstream should be rejected");

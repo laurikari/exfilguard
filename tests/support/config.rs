@@ -234,6 +234,12 @@ pub enum ActionSpec {
 }
 
 impl RuleSpec {
+    pub fn allow_all_destinations(methods: &[&str]) -> Self {
+        let mut rule = Self::allow(methods, "");
+        rule.url_pattern = None;
+        rule
+    }
+
     pub fn allow(methods: &[&str], url_pattern: impl Into<String>) -> Self {
         Self {
             action: ActionSpec::Allow,

@@ -1,8 +1,9 @@
 use anyhow::Error;
 use http::StatusCode;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
+use crate::authorization::FinalizationRejection;
 use crate::proxy::{
     http::{BodyTooLarge, InvalidRequestBody},
     policy_eval::RequestLogContext,
@@ -16,6 +17,61 @@ pub struct RequestTimeout;
 #[derive(Debug, Error)]
 #[error("client request body timed out")]
 pub struct ClientBodyIdleTimeout;
+
+#[derive(Debug, Error)]
+#[error("{detail}")]
+pub struct CredentialRequestRejected {
+    pub status: StatusCode,
+    pub detail: &'static str,
+}
+
+#[derive(Debug, Error)]
+#[error("credential preparation failed")]
+struct CredentialPreparationFailed {
+    #[source]
+    source: Error,
+}
+
+pub(crate) fn credential_preparation_failed(source: Error) -> Error {
+    CredentialPreparationFailed { source }.into()
+}
+
+pub(crate) fn credential_finalization_failed(source: Error) -> Error {
+    if let Some(rejection) = source.downcast_ref::<FinalizationRejection>() {
+        return CredentialRequestRejected::from_finalization(*rejection).into();
+    }
+    credential_preparation_failed(source)
+}
+
+impl CredentialRequestRejected {
+    pub const fn expectation_failed() -> Self {
+        Self {
+            status: StatusCode::EXPECTATION_FAILED,
+            detail: "credential-bearing requests must not use Expect: 100-continue",
+        }
+    }
+
+    pub const fn body_not_allowed() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            detail: "client credential limit does not permit request body access",
+        }
+    }
+
+    const fn from_finalization(rejection: FinalizationRejection) -> Self {
+        match rejection {
+            FinalizationRejection::Expectation => Self::expectation_failed(),
+            FinalizationRejection::Trailers => Self {
+                status: StatusCode::FORBIDDEN,
+                detail: "credential-bearing requests must not declare trailers",
+            },
+            FinalizationRejection::ProtectedHeader => Self {
+                status: StatusCode::FORBIDDEN,
+                detail: "client supplied a protected header",
+            },
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 #[error("upstream response failed after an informational response was forwarded: {source}")]
@@ -51,9 +107,10 @@ impl ResponseAlreadyStarted {
 
 #[derive(Debug, Error)]
 #[error(
-    "HTTP/2 request for {requested_host}:{requested_port} does not match upstream {upstream_host}:{upstream_port}"
+    "request for {requested_scheme}://{requested_host}:{requested_port} does not match HTTPS CONNECT target {upstream_host}:{upstream_port}"
 )]
 pub struct MisdirectedRequest {
+    pub requested_scheme: &'static str,
     pub upstream_host: String,
     pub upstream_port: u16,
     pub requested_host: String,
@@ -62,12 +119,14 @@ pub struct MisdirectedRequest {
 
 impl MisdirectedRequest {
     pub fn new(
+        requested_scheme: &'static str,
         upstream_host: String,
         upstream_port: u16,
         requested_host: String,
         requested_port: u16,
     ) -> Self {
         Self {
+            requested_scheme,
             upstream_host,
             upstream_port,
             requested_host,
@@ -79,8 +138,11 @@ impl MisdirectedRequest {
 /// Normalized classification of forwarding failures so HTTP/1.1 and HTTP/2 can react consistently.
 pub enum ForwardErrorKind<'a> {
     ResponseAlreadyStarted(&'a ResponseAlreadyStarted),
+    Http2StreamReset,
     RequestTimeout,
     ClientBodyIdleTimeout,
+    CredentialPreparationFailed,
+    CredentialRequestRejected(&'a CredentialRequestRejected),
     InvalidRequestBody(&'a InvalidRequestBody),
     BodyTooLarge(&'a BodyTooLarge),
     PrivateAddress(&'a PrivateAddressError),
@@ -93,8 +155,11 @@ impl ForwardErrorKind<'_> {
     pub fn as_metric_label(&self) -> &'static str {
         match self {
             Self::ResponseAlreadyStarted(_) => "response_body_failed",
+            Self::Http2StreamReset => "http2_stream_reset",
             Self::RequestTimeout => "request_timeout",
             Self::ClientBodyIdleTimeout => "request_body_timeout",
+            Self::CredentialPreparationFailed => "credential_preparation_failed",
+            Self::CredentialRequestRejected(_) => "credential_request_rejected",
             Self::InvalidRequestBody(_) => "invalid_request_body",
             Self::BodyTooLarge(_) => "body_too_large",
             Self::PrivateAddress(_) => "private_address",
@@ -114,6 +179,10 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
         ForwardErrorKind::RequestTimeout
     } else if err.downcast_ref::<ClientBodyIdleTimeout>().is_some() {
         ForwardErrorKind::ClientBodyIdleTimeout
+    } else if err.downcast_ref::<CredentialPreparationFailed>().is_some() {
+        ForwardErrorKind::CredentialPreparationFailed
+    } else if let Some(rejected) = err.downcast_ref::<CredentialRequestRejected>() {
+        ForwardErrorKind::CredentialRequestRejected(rejected)
     } else if let Some(invalid) = err.downcast_ref::<InvalidRequestBody>() {
         ForwardErrorKind::InvalidRequestBody(invalid)
     } else if let Some(body) = err.downcast_ref::<BodyTooLarge>() {
@@ -124,6 +193,12 @@ pub fn classify_forward_error(err: &Error) -> ForwardErrorKind<'_> {
         ForwardErrorKind::MisdirectedRequest(misdirected)
     } else if err.downcast_ref::<UpstreamClosed>().is_some() {
         ForwardErrorKind::UpstreamClosed
+    } else if err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<h2::Error>())
+        .any(h2::Error::is_reset)
+    {
+        ForwardErrorKind::Http2StreamReset
     } else {
         ForwardErrorKind::Other
     }
@@ -154,6 +229,19 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             error = %err,
             "response forwarding failed after downstream response started"
         ),
+        ForwardErrorKind::Http2StreamReset => debug!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            error = %err,
+            "HTTP/2 stream reset while forwarding"
+        ),
         ForwardErrorKind::RequestTimeout => warn!(
             peer = %peer,
             request_id = request_id,
@@ -177,6 +265,31 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             inner_method = inner_method,
             effective_mode = effective_mode,
             "client request body timed out"
+        ),
+        ForwardErrorKind::CredentialPreparationFailed => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            "credential preparation failed before origin forwarding"
+        ),
+        ForwardErrorKind::CredentialRequestRejected(_) => warn!(
+            peer = %peer,
+            request_id = request_id,
+            method,
+            host,
+            path,
+            session_id = session_id,
+            outer_method = outer_method,
+            inner_method = inner_method,
+            effective_mode = effective_mode,
+            error = %err,
+            "credential-bearing request rejected before forwarding"
         ),
         ForwardErrorKind::InvalidRequestBody(_) => warn!(
             peer = %peer,
@@ -218,7 +331,8 @@ pub fn log_forward_error(kind: &ForwardErrorKind<'_>, log: &RequestLogContext<'_
             upstream_port = misdirected.upstream_port,
             requested_host = %misdirected.requested_host,
             requested_port = misdirected.requested_port,
-            "HTTP/2 request did not match existing upstream connection"
+            requested_scheme = misdirected.requested_scheme,
+            "request did not match HTTPS CONNECT target"
         ),
         ForwardErrorKind::UpstreamClosed => warn!(
             peer = %peer,
@@ -268,6 +382,7 @@ mod tests {
         let invalid = InvalidRequestBody::new(4, "bad chunk");
         let private = PrivateAddressError::new("example.com", 443, "connect target");
         let misdirected = MisdirectedRequest::new(
+            "https",
             "upstream.test".to_string(),
             443,
             "requested.test".to_string(),
@@ -284,12 +399,20 @@ mod tests {
             "response_body_failed"
         );
         assert_eq!(
+            ForwardErrorKind::Http2StreamReset.as_metric_label(),
+            "http2_stream_reset"
+        );
+        assert_eq!(
             ForwardErrorKind::RequestTimeout.as_metric_label(),
             "request_timeout"
         );
         assert_eq!(
             ForwardErrorKind::ClientBodyIdleTimeout.as_metric_label(),
             "request_body_timeout"
+        );
+        assert_eq!(
+            ForwardErrorKind::CredentialPreparationFailed.as_metric_label(),
+            "credential_preparation_failed"
         );
         assert_eq!(
             ForwardErrorKind::InvalidRequestBody(&invalid).as_metric_label(),

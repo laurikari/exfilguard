@@ -472,6 +472,69 @@ static CA_VAULT_LAST_RENEWAL_SUCCESS_TIMESTAMP_SECONDS: Lazy<IntGauge> = Lazy::n
     gauge
 });
 
+static AUTHORIZATION_SERVICE_CLIENT_CERTIFICATE_NOT_AFTER_TIMESTAMP_SECONDS: Lazy<IntGaugeVec> =
+    Lazy::new(|| {
+        let vec = IntGaugeVec::new(
+            Opts::new(
+                "authorization_service_client_certificate_not_after_timestamp_seconds",
+                "Expiry of the active Vault-backed authorization-service client certificate",
+            ),
+            &["service"],
+        )
+        .expect("create authorization_service_client_certificate_not_after_timestamp_seconds");
+        REGISTRY.register(Box::new(vec.clone())).expect(
+            "register authorization_service_client_certificate_not_after_timestamp_seconds",
+        );
+        vec
+    });
+
+static AUTHORIZATION_SERVICE_VAULT_RENEWAL_ATTEMPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let vec = IntCounterVec::new(
+        Opts::new(
+            "authorization_service_vault_renewal_attempts_total",
+            "Vault authorization-service client certificate renewal attempts",
+        ),
+        &["service", "result", "reason"],
+    )
+    .expect("create authorization_service_vault_renewal_attempts_total");
+    REGISTRY
+        .register(Box::new(vec.clone()))
+        .expect("register authorization_service_vault_renewal_attempts_total");
+    vec
+});
+
+static AUTHORIZATION_SERVICE_VAULT_LAST_RENEWAL_ATTEMPT_TIMESTAMP_SECONDS: Lazy<IntGaugeVec> =
+    Lazy::new(|| {
+        let vec = IntGaugeVec::new(
+            Opts::new(
+                "authorization_service_vault_last_renewal_attempt_timestamp_seconds",
+                "Last Vault client certificate renewal attempt for an authorization service",
+            ),
+            &["service"],
+        )
+        .expect("create authorization_service_vault_last_renewal_attempt_timestamp_seconds");
+        REGISTRY
+            .register(Box::new(vec.clone()))
+            .expect("register authorization_service_vault_last_renewal_attempt_timestamp_seconds");
+        vec
+    });
+
+static AUTHORIZATION_SERVICE_VAULT_LAST_RENEWAL_SUCCESS_TIMESTAMP_SECONDS: Lazy<IntGaugeVec> =
+    Lazy::new(|| {
+        let vec = IntGaugeVec::new(
+            Opts::new(
+                "authorization_service_vault_last_renewal_success_timestamp_seconds",
+                "Last successful Vault client certificate renewal for an authorization service",
+            ),
+            &["service"],
+        )
+        .expect("create authorization_service_vault_last_renewal_success_timestamp_seconds");
+        REGISTRY
+            .register(Box::new(vec.clone()))
+            .expect("register authorization_service_vault_last_renewal_success_timestamp_seconds");
+        vec
+    });
+
 static UPSTREAM_POOL_REUSE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let vec = IntCounterVec::new(
         Opts::new(
@@ -833,6 +896,31 @@ pub fn record_ca_vault_renewal(result: &str, reason: &str) {
     }
 }
 
+pub(crate) fn set_authorization_service_client_certificate(service: &str, not_after: i64) {
+    AUTHORIZATION_SERVICE_CLIENT_CERTIFICATE_NOT_AFTER_TIMESTAMP_SECONDS
+        .with_label_values(&[service])
+        .set(not_after);
+}
+
+pub(crate) fn record_authorization_service_vault_renewal(
+    service: &str,
+    result: &str,
+    reason: &str,
+) {
+    let now = unix_timestamp_now();
+    AUTHORIZATION_SERVICE_VAULT_LAST_RENEWAL_ATTEMPT_TIMESTAMP_SECONDS
+        .with_label_values(&[service])
+        .set(now);
+    AUTHORIZATION_SERVICE_VAULT_RENEWAL_ATTEMPTS_TOTAL
+        .with_label_values(&[service, result, reason])
+        .inc();
+    if result == "success" {
+        AUTHORIZATION_SERVICE_VAULT_LAST_RENEWAL_SUCCESS_TIMESTAMP_SECONDS
+            .with_label_values(&[service])
+            .set(now);
+    }
+}
+
 pub fn record_pool_reuse(reused: bool) {
     let label = if reused { "yes" } else { "no" };
     UPSTREAM_POOL_REUSE_TOTAL.with_label_values(&[label]).inc();
@@ -1145,6 +1233,8 @@ mod tests {
         record_rule_hit("rule-1");
         set_ca_state("files", 2_000_000_000, 1_900_000_000, true, 3);
         record_ca_vault_renewal("failure", "signing");
+        set_authorization_service_client_certificate("central", 1_800_000_000);
+        record_authorization_service_vault_renewal("central", "failure", "authentication");
         let text = String::from_utf8(gather()).expect("utf8");
         assert!(
             text.contains("requests_total"),
@@ -1167,6 +1257,12 @@ mod tests {
         assert!(
             text.contains("ca_vault_renewal_attempts_total{reason=\"signing\",result=\"failure\"}")
         );
+        assert!(text.contains(
+            "authorization_service_client_certificate_not_after_timestamp_seconds{service=\"central\"} 1800000000"
+        ));
+        assert!(text.contains(
+            "authorization_service_vault_renewal_attempts_total{reason=\"authentication\",result=\"failure\",service=\"central\"}"
+        ));
     }
 
     #[tokio::test]

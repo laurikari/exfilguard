@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::SystemTime;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use http::{HeaderMap, StatusCode};
 use tokio::fs as async_fs;
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::OwnedMutexGuard;
 use tracing::{trace, warn};
 
 use super::{CacheEntry, CacheKey, CacheState, CacheTiming, VaryKey};
@@ -222,10 +223,28 @@ impl CacheWriter {
     }
 
     pub(crate) async fn finish(
+        self,
+        status: StatusCode,
+        headers: HeaderMap,
+        timing: CacheTiming,
+    ) -> Result<CacheFinishOutcome> {
+        // Waiting remains cancellable by the request's cache timeout. Only
+        // the lock holder may outlive its caller, so a stalled publication
+        // cannot accumulate detached tasks (including zero-byte fills).
+        let publish_guard = self.state.publish_lock().clone().lock_owned().await;
+        // Once admitted, retain ownership through filesystem operations and
+        // their accounting/cleanup updates even if the caller stops waiting.
+        tokio::spawn(self.finish_owned(status, headers, timing, publish_guard))
+            .await
+            .context("cache publication task failed")?
+    }
+
+    async fn finish_owned(
         mut self,
         status: StatusCode,
         headers: HeaderMap,
         timing: CacheTiming,
+        _publish_guard: OwnedMutexGuard<()>,
     ) -> Result<CacheFinishOutcome> {
         if let Some(file) = self.file.as_mut() {
             file.flush().await?;
@@ -261,8 +280,6 @@ impl CacheWriter {
             .to_hex()
             .to_string();
         let body_id = format!("{}{}", &key_id[..4], &random_id[4..]);
-        let state = self.state.clone();
-        let _publish_guard = state.publish_lock().lock().await;
         let final_path = self.state.body_path(&body_id);
         let shard_dir = final_path
             .parent()
@@ -446,7 +463,7 @@ mod tests {
         let store = CacheStore::new(dir.path().to_path_buf());
         Arc::new(CacheState {
             index: Mutex::new(index),
-            publish_lock: tokio::sync::Mutex::new(()),
+            publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             store,
             max_entry_size,
             max_bytes: 1024 * 1024,
