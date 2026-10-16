@@ -189,8 +189,10 @@ connection.
 
 - Use ExfilGuard as an explicit proxy. Transparent interception is not
   documented or supported for deployment.
-- WebSocket and HTTP/1.1 Upgrade flows are unsupported. Upstream
-  `101 Switching Protocols` responses are rejected.
+- ExfilGuard rejects HTTP/1.1 Upgrade requests, including WebSocket handshakes,
+  with `501 Not Implemented` and closes the connection. Access logs record
+  `upgrade_unsupported`. It also rejects upstream `101 Switching Protocols`
+  responses. CONNECT tunnels forward bytes unchanged.
 - ExfilGuard rejects HTTP/1.0 requests and upstream HTTP/1.0 responses. It
   only supports HTTP/1.1 framing.
 
@@ -326,9 +328,10 @@ cargo fuzz run http1_chunked_body fuzz/seeds/http1_chunked_body
 The `connect_target` seeds cover signed, empty, textual, and overflowing ports.
 Their decoded first byte selects the split between the two candidate authorities.
 
-The HTTP/1 request seeds include absolute HTTPS targets, signed object requests,
-conflicting authorities, and non-HTTPS schemes. The target exercises ordinary
-proxy parsing and inspected-request validation against `example.com:443`.
+The `http1_request_head` seeds include absolute HTTPS targets, signed object
+requests, conflicting authorities, non-HTTPS schemes, Upgrade headers, and
+mixed-case `Connection: upgrade` tokens. The target exercises ordinary proxy
+parsing and inspected-request validation against `example.com:443`.
 
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,
