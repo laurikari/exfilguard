@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::io_util::{BestEffortWriter, TeeWriter};
+use crate::io_util::PayloadCopy;
 use crate::proxy::AppContext;
 use crate::proxy::cache::{
     CacheFinishOutcome, CacheResponseTiming, CacheSkipReason, CacheStorePlan, CacheWritePlan,
@@ -14,7 +15,7 @@ use crate::proxy::cache::{
 use crate::proxy::policy_eval::AllowDecision;
 use crate::proxy::request::ParsedRequest;
 
-use super::super::body::{BodyPlan, relay_chunked_body_with_payload_copy};
+use super::super::body::BodyPlan;
 use super::super::codec::{Http1HeaderAccumulator, Http1ResponseHead};
 use super::response::{ResponseBodyPlan, relay_body};
 use super::{CacheStoreResult, ForwardTimeouts};
@@ -103,14 +104,18 @@ pub(super) async fn prepare_cache_write(
             CacheWriteState::Skip
         }
         CacheWritePlan::Store(plan) => {
-            let stream = cache
-                .open_stream(
+            let stream = timeout(
+                app.settings.response_body_idle_timeout(),
+                cache.open_stream(
                     &request.method,
                     &plan.request.uri,
                     &plan.request.headers,
                     &plan.response_headers,
-                )
-                .await;
+                ),
+            )
+            .await
+            .context("timed out opening cache write stream")
+            .and_then(|result| result);
             match stream {
                 Ok(Some(writer)) => CacheWriteState::Store(Box::new(CacheStoreContext {
                     writer,
@@ -196,6 +201,7 @@ impl CacheWriteState {
                 let bytes = relay_body(
                     upstream_reader,
                     client,
+                    None,
                     response_body_plan,
                     timeouts,
                     upstream_peer,
@@ -209,6 +215,7 @@ impl CacheWriteState {
                 let bytes = relay_body(
                     upstream_reader,
                     client,
+                    None,
                     response_body_plan,
                     timeouts,
                     upstream_peer,
@@ -224,38 +231,18 @@ impl CacheWriteState {
                     plan,
                     status,
                 } = *ctx;
-                let mut best_effort = BestEffortWriter::new(&mut writer);
-                let bytes = {
-                    if matches!(response_body_plan, ResponseBodyPlan::Chunked) {
-                        let stats = relay_chunked_body_with_payload_copy(
-                            upstream_reader,
-                            client,
-                            &mut best_effort,
-                            timeouts.response_io,
-                            timeouts.response_io,
-                            upstream_peer,
-                            total_deadline,
-                            max_response_trailer_bytes,
-                        )
-                        .await?;
-                        super::response::ResponseRelayStats {
-                            bytes: stats.bytes_written,
-                            had_trailers: stats.had_trailers,
-                        }
-                    } else {
-                        let mut tee = TeeWriter::new(client, &mut best_effort);
-                        relay_body(
-                            upstream_reader,
-                            &mut tee,
-                            response_body_plan,
-                            timeouts,
-                            upstream_peer,
-                            total_deadline,
-                            max_response_trailer_bytes,
-                        )
-                        .await?
-                    }
-                };
+                let mut best_effort = PayloadCopy::best_effort(&mut writer);
+                let bytes = relay_body(
+                    upstream_reader,
+                    client,
+                    Some(&mut best_effort),
+                    response_body_plan,
+                    timeouts,
+                    upstream_peer,
+                    total_deadline,
+                    max_response_trailer_bytes,
+                )
+                .await?;
 
                 let cache_error = best_effort.take_error();
                 let cache_failed = cache_error.is_some();
@@ -269,10 +256,10 @@ impl CacheWriteState {
                         "cache write failed"
                     );
                     crate::metrics::record_cache_store_error();
-                    writer.discard();
+                    writer.discard_in_background();
                 }
                 if discarded_for_trailers {
-                    writer.discard();
+                    writer.discard_in_background();
                 }
 
                 let CacheStorePlan {
@@ -284,7 +271,18 @@ impl CacheWriteState {
                 if matches!(response_body_plan, ResponseBodyPlan::Chunked) {
                     response_headers.remove(http::header::CONTENT_LENGTH);
                 }
-                let finish_result = writer.finish(status, response_headers, timing).await;
+                writer.defer_cleanup();
+                let finish_result = if cache_failed || discarded_for_trailers {
+                    Ok(CacheFinishOutcome::Skipped)
+                } else {
+                    timeout(
+                        timeouts.response_io,
+                        writer.finish(status, response_headers, timing),
+                    )
+                    .await
+                    .context("timed out finalizing cache entry")
+                    .and_then(|result| result)
+                };
 
                 let cache_store = match finish_result {
                     Ok(outcome) => {

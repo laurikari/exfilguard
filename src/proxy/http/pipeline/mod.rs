@@ -13,7 +13,7 @@ use crate::config::Scheme;
 use super::codec::Http1HeaderAccumulator;
 
 pub use parse::handle_non_connect;
-pub use respond::{respond_with_access_log, send_response, shutdown_stream};
+pub use respond::{respond_with_access_log, shutdown_stream};
 
 pub enum ClientDisposition {
     Continue,
@@ -28,6 +28,8 @@ pub struct RequestContext {
     pub header_bytes: usize,
     pub start: Instant,
     pub fallback_scheme: Scheme,
+    pub snapshot: crate::policy::matcher::PolicySnapshot,
+    pub authorization_token: Option<std::sync::Arc<crate::authorization::AuthorizationToken>>,
 }
 
 impl RequestContext {
@@ -56,7 +58,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, BufReader};
     use tokio::sync::watch;
 
-    fn build_test_app(temp: &TempDir) -> Result<proxy::AppContext> {
+    async fn build_test_app(temp: &TempDir) -> Result<proxy::AppContext> {
         let workspace = temp.path();
         let ca_dir = workspace.join("ca");
         let config_dir = workspace.join("config");
@@ -87,7 +89,9 @@ name = "allow"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            allow_private_upstream_cidrs: Vec::new(),
             proxy_protocol_max_pending_connections: 1024,
+            vault: None,
             ca: CaSettings::Builtin {
                 dir: ca_dir.clone(),
             },
@@ -95,6 +99,7 @@ name = "allow"
             clients_dir: None,
             policies: policies_path.clone(),
             policies_dir: None,
+            authorization: None,
             log: LogFormat::Text,
             leaf_ttl: 3600,
             leaf_cache_capacity: 4,
@@ -113,6 +118,8 @@ name = "allow"
             connect_tunnel_max_lifetime: 0,
             upstream_pool_capacity: 4,
             http2_max_concurrent_streams: 100,
+            http2_stream_window_size: 32 * 1024 * 1024,
+            http2_connection_window_size: 64 * 1024 * 1024,
             max_request_header_size: 4096,
             max_response_header_size: 4096,
             max_request_body_size: 1024 * 1024,
@@ -148,12 +155,7 @@ name = "allow"
             tls_client_h2_config,
         ));
 
-        Ok(proxy::AppContext::new(
-            Arc::new(settings),
-            policy_store,
-            tls_context,
-            None,
-        ))
+        proxy::AppContext::new(Arc::new(settings), policy_store, tls_context, None).await
     }
 
     fn build_test_client_config() -> ClientConfig {
@@ -179,7 +181,7 @@ name = "allow"
     #[tokio::test]
     async fn parse_errors_return_bad_request() -> Result<()> {
         let temp = TempDir::new()?;
-        let app = build_test_app(&temp)?;
+        let app = build_test_app(&temp).await?;
         let (client_side, server_side) = tokio::io::duplex(1024);
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let mut reader = BufReader::new(server_side);
@@ -196,6 +198,8 @@ name = "allow"
             header_bytes,
             start: Instant::now(),
             fallback_scheme: Scheme::Http,
+            snapshot: app.policies.snapshot(),
+            authorization_token: None,
         };
 
         let result =
@@ -216,7 +220,7 @@ name = "allow"
     #[tokio::test]
     async fn unsupported_expect_header_returns_417() -> Result<()> {
         let temp = TempDir::new()?;
-        let app = build_test_app(&temp)?;
+        let app = build_test_app(&temp).await?;
         let (mut client_side, server_side) = tokio::io::duplex(1024);
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let mut reader = BufReader::new(server_side);
@@ -236,6 +240,8 @@ name = "allow"
             header_bytes,
             start: Instant::now(),
             fallback_scheme: Scheme::Http,
+            snapshot: app.policies.snapshot(),
+            authorization_token: None,
         };
 
         let result =
@@ -255,7 +261,7 @@ name = "allow"
     #[tokio::test]
     async fn oversized_content_length_returns_413() -> Result<()> {
         let temp = TempDir::new()?;
-        let app = build_test_app(&temp)?;
+        let app = build_test_app(&temp).await?;
         let (mut client_side, server_side) = tokio::io::duplex(1024);
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let mut reader = BufReader::new(server_side);
@@ -275,6 +281,8 @@ name = "allow"
             header_bytes,
             start: Instant::now(),
             fallback_scheme: Scheme::Http,
+            snapshot: app.policies.snapshot(),
+            authorization_token: None,
         };
 
         let result =

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use http::StatusCode;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -8,12 +8,10 @@ use crate::logging::AccessLogBuilder;
 use crate::proxy::{
     AppContext,
     connect::ResolvedTarget,
+    forward_error::MisdirectedRequest,
     forward_limits::AllowLogTracker,
     policy_eval::PolicyLogConfig,
-    request::{
-        RequestFlowContext, parse_http1_request, parse_http1_request_origin_form,
-        request_target_for_log, scheme_name,
-    },
+    request::{RequestFlowContext, parse_http1_request, request_target_for_log, scheme_name},
     request_pipeline,
 };
 
@@ -45,6 +43,8 @@ where
         header_bytes: _,
         start,
         fallback_scheme,
+        snapshot,
+        authorization_token,
     } = ctx;
     let request_body_timeout = app.settings.request_body_idle_timeout();
     let response_header_timeout = app.settings.response_header_timeout();
@@ -65,6 +65,7 @@ where
                 StatusCode::EXPECTATION_FAILED,
                 None,
                 b"expectation failed\r\n",
+                None,
                 response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
@@ -96,6 +97,7 @@ where
             StatusCode::PAYLOAD_TOO_LARGE,
             None,
             b"request body exceeds configured limit\r\n",
+            None,
             response_body_timeout,
             total_request_bytes,
             start.elapsed(),
@@ -118,13 +120,35 @@ where
             _ => BodyPlan::Empty,
         }
     };
-    let mut parsed = match if connect_binding.is_some() {
-        parse_http1_request_origin_form(method.clone(), &target, headers.host(), fallback_scheme)
-    } else {
-        parse_http1_request(method.clone(), &target, headers.host(), fallback_scheme)
-    } {
+    let parsed_result =
+        parse_http1_request(method.clone(), &target, headers.host(), fallback_scheme).and_then(
+            |parsed| {
+                if let Some(binding) = connect_binding {
+                    let host = headers
+                        .host()
+                        .ok_or_else(|| anyhow!("request missing Host header"))?;
+                    parsed.validate_host_header(host)?;
+                    binding.validate_request(&parsed)?;
+                }
+                Ok(parsed)
+            },
+        );
+    let mut parsed = match parsed_result {
         Ok(parsed) => parsed,
         Err(err) => {
+            let (status, body, reason) = if err.is::<MisdirectedRequest>() {
+                (
+                    StatusCode::MISDIRECTED_REQUEST,
+                    b"misdirected request\r\n".as_slice(),
+                    "misdirected_request",
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    b"invalid request target\r\n".as_slice(),
+                    "invalid_request_target",
+                )
+            };
             warn!(
                 peer = %peer,
                 target = %logged_target,
@@ -133,9 +157,10 @@ where
             );
             respond_with_access_log(
                 reader.get_mut(),
-                StatusCode::BAD_REQUEST,
+                status,
                 None,
-                b"invalid request target\r\n",
+                body,
+                None,
                 response_body_timeout,
                 total_request_bytes,
                 start.elapsed(),
@@ -144,7 +169,9 @@ where
                     .scheme(scheme_name(fallback_scheme))
                     .host(headers.host().unwrap_or(""))
                     .path(logged_target)
-                    .decision("ERROR"),
+                    .apply_flow_context(flow_context, method.as_str())
+                    .decision("ERROR")
+                    .error_reason(reason),
             )
             .await?;
             return Ok(ClientDisposition::Close);
@@ -153,7 +180,7 @@ where
     if let Some(flow_context) = flow_context {
         parsed.set_flow_context(flow_context.clone());
     }
-    let snapshot = app.policies.snapshot();
+    let policy_authorization_token = authorization_token.clone();
     let log_tracker = AllowLogTracker::new(total_request_bytes, start);
     let mut handler = Http1RequestHandler {
         reader,
@@ -176,6 +203,10 @@ where
         peer,
         &parsed,
         &snapshot,
+        app.authorization
+            .as_deref()
+            .map(|authorization| (authorization, policy_authorization_token.as_ref())),
+        request_deadline.instant(),
         app.settings.log_queries,
         PolicyLogConfig::http1(),
         &mut handler,

@@ -8,7 +8,7 @@ pub mod upstream;
 
 pub use body::{BodyTooLarge, InvalidRequestBody};
 pub(crate) use codec::{Http1HeaderAccumulator, Http1ResponseHead};
-pub use pipeline::{respond_with_access_log, send_response, shutdown_stream};
+pub use pipeline::{respond_with_access_log, shutdown_stream};
 pub use server::{handle_decrypted_https, handle_http};
 
 #[cfg(feature = "fuzzing")]
@@ -41,6 +41,22 @@ pub mod fuzzing {
                 host,
                 crate::config::Scheme::Http,
             );
+            if let Ok(parsed) = crate::proxy::request::parse_http1_request(
+                head.method.clone(),
+                &head.target,
+                host,
+                crate::config::Scheme::Https,
+            ) {
+                let binding = crate::proxy::connect::ResolvedTarget::from_addresses(
+                    "example.com".into(),
+                    443,
+                    vec!["192.0.2.1:443".parse().unwrap()],
+                );
+                if let Some(host) = host {
+                    let _ = parsed.validate_host_header(host);
+                }
+                let _ = binding.validate_request(&parsed);
+            }
             let _ = head.headers.expect_continue();
             let _ = head.headers.content_length();
         }
@@ -56,8 +72,15 @@ pub mod fuzzing {
     where
         S: AsyncRead + Unpin,
     {
-        let _ =
+        let mut head =
             super::codec::read_http1_response_head(reader, timeout, peer, max_header_bytes).await?;
+        let had_zero_length = head.content_length == Some(0);
+        super::forward::normalize_final_response_framing(&mut head)?;
+        if head.status == http::StatusCode::NO_CONTENT {
+            assert!(head.content_length.is_none());
+            assert!(!head.header_map().contains_key(http::header::CONTENT_LENGTH));
+            assert!(!had_zero_length || head.connection_close);
+        }
         Ok(())
     }
 }

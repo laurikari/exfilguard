@@ -121,7 +121,10 @@ pub struct TlsBumpPreflightResult {
     pub client: Arc<str>,
 }
 
-fn evaluate_policy(policy: &super::model::CompiledPolicy, request: &Request) -> Option<Decision> {
+pub(crate) fn evaluate_policy(
+    policy: &super::model::CompiledPolicy,
+    request: &Request,
+) -> Option<Decision> {
     if request.method == Method::CONNECT {
         return evaluate_connect_policy(policy, request);
     }
@@ -158,7 +161,7 @@ fn evaluate_connect_policy(
     None
 }
 
-fn evaluate_tls_bump_preflight_policy(
+pub(crate) fn evaluate_tls_bump_preflight_policy(
     policy: &super::model::CompiledPolicy,
     request: &Request,
 ) -> bool {
@@ -166,7 +169,12 @@ fn evaluate_tls_bump_preflight_policy(
         return false;
     }
     for rule in policy.rules.iter() {
-        if rule.https_mode != HttpsMode::Inspect || rule.methods.is_connect_only() {
+        // Transport setup has observable network side effects, so a deny rule
+        // must not make an otherwise unauthorized authority reachable.
+        if !matches!(&rule.action, RuleAction::Allow)
+            || rule.https_mode != HttpsMode::Inspect
+            || rule.methods.is_connect_only()
+        {
             continue;
         }
         let url_matches = match &rule.url {
@@ -289,6 +297,8 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(policy_refs.into_boxed_slice()),
+            authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         ValidatedConfig::new(Config { clients, policies }).expect("validate config")
@@ -381,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_preflight_allows_when_inspect_rule_has_path() {
+    fn connect_preflight_allows_when_matching_inspect_allow_rule_has_path() {
         let policy = Policy {
             name: Arc::<str>::from("allow-site"),
             rules: Arc::from(
@@ -407,6 +417,8 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -428,6 +440,74 @@ mod tests {
                 .is_none()
         );
         assert!(matcher.evaluate_tls_bump_preflight(client.policies.as_ref(), &request));
+    }
+
+    #[test]
+    fn connect_preflight_rejects_deny_only_inspect_rules() {
+        let deny_action = RuleAction::Deny {
+            status: StatusCode::FORBIDDEN,
+            reason: None,
+            body: Some(Arc::<str>::from("blocked connect")),
+        };
+        let policy = Policy {
+            name: Arc::<str>::from("deny-sites"),
+            rules: Arc::from(
+                vec![
+                    Rule {
+                        id: Arc::<str>::from("deny-sites#0"),
+                        action: deny_action.clone(),
+                        methods: MethodMatch::Any,
+                        url_pattern: Some(UrlPattern {
+                            scheme: Scheme::Https,
+                            host: Arc::<str>::from("*.example.com"),
+                            port: None,
+                            path: Some(Arc::<str>::from("/**")),
+                            original: Arc::<str>::from("https://*.example.com/**"),
+                        }),
+                        https_mode: HttpsMode::Inspect,
+                        cache: None,
+                    },
+                    Rule {
+                        id: Arc::<str>::from("deny-sites#1"),
+                        action: deny_action,
+                        methods: MethodMatch::Any,
+                        url_pattern: None,
+                        https_mode: HttpsMode::Inspect,
+                        cache: None,
+                    },
+                ]
+                .into_boxed_slice(),
+            ),
+        };
+        let config = ValidatedConfig::new(Config {
+            clients: vec![Client {
+                name: Arc::<str>::from("default"),
+                selector: ClientSelector::Fallback,
+                policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
+                max_connections: 1024,
+            }],
+            policies: vec![policy],
+        })
+        .expect("validate config");
+        let compiled = Arc::new(compile_config(&config).expect("compile config"));
+        let matcher = PolicyMatcher::new(compiled.clone());
+        let client = &compiled.clients[0];
+
+        for host in ["api.example.com", "unmatched.example.net"] {
+            let request = Request {
+                method: &Method::CONNECT,
+                scheme: Scheme::Https,
+                host,
+                port: Some(443),
+                path: "/",
+            };
+            assert!(
+                !matcher.evaluate_tls_bump_preflight(client.policies.as_ref(), &request),
+                "deny-only inspect rules authorized preflight for {host}"
+            );
+        }
     }
 
     #[test]
@@ -461,6 +541,8 @@ mod tests {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
             policies: vec![policy],
@@ -498,24 +580,32 @@ mod tests {
                 name: Arc::<str>::from("exact"),
                 selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("cidr24"),
                 selector: ClientSelector::Cidr("10.0.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("cidr_other"),
                 selector: ClientSelector::Cidr("10.1.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: policy_refs.clone(),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];
@@ -555,12 +645,16 @@ mod tests {
                 name: Arc::<str>::from("ipv4-client"),
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: policy_refs.clone(),
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
             Client {
                 name: Arc::<str>::from("default"),
                 selector: ClientSelector::Fallback,
                 policies: policy_refs,
+                authorization_service: None,
+                credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
         ];
@@ -626,6 +720,8 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {
@@ -675,6 +771,8 @@ mod tests {
             name: Arc::<str>::from("default"),
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
+            authorization_service: None,
+            credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
         let config = ValidatedConfig::new(Config {

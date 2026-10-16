@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,7 +20,6 @@ use crate::{
         policy_response::{self, ForwardErrorSpec, ForwardOutcome},
         request::{EffectiveMode, RequestFlowContext},
     },
-    util::is_private_ip,
 };
 
 use super::{
@@ -40,12 +39,12 @@ use super::{
 pub struct ConnectSession {
     peer: SocketAddr,
     parsed: ConnectTarget,
-    literal_ip: Option<IpAddr>,
     target: String,
     session_id: Arc<str>,
     bytes_in: u64,
     start: Instant,
     response_timeout: Duration,
+    authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
 impl ConnectSession {
@@ -56,17 +55,17 @@ impl ConnectSession {
         bytes_in: u64,
         start: Instant,
         response_timeout: Duration,
+        authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
     ) -> Self {
-        let literal_ip = parsed.host.parse::<IpAddr>().ok();
         Self {
             peer,
             parsed,
-            literal_ip,
             target,
             session_id: Arc::<str>::from(Uuid::new_v4().to_string()),
             bytes_in,
             start,
             response_timeout,
+            authorization_token,
         }
     }
 
@@ -78,11 +77,20 @@ impl ConnectSession {
         &self.target
     }
 
+    pub fn request_bytes(&self) -> u64 {
+        self.bytes_in
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
     pub fn bump_flow_context(&self) -> RequestFlowContext {
         RequestFlowContext {
             session_id: self.session_id.clone(),
             outer_method: Arc::<str>::from("CONNECT"),
             effective_mode: EffectiveMode::Bump,
+            authorization_token: self.authorization_token.clone(),
         }
     }
 
@@ -179,48 +187,27 @@ impl ConnectSession {
         stream: &mut TcpStream,
         log: &RequestLogContext<'_>,
     ) -> Result<()> {
-        if self.literal_ip.is_some_and(is_private_ip) {
-            warn!(
-                peer = %self.peer,
-                request_id = log.request_id(),
-                method = log.method(),
-                host = %self.parsed.host,
-                path = log.logged_path(),
-                port = self.parsed.port,
-                "CONNECT target is private network; blocking"
-            );
-            self.respond_with_builder(
-                stream,
-                StatusCode::FORBIDDEN,
-                None,
-                b"CONNECT to private networks is not allowed\r\n",
-                "DENY",
-                |builder| builder.request_id(log.request_id()),
-            )
-            .await
-        } else {
-            warn!(
-                peer = %self.peer,
-                request_id = log.request_id(),
-                method = log.method(),
-                host = %self.parsed.host,
-                path = log.logged_path(),
-                port = self.parsed.port,
-                "no matching CONNECT tunnel policy or TLS bump preflight; default deny"
-            );
-            let spec = policy_response::default_deny_spec();
-            self.respond_with_builder(
-                stream,
-                spec.status,
-                spec.reason,
-                spec.body_http1,
-                "DENY",
-                |builder| {
-                    policy_response::decorate_default_deny_log(builder.request_id(log.request_id()))
-                },
-            )
-            .await
-        }
+        warn!(
+            peer = %self.peer,
+            request_id = log.request_id(),
+            method = log.method(),
+            host = %self.parsed.host,
+            path = log.logged_path(),
+            port = self.parsed.port,
+            "no matching CONNECT tunnel policy or TLS bump preflight; default deny"
+        );
+        let spec = policy_response::default_deny_spec();
+        self.respond_with_builder(
+            stream,
+            spec.status,
+            spec.reason,
+            spec.body_http1,
+            "DENY",
+            |builder| {
+                policy_response::decorate_default_deny_log(builder.request_id(log.request_id()))
+            },
+        )
+        .await
     }
 
     async fn run_splice(
@@ -405,6 +392,7 @@ impl ConnectSession {
             spec.status,
             None,
             spec.body_http1,
+            None,
             self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),
@@ -470,9 +458,16 @@ impl ConnectSession {
                 stream,
                 StatusCode::FORBIDDEN,
                 None,
-                b"CONNECT to private networks is not allowed\r\n",
+                b"upstream address blocked (private_address)\r\n",
                 "DENY",
-                |builder| build(builder.request_id(log.request_id())),
+                |builder| {
+                    build(
+                        builder
+                            .request_id(log.request_id())
+                            .error_reason("private_address")
+                            .error_detail(err.to_string()),
+                    )
+                },
             )
             .await
         } else {
@@ -520,6 +515,7 @@ impl ConnectSession {
             status,
             reason,
             body,
+            None,
             self.response_timeout,
             self.bytes_in,
             self.start.elapsed(),

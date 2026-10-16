@@ -95,22 +95,19 @@ where
             }) => (result, cache_lookup),
             Err(err) => {
                 let kind = classify_forward_error(&err);
-                if let ForwardErrorKind::ResponseAlreadyStarted(started) = &kind {
+                if let ForwardErrorKind::ResponseAlreadyStarted(_) = &kind {
                     crate::metrics::record_upstream_error(kind.as_metric_label());
                     log_forward_error(&kind, &log, &err);
-                    let spec = policy_response::forward_error_spec(&kind);
                     let error_detail = err.to_string();
                     let shutdown_result =
                         shutdown_stream(self.reader.get_mut(), self.response_body_timeout).await;
-                    policy_response::forward_error_log_builder(
+                    policy_response::forward_disconnect_log_builder(
                         log.access_log_builder(),
                         &decision,
-                        &spec,
+                        &kind,
                         &error_detail,
+                        &self.log_tracker,
                     )
-                    .status(started.status)
-                    .bytes(self.log_tracker.current_bytes(), started.bytes_to_client)
-                    .elapsed(self.log_tracker.elapsed())
                     .log();
                     shutdown_result?;
                     return Ok(ClientDisposition::Close);
@@ -155,6 +152,7 @@ where
             response.spec.status,
             response.spec.reason,
             response.spec.body_http1,
+            None,
             self.response_body_timeout,
             self.log_tracker.base_bytes(),
             self.log_tracker.elapsed(),
@@ -175,10 +173,77 @@ where
             response.spec.status,
             response.spec.reason,
             response.spec.body_http1,
+            None,
             self.response_body_timeout,
             self.log_tracker.base_bytes(),
             self.log_tracker.elapsed(),
             response.log_builder,
+        )
+        .await?;
+        Ok(ClientDisposition::Close)
+    }
+
+    async fn on_auth_deny(
+        &mut self,
+        log: policy_eval::RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        super::respond::respond_with_access_log(
+            self.reader.get_mut(),
+            http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            None,
+            b"proxy authentication required\r\n",
+            Some("ExfilGuard"),
+            self.response_body_timeout,
+            self.log_tracker.base_bytes(),
+            self.log_tracker.elapsed(),
+            log.access_log_builder()
+                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .decision("DENY")
+                .error_reason("proxy_authentication"),
+        )
+        .await?;
+        Ok(ClientDisposition::Close)
+    }
+
+    async fn on_authorization_service_error(
+        &mut self,
+        log: policy_eval::RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        super::respond::respond_with_access_log(
+            self.reader.get_mut(),
+            http::StatusCode::BAD_GATEWAY,
+            None,
+            b"authorization service failed\r\n",
+            None,
+            self.response_body_timeout,
+            self.log_tracker.base_bytes(),
+            self.log_tracker.elapsed(),
+            log.access_log_builder()
+                .status(http::StatusCode::BAD_GATEWAY)
+                .decision("ERROR")
+                .error_reason("authorization_service_failed"),
+        )
+        .await?;
+        Ok(ClientDisposition::Close)
+    }
+
+    async fn on_request_timeout(
+        &mut self,
+        log: policy_eval::RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        super::respond::respond_with_access_log(
+            self.reader.get_mut(),
+            http::StatusCode::GATEWAY_TIMEOUT,
+            None,
+            b"request timed out\r\n",
+            None,
+            self.response_body_timeout,
+            self.log_tracker.base_bytes(),
+            self.log_tracker.elapsed(),
+            log.access_log_builder()
+                .status(http::StatusCode::GATEWAY_TIMEOUT)
+                .decision("ERROR")
+                .error_reason("request_timeout"),
         )
         .await?;
         Ok(ClientDisposition::Close)

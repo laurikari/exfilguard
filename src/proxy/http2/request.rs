@@ -110,6 +110,9 @@ fn sanitize_request_parts(
         }
     }
 
+    if let Some(host) = sanitizer.host() {
+        parsed.validate_host_header(host)?;
+    }
     let request_line_bytes = (parsed.method.as_str().len() + parsed.path.len()) as u64;
 
     Ok(SanitizedRequest {
@@ -132,6 +135,7 @@ pub fn sanitize_request_for_fuzz(
         session_id: "fuzz".into(),
         outer_method: "CONNECT".into(),
         effective_mode: crate::proxy::request::EffectiveMode::Bump,
+        authorization_token: None,
     };
     let _ = sanitize_request_parts(method, uri, headers, max_header_bytes, &flow_context)?;
     Ok(())
@@ -201,6 +205,7 @@ mod tests {
             session_id: "test-session".into(),
             outer_method: "CONNECT".into(),
             effective_mode: EffectiveMode::Bump,
+            authorization_token: None,
         };
 
         let sanitized = sanitize_request_parts(&Method::PUT, &uri, &headers, 1024, &flow_context)?;
@@ -212,14 +217,19 @@ mod tests {
     }
 
     #[test]
-    fn build_upstream_uri_preserves_explicit_default_port() -> Result<()> {
-        let uri: Uri = "https://example.com:443/upload".parse()?;
-        let parsed = parse_uri_request(Method::PUT, &uri, Scheme::Https)?;
-        let upstream = super::build_upstream_uri(&parsed)?;
-        assert_eq!(
-            upstream.authority().map(|authority| authority.as_str()),
-            Some("example.com:443")
-        );
+    fn build_upstream_uri_preserves_authority_and_path() -> Result<()> {
+        for authority in [
+            "example.com",
+            "example.com:443",
+            "example.com:8443",
+            "[2001:db8::1]:8443",
+        ] {
+            let uri: Uri = format!("https://{authority}/raw%2fpath?b=2&a=%41").parse()?;
+            let parsed = parse_uri_request(Method::PUT, &uri, Scheme::Https)?;
+            let upstream = super::build_upstream_uri(&parsed)?;
+            assert_eq!(upstream.authority().unwrap().as_str(), authority);
+            assert_eq!(upstream.path_and_query(), uri.path_and_query());
+        }
         Ok(())
     }
 }

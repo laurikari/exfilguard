@@ -5,10 +5,8 @@ mod session;
 mod splice;
 mod target;
 
-pub use self::{
-    handler::{ConnectRequest, handle_connect},
-    resolve::ResolvedTarget,
-};
+pub(crate) use self::handler::{ConnectRequest, handle_connect};
+pub use self::resolve::ResolvedTarget;
 
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {

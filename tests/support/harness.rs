@@ -27,7 +27,9 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         listen,
         proxy_protocol: ProxyProtocolMode::Off,
         proxy_protocol_allowed_cidrs: None,
+        allow_private_upstream_cidrs: Vec::new(),
         proxy_protocol_max_pending_connections: 1024,
+        vault: None,
         ca: CaSettings::Builtin {
             dir: dirs.ca_dir.clone(),
         },
@@ -35,6 +37,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         clients_dir: None,
         policies: dirs.policies_path.clone(),
         policies_dir: None,
+        authorization: None,
         log: LogFormat::Text,
         leaf_ttl: 3_600,
         leaf_cache_capacity: 512,
@@ -53,6 +56,8 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
         connect_tunnel_max_lifetime: 0,
         upstream_pool_capacity: 32,
         http2_max_concurrent_streams: 100,
+        http2_stream_window_size: 32 * 1024 * 1024,
+        http2_connection_window_size: 64 * 1024 * 1024,
         max_request_header_size: 32 * 1024,
         max_response_header_size: 4096,
         max_request_body_size: 0,
@@ -200,11 +205,11 @@ impl ProxyHarnessBuilder {
             proxy_client_config,
             proxy_client_h2_config,
         ));
+        let app = AppContext::new(settings.clone(), policy_store, tls, cache.clone()).await?;
         let app = if self.allow_private_test_upstreams {
-            AppContext::new(settings.clone(), policy_store, tls, cache.clone())
-                .with_permissive_test_upstream_resolver()
+            app.with_permissive_test_upstream_resolver()
         } else {
-            AppContext::new(settings.clone(), policy_store, tls, cache.clone())
+            app
         };
 
         let handle = tokio::spawn(async move {

@@ -2,6 +2,28 @@
 
 This file explains choices that may otherwise look like missing work.
 
+## Fixed HTTP/2 receive windows
+
+ExfilGuard uses configurable HTTP/2 receive windows with per-stream and
+connection-wide limits. Larger windows improve throughput on high-bandwidth,
+high-latency links, but allow more data to accumulate when the receiving
+application is slow.
+
+`proxy::http2::server` configures the windows for receiving client uploads.
+`proxy::http2::upstream` configures them for receiving upstream responses,
+including connections opened during CONNECT preflight.
+
+In `proxy::http2::forward`, `send_data_with_backpressure` waits for capacity on
+the outgoing stream. After forwarding a chunk, the caller releases the
+corresponding capacity on the incoming stream. When the receiver stops reading,
+this eventually stops the sender.
+
+The windows have fixed sizes to keep configuration and flow-control behavior
+simple. ExfilGuard does not estimate bandwidth and latency to adjust them
+automatically. Operators can tune the sizes using the
+[configuration settings](configuration.md#http2). The benchmarks in `perf/h2/`
+measure throughput and memory use with slow readers.
+
 ## Canonical request data for policy
 
 ExfilGuard makes policy decisions from a normalized request view and keeps the
@@ -28,6 +50,20 @@ path wildcard, `\*` is the policy-only spelling for a literal raw asterisk;
 request paths themselves reject backslashes. This keeps raw `*`, encoded `%2A`,
 and literal `%2A` text exactly distinguishable in policy.
 
+## Policy stops at the application-routing boundary
+
+ExfilGuard evaluates the HTTP method and RFC-defined request target that it
+receives on the wire. It does not emulate framework- or origin-specific routing
+transformations. Valid reserved path characters remain part of the canonical
+policy path, retained percent escapes remain encoded, and the original target
+is forwarded unchanged. In particular, semicolon is valid path data, literal
+`;` remains distinct from `%3B`, and `%2F` remains distinct from `/`.
+
+Operators are responsible for making policy rules consistent with downstream
+routing semantics. Guessing application transformations here would reject
+standards-compliant traffic without providing a complete model of arbitrary
+origin rewrites.
+
 ## Reject ambiguous syntax
 
 ExfilGuard rejects malformed or ambiguous HTTP syntax on both sides of the
@@ -38,8 +74,9 @@ That includes cases such as:
 - both `Content-Length` and `Transfer-Encoding`
 - malformed or ambiguously terminated chunk framing
 - malformed CONNECT authorities
-- encoded path separators
+- raw or encoded backslashes
 - encoded dot-segment tricks
+- request targets containing URI-fragment delimiters
 
 Upstream HTTP/1 status lines must use exact CRLF framing and the standard
 `HTTP/1.1 SP 3DIGIT SP [reason-phrase]` grammar. Valid reason-phrase bytes are
@@ -48,6 +85,15 @@ the response is committed downstream.
 
 This is a security choice. ExfilGuard should not quietly “fix” a request into
 a different request or turn a malformed response into a different response.
+
+HTTP/1 origins that send `204 No Content` with one `Content-Length` field whose
+decimal value is zero are a narrow compatibility exception. A 204 ends at the header
+boundary regardless of framing fields, so ExfilGuard removes that redundant
+header before forwarding or caching and sends no body. Nonzero or malformed
+lengths and all `Transfer-Encoding` fields remain errors. The exception closes
+both the upstream and downstream connections, sacrificing keep-alive for this
+nonconforming case so unsolicited origin bytes cannot poison a pooled response.
+Conforming 204 responses retain their existing connection behavior.
 
 ## Close after a committed response fails
 
@@ -95,13 +141,20 @@ this complete key.
 
 When reuse of a pooled HTTP/1 upstream connection fails with an error that
 indicates a stale socket, ExfilGuard retries once on a fresh connection only if
-the request is bodyless and uses a standard idempotent method: `GET`, `HEAD`,
-`OPTIONS`, `TRACE`, `PUT`, or `DELETE`.
+the request is bodyless, no response has started downstream, and it uses a
+standard idempotent method: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, or `DELETE`.
+Response commitment is tracked before attempting the final head write, since
+a failed write may already have delivered bytes. Underlying connection errors
+cannot make a committed response retryable.
 
 The bodyless restriction makes the request locally replayable without buffering.
 The method restriction follows HTTP idempotency semantics when delivery to the
 origin is ambiguous. Non-idempotent methods and extension methods whose
 semantics ExfilGuard cannot establish are not retried automatically.
+
+Requests with service-supplied authentication headers are never retried, even
+when they are bodyless and idempotent. The service prepared those headers for
+one exact request. A retry would have to ask the service for new headers.
 
 ## TLS leaf certificates are cached only in memory
 
@@ -157,11 +210,31 @@ This separation is preferable to accepting partially managed directories or
 guessing an operator's intended lifecycle from whichever files happen to be
 present.
 
+Vault connection, PKI trust, and login settings are global rather than owned by
+the inspection CA. The inspection CA and authorization services use the same
+Vault connection and AppRole because both uses happen inside the same
+ExfilGuard process; separate logins would not isolate them. Vault permissions
+still name separate signing paths: one for the inspection intermediate and one
+leaf-certificate role for each authorization service.
+
 ## HTTPS inspect and tunnel modes
 
-In `inspect` mode, ExfilGuard may do the CONNECT host and port preflight that
-lets it start a bumped TLS session. That does not allow arbitrary inner
-methods or paths. It checks those only after decryption.
+In `inspect` mode, only a matching `ALLOW` rule may authorize the CONNECT host
+and port preflight that lets ExfilGuard start a bumped TLS session. A matching
+`DENY` rule does not authorize transport setup by itself, so deny-only
+authorities fail at the outer CONNECT without opening an upstream connection.
+Preflight does not allow arbitrary inner methods or paths. ExfilGuard checks
+those only after decryption.
+
+Inspected HTTP/1 accepts both origin-form targets and absolute HTTPS URIs.
+Every inspected HTTP/1 or HTTP/2 request must match the CONNECT host and
+effective port and retain the HTTPS scheme before policy evaluation or cache
+lookup. Host comparison uses the canonical destination identity, while
+forwarding preserves the original authority and path/query spelling; absolute
+HTTP/1 targets are sent upstream in origin-form. A conflicting Host header is
+rejected instead of silently changing its meaning. This supports signed
+requests from clients that send absolute-form inside TLS without allowing the
+session to change destinations or bypass inner method/path policy.
 
 In `tunnel` mode, ExfilGuard may open a CONNECT tunnel and leave the payload
 alone.
@@ -185,7 +258,7 @@ request.
 This keeps policy behavior readable. Operators can put specific rules before
 general rules and know what will happen.
 
-## Client identity from source IP and CIDR
+## Client selection and delegated authorization are separate
 
 ExfilGuard identifies a client from the downstream source address. It uses
 exact IP matches, CIDR ranges, and one fallback client.
@@ -208,7 +281,52 @@ separate pending-connection limit bound resource retention if that
 infrastructure stalls or malfunctions before ExfilGuard learns the logical
 client identity.
 
-Other auth or identity methods may come later.
+An authorization token does not select the client and ExfilGuard does not treat
+it as an identity. ExfilGuard first selects the client from its source address.
+The client configuration then says whether to use an authorization service.
+Clients without one continue to use ordinary static policy on the same
+listener.
+
+A client that uses an authorization service sends its token with proxy
+authentication. ExfilGuard keeps the token with the connection. Policy cache
+entries are separated by service, token hash, source address, and audience. A
+missing, invalid, or changed token denies the request. So does an inactive or
+expired service policy. ExfilGuard never falls back to static policy alone.
+
+For inspected HTTPS, the token from `CONNECT` also applies to the decrypted
+requests. ExfilGuard checks the current service policy for each one. It denies
+raw CONNECT tunnels because it cannot see or check the requests inside them.
+
+Both the local policy and the service policy must allow every request. The
+service cannot change local settings. If it asks ExfilGuard to use a credential,
+the reference, destination, headers, and body access must fit a local
+`credential_limit` on the selected client.
+
+Before asking for authentication headers, ExfilGuard resolves and checks the
+destination and builds the exact request it will send. The service may fill only
+the header positions approved by the client configuration. A unique ID and a
+hash of the request tie the reply to that request. ExfilGuard sends nothing to
+the API until this succeeds. A body may be buffered and dechunked only when
+allowed; trailers and `Expect: 100-continue` are rejected.
+
+HTTP/1 connections are pooled separately for each token. Connections used for
+authenticated requests are not returned to the pool. Within one inspected
+HTTP/2 session, authenticated and unauthenticated streams for the same token may
+share one API connection. Service-supplied headers are marked sensitive so
+HTTP/2 header compression does not store their values. Credentials that
+authenticate an entire connection rather than one request are not supported.
+
+Clients that use delegated authorization bypass the shared response cache.
+Requests with service-supplied authentication are also never retried.
+
+An authorization service may use a client certificate loaded from files or a
+client certificate signed by Vault. For Vault, ExfilGuard creates the private
+key and CSR in memory, verifies the returned client-only certificate against
+the globally pinned PKI roots, and renews it halfway through its actual
+lifetime. It builds the replacement HTTPS client before switching new service
+requests to it. Requests already in flight may finish with the previous
+certificate, but no new service request starts with an expired one. The
+inspection intermediate is never reused as a client identity.
 
 ## Block non-public upstreams by default
 
@@ -218,6 +336,13 @@ on the public Internet.
 This reduces SSRF risk. If a client is compromised or misconfigured,
 ExfilGuard should not let it reach internal or special-purpose network space
 unless an operator makes an explicit exception.
+
+`allow_private_upstream_cidrs` provides global, restart-required exceptions.
+`ConfiguredUpstreamResolver` applies them to literal addresses and individual
+DNS results before connection attempts. Request policies still determine access.
+Keeping address exceptions global lets inspected HTTPS validate its destination
+during transport preflight, before the inner request is available for policy
+evaluation.
 
 ## One policy path for all front-ends
 
@@ -278,6 +403,13 @@ If the system trust store is empty, startup fails.
 That rule is strict on purpose. If a host has no trust anchors, the fix is to
 install them.
 
+Vault HTTPS also uses platform trust, with optional additional roots from
+`vault.tls_ca_cert`, rather than a bundled public CA list. This lets operators
+manage Vault transport trust through the host. Authorization-service HTTPS
+remains restricted to its configured `server_ca_cert` roots; platform trust
+must not broaden that service-specific boundary. Neither transport trust store
+replaces the pinned roots used to validate certificates issued by Vault PKI.
+
 ## Debian package provisioning is root-aware and declarative
 
 The Debian package provisions the `exfilguard` system account with
@@ -296,6 +428,22 @@ allow rule enables caching.
 
 ExfilGuard does not cache allowed traffic by default. That keeps response
 storage and freshness changes under explicit operator control.
+
+## Cache freshness does not imply mutation coherence
+
+ExfilGuard makes no attempt to invalidate cached responses when resources are
+modified, even when it observes a successful POST, PUT, or DELETE. When a rule
+enables caching and upstream permits it, responses may be reused for their
+declared freshness lifetime. The existing per-rule fallback lifetime applies
+only when upstream freshness metadata is absent.
+
+Multi-node deployments have independent caches, and mutations can also bypass
+ExfilGuard entirely. Local invalidation would not provide deployment-wide
+consistency, so ExfilGuard deliberately does not implement the mutation-driven
+invalidation required by RFC 9111 section 4.4. It offers freshness-based caching,
+not cache coherence. Operators select cacheable traffic through fine-grained
+allow rules and leave caching disabled where this freshness model is unsuitable.
+Expiration, capacity eviction, and corrupt-entry cleanup remain unchanged.
 
 ## Response cache entries are protocol-neutral
 
@@ -317,9 +465,18 @@ metadata and filesystem overhead still require headroom.
 
 When the staging allowance is exhausted, ExfilGuard abandons only the cache
 copy and continues forwarding the response. It does not slow or reject client
-traffic to protect cache population. HTTP/2 cache file operations on the
-response path are likewise bounded by the response-body idle timeout; a storage
-error or timeout abandons caching without failing the forwarded response.
+traffic to protect cache population. HTTP/1 and HTTP/2 waits for cache file operations
+on the response path are bounded by the response-body idle timeout; a storage
+error or timeout does not fail the forwarded response. File creation and final
+publication retain ownership after the caller stops waiting: they finish or clean
+up in the background, retaining staging reservations while publication runs.
+Publication acquires the shared cache lock within the caller's timeout before
+becoming independent of the request. Timed-out waiters discard their fills;
+only one publication per cache can outlive its caller, without an unbounded
+background queue. That publication may still store an entry after the timeout.
+Client writes and cache payload copies have independent deadlines; no cache
+operation runs inside a client-write idle timeout. Payload copies are sequential
+and bounded rather than queued in a separate background buffering pipeline.
 Same-key fills are not coalesced: that is an upstream-load optimization with
 response-variant complexity, not necessary for bounding temporary disk use.
 
@@ -387,7 +544,12 @@ their setup-time decision until they close or reach their configured lifetime.
 ExfilGuard does not currently support some protocol features, including
 HTTP/1.0 and upgrade-style flows such as WebSocket over HTTP/1.1.
 
-We leave them out because that keeps the code easier to reason about.
+Supporting protocol upgrades would require separate policy, connection-lifetime,
+and forwarding behavior. `proxy::http::dispatch::serve_http_loop` rejects HTTP/1.1
+requests containing an `Upgrade` header or an `upgrade` connection token with
+501 and closes the client connection. This check runs before policy evaluation
+or forwarding, after proxy-token validation. Access logs identify the failure as
+`upgrade_unsupported`. Established CONNECT tunnels remain opaque.
 
 Inspected live forwarding also preserves the HTTP version across the client
 and upstream legs instead of translating between HTTP/1.1 and HTTP/2. The
@@ -413,6 +575,11 @@ idle connection with the connection-idle timeout instead of maintaining a
 second partial HTTP/2 frame parser solely to apply a shorter header deadline.
 This keeps setup and idle retention bounded without imposing a lifetime on
 legitimate active or multiplexed sessions.
+
+After the origin connection closes, graceful downstream shutdown also has one
+`client_keepalive_idle_timeout` interval to finish. On expiry, ExfilGuard drops
+the connection and cancels remaining streams. An unanswered shutdown PING must
+not retain the connection indefinitely.
 
 ## HTTP/2 stream admission follows the origin's limit
 
@@ -458,16 +625,15 @@ request budget.
 
 ## Upstream TCP connection setup has one multi-address budget
 
-`upstream_connect_timeout` bounds one complete TCP connection operation across
-all resolved addresses, rather than granting a fresh timeout to each address.
-ExfilGuard preserves resolver preference within each address family, alternates
-IPv6 and IPv4 candidates, and starts attempts 250 milliseconds apart. The first
-success wins and cancels the remaining attempts.
+`upstream_connect_timeout` sets one deadline for connecting across all resolved
+addresses. ExfilGuard preserves resolver preference within each address family
+and alternates IPv6 and IPv4 candidates. While an attempt is pending,
+`proxy::upstream::race_connection_attempts` starts further attempts 250 milliseconds
+apart. If a failure leaves no attempt pending, it tries the next address
+immediately. The first success cancels the remaining attempts.
 
-There is no fixed address-count cutoff. The total deadline and stagger bound the
-work naturally; candidates whose turn falls beyond the deadline remain
-unattempted. DNS resolution and TLS handshakes retain their own phase-specific
-timeouts.
+All resolved candidates remain eligible until the deadline. DNS resolution and
+TLS handshakes have separate timeouts.
 
 ## Raw CONNECT tunnel idleness is bidirectional
 

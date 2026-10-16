@@ -1,6 +1,7 @@
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,6 +19,7 @@ enum UpstreamBehavior {
 
 pub struct TestUpstream {
     addr: SocketAddr,
+    accepts: Arc<AtomicUsize>,
     handle: JoinHandle<()>,
 }
 
@@ -54,9 +56,15 @@ impl TestUpstream {
         self.addr.port()
     }
 
+    pub fn accept_count(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
     async fn spawn(behavior: UpstreamBehavior) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_counter = accepts.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -64,12 +72,17 @@ impl TestUpstream {
                     Err(_) => break,
                 };
                 let behavior = behavior.clone();
+                accept_counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let _ = handle_connection(&mut stream, behavior).await;
                 });
             }
         });
-        Ok(Self { addr, handle })
+        Ok(Self {
+            addr,
+            accepts,
+            handle,
+        })
     }
 }
 

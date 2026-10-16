@@ -21,20 +21,23 @@ use async_trait::async_trait;
 
 use super::{session::ConnectSession, target::parse_connect_target};
 
-pub struct ConnectRequest<'a> {
-    pub stream: TcpStream,
-    pub prefetched: Vec<u8>,
-    pub peer: SocketAddr,
-    pub target: &'a str,
-    pub snapshot: PolicySnapshot,
-    pub app: &'a AppContext,
-    pub request_bytes: usize,
-    pub start: Instant,
+pub(crate) struct ConnectRequest<'a> {
+    pub(crate) stream: TcpStream,
+    pub(crate) prefetched: Vec<u8>,
+    pub(crate) peer: SocketAddr,
+    pub(crate) target: &'a str,
+    pub(crate) snapshot: PolicySnapshot,
+    pub(crate) app: &'a AppContext,
+    pub(crate) request_bytes: usize,
+    pub(crate) start: Instant,
 }
 
 /// Handles an incoming CONNECT request, delegating policy evaluation to the shared request
 /// pipeline and invoking splice/bump logic via the session handler.
-pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
+pub(crate) async fn handle_connect(
+    ctx: ConnectRequest<'_>,
+    authorization_token: Option<std::sync::Arc<crate::authorization::AuthorizationToken>>,
+) -> Result<()> {
     let ConnectRequest {
         stream,
         prefetched,
@@ -72,6 +75,7 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         request_bytes as u64,
         start,
         response_timeout,
+        authorization_token.clone(),
     );
 
     let parsed_request = ParsedRequest {
@@ -94,11 +98,16 @@ pub async fn handle_connect(ctx: ConnectRequest<'_>) -> Result<()> {
         snapshot: &snapshot,
         parsed_request: &parsed_request,
     };
+    let policy_authorization_token = authorization_token.clone();
 
     request_pipeline::process_request(
         peer,
         &parsed_request,
         &snapshot,
+        app.authorization
+            .as_deref()
+            .map(|authorization| (authorization, policy_authorization_token.as_ref())),
+        None,
         app.settings.log_queries,
         PolicyLogConfig::connect_tunnel(),
         &mut handler,
@@ -144,6 +153,16 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
         outcome: policy_eval::DefaultDenyOutcome<'_>,
     ) -> Result<Self::Output> {
         let request = self.parsed_request.as_policy_request();
+        if self
+            .snapshot
+            .resolve_client(self.peer.ip())
+            .is_some_and(|client| client.authorization_service.is_some())
+        {
+            return self
+                .session
+                .respond_default_denial(self.stream.as_mut().expect("stream present"), &outcome.log)
+                .await;
+        }
         if let Some(preflight) = self
             .snapshot
             .evaluate_tls_bump_preflight(self.peer.ip(), &request)
@@ -165,6 +184,65 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
             .respond_default_denial(self.stream.as_mut().expect("stream present"), &outcome.log)
             .await
     }
+
+    async fn on_tls_bump_preflight(
+        &mut self,
+        outcome: policy_eval::TlsBumpPreflightOutcome<'_>,
+    ) -> Result<Self::Output> {
+        let stream = self.stream.take().expect("stream present");
+        let prefetched = self.prefetched.take().expect("prefetched bytes present");
+        self.session
+            .process_tls_bump_preflight(stream, prefetched, outcome.client, outcome.log, self.app)
+            .await
+    }
+
+    async fn on_auth_deny(
+        &mut self,
+        log: policy_eval::RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        self.respond_auth_deny(log).await
+    }
+
+    async fn on_authorization_service_error(
+        &mut self,
+        log: policy_eval::RequestLogContext<'_>,
+    ) -> Result<Self::Output> {
+        respond_with_access_log(
+            self.stream.as_mut().expect("stream present"),
+            StatusCode::BAD_GATEWAY,
+            None,
+            b"authorization service failed\r\n",
+            None,
+            self.app.settings.response_body_idle_timeout(),
+            self.session.request_bytes(),
+            self.session.elapsed(),
+            log.access_log_builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .decision("ERROR")
+                .error_reason("authorization_service_failed"),
+        )
+        .await
+    }
+}
+
+impl ConnectRequestHandler<'_> {
+    async fn respond_auth_deny(&mut self, log: policy_eval::RequestLogContext<'_>) -> Result<()> {
+        respond_with_access_log(
+            self.stream.as_mut().expect("stream present"),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            None,
+            b"proxy authentication required\r\n",
+            Some("ExfilGuard"),
+            self.app.settings.response_body_idle_timeout(),
+            self.session.request_bytes(),
+            self.session.elapsed(),
+            log.access_log_builder()
+                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .decision("DENY")
+                .error_reason("proxy_authentication"),
+        )
+        .await
+    }
 }
 
 async fn respond_invalid_connect_target(
@@ -180,6 +258,7 @@ async fn respond_invalid_connect_target(
         StatusCode::BAD_REQUEST,
         None,
         b"invalid CONNECT target\r\n",
+        None,
         response_timeout,
         bytes_in,
         start.elapsed(),

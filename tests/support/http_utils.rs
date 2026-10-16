@@ -31,6 +31,9 @@ where
         }
     }
     let head_str = String::from_utf8(head.clone()).context("invalid UTF-8 response headers")?;
+    if head_str.starts_with("HTTP/1.1 204 ") {
+        return Ok(head_str);
+    }
     let content_length = extract_content_length(&head_str)?;
     let mut body = vec![0u8; content_length];
     if content_length > 0 {

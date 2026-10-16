@@ -9,7 +9,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
+use zeroize::Zeroizing;
 
+use crate::authorization::FinalizedRequestV1;
 use crate::io_util::{CountingWriter, write_all_with_timeout};
 use crate::proxy::AppContext;
 use crate::proxy::forward_error::{RequestTimeout, ResponseAlreadyStarted};
@@ -90,13 +92,18 @@ pub(super) async fn forward_with_connection<S>(
     max_response_header_bytes: usize,
     decision: &AllowDecision,
     app: &AppContext,
+    finalized: Option<FinalizedRequestV1>,
 ) -> Result<(ForwardStats, bool, bool)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request_deadline = request_deadline.instant();
-    let request_bytes =
-        build_upstream_request(request, headers, request_close, &body_plan, expect_continue);
+    let request_bytes = Zeroizing::new(match finalized.as_ref() {
+        Some(finalized) => finalized.encode_http1_head(),
+        None => {
+            build_upstream_request(request, headers, request_close, &body_plan, expect_continue)
+        }
+    });
     let upstream_request_instant = Instant::now();
     write_all_with_timeout(
         &mut connection.stream,
@@ -105,44 +112,58 @@ where
         "sending request headers to upstream",
     )
     .await?;
+    drop(request_bytes);
 
-    send_continue_if_needed(
-        client_reader.get_mut(),
-        expect_continue,
-        body_plan,
-        timeouts.request_io,
-    )
-    .await?;
-
-    let mut client_body_bytes = 0u64;
-    match body_plan {
-        BodyPlan::Empty => {}
-        BodyPlan::Fixed(length) => {
-            client_body_bytes = stream_fixed_body(
-                client_reader,
+    let client_body_bytes = if let Some(finalized) = finalized.as_ref() {
+        if let Some(body) = finalized.body() {
+            write_all_with_timeout(
                 &mut connection.stream,
-                length,
+                body,
                 timeouts.request_io,
-                timeouts.request_io,
-                request_deadline,
+                "sending finalized request body to upstream",
             )
             .await?;
         }
-        BodyPlan::Chunked => {
-            client_body_bytes = stream_chunked_body(
-                client_reader,
-                &mut connection.stream,
-                timeouts.request_io,
-                timeouts.request_io,
-                request_deadline,
-                peer,
-                max_request_body_size,
-                app.settings.max_request_header_size,
-            )
-            .await?;
-        }
-    }
+        finalized.client_body_wire_bytes()
+    } else {
+        send_continue_if_needed(
+            client_reader.get_mut(),
+            expect_continue,
+            body_plan,
+            timeouts.request_io,
+        )
+        .await?;
 
+        match body_plan {
+            BodyPlan::Empty => 0,
+            BodyPlan::Fixed(length) => {
+                stream_fixed_body(
+                    client_reader,
+                    &mut connection.stream,
+                    length,
+                    timeouts.request_io,
+                    timeouts.request_io,
+                    request_deadline,
+                )
+                .await?
+            }
+            BodyPlan::Chunked => {
+                stream_chunked_body(
+                    client_reader,
+                    &mut connection.stream,
+                    timeouts.request_io,
+                    timeouts.request_io,
+                    request_deadline,
+                    peer,
+                    max_request_body_size,
+                    app.settings.max_request_header_size,
+                )
+                .await?
+            }
+        }
+    };
+
+    drop(finalized);
     timeout_with_context(
         timeouts.request_io,
         connection.stream.flush(),

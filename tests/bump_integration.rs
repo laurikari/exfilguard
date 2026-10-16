@@ -92,6 +92,51 @@ fn log_field_value(line: &str, field: &str) -> Option<String> {
     }
 }
 
+async fn wait_for_bumped_upstream_requests(
+    fixture: &BumpedTlsFixture,
+    expected: usize,
+) -> Result<()> {
+    timeout(StdDuration::from_secs(2), async {
+        while fixture.request_count() < expected {
+            sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for {expected} upstream HTTP/2 requests"))?;
+    Ok(())
+}
+
+fn bumped_h2_request(authority: &str, method: Method, path: &str) -> Result<http::Request<()>> {
+    Ok(http::Request::builder()
+        .method(method)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority)
+                .path_and_query(path)
+                .build()?,
+        )
+        .body(())?)
+}
+
+async fn wait_for_bumped_cache_entry(fixture: &BumpedTlsFixture, uri: &Uri) -> Result<()> {
+    let cache = fixture.cache();
+    timeout(StdDuration::from_secs(2), async {
+        loop {
+            if cache
+                .lookup(&Method::GET, uri, &http::HeaderMap::new())
+                .await
+                .is_some()
+            {
+                return;
+            }
+            sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for cache entry: {uri}"))
+}
+
 async fn proxy_response_for_raw_upstream_response(upstream_response: Vec<u8>) -> Result<String> {
     let upstream = TestUpstream::http_response(upstream_response).await?;
     let upstream_port = upstream.port();
@@ -187,8 +232,8 @@ async fn http_private_ip_blocked_by_default() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("request blocked by policy"),
-        "expected policy block body, got: {response}"
+        response.contains("upstream address blocked (private_address)"),
+        "expected address block body, got: {response}"
     );
 
     client.shutdown().await;
@@ -499,6 +544,162 @@ async fn malformed_upstream_header_line_endings_are_rejected_before_forwarding()
     }
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_accepts_zero_length_no_content_for_get_and_delete() -> Result<()> {
+    for method in ["GET", "DELETE"] {
+        let mut fixture = no_content_fixture(false).await?;
+        let response = request_no_content_path(&mut fixture, method, "/zero").await?;
+        assert_empty_no_content(&response);
+        assert!(response.contains("ETag: \"kept\""), "{response}");
+        assert!(response.contains("Connection: close"), "{response}");
+        let mut trailing = Vec::new();
+        timeout(
+            StdDuration::from_secs(2),
+            fixture.tls_stream_mut().read_to_end(&mut trailing),
+        )
+        .await??;
+        assert!(
+            trailing.is_empty(),
+            "unexpected response body: {trailing:?}"
+        );
+        assert_eq!(fixture.request_count(), 1);
+        fixture.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_rejects_unsafe_no_content_framing() -> Result<()> {
+    for path in ["/nonzero", "/chunked", "/both"] {
+        for method in ["GET", "DELETE"] {
+            let mut fixture = no_content_fixture(false).await?;
+            let response = request_no_content_path(&mut fixture, method, path).await?;
+            assert!(response.starts_with("HTTP/1.1 502"), "{path}: {response}");
+            assert!(!response.contains("204 No Content"), "{path}: {response}");
+            fixture.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_conforming_no_content_preserves_keepalive() -> Result<()> {
+    let mut fixture = no_content_fixture(false).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/plain").await?;
+    assert_empty_no_content(&response);
+    assert!(!response.to_ascii_lowercase().contains("connection: close"));
+    let connections = fixture.accept_count();
+    let response = request_no_content_path(&mut fixture, "GET", "/after").await?;
+    assert!(response.ends_with("\r\n\r\nreal"), "{response}");
+    assert_eq!(fixture.accept_count(), connections);
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_zero_length_no_content_does_not_poison_next_response() -> Result<()> {
+    let mut fixture = no_content_fixture(false).await?;
+    let response = request_no_content_path(&mut fixture, "DELETE", "/poison").await?;
+    assert_empty_no_content(&response);
+    let mut trailing = Vec::new();
+    timeout(
+        StdDuration::from_secs(2),
+        fixture.tls_stream_mut().read_to_end(&mut trailing),
+    )
+    .await??;
+    assert!(
+        trailing.is_empty(),
+        "injected response escaped: {trailing:?}"
+    );
+    let connections = fixture.accept_count();
+    fixture.reconnect(ClientProtocols::Http1).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/after").await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("\r\n\r\nreal"), "{response}");
+    assert!(!response.contains("poison"), "{response}");
+    assert!(fixture.accept_count() > connections);
+    assert_eq!(fixture.request_count(), 2);
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_caches_normalized_no_content() -> Result<()> {
+    let mut fixture = no_content_fixture(true).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/zero").await?;
+    assert_empty_no_content(&response);
+    // Wait for completion of the cache write and retirement of the connection.
+    let mut trailing = Vec::new();
+    timeout(
+        StdDuration::from_secs(2),
+        fixture.tls_stream_mut().read_to_end(&mut trailing),
+    )
+    .await??;
+    assert!(trailing.is_empty());
+    let uri: Uri = format!("https://localhost:{}/zero", fixture.upstream_addr().port()).parse()?;
+    let cached = fixture
+        .cache()
+        .lookup(&Method::GET, &uri, &http::HeaderMap::new())
+        .await
+        .context("204 was not cached")?;
+    assert_eq!(cached.status, StatusCode::NO_CONTENT);
+    assert_eq!(cached.content_length, 0);
+    assert!(!cached.headers.contains_key(http::header::CONTENT_LENGTH));
+    fixture.reconnect(ClientProtocols::Http1).await?;
+    let response = request_no_content_path(&mut fixture, "GET", "/zero").await?;
+    assert_empty_no_content(&response);
+    assert_eq!(
+        fixture.request_count(),
+        1,
+        "second response was not a cache hit"
+    );
+    fixture.shutdown().await;
+    Ok(())
+}
+
+async fn no_content_fixture(cache: bool) -> Result<BumpedTlsFixture> {
+    let rule = RuleSpec::allow(&["GET", "DELETE"], "https://localhost/**");
+    let policy =
+        PolicySpec::new("allow-no-content").rule(if cache { rule.cache_enabled() } else { rule });
+    let mut options = BumpedTlsOptions::new("localhost", "allow-no-content", policy)
+        .upstream_mode(UpstreamMode::Http1NoContent);
+    if cache {
+        options = options.with_cache();
+    }
+    BumpedTlsFixture::new(options).await
+}
+
+async fn request_no_content_path(
+    fixture: &mut BumpedTlsFixture,
+    method: &str,
+    path: &str,
+) -> Result<String> {
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+        fixture.upstream_addr().port()
+    );
+    let mut client = fixture.http1_client();
+    client.send(request).await?;
+    client.read_response_with_length().await
+}
+
+fn assert_empty_no_content(response: &str) {
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content\r\n"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("content-length"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("transfer-encoding"),
+        "{response}"
+    );
+    assert!(response.ends_with("\r\n\r\n"), "{response}");
+    assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1130,6 +1331,49 @@ async fn connect_default_deny_returns_403() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_inspect_deny_does_not_authorize_transport_preflight() -> Result<()> {
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["deny-only"])
+        .policy(
+            PolicySpec::new("deny-only").rule(
+                RuleSpec::deny(&["ANY"], format!("https://*:{}/**", upstream_addr.port()))
+                    .status(470)
+                    .body("inner request denied"),
+            ),
+        )
+        .render();
+
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    let request = format!(
+        "CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+        port = upstream_addr.port()
+    );
+    client.send(request).await?;
+
+    let response = client.read_headers().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "deny-only inspect rule authorized CONNECT preflight: {response}"
+    );
+    assert!(
+        timeout(StdDuration::from_millis(100), upstream_listener.accept())
+            .await
+            .is_err(),
+        "deny-only inspect rule caused an upstream connection"
+    );
+
+    client.shutdown().await;
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_equivalent_ipv6_spelling_hits_ordered_deny() -> Result<()> {
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
@@ -1199,7 +1443,7 @@ async fn connect_hostname_private_resolution_is_blocked() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("CONNECT to private networks is not allowed"),
+        response.contains("upstream address blocked (private_address)"),
         "expected private network denial message, got: {response}"
     );
 
@@ -1239,7 +1483,7 @@ async fn connect_bumped_private_resolution_is_blocked() -> Result<()> {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("CONNECT to private networks is not allowed"),
+        response.contains("upstream address blocked (private_address)"),
         "expected private network denial message, got: {response}"
     );
 
@@ -1324,7 +1568,7 @@ async fn connect_splice_preserves_pipelined_payload() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_blocks_private_ip_targets() -> Result<()> {
+async fn connect_private_ip_without_policy_reports_default_denial() -> Result<()> {
     let log_capture = LogCapture::new("info").await;
     let dirs = TestDirs::new()?;
     let (clients, policies) = TestConfigBuilder::new()
@@ -1349,13 +1593,13 @@ async fn connect_blocks_private_ip_targets() -> Result<()> {
         "unexpected private IP response: {response}"
     );
     assert!(
-        response.contains("CONNECT to private networks is not allowed"),
-        "missing private network warning body: {response}"
+        response.contains("request blocked by policy"),
+        "missing policy denial body: {response}"
     );
     let logs = log_capture.text();
     assert!(
-        logs.contains("CONNECT target is private network; blocking"),
-        "expected private CONNECT block log entry, got: {logs}"
+        logs.contains("default deny"),
+        "expected default denial log entry, got: {logs}"
     );
 
     stream.shutdown().await.ok();
@@ -1644,6 +1888,89 @@ async fn http_keepalive_retries_stale_upstream_connection() -> Result<()> {
 
     harness.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_keepalive_does_not_retry_after_response_body_reset() -> Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let origin = listener.local_addr()?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["allow-local"])
+        .policy(
+            PolicySpec::new("allow-local")
+                .rule(RuleSpec::allow(&["GET"], format!("http://{origin}/**"))),
+        )
+        .render();
+    let harness = ProxyHarnessBuilder::with_dirs(TestDirs::new()?, &clients, &policies)
+        .spawn()
+        .await?;
+
+    let (reset_tx, reset_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let warm = read_until_double_crlf(&mut stream).await?;
+        assert!(warm.starts_with("GET /warm "), "{warm}");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nwarm")
+            .await?;
+        let request = read_until_double_crlf(&mut stream).await?;
+        assert!(request.starts_with("GET /reset "), "{request}");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+            .await?;
+
+        // Wait until the client has received the prefix, so the reset cannot
+        // discard the response head and accidentally exercise a stale socket.
+        reset_rx.await?;
+        #[allow(deprecated)]
+        stream.set_linger(Some(StdDuration::ZERO))?;
+        drop(stream);
+
+        let retried = tokio::select! {
+            _ = stop_rx => false,
+            accepted = listener.accept() => {
+                let (mut stream, _) = accepted?;
+                let _ = read_until_double_crlf(&mut stream).await?;
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nretry"
+                ).await?;
+                true
+            }
+        };
+        Ok::<_, anyhow::Error>(retried)
+    });
+
+    let mut client = TcpStream::connect(harness.addr).await?;
+    client
+        .write_all(
+            format!("GET http://{origin}/warm HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    let warm = read_http_response(&mut client).await?;
+    assert!(warm.ends_with("warm"), "{warm}");
+    client
+        .write_all(
+            format!("GET http://{origin}/reset HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    let head = read_until_double_crlf(&mut client).await?;
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    let mut prefix = [0; 7];
+    timeout(StdDuration::from_secs(3), client.read_exact(&mut prefix)).await??;
+    assert_eq!(&prefix, b"partial");
+    reset_tx
+        .send(())
+        .expect("upstream should be waiting to reset");
+
+    let tail = read_tunnel_tail(&mut client).await?;
+    let _ = stop_tx.send(());
+    let retried = timeout(StdDuration::from_secs(3), upstream_task).await???;
+    harness.shutdown().await;
+
+    assert!(!retried, "a committed response must not be retried");
+    assert!(tail.is_empty(), "a second response was appended: {tail:?}");
     Ok(())
 }
 
@@ -1979,35 +2306,24 @@ async fn connect_bump_allows_large_streamed_upload_with_default_unlimited_body_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_bump_rejects_absolute_form_targets() -> Result<()> {
-    let upstream_host = "localhost";
-    let policy_name = "allow-bump";
-    let policy = PolicySpec::new(policy_name)
-        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
-    let mut fixture =
-        BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
-    let upstream_addr = fixture.upstream_addr();
-    let mut client = fixture.http1_client();
-    let request = format!(
-        "GET http://{host}:{port}/absolute HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
-        host = upstream_host,
-        port = upstream_addr.port()
-    );
-    client.send(request.as_bytes()).await?;
-
-    let response = client.read_response().await?;
-    assert!(
-        response.starts_with("HTTP/1.1 400"),
-        "unexpected bumped response: {response}"
-    );
-    assert!(
-        response.contains("invalid request target"),
-        "expected target rejection body, got: {response}"
-    );
-
-    client.stream_mut().shutdown().await.ok();
-    fixture.shutdown().await;
-
+async fn connect_bump_rejects_invalid_host_ports() -> Result<()> {
+    for port in ["wat", "65536", "+443", ""] {
+        let policy =
+            PolicySpec::new("invalid-port").rule(RuleSpec::allow_any("https://localhost/**"));
+        let mut fixture =
+            BumpedTlsFixture::new(BumpedTlsOptions::new("localhost", "invalid-port", policy))
+                .await?;
+        let mut client = fixture.http1_client();
+        client
+            .send(format!(
+                "GET / HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+            ))
+            .await?;
+        let response = client.read_response().await?;
+        assert!(response.starts_with("HTTP/1.1 400"), "{port}: {response}");
+        assert_eq!(fixture.request_count(), 0);
+        fixture.shutdown().await;
+    }
     Ok(())
 }
 
@@ -2037,6 +2353,52 @@ async fn connect_bump_uses_canonical_policy_path_and_forwards_raw_target() -> Re
     assert!(
         response.contains("/alias/../c%61nonical/report?sig=abc"),
         "expected upstream to see raw request target, got: {response}"
+    );
+
+    client.stream_mut().shutdown().await.ok();
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http1_accepts_npm_encoded_slash_without_rewriting_target() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-npm-scoped-package";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET"],
+        format!("https://{upstream_host}/@scope%2Fpackage"),
+    ));
+    let mut fixture =
+        BumpedTlsFixture::new(BumpedTlsOptions::new(upstream_host, policy_name, policy)).await?;
+    let upstream_addr = fixture.upstream_addr();
+    let authority = format!("{upstream_host}:{}", upstream_addr.port());
+    let mut client = fixture.http1_client();
+
+    let encoded_request =
+        format!("GET /@scope%2fpackage?write=true HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(encoded_request).await?;
+    let encoded_response = client.read_response_with_length().await?;
+    assert!(
+        encoded_response.starts_with("HTTP/1.1 200"),
+        "lowercase encoded slash did not match the canonical policy pattern: {encoded_response}"
+    );
+    let (_, encoded_body) = encoded_response
+        .split_once("\r\n\r\n")
+        .context("encoded-slash response missing head terminator")?;
+    assert_eq!(
+        encoded_body, "/@scope%2fpackage?write=true",
+        "upstream did not receive the original npm request target"
+    );
+
+    let literal_request = format!(
+        "GET /@scope/package?write=true HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    );
+    client.send(literal_request).await?;
+    let literal_response = client.read_response_with_length().await?;
+    assert!(
+        literal_response.starts_with("HTTP/1.1 403"),
+        "literal slash unexpectedly matched the encoded-slash rule: {literal_response}"
     );
 
     client.stream_mut().shutdown().await.ok();
@@ -2187,6 +2549,60 @@ async fn connect_bump_rejects_h2_only_client_when_upstream_http1_only() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http1_closes_unused_http2_probe() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "close-unused-h2-probe";
+    let policy = PolicySpec::new(policy_name)
+        .rule(
+            RuleSpec::deny(
+                &["GET"],
+                format!("https://{upstream_host}/downstream-still-open"),
+            )
+            .status(451)
+            .body("downstream session remained open"),
+        )
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http1)
+            .upstream_mode(UpstreamMode::Http2),
+    )
+    .await?;
+    let upstream_addr = fixture.upstream_addr();
+
+    fixture
+        .wait_for_upstream_close(StdDuration::from_secs(2))
+        .await?;
+
+    let mut client = fixture.http1_client();
+    assert_eq!(
+        client.stream().get_ref().1.alpn_protocol(),
+        Some(&b"http/1.1"[..])
+    );
+    let request = format!(
+        "GET /downstream-still-open HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
+        host = upstream_host,
+        port = upstream_addr.port(),
+    );
+    client.send(request).await?;
+    let response = client.read_response().await?;
+    assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+    assert!(
+        response.contains("downstream session remained open"),
+        "{response}"
+    );
+    client.stream_mut().shutdown().await.ok();
+
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "the denied request must not open another origin connection"
+    );
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_supports_http2() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2";
@@ -2255,6 +2671,168 @@ async fn connect_bump_supports_http2() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_forwards_authority_without_host() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-authority";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2Inspect),
+    )
+    .await?;
+    let authority = format!("{upstream_host}:{}", fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+    let path = "/raw%2fpath?b=2&a=%41";
+    let body = Bytes::from_static(b"hello world");
+
+    for include_host in [false, true] {
+        let mut request = bumped_h2_request(&authority, Method::PUT, path)?;
+        request.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string())?,
+        );
+        if include_host {
+            request
+                .headers_mut()
+                .insert(http::header::HOST, HeaderValue::from_str(&authority)?);
+        }
+        let (status, response) = client.request_text_with_body(request, body.clone()).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response,
+            format!(
+                "authority={authority}\npath={path}\nhost-present=false\ncontent-length=11\nbody-len=11\nbody=hello world"
+            ),
+            "incoming Host present: {include_host}"
+        );
+    }
+
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "expected upstream connection reuse"
+    );
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_client_reset_preserves_other_streams() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-client-reset";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2StreamIsolation),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let (cancelled_response, mut cancelled_body) = client.start_request_with_open_body(
+        bumped_h2_request(&authority, Method::PUT, "/client-reset")?,
+    )?;
+    wait_for_bumped_upstream_requests(&fixture, 1).await?;
+
+    let survivor_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/survivor")?)?;
+    wait_for_bumped_upstream_requests(&fixture, 2).await?;
+
+    cancelled_body.send_reset(h2::Reason::CANCEL);
+    let reset_error = timeout(StdDuration::from_secs(2), cancelled_response)
+        .await
+        .context("timed out waiting for cancelled downstream HTTP/2 stream")?
+        .expect_err("cancelled downstream HTTP/2 stream returned a response");
+    assert!(reset_error.is_reset());
+
+    let release_response = client.start_request(bumped_h2_request(
+        &authority,
+        Method::GET,
+        "/release-after-client-reset",
+    )?)?;
+    let release_response = timeout(StdDuration::from_secs(2), release_response)
+        .await
+        .context("timed out waiting for release HTTP/2 response")??;
+    assert_eq!(release_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(release_response.into_body()).await?,
+        "/release-after-client-reset"
+    );
+
+    let survivor_response = timeout(StdDuration::from_secs(2), survivor_response)
+        .await
+        .context("timed out waiting for surviving HTTP/2 stream")??;
+    assert_eq!(survivor_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(survivor_response.into_body()).await?,
+        "/survivor"
+    );
+    assert_eq!(fixture.accept_count(), 1);
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_origin_reset_preserves_other_streams() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-origin-reset";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2StreamIsolation),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let survivor_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/survivor")?)?;
+    wait_for_bumped_upstream_requests(&fixture, 1).await?;
+
+    let reset_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/origin-reset")?)?;
+    let reset_error = timeout(StdDuration::from_secs(2), reset_response)
+        .await
+        .context("timed out waiting for origin HTTP/2 stream reset")?
+        .expect_err("origin-reset HTTP/2 stream returned a response");
+    assert!(reset_error.is_reset());
+
+    let release_response =
+        client.start_request(bumped_h2_request(&authority, Method::GET, "/release")?)?;
+    let release_response = timeout(StdDuration::from_secs(2), release_response)
+        .await
+        .context("timed out waiting for release HTTP/2 response")??;
+    assert_eq!(release_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(release_response.into_body()).await?,
+        "/release"
+    );
+
+    let survivor_response = timeout(StdDuration::from_secs(2), survivor_response)
+        .await
+        .context("timed out waiting for surviving HTTP/2 stream")??;
+    assert_eq!(survivor_response.status(), StatusCode::OK);
+    assert_eq!(
+        BumpedH2Client::read_body(survivor_response.into_body()).await?,
+        "/survivor"
+    );
+    assert_eq!(fixture.accept_count(), 1);
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_cache_miss_then_hit() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "cache-h2";
@@ -2284,7 +2862,7 @@ async fn connect_bump_http2_cache_miss_then_hit() -> Result<()> {
     assert_eq!(first_status, StatusCode::OK);
     assert_eq!(first_body, "request=1\npath=/h2/cached\nbody=");
 
-    sleep(StdDuration::from_millis(50)).await;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     let second = http::Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -2337,18 +2915,13 @@ async fn bumped_cache_reuses_http1_chunk_payload_for_http2() -> Result<()> {
     }
     assert_eq!(fixture.request_count(), 1);
 
-    sleep(StdDuration::from_millis(50)).await;
+    let uri: Uri = format!("https://{authority}/cross/h1-to-h2").parse()?;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     fixture.reconnect(ClientProtocols::Http2Preferred).await?;
     let mut client = fixture.h2_client().await?;
     let request = http::Request::builder()
         .method(Method::GET)
-        .uri(
-            Uri::builder()
-                .scheme("https")
-                .authority(authority.as_str())
-                .path_and_query("/cross/h1-to-h2")
-                .build()?,
-        )
+        .uri(uri)
         .body(())?;
     let (status, body) = client.request_text(request).await?;
     assert_eq!(status, StatusCode::OK);
@@ -2392,7 +2965,7 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
     let mut h2_client = fixture.h2_client().await?;
     let first = http::Request::builder()
         .method(Method::GET)
-        .uri(uri)
+        .uri(uri.clone())
         .body(())?;
     let (status, body) = h2_client.request_text(first).await?;
     assert_eq!(status, StatusCode::OK);
@@ -2400,7 +2973,7 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
     assert_eq!(fixture.request_count(), 1);
     h2_client.shutdown().await;
 
-    sleep(StdDuration::from_millis(50)).await;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     fixture.reconnect(ClientProtocols::Http1).await?;
     let mut client = fixture.http1_client();
     let request =
@@ -2477,7 +3050,7 @@ async fn connect_bump_http2_body_requests_bypass_cache() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(cached_body, "request=3\npath=/h2/body\nbody=");
 
-    sleep(StdDuration::from_millis(50)).await;
+    wait_for_bumped_cache_entry(&fixture, &uri).await?;
     let second_bodyless = http::Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -2757,6 +3330,60 @@ async fn connect_bump_http2_encoded_unreserved_hits_ordered_deny() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_accepts_npm_encoded_slash_as_distinct_path_data() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-npm-scoped-package";
+    let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
+        &["GET"],
+        format!("https://{upstream_host}/@scope%2Fpackage"),
+    ));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2),
+    )
+    .await?;
+    let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+
+    let encoded_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/@scope%2fpackage")
+                .build()?,
+        )
+        .body(())?;
+    let (encoded_status, encoded_body) = client.request_text(encoded_request).await?;
+    assert_eq!(encoded_status, StatusCode::OK);
+    assert_eq!(
+        encoded_body, "/@scope%2fpackage",
+        "HTTP/2 upstream did not receive the original encoded path"
+    );
+
+    let literal_request = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/@scope/package")
+                .build()?,
+        )
+        .body(())?;
+    let (literal_status, literal_body) = client.request_text(literal_request).await?;
+    assert_eq!(literal_status, StatusCode::FORBIDDEN);
+    assert_eq!(literal_body, "request blocked by policy");
+
+    client.shutdown().await;
+    fixture.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_closes_request_idle_session() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-idle";
@@ -2946,7 +3573,7 @@ async fn connect_bump_http2_disconnects_when_upstream_closes_before_response() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result<()> {
+async fn connect_bump_http2_response_header_timeout_preserves_session() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-timeout";
     let policy = PolicySpec::new(policy_name)
@@ -2975,11 +3602,30 @@ async fn connect_bump_http2_disconnects_on_upstream_response_timeout() -> Result
         )
         .body(())?;
 
-    let _ = client
-        .request_text(request)
-        .await
-        .expect_err("expected downstream disconnect after upstream response timeout");
-    client.wait_closed(StdDuration::from_secs(2)).await?;
+    let (status, body) = timeout(StdDuration::from_secs(2), client.request_text(request)).await??;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body, "request timed out");
+
+    let follow_up = http::Request::builder()
+        .method(Method::GET)
+        .uri(
+            Uri::builder()
+                .scheme("https")
+                .authority(authority.as_str())
+                .path_and_query("/h2/after-timeout")
+                .build()?,
+        )
+        .body(())?;
+    let (status, body) =
+        timeout(StdDuration::from_secs(2), client.request_text(follow_up)).await??;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "/h2/after-timeout");
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "upstream H2 session was replaced"
+    );
+
     client.shutdown().await;
 
     fixture.shutdown().await;
@@ -3532,4 +4178,107 @@ fn extract_content_length(head: &str) -> Result<usize> {
         }
     }
     Ok(0)
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_rejects_truncated_response_during_upload() -> Result<()> {
+    let policy_name = "review-truncated-upload";
+    let policy =
+        PolicySpec::new(policy_name).rule(RuleSpec::allow(&["PUT"], "https://localhost/**"));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new("localhost", policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2EarlyResponse)
+            .with_settings(|settings| {
+                settings.request_body_idle_timeout = 5;
+                settings.response_header_timeout = 2;
+            }),
+    )
+    .await?;
+    let authority = format!("localhost:{}", fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+    let request = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("https://{authority}/truncated"))
+        .body(())?;
+    // Retain the upload handle without sending END_STREAM, guaranteeing the
+    // upstream response arrives while the request upload remains active.
+    let (response, upload) = client.start_request_with_open_body(request)?;
+    let outcome = timeout(StdDuration::from_secs(3), async {
+        let response = response.await.context("response head")?;
+        let status = response.status();
+        let body = BumpedH2Client::read_body(response.into_body()).await?;
+        Ok::<_, anyhow::Error>((status, body))
+    })
+    .await
+    .context("waiting for truncated response")?;
+    drop(upload);
+    client.shutdown().await;
+    fixture.shutdown().await;
+    assert!(
+        outcome.is_err(),
+        "Origin sent RST_STREAM(NO_ERROR) without END_STREAM, but proxy completed response: {outcome:?}"
+    );
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_bounds_unacknowledged_graceful_shutdown() -> Result<()> {
+    let policy =
+        PolicySpec::new("review-close").rule(RuleSpec::allow(&["GET"], "https://localhost/**"));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new("localhost", "review-close", policy)
+            .client_protocols(ClientProtocols::Http2Only)
+            .upstream_mode(UpstreamMode::Http2SingleUse)
+            .with_settings(|settings| settings.client_keepalive_idle_timeout = 1),
+    )
+    .await?;
+    let authority = format!("localhost:{}", fixture.upstream_addr().port());
+    let mut tls = fixture.take_tls_stream();
+    // A minimal ordinary GET, using HPACK static entries and a literal authority.
+    let mut headers = vec![0x82, 0x87, 0x84, 0x01, authority.len() as u8];
+    headers.extend_from_slice(authority.as_bytes());
+    tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+    tls.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+    tls.write_all(&[0, 0, headers.len() as u8, 1, 5, 0, 0, 0, 1])
+        .await?;
+    tls.write_all(&headers).await?;
+    tls.flush().await?;
+    let mut saw_shutdown_ping = false;
+    let mut saw_goaway = false;
+    let outcome = tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let mut frame = [0u8; 9];
+            if let Err(err) = tls.read_exact(&mut frame).await {
+                return err;
+            }
+            let len = (usize::from(frame[0]) << 16)
+                | (usize::from(frame[1]) << 8)
+                | usize::from(frame[2]);
+            let mut payload = vec![0; len];
+            if let Err(err) = tls.read_exact(&mut payload).await {
+                return err;
+            }
+            if frame[3] == 4 && frame[4] & 1 == 0 {
+                tls.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+                tls.flush().await.unwrap();
+            }
+            saw_shutdown_ping |= frame[3] == 6 && frame[4] & 1 == 0;
+            saw_goaway |= frame[3] == 7;
+            // Simulate a client that receives frames but no longer answers PING.
+        }
+    })
+    .await;
+    fixture
+        .wait_for_upstream_close(StdDuration::from_secs(1))
+        .await?;
+    drop(tls);
+    fixture.shutdown().await;
+    assert!(
+        saw_shutdown_ping && saw_goaway,
+        "shutdown exchange was not reached"
+    );
+    assert!(
+        outcome.is_ok(),
+        "connection remained open for 3s despite 1s idle timeout after origin closed"
+    );
+    Ok(())
 }

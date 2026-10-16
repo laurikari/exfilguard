@@ -11,7 +11,10 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::libc::O_NOFOLLOW;
 use nix::unistd::geteuid;
 use rand::{TryRng, rngs::SysRng};
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::OffsetDateTime;
@@ -23,8 +26,8 @@ use super::{ca::CertificateAuthority, issuer::TlsIssuer};
 
 const MAX_VAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
-const INITIAL_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
-const MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(15 * 60);
+pub(crate) const INITIAL_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
+pub(crate) const MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(15 * 60);
 const MAX_RENEWAL_SCHEDULE_SLEEP: StdDuration = StdDuration::from_secs(60 * 60);
 
 #[derive(Clone, Debug)]
@@ -47,10 +50,7 @@ pub(crate) struct VaultConfig {
     pub tls_server_name: Option<String>,
     pub namespace: Option<String>,
     pub pki_mount: String,
-    pub issuer: String,
     pub expected_root_certs: PathBuf,
-    pub intermediate_ttl: StdDuration,
-    pub renewal_threshold: StdDuration,
     pub request_timeout: StdDuration,
     pub tls_client_cert: Option<PathBuf>,
     pub tls_client_key: Option<PathBuf>,
@@ -58,16 +58,28 @@ pub(crate) struct VaultConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct VaultCaSource {
+pub(crate) struct VaultClient {
     client: Client,
     base_url: Url,
     namespace: Option<String>,
     pki_mount: String,
-    issuer: String,
     expected_roots: Arc<Vec<Vec<u8>>>,
+    auth: VaultAuthConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VaultCaConfig {
+    pub issuer: String,
+    pub intermediate_ttl: StdDuration,
+    pub renewal_threshold: StdDuration,
+}
+
+#[derive(Clone)]
+pub(crate) struct VaultCaSource {
+    vault: Arc<VaultClient>,
+    issuer: String,
     intermediate_ttl: StdDuration,
     renewal_threshold: StdDuration,
-    auth: VaultAuthConfig,
 }
 
 #[derive(Debug)]
@@ -92,7 +104,7 @@ fn vault_failure(kind: &'static str, error: impl std::fmt::Display) -> anyhow::E
     .into()
 }
 
-fn failure_kind(error: &anyhow::Error) -> &'static str {
+pub(crate) fn failure_kind(error: &anyhow::Error) -> &'static str {
     error
         .downcast_ref::<VaultFailure>()
         .map_or("other", |failure| failure.kind)
@@ -127,15 +139,39 @@ struct SignIntermediateRequest<'a> {
 
 #[derive(Deserialize)]
 struct SignIntermediateResponse {
-    data: SignedIntermediate,
+    data: SignedCertificate,
 }
 
 #[derive(Deserialize)]
-struct SignedIntermediate {
+struct SignedCertificate {
     certificate: String,
     issuing_ca: String,
     #[serde(default)]
     ca_chain: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SignClientCertificateRequest<'a> {
+    csr: &'a str,
+    common_name: &'a str,
+    exclude_cn_from_sans: bool,
+    format: &'static str,
+    remove_roots_from_chain: bool,
+}
+
+#[derive(Deserialize)]
+struct SignClientCertificateResponse {
+    data: SignedCertificate,
+}
+
+struct ParsedSignedChain {
+    der: Vec<Vec<u8>>,
+    pem: Vec<String>,
+}
+
+pub(crate) struct VaultClientCertificate {
+    pub identity_pem: Zeroizing<Vec<u8>>,
+    pub validity: super::validation::ClientCertificateValidity,
 }
 
 #[derive(Deserialize)]
@@ -144,7 +180,7 @@ struct VaultErrors {
     errors: Vec<String>,
 }
 
-impl VaultCaSource {
+impl VaultClient {
     pub(crate) fn new(config: VaultConfig) -> Result<Self> {
         let mut base_url = Url::parse(&config.address).context("invalid Vault address")?;
         ensure!(
@@ -195,7 +231,7 @@ impl VaultCaSource {
             if original_host != *server_name {
                 let address = original_host.parse::<IpAddr>().map_err(|_| {
                     anyhow!(
-                        "tls_server_name may differ from ca.address only when the address host is an IP literal"
+                        "tls_server_name may differ from vault.address only when the address host is an IP literal"
                     )
                 })?;
                 base_url
@@ -207,10 +243,8 @@ impl VaultCaSource {
 
         if let Some(ca_path) = &config.tls_ca_cert {
             for cert in read_public_certificate_bundle(ca_path)? {
-                builder = builder.add_root_certificate(
-                    reqwest::Certificate::from_der(&cert)
-                        .context("failed to add Vault TLS trust certificate")?,
-                );
+                builder = builder.tls_certs_merge([reqwest::Certificate::from_der(&cert)
+                    .context("failed to add Vault TLS trust certificate")?]);
             }
         }
 
@@ -242,11 +276,6 @@ impl VaultCaSource {
             },
             other => other,
         };
-        let issuer = validate_api_path(&config.issuer, "Vault issuer")?;
-        ensure!(
-            !issuer.contains('/'),
-            "Vault issuer must be one path segment"
-        );
         if let Some(namespace) = &config.namespace {
             reqwest::header::HeaderValue::from_str(namespace)
                 .context("Vault namespace is not a valid HTTP header value")?;
@@ -259,11 +288,194 @@ impl VaultCaSource {
             base_url,
             namespace: config.namespace,
             pki_mount: validate_api_path(&config.pki_mount, "Vault PKI mount")?,
-            issuer,
             expected_roots: Arc::new(expected_roots),
+            auth,
+        })
+    }
+
+    async fn authenticate(&self) -> Result<Option<Zeroizing<String>>> {
+        match &self.auth {
+            VaultAuthConfig::AppRole {
+                mount,
+                role_id,
+                secret_id_file,
+            } => {
+                let secret_id = read_secret_value(secret_id_file)
+                    .map_err(|err| vault_failure("authentication", err))?;
+                let url = api_url(&self.base_url, &["auth", mount, "login"])?;
+                let body = AppRoleLoginRequest {
+                    role_id,
+                    secret_id: secret_id.as_str(),
+                };
+                let response: AppRoleLoginResponse = self
+                    .post_json(url, None, &body)
+                    .await
+                    .map_err(|err| vault_failure("authentication", err))?;
+                let client_token = Zeroizing::new(response.auth.client_token);
+                validate_secret_value(&client_token, "Vault token")
+                    .map_err(|err| vault_failure("authentication", err))?;
+                Ok(Some(client_token))
+            }
+            VaultAuthConfig::TokenFile { token_file } => Ok(Some(
+                read_secret_value(token_file)
+                    .map_err(|err| vault_failure("authentication", err))?,
+            )),
+            VaultAuthConfig::Proxy => Ok(None),
+        }
+    }
+
+    async fn post_json<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        url: Url,
+        token: Option<&str>,
+        body: &T,
+    ) -> Result<R> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("X-Vault-Request", "true")
+            .json(body);
+        if let Some(namespace) = &self.namespace {
+            request = request.header("X-Vault-Namespace", namespace);
+        }
+        if let Some(token) = token {
+            request = request.header("X-Vault-Token", token);
+        }
+        let response = request.send().await.context("Vault request failed")?;
+        let status = response.status();
+        let bytes = read_limited_response(response).await?;
+        if status != StatusCode::OK {
+            let message = serde_json::from_slice::<VaultErrors>(&bytes)
+                .ok()
+                .map(|body| body.errors.join("; "))
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            bail!("Vault returned {status}: {message}");
+        }
+        serde_json::from_slice(&bytes).context("failed to parse Vault response")
+    }
+
+    pub(crate) async fn issue_client_certificate(
+        &self,
+        role: &str,
+        common_name: &str,
+    ) -> Result<VaultClientCertificate> {
+        let role = validate_single_api_segment(role, "Vault PKI role")?;
+        let common_name = common_name.to_string();
+        let csr_name = common_name.clone();
+        let (key, csr) = tokio::task::spawn_blocking(move || build_client_csr(&csr_name))
+            .await
+            .context("client certificate CSR worker failed")??;
+        let token = self.authenticate().await?;
+        let mut segments: Vec<&str> = self.pki_mount.split('/').collect();
+        segments.extend(["sign", role.as_str()]);
+        let url = api_url(&self.base_url, &segments)?;
+        let body = SignClientCertificateRequest {
+            csr: &csr,
+            common_name: &common_name,
+            exclude_cn_from_sans: true,
+            format: "pem",
+            remove_roots_from_chain: false,
+        };
+        let response: SignClientCertificateResponse = self
+            .post_json(url, token.as_deref().map(|value| value.as_str()), &body)
+            .await
+            .map_err(|err| vault_failure("signing", err))?;
+        drop(token);
+
+        let chain = self
+            .parse_signed_chain(response.data, "Vault client certificate")
+            .map_err(|err| vault_failure("validation", err))?;
+        let chain_refs: Vec<&[u8]> = chain.der.iter().map(Vec::as_slice).collect();
+        let validity = super::validation::validate_client_certificate_chain(
+            &chain_refs,
+            &key,
+            &common_name,
+            OffsetDateTime::now_utc(),
+        )
+        .map_err(|err| vault_failure("validation", err))?;
+
+        let mut identity_pem = Zeroizing::new(Vec::new());
+        let identity_certificate_count = chain.pem.len() - 1;
+        for certificate in chain.pem.into_iter().take(identity_certificate_count) {
+            identity_pem.extend_from_slice(certificate.trim().as_bytes());
+            identity_pem.push(b'\n');
+        }
+        identity_pem.extend_from_slice(key.serialize_pem().as_bytes());
+        Ok(VaultClientCertificate {
+            identity_pem,
+            validity,
+        })
+    }
+
+    fn parse_signed_chain(
+        &self,
+        signed: SignedCertificate,
+        leaf_name: &str,
+    ) -> Result<ParsedSignedChain> {
+        let leaf_der = parse_single_certificate(signed.certificate.as_bytes(), leaf_name)?;
+        let issuing_ca_der =
+            parse_single_certificate(signed.issuing_ca.as_bytes(), "Vault issuing certificate")?;
+        let (mut parent_der, mut parent_pem) = if signed.ca_chain.is_empty() {
+            (vec![issuing_ca_der.clone()], vec![signed.issuing_ca])
+        } else {
+            let der = signed
+                .ca_chain
+                .iter()
+                .enumerate()
+                .map(|(index, certificate)| {
+                    parse_single_certificate(
+                        certificate.as_bytes(),
+                        &format!("Vault CA chain certificate {index}"),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (der, signed.ca_chain)
+        };
+        if parent_der.first() == Some(&leaf_der) {
+            parent_der.remove(0);
+            parent_pem.remove(0);
+        }
+        ensure!(
+            parent_der.first() == Some(&issuing_ca_der),
+            "Vault ca_chain does not begin with issuing_ca"
+        );
+        for (index, certificate) in parent_der.iter().enumerate() {
+            ensure!(
+                !parent_der[..index].contains(certificate),
+                "Vault ca_chain contains a duplicate certificate"
+            );
+        }
+        let pinned_root = parent_der.last().expect("parent chain is nonempty");
+        ensure!(
+            self.expected_roots
+                .iter()
+                .any(|expected| expected == pinned_root),
+            "Vault returned a certificate chained to an unpinned root"
+        );
+
+        let mut der = Vec::with_capacity(parent_der.len() + 1);
+        der.push(leaf_der);
+        der.append(&mut parent_der);
+        let mut pem = Vec::with_capacity(parent_pem.len() + 1);
+        pem.push(signed.certificate);
+        pem.append(&mut parent_pem);
+        Ok(ParsedSignedChain { der, pem })
+    }
+}
+
+impl VaultCaSource {
+    pub(crate) fn new(vault: Arc<VaultClient>, config: VaultCaConfig) -> Result<Self> {
+        let issuer = validate_api_path(&config.issuer, "Vault issuer")?;
+        ensure!(
+            !issuer.contains('/'),
+            "Vault issuer must be one path segment"
+        );
+        Ok(Self {
+            vault,
+            issuer,
             intermediate_ttl: config.intermediate_ttl,
             renewal_threshold: config.renewal_threshold,
-            auth,
         })
     }
 
@@ -271,7 +483,7 @@ impl VaultCaSource {
         let (key, csr) = tokio::task::spawn_blocking(build_intermediate_csr)
             .await
             .context("intermediate CSR worker failed")??;
-        let token = self.authenticate().await?;
+        let token = self.vault.authenticate().await?;
         let url = self.sign_intermediate_url()?;
         let ttl = format!("{}s", self.intermediate_ttl.as_secs());
         let body = SignIntermediateRequest {
@@ -284,71 +496,17 @@ impl VaultCaSource {
             ttl,
         };
         let response: SignIntermediateResponse = self
+            .vault
             .post_json(url, token.as_deref().map(|value| value.as_str()), &body)
             .await
             .map_err(|err| vault_failure("signing", err))?;
         drop(token);
 
-        let intermediate_der = parse_single_certificate(
-            response.data.certificate.as_bytes(),
-            "Vault intermediate certificate",
-        )
-        .map_err(|err| vault_failure("validation", err))?;
-        let issuing_ca_der = parse_single_certificate(
-            response.data.issuing_ca.as_bytes(),
-            "Vault issuing certificate",
-        )
-        .map_err(|err| vault_failure("validation", err))?;
-        let mut parent_chain = if response.data.ca_chain.is_empty() {
-            vec![issuing_ca_der.clone()]
-        } else {
-            response
-                .data
-                .ca_chain
-                .iter()
-                .enumerate()
-                .map(|(index, certificate)| {
-                    parse_single_certificate(
-                        certificate.as_bytes(),
-                        &format!("Vault CA chain certificate {index}"),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map_err(|err| vault_failure("validation", err))?
-        };
-        if parent_chain.first() == Some(&intermediate_der) {
-            parent_chain.remove(0);
-        }
-        if parent_chain.first() != Some(&issuing_ca_der) {
-            return Err(vault_failure(
-                "validation",
-                "Vault ca_chain does not begin with issuing_ca",
-            ));
-        }
-        for (index, certificate) in parent_chain.iter().enumerate() {
-            if parent_chain[..index].contains(certificate) {
-                return Err(vault_failure(
-                    "validation",
-                    "Vault ca_chain contains a duplicate certificate",
-                ));
-            }
-        }
-        let pinned_root = parent_chain.last().expect("parent chain is nonempty");
-        if !self
-            .expected_roots
-            .iter()
-            .any(|expected| expected == pinned_root)
-        {
-            return Err(vault_failure(
-                "validation",
-                "Vault returned an intermediate chained to an unpinned root",
-            ));
-        }
-
-        let mut certificate_chain = Vec::with_capacity(parent_chain.len() + 1);
-        certificate_chain.push(intermediate_der);
-        certificate_chain.append(&mut parent_chain);
-        let ca = CertificateAuthority::from_chain(certificate_chain, key)
+        let chain = self
+            .vault
+            .parse_signed_chain(response.data, "Vault intermediate certificate")
+            .map_err(|err| vault_failure("validation", err))?;
+        let ca = CertificateAuthority::from_chain(chain.der, key)
             .map_err(|err| vault_failure("validation", err))?;
         let remaining = ca.intermediate_not_after() - OffsetDateTime::now_utc();
         let threshold = time::Duration::try_from(self.renewal_threshold)
@@ -373,7 +531,7 @@ impl VaultCaSource {
         loop {
             let threshold =
                 time::Duration::try_from(self.renewal_threshold).unwrap_or(time::Duration::days(1));
-            let waited_for_schedule = wait_until_renewal(
+            let waited_for_schedule = wait_until_renewal_with(
                 || issuer.current_ca().intermediate_not_after(),
                 threshold,
                 OffsetDateTime::now_utc,
@@ -428,76 +586,21 @@ impl VaultCaSource {
         Ok(generation)
     }
 
-    async fn authenticate(&self) -> Result<Option<Zeroizing<String>>> {
-        match &self.auth {
-            VaultAuthConfig::AppRole {
-                mount,
-                role_id,
-                secret_id_file,
-            } => {
-                let secret_id = read_secret_value(secret_id_file)
-                    .map_err(|err| vault_failure("authentication", err))?;
-                let url = api_url(&self.base_url, &["auth", mount, "login"])?;
-                let body = AppRoleLoginRequest {
-                    role_id,
-                    secret_id: secret_id.as_str(),
-                };
-                let response: AppRoleLoginResponse = self
-                    .post_json(url, None, &body)
-                    .await
-                    .map_err(|err| vault_failure("authentication", err))?;
-                let client_token = Zeroizing::new(response.auth.client_token);
-                validate_secret_value(&client_token, "Vault token")
-                    .map_err(|err| vault_failure("authentication", err))?;
-                Ok(Some(client_token))
-            }
-            VaultAuthConfig::TokenFile { token_file } => Ok(Some(
-                read_secret_value(token_file)
-                    .map_err(|err| vault_failure("authentication", err))?,
-            )),
-            VaultAuthConfig::Proxy => Ok(None),
-        }
-    }
-
     fn sign_intermediate_url(&self) -> Result<Url> {
-        let mut segments: Vec<&str> = self.pki_mount.split('/').collect();
+        let mut segments: Vec<&str> = self.vault.pki_mount.split('/').collect();
         segments.extend(["issuer", self.issuer.as_str(), "sign-intermediate"]);
-        api_url(&self.base_url, &segments)
-    }
-
-    async fn post_json<T: Serialize + ?Sized, R: DeserializeOwned>(
-        &self,
-        url: Url,
-        token: Option<&str>,
-        body: &T,
-    ) -> Result<R> {
-        let mut request = self
-            .client
-            .post(url)
-            .header("X-Vault-Request", "true")
-            .json(body);
-        if let Some(namespace) = &self.namespace {
-            request = request.header("X-Vault-Namespace", namespace);
-        }
-        if let Some(token) = token {
-            request = request.header("X-Vault-Token", token);
-        }
-        let response = request.send().await.context("Vault request failed")?;
-        let status = response.status();
-        let bytes = read_limited_response(response).await?;
-        if status != StatusCode::OK {
-            let message = serde_json::from_slice::<VaultErrors>(&bytes)
-                .ok()
-                .map(|body| body.errors.join("; "))
-                .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| format!("HTTP {status}"));
-            bail!("Vault returned {status}: {message}");
-        }
-        serde_json::from_slice(&bytes).context("failed to parse Vault response")
+        api_url(&self.vault.base_url, &segments)
     }
 }
 
-async fn wait_until_renewal<NotAfter, Now, SleepFor, SleepFuture>(
+pub(crate) async fn wait_until_renewal_due(
+    not_after: OffsetDateTime,
+    threshold: time::Duration,
+) -> bool {
+    wait_until_renewal_with(|| not_after, threshold, OffsetDateTime::now_utc, sleep).await
+}
+
+async fn wait_until_renewal_with<NotAfter, Now, SleepFor, SleepFuture>(
     mut intermediate_not_after: NotAfter,
     threshold: time::Duration,
     mut now: Now,
@@ -524,7 +627,7 @@ where
     }
 }
 
-fn with_jitter(delay: StdDuration) -> StdDuration {
+pub(crate) fn with_jitter(delay: StdDuration) -> StdDuration {
     let sample = SysRng.try_next_u64().unwrap_or(500) % 501;
     delay.mul_f64(0.75 + sample as f64 / 1000.0)
 }
@@ -542,6 +645,29 @@ fn build_intermediate_csr() -> Result<(KeyPair, String)> {
         .pem()
         .map_err(|err| anyhow!("failed to encode Vault intermediate CSR: {err}"))?;
     Ok((key, csr))
+}
+
+fn build_client_csr(common_name: &str) -> Result<(KeyPair, String)> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|err| anyhow!("failed to generate Vault client key: {err}"))?;
+    let mut params = CertificateParams::default();
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, common_name);
+    params.distinguished_name = name;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let csr = params
+        .serialize_request(&key)
+        .map_err(|err| anyhow!("failed to generate Vault client CSR: {err}"))?
+        .pem()
+        .map_err(|err| anyhow!("failed to encode Vault client CSR: {err}"))?;
+    Ok((key, csr))
+}
+
+fn validate_single_api_segment(value: &str, name: &str) -> Result<String> {
+    let value = validate_api_path(value, name)?;
+    ensure!(!value.contains('/'), "{name} must be one path segment");
+    Ok(value)
 }
 
 fn validate_api_path(value: &str, name: &str) -> Result<String> {
@@ -644,14 +770,14 @@ fn validate_secret_value(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_secret_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_secret_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let mut file = open_checked_file(path, true)?;
     let metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     ensure!(
         metadata.len() <= MAX_CREDENTIAL_BYTES,
-        "Vault credential {} is too large",
+        "secret file {} is too large",
         path.display()
     );
     let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
@@ -668,7 +794,7 @@ fn read_public_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn read_public_certificate_bundle(path: &Path) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn read_public_certificate_bundle(path: &Path) -> Result<Vec<Vec<u8>>> {
     let bytes = read_public_file(path)?;
     super::validation::parse_strict_certificate_pem_bundle(
         &bytes,
@@ -945,6 +1071,59 @@ mod tests {
         (address, server)
     }
 
+    async fn spawn_fake_vault_client_signer(
+        issuing_ca_pem: String,
+        ca_chain: Vec<String>,
+        signing_issuer: Issuer<'static, KeyPair>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut login_stream, _) = listener.accept().await.unwrap();
+            let login = read_request(&mut login_stream).await;
+            assert_eq!(login.target, "/v1/auth/team-approle/login");
+            respond_json(
+                &mut login_stream,
+                json!({"auth": {"client_token": "one-use-token"}}),
+            )
+            .await;
+
+            let (mut sign_stream, _) = listener.accept().await.unwrap();
+            let sign = read_request(&mut sign_stream).await;
+            assert_eq!(sign.target, "/v1/team/pki/sign/authorization-client");
+            assert_eq!(sign.headers.get("x-vault-token").unwrap(), "one-use-token");
+            let body: Value = serde_json::from_slice(&sign.body).unwrap();
+            assert_eq!(body["common_name"], "exfilguard-production");
+            assert_eq!(body["exclude_cn_from_sans"], true);
+            assert_eq!(body["format"], "pem");
+            assert_eq!(body["remove_roots_from_chain"], false);
+
+            let mut request = CertificateSigningRequestParams::from_pem(
+                body["csr"].as_str().expect("CSR must be a string"),
+            )
+            .unwrap();
+            let now = OffsetDateTime::now_utc();
+            request.params.not_before = now - time::Duration::minutes(1);
+            request.params.not_after = now + time::Duration::hours(12);
+            request.params.is_ca = IsCa::NoCa;
+            request.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            request.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            let certificate = request.signed_by(&signing_issuer).unwrap();
+            respond_json(
+                &mut sign_stream,
+                json!({
+                    "data": {
+                        "certificate": certificate.pem(),
+                        "issuing_ca": issuing_ca_pem,
+                        "ca_chain": ca_chain,
+                    }
+                }),
+            )
+            .await;
+        });
+        (address, server)
+    }
+
     fn write_file(directory: &TempDir, name: &str, contents: &[u8]) -> PathBuf {
         let path = directory.path().join(name);
         std::fs::write(&path, contents).unwrap();
@@ -959,10 +1138,7 @@ mod tests {
             tls_server_name: None,
             namespace: Some("team-a".to_string()),
             pki_mount: "team/pki".to_string(),
-            issuer: "selected-issuer".to_string(),
             expected_root_certs: roots,
-            intermediate_ttl: StdDuration::from_secs(30 * 24 * 60 * 60),
-            renewal_threshold: StdDuration::from_secs(7 * 24 * 60 * 60),
             request_timeout: StdDuration::from_secs(5),
             tls_client_cert: None,
             tls_client_key: None,
@@ -974,6 +1150,27 @@ mod tests {
         }
     }
 
+    fn vault_ca_config() -> VaultCaConfig {
+        VaultCaConfig {
+            issuer: "selected-issuer".to_string(),
+            intermediate_ttl: StdDuration::from_secs(30 * 24 * 60 * 60),
+            renewal_threshold: StdDuration::from_secs(7 * 24 * 60 * 60),
+        }
+    }
+
+    fn vault_ca_source(
+        address: String,
+        roots: PathBuf,
+        secret_id_file: PathBuf,
+    ) -> Result<VaultCaSource> {
+        let vault = Arc::new(VaultClient::new(vault_config(
+            address,
+            roots,
+            secret_id_file,
+        ))?);
+        VaultCaSource::new(vault, vault_ca_config())
+    }
+
     #[tokio::test]
     async fn renewal_schedule_caps_sleep_and_rechecks_after_wall_clock_jump() {
         let start = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
@@ -982,7 +1179,7 @@ mod tests {
         let sleep_clock = clock.clone();
         let recorded_sleeps = sleeps.clone();
 
-        wait_until_renewal(
+        wait_until_renewal_with(
             || start + time::Duration::hours(4),
             time::Duration::hours(1),
             {
@@ -1011,7 +1208,7 @@ mod tests {
         let sleep_clock = clock.clone();
         let recorded_sleeps = sleeps.clone();
 
-        wait_until_renewal(
+        wait_until_renewal_with(
             || start + time::Duration::hours(4),
             time::Duration::hours(1),
             {
@@ -1043,7 +1240,7 @@ mod tests {
     async fn renewal_schedule_reports_when_renewal_is_already_due() {
         let now = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
 
-        let slept = wait_until_renewal(
+        let slept = wait_until_renewal_with(
             || now + time::Duration::hours(1),
             time::Duration::hours(1),
             || now,
@@ -1088,13 +1285,28 @@ mod tests {
     }
 
     #[test]
+    fn secret_file_reader_rejects_permissive_and_symlinked_keys() {
+        let directory = TempDir::new().unwrap();
+        let key = write_file(&directory, "client.key", b"private key");
+        assert_eq!(read_secret_bytes(&key).unwrap().as_slice(), b"private key");
+
+        std::fs::set_permissions(&key, Permissions::from_mode(0o644)).unwrap();
+        assert!(read_secret_bytes(&key).is_err());
+        std::fs::set_permissions(&key, Permissions::from_mode(0o600)).unwrap();
+
+        let link = directory.path().join("client-link.key");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        assert!(read_secret_bytes(&link).is_err());
+    }
+
+    #[test]
     fn rejects_plaintext_remote_vault_address() {
         let config = vault_config(
             "http://192.0.2.10:8200".to_string(),
             PathBuf::from("unused-roots.pem"),
             PathBuf::from("unused-secret-id"),
         );
-        let error = match VaultCaSource::new(config) {
+        let error = match VaultClient::new(config) {
             Ok(_) => panic!("remote plaintext Vault must be rejected"),
             Err(error) => error,
         };
@@ -1116,7 +1328,7 @@ mod tests {
         )
         .await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let issuer = initial_issuer(&directory);
         let old_leaf = issuer.issue(&["renew.example"]).await.unwrap();
         assert_eq!(source.renew_once(&issuer).await.unwrap(), 1);
@@ -1134,6 +1346,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signs_a_client_certificate_without_exporting_its_private_key() {
+        let directory = TempDir::new().unwrap();
+        let (root_pem, _, signer_pem, _, signer_issuer) = generate_vault_signing_hierarchy();
+        let roots = write_file(&directory, "roots.pem", root_pem.as_bytes());
+        let secret_id = write_file(&directory, "secret-id", b"test-secret");
+        let (address, server) = spawn_fake_vault_client_signer(
+            signer_pem.clone(),
+            vec![signer_pem, root_pem],
+            signer_issuer,
+        )
+        .await;
+        let vault = VaultClient::new(vault_config(address, roots, secret_id)).unwrap();
+
+        let certificate = vault
+            .issue_client_certificate("authorization-client", "exfilguard-production")
+            .await
+            .unwrap();
+
+        assert!(certificate.validity.not_before < OffsetDateTime::now_utc());
+        assert!(certificate.validity.not_after > OffsetDateTime::now_utc());
+        let identity = std::str::from_utf8(&certificate.identity_pem).unwrap();
+        assert_eq!(identity.matches("BEGIN CERTIFICATE").count(), 2);
+        assert!(identity.contains("BEGIN PRIVATE KEY"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn accepts_ca_chain_that_begins_with_the_issued_intermediate() {
         let directory = TempDir::new().unwrap();
         let (root_pem, root_der, root_issuer) = generate_root("Pinned Root");
@@ -1142,7 +1381,7 @@ mod tests {
         let (address, server) =
             spawn_fake_vault(root_pem.clone(), vec![root_pem], root_issuer, true).await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let authority = source.issue().await.unwrap();
 
         assert_eq!(authority.root_certificate_der().as_ref(), root_der);
@@ -1169,7 +1408,7 @@ mod tests {
         )
         .await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let error = match source.issue().await {
             Ok(_) => panic!("duplicate parent certificates must be rejected"),
             Err(error) => error,
@@ -1197,7 +1436,7 @@ mod tests {
         )
         .await;
 
-        let source = VaultCaSource::new(vault_config(address, roots, secret_id)).unwrap();
+        let source = vault_ca_source(address, roots, secret_id).unwrap();
         let issuer = initial_issuer(&directory);
         let original = issuer.current_ca();
         let original_leaf = issuer.issue(&["retain.example"]).await.unwrap();

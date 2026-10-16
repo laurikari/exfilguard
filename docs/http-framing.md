@@ -26,6 +26,13 @@ response.
 
 ## Legacy or Lenient Upstreams
 
+Some origins incorrectly send `Content-Length: 0` on a `204 No Content`
+response. ExfilGuard accepts this narrow HTTP/1 compatibility case, removes the
+header, and forwards only the empty 204 response. It closes the upstream and
+downstream connections after the response to prevent stray origin bytes from
+being reused as another response. Nonzero lengths, malformed or duplicate
+length fields, and any `Transfer-Encoding` on 204 still produce a 502.
+
 Some legacy servers treat a missing length as "read until close". On keep-alive
 connections that can lead to timeouts or other odd behavior. If you must talk
 to such servers, make sure clients send `Content-Length` or

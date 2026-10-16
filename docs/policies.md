@@ -144,11 +144,13 @@ methods = ["ANY"]
 
 ExfilGuard evaluates CONNECT requests against explicit CONNECT tunnel rules
 first. If no tunnel rule matches, it can still perform a TLS bump preflight
-when matching HTTPS inspect rules exist for the same host and port. It then
-attaches the real policy decision to the inner HTTP request. ExfilGuard still
-blocks private upstream addresses in every mode. That includes plain HTTP,
-tunneled CONNECT, and bumped HTTPS. The point is to reduce SSRF risk and stop
-clients from reaching internal address space by mistake.
+when matching HTTPS inspect `ALLOW` rules exist for the same host and port. It
+then attaches the real policy decision to the inner HTTP request. A deny-only
+authority fails at the outer CONNECT without opening an upstream connection.
+ExfilGuard blocks private upstream addresses by default in plain HTTP, tunneled
+CONNECT, and bumped HTTPS. The global `allow_private_upstream_cidrs` setting
+permits selected address ranges; request policies still determine access.
+See [Private Upstream Exceptions](configuration.md#private-upstream-exceptions).
 
 ---
 
@@ -228,8 +230,13 @@ url_pattern = "https://example.com:8443/api/**"
 
 !!! note
     Requests are rejected if the path contains characters outside RFC 3986
-    path syntax, invalid escapes, backslashes, encoded path separators, or
-    encoded dot-segments such as `%2e%2e`.
+    path syntax, invalid escapes, raw or encoded backslashes, or encoded
+    dot-segments such as `%2e%2e`.
+
+    Percent-encoded reserved characters remain encoded for policy matching,
+    with uppercase hexadecimal digits. For example, npm's scoped-package path
+    `/@scope%2fname` has the canonical policy path `/@scope%2Fname`, which
+    remains distinct from `/@scope/name`.
 
 ### Complete Examples
 
@@ -258,7 +265,8 @@ url_pattern = "https://example.com:8443/api/**"
 - Decrypted HTTP requests are checked after TLS interception
 - TLS is terminated and re-encrypted
 - Used for normal HTTPS `GET`/`POST`/`PUT`/`DELETE` style rules
-- Matching HTTPS rules authorize a TLS bump preflight for the same host/port
+- Matching HTTPS `ALLOW` rules authorize a TLS bump preflight for the same
+  host/port; deny-only authorities fail at the outer CONNECT
 - The real policy decision is attached to the inner HTTP request
 - Private upstream resolution is still blocked
 - Enables normal request logging, metrics, and caching when configured
@@ -284,6 +292,12 @@ url_pattern = "https://example.com:8443/api/**"
 Rules can enable caching for matched responses when the shared cache is
 configured globally. The same rule behavior and cache entries apply to
 inspected HTTP/1.1 and HTTP/2 traffic.
+
+Caching is a freshness-based optimization, not a consistency guarantee.
+ExfilGuard does not invalidate cached responses after mutations or synchronize
+caches between nodes. Enable it only on rules where reuse for the upstream's
+declared lifetime (or the configured fallback) is acceptable. Rules without
+cache configuration bypass caching entirely, including existing entries.
 
 ```toml
 [[policy.rule]]

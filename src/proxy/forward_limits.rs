@@ -54,7 +54,7 @@ impl RequestDeadline {
     }
 }
 
-/// Tracks whether a total-timeout response may still be sent safely.
+/// Tracks final response delivery so retries and error responses stay safe.
 #[derive(Clone, Default)]
 pub struct ResponseProgress {
     inner: Arc<ResponseProgressInner>,
@@ -68,6 +68,8 @@ struct ResponseProgressInner {
 }
 
 impl ResponseProgress {
+    /// Mark commitment before attempting the head write: a failed write can
+    /// still have delivered a prefix to the client.
     pub fn mark_started(&self, status: StatusCode, bytes_to_client: u64) {
         self.inner.status.store(status.as_u16(), Ordering::Relaxed);
         self.inner
@@ -86,6 +88,10 @@ impl ResponseProgress {
         self.inner.state.store(RESPONSE_COMPLETE, Ordering::Release);
     }
 
+    pub fn has_started(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) != 0
+    }
+
     fn is_complete(&self) -> bool {
         self.inner.state.load(Ordering::Acquire) == RESPONSE_COMPLETE
     }
@@ -93,7 +99,7 @@ impl ResponseProgress {
     fn guard_result<T>(&self, result: Result<T>) -> Result<T> {
         match result {
             Err(source)
-                if self.inner.state.load(Ordering::Acquire) != 0
+                if self.has_started()
                     && source.downcast_ref::<ResponseAlreadyStarted>().is_none() =>
             {
                 Err(self.started_error(source))
@@ -103,7 +109,7 @@ impl ResponseProgress {
     }
 
     fn timeout_error(&self) -> anyhow::Error {
-        if self.inner.state.load(Ordering::Acquire) != 0 {
+        if self.has_started() {
             self.started_error(RequestTimeout.into())
         } else {
             RequestTimeout.into()
@@ -217,11 +223,8 @@ impl AllowLogTracker {
         }
     }
 
-    pub fn add_client_bytes(&mut self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.bytes_in = self.bytes_in.saturating_add(bytes);
+    pub fn record_client_body_bytes(&mut self, bytes: u64) {
+        self.bytes_in = self.bytes_in.max(self.base_bytes.saturating_add(bytes));
     }
 
     pub fn base_bytes(&self) -> u64 {
@@ -269,6 +272,16 @@ mod tests {
         let error = validate_declared_body_size(Some(1001), 1000).unwrap_err();
         let too_large = error.downcast_ref::<BodyTooLarge>().unwrap();
         assert_eq!(too_large.bytes_read, 0);
+    }
+
+    #[test]
+    fn allow_log_tracker_records_the_largest_body_progress_once() {
+        let mut tracker = AllowLogTracker::new(100, Instant::now());
+        tracker.record_client_body_bytes(20);
+        tracker.record_client_body_bytes(20);
+        tracker.record_client_body_bytes(10);
+
+        assert_eq!(tracker.current_bytes(), 120);
     }
 
     #[tokio::test(start_paused = true)]

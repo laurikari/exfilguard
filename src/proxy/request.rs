@@ -49,65 +49,24 @@ pub struct RequestFlowContext {
     pub session_id: Arc<str>,
     pub outer_method: Arc<str>,
     pub effective_mode: EffectiveMode,
+    pub(crate) authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Http1TargetMode {
-    Proxy,
-    OriginOnly,
-}
-
-/// Parse an HTTP/1.1 request target into a [`ParsedRequest`] with separate raw
-/// forwarding and canonical policy paths.
+/// Parse an HTTP/1.1 request target with separate raw forwarding and canonical policy paths.
 pub fn parse_http1_request(
     method: Method,
     target: &str,
     host_header: Option<&str>,
     fallback_scheme: Scheme,
 ) -> Result<ParsedRequest> {
-    parse_http1_request_with_mode(
-        method,
-        target,
-        host_header,
-        fallback_scheme,
-        Http1TargetMode::Proxy,
-    )
-}
+    if target.contains('#') {
+        bail!("request target must not contain a URI fragment");
+    }
 
-/// Parse an HTTP/1.1 request target that must be origin-form (no absolute-form).
-pub(crate) fn parse_http1_request_origin_form(
-    method: Method,
-    target: &str,
-    host_header: Option<&str>,
-    fallback_scheme: Scheme,
-) -> Result<ParsedRequest> {
-    parse_http1_request_with_mode(
-        method,
-        target,
-        host_header,
-        fallback_scheme,
-        Http1TargetMode::OriginOnly,
-    )
-}
-
-fn parse_http1_request_with_mode(
-    method: Method,
-    target: &str,
-    host_header: Option<&str>,
-    fallback_scheme: Scheme,
-    mode: Http1TargetMode,
-) -> Result<ParsedRequest> {
     let uri: Uri = target.parse().context("invalid request target")?;
 
     if uri.scheme().is_some() {
-        match mode {
-            Http1TargetMode::Proxy => return parse_uri_request(method, &uri, fallback_scheme),
-            Http1TargetMode::OriginOnly => {
-                bail!(
-                    "absolute-form request targets are not allowed over bumped HTTPS connections"
-                );
-            }
-        }
+        return parse_uri_request(method, &uri, fallback_scheme);
     }
 
     if target == "*" {
@@ -209,13 +168,28 @@ pub fn parse_host_header(value: &str) -> Result<(String, Option<u16>)> {
     let uri: Uri = format!("http://{trimmed}")
         .parse()
         .with_context(|| format!("invalid Host header '{trimmed}'"))?;
+    // Uri accepts textual ports that port_u16() reports as absent. Validate
+    // the explicit spelling before callers can substitute a default port.
+    let port = if trimmed.ends_with(']') {
+        None
+    } else {
+        trimmed
+            .rsplit_once(':')
+            .map(|(_, port)| {
+                if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                    bail!("authority port must contain only decimal digits");
+                }
+                port.parse::<u16>().context("authority port out of range")
+            })
+            .transpose()?
+    };
     let host = uri
         .host()
         .ok_or_else(|| anyhow!("Host header missing hostname"))?
         .trim_start_matches('[')
         .trim_end_matches(']');
     let host = canonicalize_policy_host(host)?;
-    Ok((host, uri.port_u16()))
+    Ok((host, port))
 }
 
 fn canonicalize_policy_host(host: &str) -> Result<String> {
@@ -240,6 +214,18 @@ pub fn scheme_name(scheme: Scheme) -> &'static str {
 }
 
 impl ParsedRequest {
+    /// Validate redundant Host information without changing the forwarding authority.
+    pub(crate) fn validate_host_header(&self, value: &str) -> Result<()> {
+        let (host, port) = parse_host_header(value)?;
+        if host != self.host
+            || port.unwrap_or(self.scheme.default_port())
+                != self.port.unwrap_or(self.scheme.default_port())
+        {
+            bail!("Host header does not match request authority");
+        }
+        Ok(())
+    }
+
     pub fn as_policy_request(&self) -> PolicyRequest<'_> {
         PolicyRequest {
             method: &self.method,
@@ -330,6 +316,39 @@ mod tests {
     use http::Method;
 
     #[test]
+    fn reject_invalid_explicit_ports() {
+        for host in ["example.com", "[::1]"] {
+            for port in ["", "wat", "65536", "+80", "-1", "99999999999999999999"] {
+                let authority = format!("{host}:{port}");
+                assert!(parse_host_header(&authority).is_err(), "{authority}");
+                assert!(
+                    parse_http1_request(Method::GET, "/", Some(&authority), Scheme::Https).is_err()
+                );
+                let target = format!("http://{authority}/");
+                assert!(parse_http1_request(Method::GET, &target, None, Scheme::Http).is_err());
+                if let Ok(uri) = target.parse() {
+                    assert!(parse_uri_request(Method::GET, &uri, Scheme::Http).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_valid_authority_ports() -> Result<()> {
+        for host in ["example.com", "[::1]"] {
+            assert_eq!(parse_host_header(host)?.1, None);
+            for (port, expected) in [("0", 0), ("00080", 80), ("443", 443), ("65535", 65535)] {
+                let authority = format!("{host}:{port}");
+                let parsed =
+                    parse_http1_request(Method::GET, "/", Some(&authority), Scheme::Https)?;
+                assert_eq!(parsed.port, Some(expected));
+                assert_eq!(parsed.authority_host(), authority);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn request_target_logging_redacts_queries_lexically() {
         let cases = [
             ("/resource?secret=one", "/resource"),
@@ -356,6 +375,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_http1_request_rejects_uri_fragments() {
+        let targets = [
+            "http://example.com/allowed#fragment",
+            "http://example.com/allowed?key=value#fragment",
+            "/allowed?key=value#fragment",
+        ];
+
+        for target in targets {
+            let err = parse_http1_request(Method::GET, target, Some("example.com"), Scheme::Http)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("URI fragment"),
+                "unexpected error for {target:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_http1_request_fills_default_port() -> Result<()> {
         let parsed =
             parse_http1_request(Method::GET, "/resource", Some("example.com"), Scheme::Https)?;
@@ -379,18 +416,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_http1_request_origin_form_rejects_absolute_form() {
-        let err = parse_http1_request_origin_form(
+    fn parse_http1_request_preserves_absolute_https_target() -> Result<()> {
+        let parsed = parse_http1_request(
             Method::GET,
-            "http://example.com/resource",
-            Some("example.com"),
+            "https://EXAMPLE.com:443/objects/a%2fb?z=2&x=%252F&x=+",
+            Some("EXAMPLE.com:443"),
             Scheme::Https,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("absolute-form"),
-            "unexpected error: {err:?}"
-        );
+        )?;
+        assert_eq!(parsed.scheme, Scheme::Https);
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, Some(443));
+        assert_eq!(parsed.authority_host(), "EXAMPLE.com:443");
+        assert_eq!(parsed.path, "/objects/a%2fb?z=2&x=%252F&x=+");
+        assert_eq!(parsed.policy_path(), "/objects/a%2Fb");
+        for host in ["example.com", "EXAMPLE.com:443", "example.com."] {
+            parsed.validate_host_header(host)?;
+        }
+        for host in ["other.test", "example.com:80", "example.com:wat", ""] {
+            assert!(parsed.validate_host_header(host).is_err(), "{host}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -558,16 +603,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_request_rejects_encoded_path_separator() {
+    fn parse_request_preserves_encoded_slash_for_policy() -> Result<()> {
+        let parsed = parse_http1_request(
+            Method::GET,
+            "/@scope%2fname?download=true",
+            Some("registry.example"),
+            Scheme::Https,
+        )?;
+        assert_eq!(parsed.path, "/@scope%2fname?download=true");
+        assert_eq!(parsed.policy_path(), "/@scope%2Fname");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_request_rejects_encoded_backslash() {
         let err = parse_http1_request(
             Method::GET,
-            "/public%2fadmin",
+            "/public%5cadmin",
             Some("example.com"),
             Scheme::Https,
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("encoded path separators"),
+            err.to_string().contains("encoded backslashes"),
             "unexpected error: {err:?}"
         );
     }

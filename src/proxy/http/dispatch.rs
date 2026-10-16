@@ -5,12 +5,13 @@ use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tracing::warn;
 
+use crate::authorization::AuthorizationToken;
 use crate::config::Scheme;
 use crate::logging::AccessLogBuilder;
 
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::request::{RequestFlowContext, scheme_name};
+use crate::proxy::request::{RequestFlowContext, request_target_for_log, scheme_name};
 
 use super::codec::{Http1RequestHead, read_http1_request_head};
 use super::pipeline::{
@@ -36,6 +37,8 @@ pub(super) struct ConnectRequest<S> {
     pub target: String,
     pub request_bytes: usize,
     pub start: Instant,
+    pub snapshot: crate::policy::matcher::PolicySnapshot,
+    pub authorization_token: Option<std::sync::Arc<AuthorizationToken>>,
 }
 
 pub(super) async fn serve_http_loop<S>(
@@ -60,6 +63,9 @@ where
     let mut reader = BufReader::new(stream);
     let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
     let binding = connect_binding.as_ref();
+    let mut bound_authorization_token = flow_context
+        .as_ref()
+        .and_then(|flow| flow.authorization_token.clone());
 
     loop {
         let header_start = Instant::now();
@@ -86,6 +92,7 @@ where
                     StatusCode::BAD_REQUEST,
                     None,
                     b"invalid request\r\n",
+                    None,
                     response_timeout,
                     0,
                     header_start.elapsed(),
@@ -108,6 +115,73 @@ where
             header_bytes,
         } = request_head;
 
+        let snapshot = app.policies.snapshot();
+        let requires_authorization = snapshot
+            .resolve_client(peer.ip())
+            .is_some_and(|client| client.authorization_service.is_some());
+        let authorization_token = match bind_authorization_token(
+            app,
+            &headers,
+            &mut bound_authorization_token,
+            requires_authorization,
+        ) {
+            Ok(token) => token,
+            Err(()) => {
+                warn!(peer = %peer, "proxy authorization token rejected");
+                respond_with_access_log(
+                    reader.get_mut(),
+                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                    None,
+                    b"proxy authentication required\r\n",
+                    Some("ExfilGuard"),
+                    response_timeout,
+                    (request_line_bytes + header_bytes) as u64,
+                    header_start.elapsed(),
+                    AccessLogBuilder::new(peer)
+                        .method(method.as_str())
+                        .scheme(scheme_name(fallback_scheme))
+                        .host(headers.host().unwrap_or(""))
+                        .path("")
+                        .decision("DENY")
+                        .error_reason("proxy_authentication"),
+                )
+                .await?;
+                break;
+            }
+        };
+
+        if headers.requests_upgrade() {
+            let scheme = if method == Method::CONNECT {
+                Scheme::Https
+            } else {
+                fallback_scheme
+            };
+            let mut log = AccessLogBuilder::new(peer)
+                .method(method.as_str())
+                .scheme(scheme_name(scheme))
+                .host(headers.host().unwrap_or(""))
+                .path(request_target_for_log(&target, app.settings.log_queries))
+                .apply_flow_context(flow_context.as_ref(), method.as_str())
+                .decision("ERROR")
+                .error_reason("upgrade_unsupported");
+            if let Some(client) = snapshot.resolve_client(peer.ip()) {
+                log = log.client(client.name.as_ref());
+            }
+            respond_with_access_log(
+                reader.get_mut(),
+                StatusCode::NOT_IMPLEMENTED,
+                None,
+                b"HTTP/1.1 Upgrade is not supported by ExfilGuard\r\n",
+                None,
+                response_timeout,
+                (request_line_bytes + header_bytes) as u64,
+                header_start.elapsed(),
+                log,
+            )
+            .await?;
+            break;
+        }
+
         if allow_connect && method == Method::CONNECT {
             let request_bytes = request_line_bytes + header_bytes;
             let prefetched = reader.buffer().to_vec();
@@ -121,6 +195,8 @@ where
                 target,
                 request_bytes,
                 start: header_start,
+                snapshot,
+                authorization_token,
             }));
         }
 
@@ -136,6 +212,8 @@ where
             header_bytes,
             start,
             fallback_scheme,
+            snapshot,
+            authorization_token,
         };
 
         match handle_non_connect(
@@ -158,4 +236,27 @@ where
         .shutdown_all(app.settings.response_body_idle_timeout())
         .await?;
     Ok(LoopOutcome::Completed)
+}
+
+fn bind_authorization_token(
+    app: &AppContext,
+    headers: &super::codec::Http1HeaderAccumulator,
+    bound: &mut Option<std::sync::Arc<AuthorizationToken>>,
+    required: bool,
+) -> Result<Option<std::sync::Arc<AuthorizationToken>>, ()> {
+    if !required {
+        return Ok(None);
+    }
+    let authorization = app.authorization.as_ref().ok_or(())?;
+    let token = authorization
+        .bind_token(
+            headers
+                .proxy_authorizations()
+                .iter()
+                .map(|value| value.as_slice()),
+            bound.as_ref(),
+        )
+        .map_err(|_| ())?;
+    *bound = Some(token.clone());
+    Ok(Some(token))
 }
