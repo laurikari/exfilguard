@@ -98,13 +98,16 @@ impl FinalizedRequestV1 {
                 "buffered payload length does not match declared Content-Length"
             );
         }
-        let authority_value = HeaderValue::from_str(parsed.authority_host())
-            .context("generated request authority is not a valid header value")?;
-        let mut headers = vec![FinalizedHeader {
-            name: http::header::HOST,
-            value: Zeroizing::new(authority_value.as_bytes().to_vec()),
-            protected: false,
-        }];
+        let mut headers = Vec::new();
+        if matches!(protocol, FinalizedProtocol::Http1) {
+            let authority_value = HeaderValue::from_str(parsed.authority_host())
+                .context("generated request authority is not a valid header value")?;
+            headers.push(FinalizedHeader {
+                name: http::header::HOST,
+                value: Zeroizing::new(authority_value.as_bytes().to_vec()),
+                protected: false,
+            });
+        }
         for (name, value) in forward_headers {
             if name == http::header::EXPECT {
                 return Err(FinalizationRejection::Expectation.into());
@@ -465,9 +468,100 @@ mod tests {
                 .windows(b"authorization: Bearer protected".len())
                 .any(|window| window == b"authorization: Bearer protected")
         );
-        let http2 = request.build_http2_request().unwrap();
-        assert!(http2.headers()[http::header::AUTHORIZATION].is_sensitive());
-        assert!(!http2.headers()[http::header::ACCEPT].is_sensitive());
+    }
+
+    #[test]
+    fn http2_omits_host_before_fingerprinting_and_credential_preparation() {
+        for authority in ["example.com:443", "example.com:8443", "[2001:db8::1]:8443"] {
+            let parsed = parse_http1_request(
+                http::Method::GET,
+                &format!("https://{authority}/raw%2fpath?b=2&a=%41"),
+                None,
+                Scheme::Https,
+            )
+            .unwrap();
+            let make_request = |protocol| {
+                FinalizedRequestV1::new(
+                    &parsed,
+                    [(http::header::ACCEPT, HeaderValue::from_static("text/plain"))],
+                    None,
+                    None,
+                    Arc::from([http::header::AUTHORIZATION]),
+                    protocol,
+                    4096,
+                )
+                .unwrap()
+            };
+            let mut http1 = make_request(FinalizedProtocol::Http1);
+            let mut http2 = make_request(FinalizedProtocol::Http2);
+            assert_eq!(http1.headers()[0].name, http::header::HOST);
+            assert_eq!(http1.headers()[0].value(), authority.as_bytes());
+            assert!(
+                http2
+                    .headers()
+                    .iter()
+                    .all(|header| header.name != http::header::HOST)
+            );
+            assert_ne!(http1.fingerprint(), http2.fingerprint());
+            http1.headers.remove(0);
+            assert_eq!(http1.compute_base_fingerprint(), http2.fingerprint());
+
+            let fingerprint = http2.fingerprint();
+            http2
+                .apply_protected_headers(
+                    vec![(
+                        http::header::AUTHORIZATION,
+                        Zeroizing::new(b"Bearer protected".to_vec()),
+                    )],
+                    4096,
+                )
+                .unwrap();
+            assert_eq!(http2.compute_base_fingerprint(), fingerprint);
+            let request = http2.build_http2_request().unwrap();
+            assert_eq!(request.uri().authority().unwrap().as_str(), authority);
+            assert_eq!(
+                request.uri().path_and_query().unwrap().as_str(),
+                "/raw%2fpath?b=2&a=%41"
+            );
+            assert!(!request.headers().contains_key(http::header::HOST));
+            assert!(request.headers()[http::header::AUTHORIZATION].is_sensitive());
+            assert!(!request.headers()[http::header::ACCEPT].is_sensitive());
+        }
+    }
+
+    #[test]
+    fn http2_header_budget_excludes_host() {
+        let parsed = parse_http1_request(
+            http::Method::GET,
+            "https://example.com/resource",
+            None,
+            Scheme::Https,
+        )
+        .unwrap();
+        let make_request = |limit| {
+            FinalizedRequestV1::new(
+                &parsed,
+                [(http::header::ACCEPT, HeaderValue::from_static("text/plain"))],
+                None,
+                None,
+                Arc::from([]),
+                FinalizedProtocol::Http2,
+                limit,
+            )
+        };
+        let fields = [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            (":path", "/resource"),
+            ("accept", "text/plain"),
+        ];
+        let size = fields
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + 4)
+            .sum();
+        assert!(make_request(size).is_ok());
+        assert!(make_request(size - 1).is_err());
     }
 
     #[test]

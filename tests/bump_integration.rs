@@ -2653,6 +2653,55 @@ async fn connect_bump_supports_http2() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_bump_http2_forwards_authority_without_host() -> Result<()> {
+    let upstream_host = "localhost";
+    let policy_name = "allow-h2-authority";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow_any(format!("https://{upstream_host}/**")));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new(upstream_host, policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2Inspect),
+    )
+    .await?;
+    let authority = format!("{upstream_host}:{}", fixture.upstream_addr().port());
+    let mut client = fixture.h2_client().await?;
+    let path = "/raw%2fpath?b=2&a=%41";
+    let body = Bytes::from_static(b"hello world");
+
+    for include_host in [false, true] {
+        let mut request = bumped_h2_request(&authority, Method::PUT, path)?;
+        request.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string())?,
+        );
+        if include_host {
+            request
+                .headers_mut()
+                .insert(http::header::HOST, HeaderValue::from_str(&authority)?);
+        }
+        let (status, response) = client.request_text_with_body(request, body.clone()).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response,
+            format!(
+                "authority={authority}\npath={path}\nhost-present=false\ncontent-length=11\nbody-len=11\nbody=hello world"
+            ),
+            "incoming Host present: {include_host}"
+        );
+    }
+
+    assert_eq!(
+        fixture.accept_count(),
+        1,
+        "expected upstream connection reuse"
+    );
+    client.shutdown().await;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_client_reset_preserves_other_streams() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "allow-h2-client-reset";
