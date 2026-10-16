@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -25,6 +26,7 @@ use super::tls::build_proxy_tls_configs;
 fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
     Settings {
         listen,
+        proxy_tls: None,
         proxy_protocol: ProxyProtocolMode::Off,
         proxy_protocol_allowed_cidrs: None,
         allow_private_upstream_cidrs: Vec::new(),
@@ -79,6 +81,7 @@ pub struct ProxyHarness {
     pub settings: Arc<Settings>,
     pub ca: Arc<CertificateAuthority>,
     pub cache: Option<Arc<proxy::cache::HttpCache>>,
+    pub proxy_tls_roots: RootCertStore,
     _policy_tx: watch::Sender<PolicySnapshot>,
     handle: JoinHandle<()>,
 }
@@ -86,6 +89,27 @@ pub struct ProxyHarness {
 impl ProxyHarness {
     pub async fn connect(&self) -> Result<TcpStream> {
         Ok(TcpStream::connect(self.addr).await?)
+    }
+
+    pub async fn connect_tls(&self) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        self.connect_tls_with_proxy_header(&[]).await
+    }
+
+    pub async fn connect_tls_with_proxy_header(
+        &self,
+        header: &[u8],
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let connector = tokio_rustls::TlsConnector::from(super::tls::build_client_tls(
+            self.proxy_tls_roots.clone(),
+        )?);
+        let mut stream = self.connect().await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, header).await?;
+        Ok(connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")?,
+                stream,
+            )
+            .await?)
     }
 
     pub async fn shutdown(self) {
@@ -102,6 +126,7 @@ pub struct ProxyHarnessBuilder {
     cache: Option<Arc<proxy::cache::HttpCache>>,
     settings_override: Option<Box<dyn FnOnce(&mut Settings) + Send>>,
     allow_private_test_upstreams: bool,
+    tls_proxy: bool,
 }
 
 impl ProxyHarnessBuilder {
@@ -118,6 +143,7 @@ impl ProxyHarnessBuilder {
             cache: None,
             settings_override: None,
             allow_private_test_upstreams: true,
+            tls_proxy: false,
         }
     }
 
@@ -149,6 +175,11 @@ impl ProxyHarnessBuilder {
         self
     }
 
+    pub fn with_tls_proxy(mut self) -> Self {
+        self.tls_proxy = true;
+        self
+    }
+
     pub async fn spawn(mut self) -> Result<ProxyHarness> {
         write_clients_and_policies(&self.dirs, &self.clients, &self.policies)?;
 
@@ -167,6 +198,19 @@ impl ProxyHarnessBuilder {
         let mut settings = default_test_settings(proxy_addr, &self.dirs);
         if let Some(override_fn) = self.settings_override.take() {
             override_fn(&mut settings);
+        }
+        let mut proxy_tls_roots = RootCertStore::empty();
+        if self.tls_proxy {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
+            let cert = self.dirs.config_dir.join("proxy.pem");
+            let key = self.dirs.config_dir.join("proxy.key");
+            std::fs::write(&cert, certificate.cert.pem())?;
+            std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644))?;
+            std::fs::write(&key, certificate.signing_key.serialize_pem())?;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+            proxy_tls_roots.add(certificate.cert.der().clone())?;
+            settings.proxy_tls = Some(exfilguard::settings::ProxyTlsSettings::Files { cert, key });
         }
         let proxy_addr = settings.listen;
         let settings = Arc::new(settings);
@@ -226,6 +270,7 @@ impl ProxyHarnessBuilder {
             settings,
             ca,
             cache,
+            proxy_tls_roots,
             _policy_tx: policy_tx,
             handle,
         })

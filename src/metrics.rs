@@ -23,6 +23,43 @@ use tokio::{
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
+static PROXY_TLS_CERTIFICATE_NOT_AFTER: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "proxy_tls_certificate_not_after_timestamp_seconds",
+        "Proxy server certificate expiry",
+    )
+    .expect("create proxy TLS expiry gauge");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register proxy TLS expiry");
+    gauge
+});
+
+static PROXY_TLS_VAULT_RENEWALS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "proxy_tls_vault_renewal_attempts_total",
+            "Proxy server certificate renewal attempts",
+        ),
+        &["result", "reason"],
+    )
+    .expect("create proxy TLS renewal counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register proxy TLS renewals");
+    counter
+});
+
+pub(crate) fn set_proxy_tls_certificate_expiry(not_after: i64) {
+    PROXY_TLS_CERTIFICATE_NOT_AFTER.set(not_after);
+}
+
+pub(crate) fn record_proxy_tls_vault_renewal(result: &str, reason: &str) {
+    PROXY_TLS_VAULT_RENEWALS
+        .with_label_values(&[result, reason])
+        .inc();
+}
+
 static REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new(
         "requests_total",

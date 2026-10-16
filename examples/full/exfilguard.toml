@@ -17,3 +17,9 @@ allow_private_upstream_cidrs = []
 # Changes require a restart.
 http2_stream_window_size = 33554432
 http2_connection_window_size = 67108864
+
+# Enable HTTPS on the proxy listener with a certificate for its hostname.
+# [proxy_tls]
+# source = "files"
+# cert = "/etc/exfilguard/proxy.pem"
+# key = "/etc/exfilguard/proxy.key"

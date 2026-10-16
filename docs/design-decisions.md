@@ -211,11 +211,32 @@ guessing an operator's intended lifecycle from whichever files happen to be
 present.
 
 Vault connection, PKI trust, and login settings are global rather than owned by
-the inspection CA. The inspection CA and authorization services use the same
-Vault connection and AppRole because both uses happen inside the same
+the inspection CA. The inspection CA, proxy listener, and authorization services
+use the same Vault connection and AppRole because they run inside the same
 ExfilGuard process; separate logins would not isolate them. Vault permissions
-still name separate signing paths: one for the inspection intermediate and one
-leaf-certificate role for each authorization service.
+still name separate signing paths for the inspection intermediate, proxy server
+certificate, and each authorization service's client certificate.
+
+## TLS on the proxy listener
+
+`proxy_tls` enables TLS on the configured listener. Its server certificate
+comes from files or a dedicated Vault signing role. Vault shares the existing
+connection, authentication, and pinned roots, while the certificate names the
+proxy itself. Vault private keys are generated locally and retained in memory.
+
+The listener uses HTTP/1.1 for proxy requests and CONNECT. Inspected CONNECT
+sessions can negotiate HTTP/2 inside their own TLS connection. Keeping these
+transports explicit preserves the existing request and policy semantics.
+TLS is optional for all clients, including those using `authorization_service`,
+so existing deployments can adopt HTTPS proxy connections independently of
+upgrading ExfilGuard.
+
+Vault certificates renew halfway through their validity period. File
+certificates reload on SIGHUP independently of the policy snapshot. Valid
+replacements apply to new connections; active connections retain their
+certificate generation. Failed renewal or reload retains the current
+certificate, and its expiry stops new handshakes until a valid replacement
+is available.
 
 ## HTTPS inspect and tunnel modes
 
@@ -480,14 +501,11 @@ and bounded rather than queued in a separate background buffering pipeline.
 Same-key fills are not coalesced: that is an upstream-load optimization with
 response-variant complexity, not necessary for bounding temporary disk use.
 
-## `SIGHUP` reloads policy data only
+## `SIGHUP` reloads policy data and proxy certificate files
 
-`SIGHUP` reloads clients and policies. It does not reload listener settings,
-TLS material, cache settings, metrics settings, or timeout settings.
-
-That keeps reload simple. Policy data changes decisions. The other settings
-change long-lived runtime state. Restart handles those cases more clearly than
-live reload does.
+`SIGHUP` reloads clients, policies, and configured proxy server certificate
+files. Listener addresses, certificate sources and paths, inspection CA material,
+cache settings, metrics settings, and timeout settings require a restart.
 
 The configured client and policy files are one operator-managed generation.
 Deployment tooling must finish replacing the complete generation before it
@@ -521,8 +539,8 @@ settings again before we start serving traffic.
 Startup layers the main file, lexically ordered `config.d/*.toml` fragments,
 and environment overrides in that order. Fragments are partial global settings;
 all relative paths retain the main file's directory as their base. Global
-settings remain restart-only, while SIGHUP reload stays limited to client and
-policy data.
+settings require a restart; SIGHUP rereads client and policy data and configured
+proxy server certificate files.
 
 ## Client limits use connection-time accounting
 

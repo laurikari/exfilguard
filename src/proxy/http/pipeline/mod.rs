@@ -87,6 +87,7 @@ name = "allow"
 
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            proxy_tls: None,
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
             allow_private_upstream_cidrs: Vec::new(),

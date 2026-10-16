@@ -44,7 +44,8 @@ separate from policy matching.
 
 ### 1. The Listener Layer (`src/proxy/listener.rs`)
 
-Accepts raw TCP connections and hands them to the dispatcher.
+Accepts TCP connections, performs TLS when `proxy_tls` is configured, and hands
+the stream to the dispatcher.
 
 ### 2. The Dispatcher Layer (`src/proxy/http/dispatch.rs`)
 
@@ -85,8 +86,9 @@ cargo run -- --config exfilguard.toml
 Edit the copied files, or point `--config` at the originals, to try different
 policies.
 
-`SIGHUP` reloads only the client/policy data from the already configured
-`clients`, `clients_dir`, `policies`, and `policies_dir` paths. Changes to
+`SIGHUP` reloads client/policy data from the already configured
+`clients`, `clients_dir`, `policies`, and `policies_dir` paths, plus proxy server
+certificate files when configured. Changes to
 `exfilguard.toml` or `config.d/*.toml`, including listener, metrics, cache, TLS,
 logging, and timeout settings, require restarting the process.
 
@@ -144,6 +146,11 @@ path.
   backslashes, and encoded dot-segments such as `%2e%2e`.
 
 ## Security
+
+Use `[proxy_tls]` for encrypted proxy connections with file or Vault server
+certificates. See
+[HTTPS Proxy Listener](docs/configuration.md#https-proxy-listener) for
+configuration and curl examples.
 
 ExfilGuard enforces an outbound allow list and logs allowed and blocked requests.
 Timeouts close slow or stalled connections.
@@ -279,9 +286,9 @@ new requests still use the latest client mapping and policies.
 The required `ca` table chooses one explicit source: `builtin` generates a
 long-lived local hierarchy, `files` loads an externally managed hierarchy, and
 `vault` obtains and renews an in-memory intermediate from HashiCorp Vault. The
-same global Vault connection can obtain in-memory client certificates for
-authorization services. The two file-backed CA sources require
-owner-controlled directories and private keys; both reject `root.key` because
+same global Vault connection can obtain the proxy server certificate and
+in-memory client certificates for authorization services. The two file-backed
+CA sources require owner-controlled directories and private keys; both reject `root.key` because
 ExfilGuard never needs the root signing key.
 See `docs/configuration.md` for lifecycle, permission, Vault, and migration
 details. Anyone who can use the intermediate key or Vault signing credential
@@ -395,8 +402,9 @@ and explicit CONNECT tunnels stay distinct. Current-state gauges cover
 downstream connections globally and by client, in-flight requests, CONNECT
 tunnels, bumped TLS sessions, active HTTP/2 streams, upstream connections,
 cache usage, and the last successful policy reload time. Rejected connections
-are counted by client. Certificate metrics report inspection-CA state and
-Vault-backed authorization-service client certificate expiry and renewal.
+are counted by client. Certificate metrics report inspection-CA state, proxy
+server certificate expiry and renewal, and Vault-backed authorization-service
+client certificate expiry and renewal.
 Example alert rules are in `docs/prometheus-alerts.yml`.
 
 ## Learn more

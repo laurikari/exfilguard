@@ -83,4 +83,18 @@ impl LogCapture {
         let guard = self.buffer.lock().unwrap_or_else(|err| err.into_inner());
         String::from_utf8_lossy(&guard).to_string()
     }
+
+    pub async fn wait_for(&self, fragment: &str) -> anyhow::Result<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let text = self.text();
+                if text.contains(fragment) {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("missing log fragment {fragment:?}: {}", self.text()))
+    }
 }

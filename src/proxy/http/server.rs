@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 
 use anyhow::{Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 
 use crate::config::Scheme;
 use crate::proxy::AppContext;
@@ -11,7 +10,11 @@ use crate::proxy::request::RequestFlowContext;
 
 use super::dispatch::{self, HttpLoopOptions, LoopOutcome};
 
-pub async fn handle_http(stream: TcpStream, peer: SocketAddr, app: AppContext) -> Result<()> {
+pub async fn handle_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    peer: SocketAddr,
+    app: AppContext,
+) -> Result<()> {
     serve_plain_http(stream, peer, app).await
 }
 
@@ -28,7 +31,11 @@ where
     serve_bumped_connection(stream, peer, app, connect_binding, flow_context).await
 }
 
-async fn serve_plain_http(stream: TcpStream, peer: SocketAddr, app: AppContext) -> Result<()> {
+async fn serve_plain_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    peer: SocketAddr,
+    app: AppContext,
+) -> Result<()> {
     match dispatch::serve_http_loop(
         stream,
         peer,

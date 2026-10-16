@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Instant};
 
 use anyhow::Result;
 use http::{Method, StatusCode};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::warn;
 
 use crate::{
@@ -21,8 +21,8 @@ use async_trait::async_trait;
 
 use super::{session::ConnectSession, target::parse_connect_target};
 
-pub(crate) struct ConnectRequest<'a> {
-    pub(crate) stream: TcpStream,
+pub(crate) struct ConnectRequest<'a, S> {
+    pub(crate) stream: S,
     pub(crate) prefetched: Vec<u8>,
     pub(crate) peer: SocketAddr,
     pub(crate) target: &'a str,
@@ -34,8 +34,8 @@ pub(crate) struct ConnectRequest<'a> {
 
 /// Handles an incoming CONNECT request, delegating policy evaluation to the shared request
 /// pipeline and invoking splice/bump logic via the session handler.
-pub(crate) async fn handle_connect(
-    ctx: ConnectRequest<'_>,
+pub(crate) async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    ctx: ConnectRequest<'_, S>,
     authorization_token: Option<std::sync::Arc<crate::authorization::AuthorizationToken>>,
 ) -> Result<()> {
     let ConnectRequest {
@@ -115,9 +115,9 @@ pub(crate) async fn handle_connect(
     .await
 }
 
-struct ConnectRequestHandler<'a> {
+struct ConnectRequestHandler<'a, S> {
     session: &'a mut ConnectSession,
-    stream: &'a mut Option<TcpStream>,
+    stream: &'a mut Option<S>,
     prefetched: &'a mut Option<Vec<u8>>,
     app: &'a AppContext,
     peer: SocketAddr,
@@ -126,7 +126,9 @@ struct ConnectRequestHandler<'a> {
 }
 
 #[async_trait]
-impl<'a> RequestHandler for ConnectRequestHandler<'a> {
+impl<'a, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RequestHandler
+    for ConnectRequestHandler<'a, S>
+{
     type Output = ();
 
     async fn on_allow(&mut self, outcome: policy_eval::AllowOutcome<'_>) -> Result<Self::Output> {
@@ -225,7 +227,7 @@ impl<'a> RequestHandler for ConnectRequestHandler<'a> {
     }
 }
 
-impl ConnectRequestHandler<'_> {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> ConnectRequestHandler<'_, S> {
     async fn respond_auth_deny(&mut self, log: policy_eval::RequestLogContext<'_>) -> Result<()> {
         respond_with_access_log(
             self.stream.as_mut().expect("stream present"),
@@ -245,8 +247,8 @@ impl ConnectRequestHandler<'_> {
     }
 }
 
-async fn respond_invalid_connect_target(
-    stream: &mut TcpStream,
+async fn respond_invalid_connect_target<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
     peer: SocketAddr,
     target: &str,
     response_timeout: std::time::Duration,

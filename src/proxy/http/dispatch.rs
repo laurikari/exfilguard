@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Instant};
 
 use anyhow::Result;
 use http::{Method, StatusCode};
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::warn;
 
 use crate::authorization::AuthorizationToken;
@@ -235,6 +235,11 @@ where
     upstream_pool
         .shutdown_all(app.settings.response_body_idle_timeout())
         .await?;
+    let _ = tokio::time::timeout(
+        app.settings.response_body_idle_timeout(),
+        reader.get_mut().shutdown(),
+    )
+    .await;
     Ok(LoopOutcome::Completed)
 }
 

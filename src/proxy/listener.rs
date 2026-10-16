@@ -26,7 +26,7 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind listener on {}", bind_addr))?;
     let local_addr = listener.local_addr().unwrap_or(bind_addr);
-    info!(address = %local_addr, "proxy listener started");
+    info!(address = %local_addr, tls = app.proxy_tls.is_some(), "proxy listener started");
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
@@ -195,7 +195,15 @@ async fn handle_connection(
     drop(proxy_protocol_pending_guard);
     let _client_connection_metric =
         crate::metrics::track_downstream_connection_for_client(client_name);
-    http::handle_http(stream, peer, app).await
+    match &app.proxy_tls {
+        Some(tls) => {
+            let stream = tls
+                .accept(stream, app.settings.tls_handshake_timeout())
+                .await?;
+            http::handle_http(stream, peer, app).await
+        }
+        None => http::handle_http(stream, peer, app).await,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
