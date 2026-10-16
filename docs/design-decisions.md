@@ -337,6 +337,13 @@ This reduces SSRF risk. If a client is compromised or misconfigured,
 ExfilGuard should not let it reach internal or special-purpose network space
 unless an operator makes an explicit exception.
 
+`allow_private_upstream_cidrs` provides global, restart-required exceptions.
+`ConfiguredUpstreamResolver` applies them to literal addresses and individual
+DNS results before connection attempts. Request policies still determine access.
+Keeping address exceptions global lets inspected HTTPS validate its destination
+during transport preflight, before the inner request is available for policy
+evaluation.
+
 ## One policy path for all front-ends
 
 HTTP/1, HTTP/2, and CONNECT all go through the same policy code.

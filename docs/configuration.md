@@ -63,6 +63,39 @@ These settings are required.
 
 ---
 
+## Private Upstream Exceptions
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow_private_upstream_cidrs` | Array of CIDRs | `[]` | Non-public upstream address ranges eligible for connections |
+
+ExfilGuard blocks non-public upstream addresses by default. To reach selected
+internal services through the proxy, add their addresses or networks:
+
+```toml
+allow_private_upstream_cidrs = ["10.0.201.6/32", "100.64.0.0/10", "fd00:1234::/48"]
+```
+
+Use CIDR notation, including `/32` for a single IPv4 address or `/128` for a
+single IPv6 address. Invalid entries prevent startup. Changes require a restart.
+
+Exceptions apply to all clients and to plain HTTP, CONNECT tunnels, and inspected
+HTTPS. Existing request policies still determine which clients, methods, URLs,
+and ports are allowed. Prefer narrow exceptions: broad ranges expand the
+destinations reachable under every existing policy.
+
+The resolver checks literal addresses and each DNS result. Connections use only
+eligible addresses; blocked results are discarded even when other results are
+allowed. IPv4 CIDRs do not implicitly include IPv4-mapped IPv6 or NAT64
+representations. Loopback, link-local, and other non-public ranges require
+explicit inclusion.
+
+An address rejection returns HTTP 403 with
+`upstream address blocked (private_address)`. Access logs record
+`error_reason="private_address"`.
+
+---
+
 ## Global Configuration Fragments
 
 ExfilGuard reads regular `*.toml` files from a `config.d` directory beside the

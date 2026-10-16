@@ -94,8 +94,8 @@ pub fn forward_error_spec(kind: &ForwardErrorKind<'_>) -> ForwardErrorSpec {
         },
         ForwardErrorKind::PrivateAddress(_) => ForwardErrorSpec {
             status: StatusCode::FORBIDDEN,
-            body_http1: b"request blocked by policy\r\n",
-            body_http2: "request blocked by policy",
+            body_http1: b"upstream address blocked (private_address)\r\n",
+            body_http2: "upstream address blocked (private_address)",
             decision: "DENY",
             extra_client_bytes: 0,
             log_reason: "private_address",
@@ -402,6 +402,23 @@ mod tests {
             panic!("expected responded outcome");
         }
         Ok(())
+    }
+
+    #[test]
+    fn private_address_response_identifies_address_filtering() {
+        let error = crate::proxy::resolver::PrivateAddressError::new("internal.test", 443, "test");
+        let spec = forward_error_spec(&ForwardErrorKind::PrivateAddress(&error));
+        assert_eq!(spec.status, StatusCode::FORBIDDEN);
+        assert_eq!(spec.decision, "DENY");
+        assert_eq!(spec.log_reason, "private_address");
+        assert_eq!(
+            spec.body_http1,
+            b"upstream address blocked (private_address)\r\n"
+        );
+        assert_eq!(
+            spec.body_http2,
+            "upstream address blocked (private_address)"
+        );
     }
 
     #[test]

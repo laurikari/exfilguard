@@ -410,6 +410,8 @@ pub struct Settings {
     pub proxy_protocol: ProxyProtocolMode,
     #[serde(default)]
     pub proxy_protocol_allowed_cidrs: Option<Vec<IpNet>>,
+    #[serde(default)]
+    pub allow_private_upstream_cidrs: Vec<IpNet>,
     #[serde(default = "SettingsDefaults::proxy_protocol_max_pending_connections")]
     pub proxy_protocol_max_pending_connections: usize,
     #[serde(default)]
@@ -1026,6 +1028,59 @@ policies = "policies.toml"
         assert_eq!(settings.http2_connection_window_size, 1_048_576);
     }
 
+    #[test]
+    fn private_upstream_cidr_settings() {
+        let dir = TempDir::new().unwrap();
+        for (setting, expected) in [
+            ("", 0),
+            ("allow_private_upstream_cidrs=[]\n", 0),
+            (
+                "allow_private_upstream_cidrs=['10.0.201.6/32', 'fd00::/48']\n",
+                2,
+            ),
+        ] {
+            let config =
+                write_settings_config(&dir, &format!("{setting}[ca]\nsource='builtin'\ndir='ca'"));
+            let settings = Settings::load(&Cli {
+                config: Some(config),
+            })
+            .unwrap();
+            assert_eq!(settings.allow_private_upstream_cidrs.len(), expected);
+            if expected == 2 {
+                assert_eq!(
+                    settings.allow_private_upstream_cidrs,
+                    vec![
+                        "10.0.201.6/32".parse::<ipnet::IpNet>().unwrap(),
+                        "fd00::/48".parse().unwrap()
+                    ]
+                );
+            }
+        }
+        for entry in [
+            "10.0.0.1",
+            "::1",
+            "10.0.0.0/33",
+            "::/129",
+            "localhost/32",
+            "garbage",
+        ] {
+            let config = write_settings_config(
+                &dir,
+                &format!(
+                    "allow_private_upstream_cidrs=['{entry}']\n[ca]\nsource='builtin'\ndir='ca'"
+                ),
+            );
+            let error = Settings::load(&Cli {
+                config: Some(config),
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("allow_private_upstream_cidrs"),
+                "{error}"
+            );
+        }
+    }
+
     fn valid_vault_ca_settings() -> VaultCaSettings {
         VaultCaSettings {
             issuer: "exfilguard".to_string(),
@@ -1561,6 +1616,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            allow_private_upstream_cidrs: Vec::new(),
             proxy_protocol_max_pending_connections: 1024,
             vault: None,
             ca: CaSettings::Builtin {
@@ -1633,6 +1689,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            allow_private_upstream_cidrs: Vec::new(),
             proxy_protocol_max_pending_connections: 1024,
             vault: None,
             ca: CaSettings::Builtin {
@@ -1694,6 +1751,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
+            allow_private_upstream_cidrs: Vec::new(),
             proxy_protocol_max_pending_connections: 1024,
             vault: None,
             ca: CaSettings::Builtin {
@@ -1748,6 +1806,7 @@ policies = "policies.toml"
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_protocol: ProxyProtocolMode::Required,
             proxy_protocol_allowed_cidrs: None,
+            allow_private_upstream_cidrs: Vec::new(),
             proxy_protocol_max_pending_connections: 1024,
             vault: None,
             ca: CaSettings::Builtin {

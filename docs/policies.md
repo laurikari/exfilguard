@@ -147,9 +147,10 @@ first. If no tunnel rule matches, it can still perform a TLS bump preflight
 when matching HTTPS inspect `ALLOW` rules exist for the same host and port. It
 then attaches the real policy decision to the inner HTTP request. A deny-only
 authority fails at the outer CONNECT without opening an upstream connection.
-ExfilGuard still blocks private upstream addresses in every mode. That includes
-plain HTTP, tunneled CONNECT, and bumped HTTPS. The point is to reduce SSRF risk
-and stop clients from reaching internal address space by mistake.
+ExfilGuard blocks private upstream addresses by default in plain HTTP, tunneled
+CONNECT, and bumped HTTPS. The global `allow_private_upstream_cidrs` setting
+permits selected address ranges; request policies still determine access.
+See [Private Upstream Exceptions](configuration.md#private-upstream-exceptions).
 
 ---
 

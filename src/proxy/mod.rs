@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 pub(crate) use self::resolver::{
-    UpstreamResolver, default_upstream_resolver, permissive_test_upstream_resolver,
+    UpstreamResolver, configured_upstream_resolver, permissive_test_upstream_resolver,
 };
 use crate::authorization::AuthorizationServices;
 use crate::{policy::matcher::PolicySnapshot, settings::Settings, tls::issuer::TlsIssuer};
@@ -87,6 +87,8 @@ impl AppContext {
         let proxy_protocol_pending_connections = Arc::new(Semaphore::new(
             settings.proxy_protocol_max_pending_connections,
         ));
+        let upstream_resolver =
+            configured_upstream_resolver(&settings.allow_private_upstream_cidrs);
         Self {
             settings,
             policies,
@@ -95,7 +97,7 @@ impl AppContext {
             authorization,
             client_connections: Arc::new(admission::ClientConnectionLimiter::default()),
             proxy_protocol_pending_connections,
-            upstream_resolver: default_upstream_resolver(),
+            upstream_resolver,
         }
     }
 
