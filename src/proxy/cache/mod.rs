@@ -227,7 +227,7 @@ impl CacheState {
             return true;
         }
         self.in_flight_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|total| *total <= self.max_entry_size)
@@ -241,7 +241,7 @@ impl CacheState {
         }
         let released =
             self.in_flight_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current.checked_sub(bytes)
                 });
         debug_assert!(released.is_ok(), "cache in-flight accounting underflow");
