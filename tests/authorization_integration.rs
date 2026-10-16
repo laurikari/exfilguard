@@ -432,6 +432,29 @@ async fn plain_http_binds_token_applies_credentials_and_bypasses_cache() -> Resu
         .spawn()
         .await?;
 
+    for (token_header, expected_status) in [
+        (String::new(), "HTTP/1.1 407"),
+        (
+            format!("Proxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\n"),
+            "HTTP/1.1 501",
+        ),
+    ] {
+        let mut client = harness.connect().await?;
+        client.write_all(format!(
+            "GET http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{token_header}Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            origin.addr.port(), origin.addr.port(),
+        ).as_bytes()).await?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_http_response_with_length(&mut client),
+        )
+        .await??;
+        assert!(response.starts_with(expected_status), "{response}");
+        assert_eq!(services.policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(origin.requests.load(Ordering::SeqCst), 0);
+    }
+
     let mut downstream = TcpStream::connect(harness.addr).await?;
     let first = format!(
         "GET http://127.0.0.1:{}/credential HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: keep-alive\r\n\r\n",

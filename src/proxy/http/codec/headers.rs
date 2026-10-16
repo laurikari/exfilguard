@@ -92,6 +92,7 @@ pub(crate) struct Http1HeaderAccumulator {
     sanitizer: RequestHeaderSanitizer,
     headers: Vec<Http1HeaderLine>,
     proxy_authorizations: Vec<Zeroizing<Vec<u8>>>,
+    upgrade_present: bool,
 }
 
 impl Http1HeaderAccumulator {
@@ -100,6 +101,7 @@ impl Http1HeaderAccumulator {
             sanitizer: RequestHeaderSanitizer::new(max_bytes),
             headers: Vec::new(),
             proxy_authorizations: Vec::new(),
+            upgrade_present: false,
         }
     }
 
@@ -110,6 +112,9 @@ impl Http1HeaderAccumulator {
             return Ok(false);
         };
         let action = self.sanitizer.record(name, value, line_len)?;
+        if name.eq_ignore_ascii_case("upgrade") {
+            self.upgrade_present = true;
+        }
         if name.eq_ignore_ascii_case("proxy-authorization") {
             self.proxy_authorizations
                 .push(Zeroizing::new(value.as_bytes().to_vec()));
@@ -187,6 +192,10 @@ impl Http1HeaderAccumulator {
     pub fn wants_connection_close(&self) -> bool {
         self.has_connection_token("close")
     }
+
+    pub fn requests_upgrade(&self) -> bool {
+        self.upgrade_present || self.has_connection_token("upgrade")
+    }
 }
 
 pub(super) fn header_lines_to_map<'a, I>(headers: I) -> HeaderMap
@@ -203,6 +212,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::Http1HeaderAccumulator;
+
+    #[test]
+    fn upgrade_detection_survives_header_sanitization() -> anyhow::Result<()> {
+        for lines in [
+            vec!["Upgrade: websocket\r\n", "Connection: Upgrade\r\n"],
+            vec![
+                "cOnNeCtIoN: keep-alive, uPgRaDe\r\n",
+                "uPgRaDe: websocket\r\n",
+            ],
+            vec!["Upgrade: h2c\r\n"],
+            vec!["Upgrade:\r\n"],
+            vec!["Connection: upgrade\r\n"],
+            vec!["Upgrade: other-protocol\r\n"],
+        ] {
+            let mut accumulator = Http1HeaderAccumulator::new(1024);
+            for line in lines {
+                accumulator.push_line(line)?;
+            }
+            assert!(accumulator.requests_upgrade());
+            assert_eq!(accumulator.forward_headers().count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_headers_do_not_request_an_upgrade() -> anyhow::Result<()> {
+        let mut accumulator = Http1HeaderAccumulator::new(1024);
+        assert!(!accumulator.requests_upgrade());
+        for line in [
+            "Host: example.test\r\n",
+            "Connection: keep-alive, x-upgrade\r\n",
+            "Sec-WebSocket-Key: fixture\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "X-Upgrade: websocket\r\n",
+        ] {
+            accumulator.push_line(line)?;
+            assert!(!accumulator.requests_upgrade());
+        }
+        Ok(())
+    }
 
     #[test]
     fn forward_headers_skip_connection_tokens() {

@@ -11,7 +11,7 @@ use crate::logging::AccessLogBuilder;
 
 use crate::proxy::AppContext;
 use crate::proxy::connect::ResolvedTarget;
-use crate::proxy::request::{RequestFlowContext, scheme_name};
+use crate::proxy::request::{RequestFlowContext, request_target_for_log, scheme_name};
 
 use super::codec::{Http1RequestHead, read_http1_request_head};
 use super::pipeline::{
@@ -149,6 +149,38 @@ where
                 break;
             }
         };
+
+        if headers.requests_upgrade() {
+            let scheme = if method == Method::CONNECT {
+                Scheme::Https
+            } else {
+                fallback_scheme
+            };
+            let mut log = AccessLogBuilder::new(peer)
+                .method(method.as_str())
+                .scheme(scheme_name(scheme))
+                .host(headers.host().unwrap_or(""))
+                .path(request_target_for_log(&target, app.settings.log_queries))
+                .apply_flow_context(flow_context.as_ref(), method.as_str())
+                .decision("ERROR")
+                .error_reason("upgrade_unsupported");
+            if let Some(client) = snapshot.resolve_client(peer.ip()) {
+                log = log.client(client.name.as_ref());
+            }
+            respond_with_access_log(
+                reader.get_mut(),
+                StatusCode::NOT_IMPLEMENTED,
+                None,
+                b"HTTP/1.1 Upgrade is not supported by ExfilGuard\r\n",
+                None,
+                response_timeout,
+                (request_line_bytes + header_bytes) as u64,
+                header_start.elapsed(),
+                log,
+            )
+            .await?;
+            break;
+        }
 
         if allow_connect && method == Method::CONNECT {
             let request_bytes = request_line_bytes + header_bytes;

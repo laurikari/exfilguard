@@ -537,7 +537,12 @@ their setup-time decision until they close or reach their configured lifetime.
 ExfilGuard does not currently support some protocol features, including
 HTTP/1.0 and upgrade-style flows such as WebSocket over HTTP/1.1.
 
-We leave them out because that keeps the code easier to reason about.
+Supporting protocol upgrades would require separate policy, connection-lifetime,
+and forwarding behavior. `proxy::http::dispatch::serve_http_loop` rejects HTTP/1.1
+requests containing an `Upgrade` header or an `upgrade` connection token with
+501 and closes the client connection. This check runs before policy evaluation
+or forwarding, after proxy-token validation. Access logs identify the failure as
+`upgrade_unsupported`. Established CONNECT tunnels remain opaque.
 
 Inspected live forwarding also preserves the HTTP version across the client
 and upstream legs instead of translating between HTTP/1.1 and HTTP/2. The
