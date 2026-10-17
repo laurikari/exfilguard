@@ -45,6 +45,7 @@ where
         fallback_scheme,
         snapshot,
         authorization_token,
+        client_name,
     } = ctx;
     let request_body_timeout = app.settings.request_body_idle_timeout();
     let response_header_timeout = app.settings.response_header_timeout();
@@ -180,6 +181,7 @@ where
     if let Some(flow_context) = flow_context {
         parsed.set_flow_context(flow_context.clone());
     }
+    parsed.client_name = client_name;
     let policy_authorization_token = authorization_token.clone();
     let log_tracker = AllowLogTracker::new(total_request_bytes, start);
     let mut handler = Http1RequestHandler {

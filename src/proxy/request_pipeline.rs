@@ -75,7 +75,7 @@ pub(crate) async fn process_request<H: RequestHandler + Send>(
     handler: &mut H,
 ) -> Result<H::Output> {
     let authorization_service = snapshot
-        .resolve_client(peer.ip())
+        .request_client(peer.ip(), parsed.client_name.as_deref())
         .and_then(|client| client.authorization_service.as_ref());
     let policy_outcome = if let Some(service_name) = authorization_service {
         let Some((authorization, authorization_token)) = authorization else {
@@ -152,6 +152,20 @@ pub(crate) async fn process_request<H: RequestHandler + Send>(
     } else {
         policy_eval::evaluate_request(peer, parsed, snapshot, log_queries, log_config)
     };
+    let anonymous = snapshot
+        .request_client(peer.ip(), parsed.client_name.as_deref())
+        .is_some_and(|client| {
+            client.password_hash.is_none() && client.authorization_service.is_none()
+        });
+    if anonymous && snapshot.authentication_available(peer.ip()) {
+        match policy_outcome {
+            PolicyOutcome::Deny(outcome) => return handler.on_auth_deny(outcome.log).await,
+            PolicyOutcome::DefaultDeny(outcome) if parsed.method != http::Method::CONNECT => {
+                return handler.on_auth_deny(outcome.log).await;
+            }
+            _ => {}
+        }
+    }
     dispatch_policy_outcome(policy_outcome, handler).await
 }
 

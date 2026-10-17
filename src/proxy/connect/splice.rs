@@ -4,7 +4,6 @@ use std::time::Duration;
 use anyhow::{Context, Error, Result};
 use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
@@ -58,8 +57,8 @@ impl ConnectTunnelCommittedError {
     }
 }
 
-pub async fn handle_splice(
-    client_stream: &mut TcpStream,
+pub async fn handle_splice<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    client_stream: &mut S,
     prefetched: &[u8],
     target: &ConnectTarget,
     resolved: &ResolvedTarget,
@@ -297,7 +296,7 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use tokio::io::duplex;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_applies_to_the_whole_tunnel() -> Result<()> {

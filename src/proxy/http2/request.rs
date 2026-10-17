@@ -136,6 +136,7 @@ pub fn sanitize_request_for_fuzz(
         outer_method: "CONNECT".into(),
         effective_mode: crate::proxy::request::EffectiveMode::Bump,
         authorization_token: None,
+        client_session: None,
     };
     let _ = sanitize_request_parts(method, uri, headers, max_header_bytes, &flow_context)?;
     Ok(())
@@ -206,6 +207,7 @@ mod tests {
             outer_method: "CONNECT".into(),
             effective_mode: EffectiveMode::Bump,
             authorization_token: None,
+            client_session: None,
         };
 
         let sanitized = sanitize_request_parts(&Method::PUT, &uri, &headers, 1024, &flow_context)?;

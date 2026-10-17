@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use rustls::{crypto::ring, pki_types::ServerName, server::ServerConfig, sign::SingleCertAndKey};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::warn;
 
@@ -23,8 +24,8 @@ pub struct BumpStats {
     pub handshake_bytes: u64,
 }
 
-pub async fn handle_bump(
-    stream: TcpStream,
+pub async fn handle_bump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
     prefetched: Vec<u8>,
     target: &ConnectTarget,
     resolved: ResolvedTarget,
