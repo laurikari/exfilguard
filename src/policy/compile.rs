@@ -54,6 +54,8 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         }
         compiled_clients.push(ClientEntry {
             name: client.name.clone(),
+            selector: client.selector.clone(),
+            password_hash: client.password_hash.clone(),
             policies: Arc::from(indices.into_boxed_slice()),
             authorization_service: client.authorization_service.clone(),
             credential_limits: Arc::from(
@@ -86,25 +88,47 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         });
     }
 
-    let fallback_index = config
-        .clients
+    let fallback_index = config.clients.iter().position(|client| {
+        matches!(client.selector, ClientSelector::Fallback)
+            && client.authorization_service.is_none()
+    });
+    let lease_fallback_index = config.clients.iter().position(|client| {
+        matches!(client.selector, ClientSelector::Fallback)
+            && client.authorization_service.is_some()
+    });
+    let cidr_trie = build_client_trie(&config.clients, |client| {
+        client.password_hash.is_none() && client.authorization_service.is_none()
+    });
+    let lease_cidr_trie = build_client_trie(&config.clients, |client| {
+        client.authorization_service.is_some()
+    });
+    let password_cidr_trie =
+        build_client_trie(&config.clients, |client| client.password_hash.is_some());
+    let client_names = compiled_clients
         .iter()
-        .position(|client| matches!(client.selector, ClientSelector::Fallback))
-        .expect("validate_clients guarantees a fallback client");
-    let cidr_trie = build_client_trie(&config.clients);
+        .enumerate()
+        .map(|(index, client)| (client.name.clone(), index))
+        .collect();
 
     Ok(CompiledConfig {
         clients: compiled_clients,
         policies: Arc::from(policies.into_boxed_slice()),
         cidr_trie,
         fallback_client: fallback_index,
+        lease_cidr_trie,
+        password_cidr_trie,
+        lease_fallback_client: lease_fallback_index,
+        client_names,
     })
 }
 
-fn build_client_trie(clients: &[Client]) -> CidrTrie {
+fn build_client_trie(clients: &[Client], matches: impl Fn(&Client) -> bool) -> CidrTrie {
     let mut cidr_trie = CidrTrie::new();
 
     for (index, client) in clients.iter().enumerate() {
+        if !matches(client) {
+            continue;
+        }
         match &client.selector {
             ClientSelector::Ip(addr) => {
                 cidr_trie.insert(IpNet::from(*addr), index);
@@ -308,6 +332,7 @@ mod tests {
                     .into_boxed_slice(),
             ),
             authorization_service: None,
+            password_hash: None,
             credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
@@ -349,6 +374,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -357,6 +383,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -378,6 +405,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -386,6 +414,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.10.1.128/25".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -404,6 +433,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.10.1.0/24".parse::<IpNet>().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -412,6 +442,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.10.1.5".parse().unwrap()),
                 policies: Arc::from(vec![policies[0].name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },

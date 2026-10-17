@@ -1,12 +1,15 @@
 [package]
 name = "exfilguard"
-version = "0.10.3"
+version = "0.11.0"
 edition = "2024"
 description = "Rust egress proxy that enforces outbound network policies with TLS interception support."
 license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+base64 = "0.22"
+bcrypt = "0.19.3"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 futures = "0.3.34"
@@ -20,6 +23,7 @@ parking_lot = "0.12"
 prometheus = "0.14"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 regex = "1.13"
+rpassword = "7.5"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.8"
 serde = { version = "1.0", features = ["derive"] }
@@ -43,6 +47,7 @@ httpdate = "1.0.3"
 uuid = { version = "1.26.0", features = ["v4"] }
 x509-parser = { version = "0.18", features = ["verify"] }
 sha2 = "0.11"
+sha-crypt = "0.5"
 
 [features]
 fuzzing = []

@@ -9,7 +9,8 @@ pub mod upstream;
 pub use body::{BodyTooLarge, InvalidRequestBody};
 pub(crate) use codec::{Http1HeaderAccumulator, Http1ResponseHead};
 pub use pipeline::{respond_with_access_log, shutdown_stream};
-pub use server::{handle_decrypted_https, handle_http};
+pub use server::handle_decrypted_https;
+pub(crate) use server::handle_http;
 
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {

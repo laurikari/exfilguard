@@ -705,15 +705,15 @@ pub(super) async fn send_error_response(
     respond: &mut SendResponse<Bytes>,
     status: StatusCode,
     message: &str,
-    proxy_authenticate: Option<&str>,
+    proxy_authenticate: Option<&[&str]>,
 ) -> Result<()> {
     let mut builder = http::Response::builder().status(status);
     {
         let headers = builder
             .headers_mut()
             .expect("headers_mut available before body");
-        if let Some(value) = proxy_authenticate {
-            headers.insert(
+        for value in proxy_authenticate.into_iter().flatten() {
+            headers.append(
                 http::header::PROXY_AUTHENTICATE,
                 HeaderValue::from_str(value).context("invalid proxy authentication challenge")?,
             );

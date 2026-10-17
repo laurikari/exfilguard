@@ -18,6 +18,7 @@ pub struct Client {
     pub selector: ClientSelector,
     pub policies: Arc<[Arc<str>]>,
     pub authorization_service: Option<Arc<str>>,
+    pub password_hash: Option<crate::authentication::PasswordHash>,
     pub credential_limits: Arc<[CredentialLimit]>,
     pub max_connections: usize,
 }
@@ -43,6 +44,17 @@ pub enum ClientSelector {
     Ip(IpAddr),
     Cidr(IpNet),
     Fallback,
+}
+
+impl ClientSelector {
+    pub(crate) fn contains(&self, addr: IpAddr) -> bool {
+        let addr = crate::util::normalize_mapped_ip(addr);
+        match self {
+            Self::Ip(ip) => *ip == addr,
+            Self::Cidr(net) => net.contains(&addr),
+            Self::Fallback => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

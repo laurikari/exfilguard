@@ -2,10 +2,9 @@ use std::{net::SocketAddr, time::Instant};
 
 use anyhow::Result;
 use http::{Method, StatusCode};
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::warn;
 
-use crate::authorization::AuthorizationToken;
 use crate::config::Scheme;
 use crate::logging::AccessLogBuilder;
 
@@ -24,6 +23,7 @@ pub(super) struct HttpLoopOptions {
     pub fallback_scheme: Scheme,
     pub connect_binding: Option<ResolvedTarget>,
     pub flow_context: Option<RequestFlowContext>,
+    pub client_session: std::sync::Arc<crate::authentication::ConnectionSession>,
 }
 
 pub(super) enum LoopOutcome<S> {
@@ -38,7 +38,8 @@ pub(super) struct ConnectRequest<S> {
     pub request_bytes: usize,
     pub start: Instant,
     pub snapshot: crate::policy::matcher::PolicySnapshot,
-    pub authorization_token: Option<std::sync::Arc<AuthorizationToken>>,
+    pub authorization_token: Option<std::sync::Arc<crate::authorization::AuthorizationToken>>,
+    pub client_session: std::sync::Arc<crate::authentication::ConnectionSession>,
 }
 
 pub(super) async fn serve_http_loop<S>(
@@ -55,6 +56,7 @@ where
         fallback_scheme,
         connect_binding,
         flow_context,
+        client_session,
     } = options;
     let keepalive_timeout = app.settings.client_keepalive_idle_timeout();
     let header_timeout = app.settings.request_header_timeout();
@@ -63,9 +65,6 @@ where
     let mut reader = BufReader::new(stream);
     let mut upstream_pool = UpstreamPool::new(app.settings.upstream_pool_capacity_nonzero());
     let binding = connect_binding.as_ref();
-    let mut bound_authorization_token = flow_context
-        .as_ref()
-        .and_then(|flow| flow.authorization_token.clone());
 
     loop {
         let header_start = Instant::now();
@@ -116,40 +115,67 @@ where
         } = request_head;
 
         let snapshot = app.policies.snapshot();
-        let requires_authorization = snapshot
-            .resolve_client(peer.ip())
-            .is_some_and(|client| client.authorization_service.is_some());
-        let authorization_token = match bind_authorization_token(
-            app,
-            &headers,
-            &mut bound_authorization_token,
-            requires_authorization,
-        ) {
-            Ok(token) => token,
-            Err(()) => {
-                warn!(peer = %peer, "proxy authorization token rejected");
-                respond_with_access_log(
-                    reader.get_mut(),
-                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                    None,
-                    b"proxy authentication required\r\n",
-                    Some("ExfilGuard"),
-                    response_timeout,
-                    (request_line_bytes + header_bytes) as u64,
-                    header_start.elapsed(),
-                    AccessLogBuilder::new(peer)
-                        .method(method.as_str())
-                        .scheme(scheme_name(fallback_scheme))
-                        .host(headers.host().unwrap_or(""))
-                        .path("")
-                        .decision("DENY")
-                        .error_reason("proxy_authentication"),
-                )
-                .await?;
-                break;
+        let was_bound = client_session.client_name().is_some();
+        let authentication = client_session
+            .authenticate(
+                &snapshot,
+                peer.ip(),
+                headers
+                    .proxy_authorizations()
+                    .iter()
+                    .map(|value| value.as_slice())
+                    .collect(),
+                app,
+            )
+            .await;
+        let snapshot = app.policies.snapshot();
+        let authentication = authentication.and_then(|()| {
+            if client_session.valid(&snapshot, peer.ip()) {
+                Ok(())
+            } else {
+                Err(crate::authentication::AuthenticationError::Denied)
             }
-        };
-
+        });
+        if let Err(error) = authentication {
+            let busy = matches!(error, crate::authentication::AuthenticationError::Busy);
+            crate::metrics::record_authentication(if busy { "busy" } else { "denied" });
+            let challenge = crate::authentication::challenges(&snapshot, peer.ip());
+            respond_with_access_log(
+                reader.get_mut(),
+                if busy {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::PROXY_AUTHENTICATION_REQUIRED
+                },
+                None,
+                b"proxy authentication failed\r\n",
+                if busy || challenge.is_empty() {
+                    None
+                } else {
+                    Some(challenge.as_slice())
+                },
+                response_timeout,
+                (request_line_bytes + header_bytes) as u64,
+                header_start.elapsed(),
+                AccessLogBuilder::new(peer)
+                    .method(method.as_str())
+                    .scheme(scheme_name(fallback_scheme))
+                    .host(headers.host().unwrap_or(""))
+                    .path("")
+                    .decision("DENY")
+                    .error_reason(if busy {
+                        "authentication_busy"
+                    } else {
+                        "proxy_authentication"
+                    }),
+            )
+            .await?;
+            break;
+        }
+        if !was_bound {
+            crate::metrics::record_authentication("success");
+        }
+        let authorization_token = client_session.authorization_token();
         if headers.requests_upgrade() {
             let scheme = if method == Method::CONNECT {
                 Scheme::Https
@@ -164,7 +190,9 @@ where
                 .apply_flow_context(flow_context.as_ref(), method.as_str())
                 .decision("ERROR")
                 .error_reason("upgrade_unsupported");
-            if let Some(client) = snapshot.resolve_client(peer.ip()) {
+            if let Some(client) =
+                snapshot.request_client(peer.ip(), client_session.client_name().as_deref())
+            {
                 log = log.client(client.name.as_ref());
             }
             respond_with_access_log(
@@ -197,11 +225,11 @@ where
                 start: header_start,
                 snapshot,
                 authorization_token,
+                client_session: client_session.clone(),
             }));
         }
 
-        // Header receipt has its own deadline. The total request budget begins only after the
-        // complete request head is accepted, matching HTTP/2 stream handling.
+        // Connection authentication is complete. Give request processing its full timeout budget.
         let start = Instant::now();
 
         let ctx = RequestContext {
@@ -214,6 +242,7 @@ where
             fallback_scheme,
             snapshot,
             authorization_token,
+            client_name: client_session.client_name(),
         };
 
         match handle_non_connect(
@@ -235,28 +264,10 @@ where
     upstream_pool
         .shutdown_all(app.settings.response_body_idle_timeout())
         .await?;
+    let _ = tokio::time::timeout(
+        app.settings.response_body_idle_timeout(),
+        reader.get_mut().shutdown(),
+    )
+    .await;
     Ok(LoopOutcome::Completed)
-}
-
-fn bind_authorization_token(
-    app: &AppContext,
-    headers: &super::codec::Http1HeaderAccumulator,
-    bound: &mut Option<std::sync::Arc<AuthorizationToken>>,
-    required: bool,
-) -> Result<Option<std::sync::Arc<AuthorizationToken>>, ()> {
-    if !required {
-        return Ok(None);
-    }
-    let authorization = app.authorization.as_ref().ok_or(())?;
-    let token = authorization
-        .bind_token(
-            headers
-                .proxy_authorizations()
-                .iter()
-                .map(|value| value.as_slice()),
-            bound.as_ref(),
-        )
-        .map_err(|_| ())?;
-    *bound = Some(token.clone());
-    Ok(Some(token))
 }

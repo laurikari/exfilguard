@@ -1,3 +1,4 @@
+pub mod authentication;
 mod authorization;
 mod canonical_path;
 pub mod cli;
@@ -52,6 +53,10 @@ async fn run_with_upstream_resolver(
         policy_snapshot,
         tls_client_configs,
     } = build_startup_preflight(&settings)?;
+    let proxy_tls = match &settings.proxy_tls {
+        Some(source) => Some(tls::proxy::ProxyTls::new(source, vault.clone()).await?),
+        None => None,
+    };
     let settings = Arc::new(settings);
     let metrics = settings.metrics_listen.map(|addr| {
         let path = "/metrics".to_string();
@@ -93,7 +98,7 @@ async fn run_with_upstream_resolver(
     let TlsClientConfigs { http1, http2 } = tls_client_configs;
     crate::metrics::mark_policy_reload_success();
     let (policy_tx, policy_rx) = watch::channel(policy_snapshot);
-    spawn_runtime_policy_reload_task(settings.clone(), policy_tx);
+    spawn_runtime_policy_reload_task(settings.clone(), policy_tx, proxy_tls.clone());
     let policy_store = proxy::PolicyStore::new(policy_rx);
     let tls_context = Arc::new(proxy::TlsContext::new(tls_issuer, http1, http2));
 
@@ -119,6 +124,7 @@ async fn run_with_upstream_resolver(
         tls_context,
         cache,
         authorization,
+        proxy_tls,
     )
     .with_upstream_resolver(upstream_resolver);
 
@@ -298,6 +304,7 @@ where
 fn spawn_runtime_policy_reload_task(
     settings: Arc<Settings>,
     policy_tx: watch::Sender<PolicySnapshot>,
+    proxy_tls: Option<Arc<tls::proxy::ProxyTls>>,
 ) {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -311,6 +318,11 @@ fn spawn_runtime_policy_reload_task(
         };
 
         while hup.recv().await.is_some() {
+            if let Some(proxy_tls) = &proxy_tls
+                && let Err(error) = proxy_tls.reload_files().await
+            {
+                tracing::error!(error = %error, "proxy TLS certificate reload failed");
+            }
             tracing::info!("received SIGHUP; reloading runtime policy");
             let reload_settings = settings.clone();
             let build = move || build_runtime_policy_snapshot(&reload_settings);
@@ -340,6 +352,7 @@ fn spawn_runtime_policy_reload_task(
 fn spawn_runtime_policy_reload_task(
     _settings: Arc<Settings>,
     _policy_tx: watch::Sender<PolicySnapshot>,
+    _proxy_tls: Option<Arc<tls::proxy::ProxyTls>>,
 ) {
     tracing::info!("SIGHUP runtime policy reload is not supported on this platform");
 }

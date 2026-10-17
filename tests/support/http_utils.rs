@@ -68,7 +68,9 @@ pub async fn read_response_status(reader: &mut BufReader<TcpStream>) -> Result<u
     Ok(status)
 }
 
-pub async fn read_until_double_crlf(stream: &mut TcpStream) -> Result<String> {
+pub async fn read_until_double_crlf(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<String> {
     let mut buffer = Vec::new();
     loop {
         let mut byte = [0u8; 1];

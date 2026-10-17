@@ -7,8 +7,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use http::StatusCode;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramTimer, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use rustls::{
     ServerConfig,
@@ -22,6 +22,108 @@ use tokio::{
 };
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+
+static AUTHENTICATION_PENDING: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "client_authentication_pending_connections",
+        "Connections awaiting client selection",
+    )
+    .expect("create authentication gauge");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register authentication gauge");
+    gauge
+});
+static PASSWORD_VERIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "client_password_verifications_in_flight",
+        "Admitted password verifications awaiting or running on a blocking worker",
+    )
+    .expect("create verification gauge");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register verification gauge");
+    gauge
+});
+static PASSWORD_VERIFICATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "client_password_verification_duration_seconds",
+            "Password verification latency including blocking worker scheduling",
+        )
+        .buckets(latency_buckets()),
+    )
+    .expect("create verification histogram");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("register verification histogram");
+    histogram
+});
+static AUTHENTICATION_ATTEMPTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "client_authentication_attempts_total",
+            "Client authentication outcomes",
+        ),
+        &["result"],
+    )
+    .expect("create authentication counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register authentication counter");
+    counter
+});
+pub(crate) fn record_authentication(result: &str) {
+    AUTHENTICATION_ATTEMPTS.with_label_values(&[result]).inc();
+}
+pub(crate) fn track_authentication_pending() -> MetricGuard {
+    AUTHENTICATION_PENDING.inc();
+    guard(|| AUTHENTICATION_PENDING.dec())
+}
+pub(crate) fn track_password_verification() -> (MetricGuard, HistogramTimer) {
+    PASSWORD_VERIFICATIONS.inc();
+    (
+        guard(|| PASSWORD_VERIFICATIONS.dec()),
+        PASSWORD_VERIFICATION_SECONDS.start_timer(),
+    )
+}
+
+static PROXY_TLS_CERTIFICATE_NOT_AFTER: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "proxy_tls_certificate_not_after_timestamp_seconds",
+        "Proxy server certificate expiry",
+    )
+    .expect("create proxy TLS expiry gauge");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register proxy TLS expiry");
+    gauge
+});
+
+static PROXY_TLS_VAULT_RENEWALS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "proxy_tls_vault_renewal_attempts_total",
+            "Proxy server certificate renewal attempts",
+        ),
+        &["result", "reason"],
+    )
+    .expect("create proxy TLS renewal counter");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register proxy TLS renewals");
+    counter
+});
+
+pub(crate) fn set_proxy_tls_certificate_expiry(not_after: i64) {
+    PROXY_TLS_CERTIFICATE_NOT_AFTER.set(not_after);
+}
+
+pub(crate) fn record_proxy_tls_vault_renewal(result: &str, reason: &str) {
+    PROXY_TLS_VAULT_RENEWALS
+        .with_label_values(&[result, reason])
+        .inc();
+}
 
 static REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new(

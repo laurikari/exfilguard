@@ -1,7 +1,7 @@
 mod loader;
 pub mod model;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::ops::Deref;
 
@@ -285,6 +285,22 @@ fn validate_config(config: &Config) -> Result<()> {
                 client.name
             );
         }
+        if client.password_hash.is_some() {
+            ensure!(
+                crate::authentication::hash::valid_username(&client.name),
+                "password client name must contain 1 to 128 printable ASCII bytes without whitespace or colons"
+            );
+            ensure!(
+                client.authorization_service.is_none() && client.credential_limits.is_empty(),
+                "password client '{}' cannot use authorization_service or credential limits",
+                client.name
+            );
+            ensure!(
+                !matches!(client.selector, ClientSelector::Fallback),
+                "password client '{}' must specify ip or cidr",
+                client.name
+            );
+        }
         if client.authorization_service.is_none() && !client.credential_limits.is_empty() {
             bail!(
                 "client '{}' defines credential limits without an authorization_service",
@@ -329,20 +345,8 @@ fn validate_config(config: &Config) -> Result<()> {
 /// This remains the single semantic check used by loaded configs, runtime
 /// reloads, and programmatic configs so those paths keep identical guarantees.
 pub fn validate_clients(clients: &[Client]) -> Result<()> {
-    struct CidrClaim<'a> {
-        name: &'a str,
-        net: IpNet,
-    }
-
-    struct IpClaim<'a> {
-        name: &'a str,
-    }
-
     let mut fallback_seen = false;
-    let mut ip_claims: HashMap<IpAddr, IpClaim<'_>> = HashMap::new();
-    let mut cidr_claims: Vec<CidrClaim<'_>> = Vec::new();
-
-    for client in clients {
+    for (index, client) in clients.iter().enumerate() {
         ensure!(
             client.max_connections > 0,
             "client '{}' max_connections must be greater than 0 (got {})",
@@ -357,90 +361,83 @@ pub fn validate_clients(clients: &[Client]) -> Result<()> {
                 );
                 fallback_seen = true;
             }
-            ClientSelector::Ip(addr) => {
-                if let IpAddr::V6(v6) = addr
-                    && let Some(v4) = v6.to_ipv4_mapped()
-                {
-                    bail!(
-                        "client '{}' IP {} is an IPv4-mapped IPv6 address; use IPv4 selector '{}'",
-                        client.name,
-                        addr,
-                        v4
-                    );
-                }
-                if let Some(existing) = ip_claims.insert(
-                    *addr,
-                    IpClaim {
-                        name: client.name.as_ref(),
-                    },
-                ) {
+            ClientSelector::Ip(IpAddr::V6(addr)) if addr.to_ipv4_mapped().is_some() => {
+                bail!(
+                    "client '{}' IP {} is an IPv4-mapped IPv6 address; use IPv4 selector '{}'",
+                    client.name,
+                    addr,
+                    addr.to_ipv4_mapped().unwrap()
+                );
+            }
+            ClientSelector::Cidr(IpNet::V6(net))
+                if net.prefix_len() >= 96 && net.network().to_ipv4_mapped().is_some() =>
+            {
+                bail!(
+                    "client '{}' CIDR {} is an IPv4-mapped IPv6 range; use IPv4 CIDR '{}/{}'",
+                    client.name,
+                    net,
+                    net.network().to_ipv4_mapped().unwrap(),
+                    net.prefix_len() - 96
+                );
+            }
+            _ => {}
+        }
+        if client.password_hash.is_some() {
+            continue;
+        }
+        for previous in &clients[..index] {
+            if previous.password_hash.is_some()
+                || previous.authorization_service.is_some()
+                    != client.authorization_service.is_some()
+            {
+                continue;
+            }
+            match (&client.selector, &previous.selector) {
+                (ClientSelector::Ip(addr), ClientSelector::Ip(other)) if addr == other => {
                     bail!(
                         "client '{}' specifies IP {} which is already claimed by client '{}'",
                         client.name,
                         addr,
-                        existing.name
+                        previous.name
                     );
                 }
-                for claim in &cidr_claims {
-                    if claim.net.contains(addr) {
-                        bail!(
-                            "client '{}' IP {} overlaps with client '{}' CIDR {}",
-                            client.name,
-                            addr,
-                            claim.name,
-                            claim.net
-                        );
-                    }
-                }
-            }
-            ClientSelector::Cidr(net) => {
-                if let IpNet::V6(v6) = net
-                    && v6.prefix_len() >= 96
-                    && let Some(v4) = v6.network().to_ipv4_mapped()
-                {
+                (ClientSelector::Ip(addr), ClientSelector::Cidr(net)) if net.contains(addr) => {
                     bail!(
-                        "client '{}' CIDR {} is an IPv4-mapped IPv6 range; use IPv4 CIDR '{}/{}'",
+                        "client '{}' IP {} overlaps with client '{}' CIDR {}",
+                        client.name,
+                        addr,
+                        previous.name,
+                        net
+                    );
+                }
+                (ClientSelector::Cidr(net), ClientSelector::Ip(addr)) if net.contains(addr) => {
+                    bail!(
+                        "client '{}' CIDR {} overlaps with client '{}' IP {}",
                         client.name,
                         net,
-                        v4,
-                        v6.prefix_len() - 96
+                        previous.name,
+                        addr
                     );
                 }
-                for claim in &cidr_claims {
-                    if cidrs_overlap(&claim.net, net) {
-                        bail!(
-                            "client '{}' CIDR {} overlaps with client '{}' CIDR {}",
-                            client.name,
-                            net,
-                            claim.name,
-                            claim.net
-                        );
-                    }
+                (ClientSelector::Cidr(net), ClientSelector::Cidr(other))
+                    if cidrs_overlap(net, other) =>
+                {
+                    bail!(
+                        "client '{}' CIDR {} overlaps with client '{}' CIDR {}",
+                        client.name,
+                        net,
+                        previous.name,
+                        other
+                    );
                 }
-                for (addr, claim) in &ip_claims {
-                    if net.contains(addr) {
-                        bail!(
-                            "client '{}' CIDR {} overlaps with client '{}' IP {}",
-                            client.name,
-                            net,
-                            claim.name,
-                            addr
-                        );
-                    }
-                }
-                cidr_claims.push(CidrClaim {
-                    name: client.name.as_ref(),
-                    net: *net,
-                });
+                _ => {}
             }
         }
     }
-
     ensure!(
         fallback_seen,
         "exactly one client must set fallback=true to act as the fallback"
     );
-
     Ok(())
 }
 
@@ -491,6 +488,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![Arc::<str>::from(policy_name)].into_boxed_slice()),
             authorization_service: None,
+            password_hash: None,
             credential_limits: Arc::from([]),
             max_connections: super::model::DEFAULT_CLIENT_MAX_CONNECTIONS,
         }
@@ -571,6 +569,7 @@ mod tests {
                     selector,
                     policies: Arc::from([]),
                     authorization_service: None,
+                    password_hash: None,
                     credential_limits: Arc::from([]),
                     max_connections: 1024,
                 },
@@ -592,6 +591,7 @@ mod tests {
                 selector: ClientSelector::Cidr("2001:db8::/32".parse().unwrap()),
                 policies: Arc::from([]),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },

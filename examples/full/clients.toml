@@ -26,7 +26,14 @@ policies = [
   "fallback-egress-deny",
 ]
 
-# Fallback for anything not mapped above.
+# Password clients require [proxy_tls]. Generate a hash with exfilguard password-hash.
+# [[client]]
+# name = "build-worker"
+# cidr = "10.42.16.0/27"
+# password_hash = '<paste the encoded hash here>'
+# policies = ["trusted-analytics-egress", "fallback-egress-deny"]
+
+# Fallback for anonymous requests outside the mapped ranges.
 [[client]]
 name = "fallback"
 policies = [

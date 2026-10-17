@@ -17,7 +17,7 @@ pub(crate) struct CaValidity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ClientCertificateValidity {
+pub(crate) struct CertificateValidity {
     pub not_before: OffsetDateTime,
     pub not_after: OffsetDateTime,
 }
@@ -105,7 +105,7 @@ pub(crate) fn validate_client_certificate_chain(
     key: &KeyPair,
     expected_common_name: &str,
     now: OffsetDateTime,
-) -> Result<ClientCertificateValidity> {
+) -> Result<CertificateValidity> {
     ensure!(
         chain.len() >= 2,
         "client certificate chain must contain a leaf and a trust anchor"
@@ -186,9 +186,74 @@ pub(crate) fn validate_client_certificate_chain(
         );
     }
 
-    Ok(ClientCertificateValidity {
+    Ok(CertificateValidity {
         not_before: leaf.validity().not_before.to_datetime(),
         not_after: leaf.validity().not_after.to_datetime(),
+    })
+}
+
+pub(crate) fn validate_server_certificate_chain(
+    chain: &[rustls::pki_types::CertificateDer<'_>],
+) -> Result<CertificateValidity> {
+    ensure!(!chain.is_empty(), "proxy server certificate chain is empty");
+    let certificates = chain
+        .iter()
+        .map(|der| parse_certificate_exact(der, "proxy server"))
+        .collect::<Result<Vec<_>>>()?;
+    let now = OffsetDateTime::now_utc();
+    let mut not_before = OffsetDateTime::UNIX_EPOCH;
+    let mut not_after = certificates[0].validity().not_after.to_datetime();
+    for certificate in &certificates {
+        let (start, end) = validate_current_time(certificate, "proxy server chain", now)?;
+        not_before = not_before.max(start);
+        not_after = not_after.min(end);
+        let mut seen = HashSet::new();
+        for extension in certificate.extensions() {
+            ensure!(
+                seen.insert(extension.oid.clone()),
+                "proxy certificate has duplicate extensions"
+            );
+            ensure!(
+                !matches!(
+                    extension.parsed_extension(),
+                    ParsedExtension::ParseError { .. } | ParsedExtension::Unparsed
+                ),
+                "proxy certificate has malformed extensions"
+            );
+        }
+    }
+    let leaf = &certificates[0];
+    ensure!(
+        leaf.basic_constraints()?
+            .is_none_or(|value| !value.value.ca),
+        "proxy server certificate must not be a CA"
+    );
+    if let Some(usage) = leaf.key_usage()? {
+        ensure!(
+            usage.value.digital_signature(),
+            "proxy server keyUsage must include digitalSignature"
+        );
+    }
+    if let Some(usage) = leaf.extended_key_usage()? {
+        ensure!(
+            usage.value.server_auth,
+            "proxy certificate must permit serverAuth"
+        );
+    }
+    for pair in certificates.windows(2) {
+        let (child, parent) = (&pair[0], &pair[1]);
+        validate_ca_extensions(parent, "proxy certificate issuer", None, None)?;
+        ensure!(
+            child.issuer() == parent.subject(),
+            "proxy certificate issuer mismatch"
+        );
+        child
+            .verify_signature(Some(parent.public_key()))
+            .context("invalid proxy certificate chain signature")?;
+    }
+    Ok(CertificateValidity {
+        not_before,
+        not_after,
     })
 }
 

@@ -44,7 +44,8 @@ separate from policy matching.
 
 ### 1. The Listener Layer (`src/proxy/listener.rs`)
 
-Accepts raw TCP connections and hands them to the dispatcher.
+Accepts TCP connections, performs TLS when `proxy_tls` is configured, and hands
+the stream to the dispatcher.
 
 ### 2. The Dispatcher Layer (`src/proxy/http/dispatch.rs`)
 
@@ -58,7 +59,8 @@ Takes a request view with scheme, host, port, path, and method, then returns
 allow or deny.
 
 - TOML is compiled up front into matcher structures.
-- Client resolution happens from the source IP before policy checks.
+- Client selection uses the source IP and optional password or lease-token
+  credentials before policy checks.
 
 ### 4. The Request Pipeline (`src/proxy/request_pipeline.rs`)
 
@@ -85,8 +87,9 @@ cargo run -- --config exfilguard.toml
 Edit the copied files, or point `--config` at the originals, to try different
 policies.
 
-`SIGHUP` reloads only the client/policy data from the already configured
-`clients`, `clients_dir`, `policies`, and `policies_dir` paths. Changes to
+`SIGHUP` reloads client/policy data from the already configured
+`clients`, `clients_dir`, `policies`, and `policies_dir` paths, plus proxy server
+certificate files when configured. Changes to
 `exfilguard.toml` or `config.d/*.toml`, including listener, metrics, cache, TLS,
 logging, and timeout settings, require restarting the process.
 
@@ -111,6 +114,7 @@ environment, such as a minimal container, install the standard CA bundle
 
 - `src/cli.rs` — entry point and runtime flags.
 - `src/config/` — config schema and loaders.
+- `src/authentication/` — client password verification and connection identity.
 - `src/authorization/` — delegated policy and authentication for outgoing requests.
 - `src/policy/` — policy compiler and matcher.
 - `src/proxy/` — listeners, HTTP handlers, and upstream clients.
@@ -144,6 +148,16 @@ path.
   backslashes, and encoded dot-segments such as `%2e%2e`.
 
 ## Security
+
+Use `[proxy_tls]` for encrypted proxy connections with file or Vault server
+certificates. See
+[HTTPS Proxy Listener](docs/configuration.md#https-proxy-listener) for
+configuration and curl examples.
+
+Clients can authenticate with Basic credentials backed by configured password
+hashes. Password clients require an HTTPS proxy connection and can share source
+ranges with IP-only and lease-token clients. See
+[Client Passwords](docs/configuration.md#client-passwords).
 
 ExfilGuard enforces an outbound allow list and logs allowed and blocked requests.
 Timeouts close slow or stalled connections.
@@ -240,11 +254,10 @@ Config loading fails if the HTTPS mode and method set are inconsistent.
 
 ### Policy evaluation
 
-1. ExfilGuard maps the request's downstream address to a client. Non-fallback
-   selectors must not overlap, so the match is unambiguous.
-2. If no selector matches, the `fallback` client is used.
-3. It evaluates that client's policies in order; the first matching rule wins.
-4. Tunnel-mode CONNECT rules stream bytes once allowed; inspect-mode HTTPS
+1. The first request selects a client using its source address and optional
+   credentials. See [client selection](docs/policies.md#matching).
+2. ExfilGuard evaluates that client's policies in order; the first matching rule wins.
+3. Tunnel-mode CONNECT rules stream bytes once allowed; inspect-mode HTTPS
    `ALLOW` rules authorize TLS bump preflight and then evaluate the inner
    request normally. Deny-only authorities fail at the outer CONNECT.
 
@@ -264,24 +277,24 @@ Config loading fails if the HTTPS mode and method set are inconsistent.
 ### Fallback client
 
 Exactly one client must set `fallback = true`. That client handles requests that
-do not match any specific IP or CIDR. Config loading fails if zero or multiple
-fallback clients exist. The fallback must not set `ip` or `cidr`.
+do not match a specific IP or CIDR within its authentication category. The
+fallback must not set `ip` or `cidr`. See [client selection](docs/policies.md#matching).
 
 Each client may have at most 1,024 simultaneous downstream connections by
 default. Set `max_connections` on a client to override that budget. A CIDR
 client shares its budget across every matching machine. The count includes
 ordinary HTTP keep-alive, raw CONNECT, and inspected CONNECT connections.
-Permits remain charged to the connection-time client identity across reloads;
-new requests still use the latest client mapping and policies.
+Connections retain their selected identity and use the latest policies.
+Reloads that invalidate the identity close its connections.
 
 ## Certificate storage and permissions
 
 The required `ca` table chooses one explicit source: `builtin` generates a
 long-lived local hierarchy, `files` loads an externally managed hierarchy, and
 `vault` obtains and renews an in-memory intermediate from HashiCorp Vault. The
-same global Vault connection can obtain in-memory client certificates for
-authorization services. The two file-backed CA sources require
-owner-controlled directories and private keys; both reject `root.key` because
+same global Vault connection can obtain the proxy server certificate and
+in-memory client certificates for authorization services. The two file-backed
+CA sources require owner-controlled directories and private keys; both reject `root.key` because
 ExfilGuard never needs the root signing key.
 See `docs/configuration.md` for lifecycle, permission, Vault, and migration
 details. Anyone who can use the intermediate key or Vault signing credential
@@ -317,6 +330,10 @@ Run a target:
 ```shell
 cargo fuzz run http1_request_head
 ```
+
+`client_authentication` exercises Basic header decoding and password hash
+parsing. Its seeds are in `fuzz/seeds/client_authentication/`; it never performs
+password hash calculations.
 
 Stable regression seeds live under `fuzz/seeds/`. For example, run the chunked
 body target from its signed-extension and malformed-framing seeds with:
@@ -395,8 +412,9 @@ and explicit CONNECT tunnels stay distinct. Current-state gauges cover
 downstream connections globally and by client, in-flight requests, CONNECT
 tunnels, bumped TLS sessions, active HTTP/2 streams, upstream connections,
 cache usage, and the last successful policy reload time. Rejected connections
-are counted by client. Certificate metrics report inspection-CA state and
-Vault-backed authorization-service client certificate expiry and renewal.
+are counted by client. Certificate metrics report inspection-CA state, proxy
+server certificate expiry and renewal, and Vault-backed authorization-service
+client certificate expiry and renewal.
 Example alert rules are in `docs/prometheus-alerts.yml`.
 
 ## Learn more
