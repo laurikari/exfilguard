@@ -1,3 +1,4 @@
+pub mod authentication;
 mod authorization;
 mod canonical_path;
 pub mod cli;

@@ -14,6 +14,12 @@ exfilguard = { path = "..", features = ["fuzzing"] }
 http = "1.5"
 
 [[bin]]
+name = "client_authentication"
+path = "fuzz_targets/client_authentication.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "http1_request_head"
 path = "fuzz_targets/http1_request_head.rs"
 test = false

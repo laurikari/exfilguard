@@ -30,6 +30,7 @@ pub struct RequestContext {
     pub fallback_scheme: Scheme,
     pub snapshot: crate::policy::matcher::PolicySnapshot,
     pub authorization_token: Option<std::sync::Arc<crate::authorization::AuthorizationToken>>,
+    pub client_name: Option<std::sync::Arc<str>>,
 }
 
 impl RequestContext {
@@ -88,6 +89,7 @@ name = "allow"
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_tls: None,
+            authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
             allow_private_upstream_cidrs: Vec::new(),
@@ -201,6 +203,7 @@ name = "allow"
             fallback_scheme: Scheme::Http,
             snapshot: app.policies.snapshot(),
             authorization_token: None,
+            client_name: None,
         };
 
         let result =
@@ -243,6 +246,7 @@ name = "allow"
             fallback_scheme: Scheme::Http,
             snapshot: app.policies.snapshot(),
             authorization_token: None,
+            client_name: None,
         };
 
         let result =
@@ -284,6 +288,7 @@ name = "allow"
             fallback_scheme: Scheme::Http,
             snapshot: app.policies.snapshot(),
             authorization_token: None,
+            client_name: None,
         };
 
         let result =

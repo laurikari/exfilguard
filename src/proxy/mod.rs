@@ -1,4 +1,4 @@
-mod admission;
+pub(crate) mod admission;
 pub mod allow_log;
 pub mod cache;
 pub mod connect;
@@ -39,6 +39,10 @@ impl PolicyStore {
     pub fn snapshot(&self) -> PolicySnapshot {
         self.rx.borrow().clone()
     }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<PolicySnapshot> {
+        self.rx.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -49,6 +53,7 @@ pub struct AppContext {
     pub cache: Option<Arc<cache::HttpCache>>,
     pub(crate) authorization: Option<Arc<AuthorizationServices>>,
     pub(crate) proxy_tls: Option<Arc<crate::tls::proxy::ProxyTls>>,
+    pub(crate) password_verifier: Arc<crate::authentication::PasswordVerifier>,
     client_connections: Arc<admission::ClientConnectionLimiter>,
     proxy_protocol_pending_connections: Arc<Semaphore>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
@@ -99,6 +104,9 @@ impl AppContext {
         let upstream_resolver =
             configured_upstream_resolver(&settings.allow_private_upstream_cidrs);
         Self {
+            password_verifier: Arc::new(crate::authentication::PasswordVerifier::new(
+                &settings.authentication,
+            )),
             settings,
             policies,
             tls,

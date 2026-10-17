@@ -23,3 +23,8 @@ http2_connection_window_size = 67108864
 # source = "files"
 # cert = "/etc/exfilguard/proxy.pem"
 # key = "/etc/exfilguard/proxy.key"
+
+# Limits for connections awaiting client selection and blocking password checks.
+# [authentication]
+# max_pending_connections = 128
+# max_concurrent_verifications = 4

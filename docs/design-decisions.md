@@ -232,9 +232,10 @@ proxy itself. Vault private keys are generated locally and retained in memory.
 The listener uses HTTP/1.1 for proxy requests and CONNECT. Inspected CONNECT
 sessions can negotiate HTTP/2 inside their own TLS connection. Keeping these
 transports explicit preserves the existing request and policy semantics.
-TLS is optional for all clients, including those using `authorization_service`,
-so existing deployments can adopt HTTPS proxy connections independently of
-upgrading ExfilGuard.
+Password clients require TLS on the proxy listener so Basic credentials are
+encrypted from the first request. TLS remains optional for anonymous and
+lease-token configurations, allowing existing deployments to adopt HTTPS
+proxy connections independently of upgrading ExfilGuard.
 
 Vault certificates renew halfway through their validity period. File
 certificates reload on SIGHUP independently of the policy snapshot. Valid
@@ -284,18 +285,30 @@ request.
 This keeps policy behavior readable. Operators can put specific rules before
 general rules and know what will happen.
 
-## Client selection and delegated authorization are separate
+## Credentials select a connection identity within source restrictions
 
-ExfilGuard identifies a client from the downstream source address. It uses
-exact IP matches, CIDR ranges, and one fallback client.
+The first request selects an anonymous, password, or lease-token client.
+Anonymous and lease-token clients are selected by source address within their
+own category. Basic authentication selects a password client by its unique
+name, then checks its source selector and password hash. Categories may share
+source ranges so node-level anonymous access and authenticated workloads can
+coexist. A workload can always omit credentials on a new connection to use the
+anonymous policy; operators must keep that baseline appropriately narrow.
+
+Only the selected client's policies apply. Invalid credentials fail
+authentication. Authenticated policy denials never fall back to an anonymous
+policy. One identity and authentication method remain bound to the connection,
+including inspected HTTP/2 streams, so connection limits and audit attribution
+remain stable across requests.
 
 IPv4-mapped IPv6 peer addresses are treated as their underlying IPv4 address.
 Configuration must therefore use the ordinary IPv4 address or CIDR; mapped-only
 selectors are rejected rather than accepted as rules that can never match.
 
-The fallback client has no address selector and is considered only after exact
-IP and CIDR matching finds nothing. Configurations that set `ip` or `cidr` on
-the fallback are rejected.
+There is one selectorless fallback, considered only within its own category.
+Password clients require an explicit source selector. Anonymous selectors must
+not overlap each other, and lease-token selectors must not overlap each other;
+password clients may share ranges because their usernames distinguish them.
 
 By default, it trusts the immediate peer address. If you enable PROXY protocol
 and trust the sender, it may use the address from that header instead. It does
@@ -307,17 +320,29 @@ separate pending-connection limit bound resource retention if that
 infrastructure stalls or malfunctions before ExfilGuard learns the logical
 client identity.
 
-An authorization token does not select the client and ExfilGuard does not treat
-it as an identity. ExfilGuard first selects the client from its source address.
-The client configuration then says whether to use an authorization service.
-Clients without one continue to use ordinary static policy on the same
-listener.
+### Password verification
+
+Client configuration stores self-describing Argon2id, bcrypt, or SHA512-crypt
+hashes. Argon2id is the generation default; the other formats support existing
+configuration management tooling. Parsing enforces verification cost ceilings
+before publishing a configuration. Passwords require proxy TLS; adding a
+password client to a plaintext listener fails validation.
+
+`authentication::session::PasswordVerifier` bounds pending connections and
+blocking hash verification separately. A canceled verification retains its
+worker permit until the blocking job finishes. Unknown usernames and source
+mismatches perform a dummy verification. Repeated credentials on a bound
+connection use a keyed fingerprint, avoiding repeated expensive hash work.
+Owned password buffers are zeroized, and password hashes have redacted Debug
+output.
+
+### Delegated authorization
 
 A client that uses an authorization service sends its token with proxy
 authentication. ExfilGuard keeps the token with the connection. Policy cache
 entries are separated by service, token hash, source address, and audience. A
-missing, invalid, or changed token denies the request. So does an inactive or
-expired service policy. ExfilGuard never falls back to static policy alone.
+malformed or changed token denies the request. So does an inactive or expired
+service policy. Requests without credentials use anonymous selection instead.
 
 For inspected HTTPS, the token from `CONNECT` also applies to the decrypted
 requests. ExfilGuard checks the current service policy for each one. It denies
@@ -396,11 +421,17 @@ Each configured client therefore has a default budget of 1,024 simultaneous
 downstream TCP connections, with an explicit per-client override. The count
 includes ordinary HTTP keep-alive connections, raw CONNECT tunnels, and
 inspected CONNECT sessions. A CIDR identity deliberately shares one budget
-across all matching machines. Admission uses the client identity after trusted
-PROXY protocol processing; excess new connections are closed without evicting
-established ones. Before that identity is available, connections from
-allowlisted PROXY peers use a separate, configurable pending budget; the permit
-is released as soon as ordinary per-client admission succeeds.
+across all matching machines. Admission follows trusted PROXY protocol
+processing and client authentication. Excess connections are closed or receive
+503 without evicting established connections. Allowlisted PROXY peers and
+connections awaiting authentication have separate configurable pending budgets.
+
+A connection retains its selected client's permit across reloads; changing a
+limit affects new admissions. Removing the client, changing its authentication
+mode or password hash, or making its source selector ineligible closes the
+connection, including idle connections and opaque tunnels. Policy-only changes
+apply to subsequent requests; established opaque tunnels retain their setup
+decision while the identity remains valid.
 
 There is no separate global lifetime, per-IP, or per-rule ceiling. Client
 limits remain stable across policy reloads and are observable through bounded
@@ -547,21 +578,6 @@ all relative paths retain the main file's directory as their base. Global
 settings require a restart; SIGHUP rereads client and policy data and configured
 proxy server certificate files.
 
-## Client limits use connection-time accounting
-
-Per-client `max_connections` is an operational resource guard, not a strict
-tenant quota. A connection acquires its permit using the client identity
-resolved when it is accepted, and that permit is not transferred if a later
-reload maps the peer address to another client. New connections use the new
-mapping and limits immediately.
-
-Requests on established HTTP and inspected HTTPS connections still use the
-latest policy snapshot, including any new client mapping. Reconciling their
-connection permits retroactively would add disruptive cross-generation
-accounting for an administrator-controlled transition without improving the
-normal steady-state resource bound. Established opaque CONNECT tunnels retain
-their setup-time decision until they close or reach their configured lifetime.
-
 ## Some protocol features stay out of scope
 
 ExfilGuard does not currently support some protocol features, including
@@ -571,7 +587,7 @@ Supporting protocol upgrades would require separate policy, connection-lifetime,
 and forwarding behavior. `proxy::http::dispatch::serve_http_loop` rejects HTTP/1.1
 requests containing an `Upgrade` header or an `upgrade` connection token with
 501 and closes the client connection. This check runs before policy evaluation
-or forwarding, after proxy-token validation. Access logs identify the failure as
+or forwarding, after client authentication. Access logs identify the failure as
 `upgrade_unsupported`. Established CONNECT tunnels remain opaque.
 
 Inspected live forwarding also preserves the HTTP version across the client
@@ -633,12 +649,15 @@ both directions throughout. A standards-defined `RST_STREAM(NO_ERROR)` after a
 complete early response terminates only the unused request side and does not
 discard the response.
 
-## The total request timeout is an end-to-end inner-request budget
+## The total request timeout covers processing after client authentication
 
-When enabled, `request_total_timeout` starts after ExfilGuard accepts a complete
-inner HTTP request head. One absolute deadline covers policy and cache work,
-upstream resolution and connection setup, retries, request upload, and complete
-response delivery. Phase-specific timeouts remain nested within that budget.
+When enabled, `request_total_timeout` starts after client authentication and
+receipt of a complete inner HTTP request head. Password verification is part of
+connection setup, with separate concurrency and hash-cost limits. One
+absolute request deadline covers policy evaluation, authorization-service calls,
+cache work, upstream resolution and connection setup, retries, request upload,
+and complete response delivery. Phase-specific timeouts remain nested within
+that budget.
 
 If the deadline expires before a final response starts, ExfilGuard returns a
 504. Once a final response has started, it closes or resets the request rather

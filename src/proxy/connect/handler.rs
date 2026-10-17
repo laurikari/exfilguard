@@ -37,6 +37,7 @@ pub(crate) struct ConnectRequest<'a, S> {
 pub(crate) async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     ctx: ConnectRequest<'_, S>,
     authorization_token: Option<std::sync::Arc<crate::authorization::AuthorizationToken>>,
+    client_session: std::sync::Arc<crate::authentication::ConnectionSession>,
 ) -> Result<()> {
     let ConnectRequest {
         stream,
@@ -75,7 +76,7 @@ pub(crate) async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         request_bytes as u64,
         start,
         response_timeout,
-        authorization_token.clone(),
+        client_session.clone(),
     );
 
     let parsed_request = ParsedRequest {
@@ -87,6 +88,7 @@ pub(crate) async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         path: session.original_target().to_string(),
         policy_path: session.original_target().to_string(),
         flow: None,
+        client_name: client_session.client_name(),
     };
 
     let mut handler = ConnectRequestHandler {
@@ -157,7 +159,7 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RequestHandler
         let request = self.parsed_request.as_policy_request();
         if self
             .snapshot
-            .resolve_client(self.peer.ip())
+            .request_client(self.peer.ip(), self.parsed_request.client_name.as_deref())
             .is_some_and(|client| client.authorization_service.is_some())
         {
             return self
@@ -165,10 +167,11 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RequestHandler
                 .respond_default_denial(self.stream.as_mut().expect("stream present"), &outcome.log)
                 .await;
         }
-        if let Some(preflight) = self
-            .snapshot
-            .evaluate_tls_bump_preflight(self.peer.ip(), &request)
-        {
+        if let Some(preflight) = self.snapshot.evaluate_tls_bump_preflight(
+            self.peer.ip(),
+            self.parsed_request.client_name.as_deref(),
+            &request,
+        ) {
             let stream = self.stream.take().expect("stream present");
             let prefetched = self.prefetched.take().expect("prefetched bytes present");
             return self
@@ -181,6 +184,16 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RequestHandler
                     self.app,
                 )
                 .await;
+        }
+        if self.snapshot.authentication_available(self.peer.ip())
+            && self
+                .snapshot
+                .request_client(self.peer.ip(), self.parsed_request.client_name.as_deref())
+                .is_some_and(|client| {
+                    client.password_hash.is_none() && client.authorization_service.is_none()
+                })
+        {
+            return self.respond_auth_deny(outcome.log).await;
         }
         self.session
             .respond_default_denial(self.stream.as_mut().expect("stream present"), &outcome.log)
@@ -229,12 +242,13 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RequestHandler
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> ConnectRequestHandler<'_, S> {
     async fn respond_auth_deny(&mut self, log: policy_eval::RequestLogContext<'_>) -> Result<()> {
+        let challenges = crate::authentication::challenges(self.snapshot, self.peer.ip());
         respond_with_access_log(
             self.stream.as_mut().expect("stream present"),
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             None,
             b"proxy authentication required\r\n",
-            Some("ExfilGuard"),
+            Some(challenges.as_slice()),
             self.app.settings.response_body_idle_timeout(),
             self.session.request_bytes(),
             self.session.elapsed(),

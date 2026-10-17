@@ -10,12 +10,13 @@ use crate::proxy::request::RequestFlowContext;
 
 use super::dispatch::{self, HttpLoopOptions, LoopOutcome};
 
-pub async fn handle_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+pub(crate) async fn handle_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     peer: SocketAddr,
     app: AppContext,
+    session: std::sync::Arc<crate::authentication::ConnectionSession>,
 ) -> Result<()> {
-    serve_plain_http(stream, peer, app).await
+    serve_plain_http(stream, peer, app, session).await
 }
 
 pub async fn handle_decrypted_https<S>(
@@ -35,6 +36,7 @@ async fn serve_plain_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     peer: SocketAddr,
     app: AppContext,
+    session: std::sync::Arc<crate::authentication::ConnectionSession>,
 ) -> Result<()> {
     match dispatch::serve_http_loop(
         stream,
@@ -45,6 +47,7 @@ async fn serve_plain_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             fallback_scheme: Scheme::Http,
             connect_binding: None,
             flow_context: None,
+            client_session: session.clone(),
         },
     )
     .await?
@@ -63,6 +66,7 @@ async fn serve_plain_http<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     start: connect.start,
                 },
                 connect.authorization_token,
+                connect.client_session,
             )
             .await
         }
@@ -79,6 +83,10 @@ async fn serve_bumped_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let client_session = flow_context
+        .as_ref()
+        .and_then(|flow| flow.client_session.clone())
+        .ok_or_else(|| anyhow::anyhow!("inspected connection has no client session"))?;
     match dispatch::serve_http_loop(
         stream,
         peer,
@@ -88,6 +96,7 @@ where
             fallback_scheme: Scheme::Https,
             connect_binding,
             flow_context,
+            client_session,
         },
     )
     .await?

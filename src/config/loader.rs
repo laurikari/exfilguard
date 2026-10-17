@@ -53,6 +53,7 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             cidr,
             policies: policy_names,
             authorization_service,
+            password_hash,
             credential_limits,
             fallback,
             max_connections,
@@ -94,6 +95,10 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
             selector,
             policies: Arc::from(policy_refs.into_boxed_slice()),
             authorization_service: authorization_service.map(Arc::from),
+            password_hash: password_hash
+                .map(|hash| crate::authentication::PasswordHash::parse(&hash))
+                .transpose()
+                .with_context(|| format!("client '{name}' has an invalid password_hash"))?,
             credential_limits: Arc::from(credential_limits.into_boxed_slice()),
             max_connections,
         });
@@ -182,6 +187,11 @@ fn parse_clients_file(path: &Path) -> Result<Vec<RawClient>> {
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read clients config at {}", path.display()))?;
     let doc: ClientsDoc = toml::from_str(&data)
+        .map_err(|mut error: toml::de::Error| {
+            // Client source excerpts can contain password hashes.
+            error.set_input(None);
+            error
+        })
         .with_context(|| format!("failed to parse clients config at {}", path.display()))?;
     Ok(doc.clients)
 }
@@ -381,14 +391,14 @@ fn parse_host_and_port(value: &str) -> Result<(&str, Option<u16>)> {
     Ok((value, None))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientsDoc {
     #[serde(default, rename = "client")]
     clients: Vec<RawClient>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawClient {
     name: String,
@@ -400,6 +410,8 @@ struct RawClient {
     policies: Vec<String>,
     #[serde(default)]
     authorization_service: Option<String>,
+    #[serde(default)]
+    password_hash: Option<String>,
     #[serde(default, rename = "credential_limit")]
     credential_limits: Vec<RawCredentialLimit>,
     #[serde(default)]

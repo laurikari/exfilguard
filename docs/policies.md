@@ -6,8 +6,8 @@ Use clients and policies to decide who can reach what.
 
 ## Client Configuration
 
-Clients map source IP addresses to policies. Define them in `clients.toml` or
-files in `clients.d/`.
+Clients assign policies to source addresses and authenticated workloads.
+Define them in `clients.toml` or files in `clients.d/`.
 
 ### Client Fields
 
@@ -18,13 +18,40 @@ files in `clients.d/`.
 | `cidr` | String | Non-fallback only: one of ip/cidr | CIDR block (e.g., `"10.0.0.0/8"`, `"2001:db8::/32"`) |
 | `policies` | Array | Yes | List of policy names to apply in order |
 | `fallback` | Boolean | No | Mark as fallback client (exactly one required) |
+| `password_hash` | String | No | Encoded password hash; `name` is the Basic username |
+| `authorization_service` | String | No | Named service for lease-token authorization |
+| `max_connections` | Integer | No | Simultaneous connections for this client; default 1024 |
 
 ### Matching
 
-Client selectors must not overlap, so each source IP maps to at most one
-non-fallback client. If nothing matches, ExfilGuard uses the fallback client.
-The fallback has no selector and is never part of IP/CIDR matching. A fallback
-that sets `ip` or `cidr` is invalid.
+The first request selects one client for the connection:
+
+- Without credentials, the source address selects an anonymous client: one
+  with neither `password_hash` nor `authorization_service`.
+- `Proxy-Authorization: Basic ...` selects a password client by username,
+  then checks its source selector and password.
+- `Proxy-Authorization: ExfilGuard ...` selects a lease-token client by source
+  address and uses its `authorization_service`.
+
+These categories may share source ranges. Password clients may also share
+ranges with each other. Selectors within the anonymous category must not
+overlap; the same restriction applies within the lease-token category.
+
+Exactly one client has `fallback = true` and no address selector. It applies
+only to its own category. Password clients require an explicit selector; use
+`0.0.0.0/0` and a separate IPv6 client when broad source access is intended.
+
+Only the selected client's policies apply. Failed authentication returns 407;
+it never selects the anonymous client. A workload can open a separate
+connection without credentials to use the anonymous policy, so keep that
+policy suitable for every workload on the source range.
+
+Later requests may omit credentials or repeat the same credentials. Changing
+identity or authentication method requires a new connection. For inspected
+HTTPS, CONNECT selects the identity used by the inner HTTP requests.
+
+Password setup and HTTPS requirements are described under
+[Client Passwords](configuration.md#client-passwords).
 
 IP literals in URL patterns are compared by address value, so equivalent
 compressed and expanded IPv6 spellings match the same rule.
@@ -34,10 +61,13 @@ compressed and expanded IPv6 spellings match the same rule.
 - Client names must be unique
 - Every non-fallback client must specify either `ip` or `cidr`, not both
 - The fallback client must not specify `ip` or `cidr`
-- Non-fallback selectors must not overlap (IP vs IP, IP vs CIDR, CIDR vs CIDR)
+- Anonymous selectors must not overlap each other; lease-token selectors must
+  not overlap each other
 - IPv4-mapped IPv6 selectors such as `::ffff:10.0.0.5` are rejected; use the
   ordinary IPv4 address or CIDR because mapped peers have IPv4 client identity
 - Exactly one client must have `fallback = true`
+- Password clients require `ip` or `cidr` and cannot use `authorization_service`
+  or `credential_limit`
 - All referenced policies must exist
 
 ### Example

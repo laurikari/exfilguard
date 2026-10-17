@@ -14,7 +14,7 @@ pub async fn respond_with_access_log<S>(
     status: StatusCode,
     reason: Option<&str>,
     body: &[u8],
-    proxy_authenticate: Option<&str>,
+    proxy_authenticate: Option<&[&str]>,
     timeout_dur: Duration,
     bytes_in: u64,
     elapsed: Duration,
@@ -46,7 +46,7 @@ async fn send_response<S>(
     status: StatusCode,
     reason: Option<&str>,
     body: &[u8],
-    proxy_authenticate: Option<&str>,
+    proxy_authenticate: Option<&[&str]>,
     timeout_dur: Duration,
 ) -> Result<usize>
 where
@@ -56,7 +56,12 @@ where
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| status.canonical_reason().unwrap_or("Unknown"));
     let proxy_authenticate = proxy_authenticate
-        .map(|value| format!("Proxy-Authenticate: {value}\r\n"))
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| format!("Proxy-Authenticate: {value}\r\n"))
+                .collect::<String>()
+        })
         .unwrap_or_default();
     let header = format!(
         "HTTP/1.1 {} {}\r\n{}Content-Length: {}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
@@ -97,7 +102,7 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, duplex};
 
-    async fn response(proxy_authenticate: Option<&str>) -> String {
+    async fn response(proxy_authenticate: Option<&[&str]>) -> String {
         let (mut client, mut server) = duplex(4096);
         send_response(
             &mut server,
@@ -119,7 +124,7 @@ mod tests {
     async fn proxy_authentication_challenge_is_explicit() {
         assert!(!response(None).await.contains("Proxy-Authenticate"));
         assert!(
-            response(Some("ExfilGuard"))
+            response(Some(&["ExfilGuard"]))
                 .await
                 .contains("Proxy-Authenticate: ExfilGuard\r\n")
         );

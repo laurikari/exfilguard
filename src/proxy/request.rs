@@ -27,6 +27,7 @@ pub struct ParsedRequest {
     /// Canonical path used only for policy evaluation.
     pub policy_path: String,
     pub flow: Option<RequestFlowContext>,
+    pub(crate) client_name: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub struct RequestFlowContext {
     pub outer_method: Arc<str>,
     pub effective_mode: EffectiveMode,
     pub(crate) authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
+    pub(crate) client_session: Option<Arc<crate::authentication::ConnectionSession>>,
 }
 
 /// Parse an HTTP/1.1 request target with separate raw forwarding and canonical policy paths.
@@ -259,6 +261,10 @@ impl ParsedRequest {
     }
 
     pub fn set_flow_context(&mut self, flow: RequestFlowContext) {
+        self.client_name = flow
+            .client_session
+            .as_ref()
+            .and_then(|session| session.client_name());
         self.flow = Some(flow);
     }
 
@@ -307,6 +313,7 @@ fn build_parsed_request(
         path,
         policy_path,
         flow: None,
+        client_name: None,
     })
 }
 

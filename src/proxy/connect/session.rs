@@ -44,18 +44,18 @@ pub struct ConnectSession {
     bytes_in: u64,
     start: Instant,
     response_timeout: Duration,
-    authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
+    client_session: Arc<crate::authentication::ConnectionSession>,
 }
 
 impl ConnectSession {
-    pub fn new(
+    pub(crate) fn new(
         peer: SocketAddr,
         target: String,
         parsed: ConnectTarget,
         bytes_in: u64,
         start: Instant,
         response_timeout: Duration,
-        authorization_token: Option<Arc<crate::authorization::AuthorizationToken>>,
+        client_session: Arc<crate::authentication::ConnectionSession>,
     ) -> Self {
         Self {
             peer,
@@ -65,7 +65,7 @@ impl ConnectSession {
             bytes_in,
             start,
             response_timeout,
-            authorization_token,
+            client_session,
         }
     }
 
@@ -90,7 +90,8 @@ impl ConnectSession {
             session_id: self.session_id.clone(),
             outer_method: Arc::<str>::from("CONNECT"),
             effective_mode: EffectiveMode::Bump,
-            authorization_token: self.authorization_token.clone(),
+            authorization_token: self.client_session.authorization_token(),
+            client_session: Some(self.client_session.clone()),
         }
     }
 

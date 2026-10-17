@@ -49,7 +49,7 @@ impl PolicyMatcher {
 /// PolicySnapshot provides a thread-safe, point-in-time view of the security configuration.
 ///
 /// The evaluation follows a two-stage hierarchy:
-/// 1. Client Resolution: Maps the source IP to a `ClientEntry` using a CIDR trie.
+/// 1. Client Resolution: Resolves the selected connection identity and its source selector.
 /// 2. Rule Matching: Iterates through the client's assigned policies. The first
 ///    `Rule` that matches the request's method and URL pattern determines the outcome.
 #[derive(Clone)]
@@ -80,11 +80,59 @@ impl PolicySnapshot {
             return Some(client);
         }
 
-        self.compiled.clients.get(self.compiled.fallback_client)
+        self.compiled
+            .fallback_client
+            .and_then(|index| self.compiled.clients.get(index))
     }
 
-    pub fn evaluate_request(&self, addr: IpAddr, request: &Request) -> Option<EvaluationResult> {
-        let client = self.resolve_client(addr)?;
+    pub(crate) fn resolve_lease_client(&self, addr: IpAddr) -> Option<&ClientEntry> {
+        let addr = normalize_mapped_ip(addr);
+        self.compiled
+            .lease_cidr_trie
+            .find(addr)
+            .or(self.compiled.lease_fallback_client)
+            .and_then(|index| self.compiled.clients.get(index))
+    }
+
+    pub(crate) fn client_named(&self, name: &str) -> Option<&ClientEntry> {
+        self.compiled
+            .client_names
+            .get(name)
+            .and_then(|index| self.compiled.clients.get(*index))
+    }
+
+    pub(crate) fn password_client(&self, name: &str) -> Option<&ClientEntry> {
+        self.client_named(name)
+            .filter(|client| client.password_hash.is_some())
+    }
+
+    pub(crate) fn authentication_available(&self, addr: IpAddr) -> bool {
+        self.resolve_lease_client(addr).is_some() || self.password_available(addr)
+    }
+
+    pub(crate) fn password_available(&self, addr: IpAddr) -> bool {
+        self.compiled
+            .password_cidr_trie
+            .find(normalize_mapped_ip(addr))
+            .is_some()
+    }
+
+    pub(crate) fn request_client(&self, addr: IpAddr, name: Option<&str>) -> Option<&ClientEntry> {
+        match name {
+            Some(name) => self
+                .client_named(name)
+                .filter(|client| client.selector.contains(addr)),
+            None => self.resolve_client(addr),
+        }
+    }
+
+    pub fn evaluate_request(
+        &self,
+        addr: IpAddr,
+        name: Option<&str>,
+        request: &Request,
+    ) -> Option<EvaluationResult> {
+        let client = self.request_client(addr, name)?;
         let decision = self.matcher.evaluate(client.policies.as_ref(), request)?;
         Some(EvaluationResult {
             client: client.name.clone(),
@@ -95,9 +143,10 @@ impl PolicySnapshot {
     pub fn evaluate_tls_bump_preflight(
         &self,
         addr: IpAddr,
+        name: Option<&str>,
         request: &Request,
     ) -> Option<TlsBumpPreflightResult> {
-        let client = self.resolve_client(addr)?;
+        let client = self.request_client(addr, name)?;
         if self
             .matcher
             .evaluate_tls_bump_preflight(client.policies.as_ref(), request)
@@ -298,6 +347,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(policy_refs.into_boxed_slice()),
             authorization_service: None,
+            password_hash: None,
             credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
@@ -418,6 +468,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
@@ -485,6 +536,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
@@ -542,6 +594,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
@@ -581,6 +634,7 @@ mod tests {
                 selector: ClientSelector::Ip(IpAddr::from(Ipv4Addr::new(10, 0, 2, 5))),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -589,6 +643,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.0.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -597,6 +652,7 @@ mod tests {
                 selector: ClientSelector::Cidr("10.1.0.0/24".parse::<IpNet>().unwrap()),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -605,6 +661,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -646,6 +703,7 @@ mod tests {
                 selector: ClientSelector::Ip("10.0.0.5".parse().unwrap()),
                 policies: policy_refs.clone(),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -654,6 +712,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: policy_refs,
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             },
@@ -682,7 +741,7 @@ mod tests {
         };
         let addr = IpAddr::from(Ipv4Addr::new(10, 0, 0, 10));
         let result = snapshot
-            .evaluate_request(addr, &request)
+            .evaluate_request(addr, None, &request)
             .expect("evaluation result");
         assert_eq!(result.client.as_ref(), "default");
         match result.decision {
@@ -721,6 +780,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
             authorization_service: None,
+            password_hash: None,
             credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
@@ -772,6 +832,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
             authorization_service: None,
+            password_hash: None,
             credential_limits: Arc::from([]),
             max_connections: 1024,
         }];

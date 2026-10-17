@@ -23,6 +23,7 @@ These settings are required.
 | `clients_dir` | Path | No | Directory containing additional client config files (*.toml) |
 | `policies_dir` | Path | No | Directory containing additional policy config files (*.toml) |
 | `authorization` | Table | No | Named services for delegated request policy and authentication |
+| `authentication` | Table | No | Pending client connections and password verification limits |
 
 !!! note
     Relative paths are resolved from the directory containing the main config file.
@@ -116,7 +117,9 @@ Existing connections survive certificate replacement and expiry.
 The outer connection uses HTTP/1.1. CONNECT supports pass-through tunnels and
 inspected HTTPS, including HTTP/2 inside the inspected TLS session. PROXY
 protocol headers from trusted peers precede the TLS handshake. Handshakes use
-`tls_handshake_timeout` and count against the client's `max_connections`.
+`tls_handshake_timeout`. Connections awaiting credential-based client selection
+count against `authentication.max_pending_connections`; other connections
+count against the selected client's `max_connections` during the handshake.
 
 TLS is optional for clients with `authorization_service`. Use `[proxy_tls]` to
 protect lease tokens in transit. With an `http://` proxy URL, CONNECT headers
@@ -206,15 +209,99 @@ max_connections = 2048
 
 The budget counts ordinary HTTP keep-alive connections, raw CONNECT tunnels,
 and inspected CONNECT sessions. A CIDR client shares one budget across every
-machine it matches. When the budget is full, ExfilGuard closes new connections
-without evicting established ones. `max_connections` must be greater than zero.
+machine it matches. When the budget is full, ExfilGuard closes new connections,
+or returns 503 when admission follows authentication. `max_connections` must
+be greater than zero.
 
 Client and policy reloads apply a changed limit to new admission without
-resetting active connection accounting. An existing connection's permit remains
-charged to the client identity assigned when it was accepted, even if a reload
-later maps its peer address to another client. Subsequent requests still use the
-latest client mapping and policies. The limit is an operational resource guard,
-not a retroactively reconciled tenant quota.
+resetting active connection accounting. An established connection retains its
+selected identity and permit. Requests use the latest policies. A reload that
+removes the client or invalidates its authentication or source selection closes
+its connections, including idle connections and CONNECT tunnels.
+
+## Client Passwords
+
+Password clients use HTTP Basic proxy authentication. Configure
+[proxy TLS](#https-proxy-listener) first; password clients require it. Clients
+must validate the proxy server certificate and use an `https://` proxy URL.
+
+Generate a hash with a hidden password prompt and confirmation:
+
+```sh
+exfilguard password-hash
+```
+
+The command prints one encoded hash to stdout and does not load configuration.
+For automation, `--stdin` reads one password line. Supply it through a protected
+pipe; passwords cannot be passed as command-line arguments.
+
+Add the hash to the client file. The client name is the username:
+
+```toml
+[[client]]
+name = "build-worker"
+cidr = "10.42.16.0/27"
+password_hash = '<paste the encoded hash here>'
+policies = ["build-egress"]
+```
+
+Password client names contain 1–128 printable ASCII bytes, excluding whitespace
+and `:`. Passwords are UTF-8, contain 1–1024 bytes, and cannot contain ASCII
+control characters. Password clients cannot use `authorization_service`,
+`credential_limit`, or `fallback`.
+
+curl can prompt for the password:
+
+```sh
+curl --proxy https://proxy.example.com:3128 \
+  --proxy-cacert vault-root.pem --proxy-basic --proxy-user build-worker \
+  --cacert inspection-root.pem https://example.com/
+```
+
+Send credentials on the first request, including CONNECT for HTTPS. The
+selected identity stays with that connection. ExfilGuard strips
+`Proxy-Authorization` before forwarding requests upstream.
+
+### Hash formats and resource limits
+
+`password-hash --algorithm` supports these formats. Configuration management
+tools can supply compatible encoded hashes directly.
+
+| Algorithm | Accepted encoding | Generated settings | Verification ceiling |
+|-----------|-------------------|--------------------|----------------------|
+| `argon2id` (default) | PHC, version 19 | 64 MiB, 3 iterations, 1 lane | 256 MiB, 10 iterations, 8 lanes |
+| `bcrypt` | `$2a$`, `$2b$`, `$2y$` | `$2b$`, cost 12 | Cost 16 |
+| `sha512-crypt` | `$6$` | 100000 rounds | 1000000 rounds |
+
+bcrypt passwords are limited to 72 bytes. SHA512-crypt requires at least 1000
+rounds; an omitted rounds field means 5000. Malformed, unsupported, and
+over-budget hashes fail configuration validation.
+
+Optional global limits belong in `exfilguard.toml` and require a restart:
+
+```toml
+[authentication]
+max_pending_connections = 128
+max_concurrent_verifications = 4
+```
+
+Both values must be positive. The pending budget covers TLS and request headers
+until credential-based selection completes. The verification budget bounds
+blocking password checks; saturation returns 503. Repeated credentials on an
+authenticated connection do not repeat the password hash calculation.
+
+Replace password hashes and send SIGHUP to rotate passwords. Successful reloads
+close affected sessions; failed reloads retain the current configuration.
+
+### Migration for lease-token clients
+
+Source ranges can now contain anonymous, password, and lease-token clients.
+Requests without credentials select only an anonymous client or anonymous
+fallback. Previously, a matching `authorization_service` client required a
+token even when an anonymous fallback allowed that destination. Review the
+anonymous policy before upgrading: it now applies to requests without tokens
+from those ranges. Use a deny policy for anonymous access if every request
+must authenticate. See [client selection](policies.md#matching).
 
 ---
 
@@ -484,8 +571,10 @@ credential with a reference that only the service understands. ExfilGuard sends 
 reference, and the exact outgoing request to the service, then adds the returned headers before
 forwarding it. The client can therefore call the API without ever having the credential.
 
-This is configured per client. A client with an `authorization_service` must send a token. Other
-clients on the same listener continue to use ordinary static policy.
+`Proxy-Authorization: ExfilGuard ...` selects a client with an
+`authorization_service` from the source address. Requests without credentials
+use a separately configured anonymous client. Basic credentials select password
+clients. See [client selection](policies.md#matching).
 
 Define one or more named services in the main configuration:
 
@@ -625,7 +714,7 @@ All timeout values are in seconds. Use `0` to disable `request_total_timeout` an
 | `request_body_idle_timeout` | u64 | 30 | Maximum idle time between request body reads/writes |
 | `response_header_timeout` | u64 | 60 | Maximum total time from waiting for the first upstream response head through receiving the final response head |
 | `response_body_idle_timeout` | u64 | 60 | Maximum idle time between response body reads/writes |
-| `request_total_timeout` | u64 | 0 | Maximum total time from accepting a complete request head through policy/cache work, upstream setup, and full response delivery (0 disables) |
+| `request_total_timeout` | u64 | 0 | Maximum request processing time after headers and client authentication, through full response delivery (0 disables) |
 | `client_keepalive_idle_timeout` | u64 | 30 | Idle time before closing an HTTP/1 keep-alive connection or an HTTP/2 connection with no active request streams |
 | `connect_tunnel_idle_timeout` | u64 | 60 | Maximum time with no successful relay progress in either direction of a raw CONNECT tunnel; also bounds individual tunnel writes and setup/shutdown operations |
 | `connect_tunnel_max_lifetime` | u64 | 0 | Maximum lifetime for CONNECT tunnels (0 disables) |
@@ -638,10 +727,11 @@ stream is active. Active streams remain governed by the request-body,
 response, and optional total-request timeouts rather than the connection-idle
 timer.
 
-The total-request timeout begins after a complete inner HTTP request head has
-been accepted. It caps cache lookup and delivery, DNS/TCP/TLS upstream setup,
-request upload, retries, and response delivery. Phase-specific timeouts still
-apply, so whichever deadline expires first wins. Before a final response has
+The total-request timeout begins after client authentication and receipt of a
+complete inner HTTP request head. It covers policy evaluation,
+authorization-service calls, cache lookup and delivery, DNS/TCP/TLS upstream
+setup, request upload, retries, and response delivery. Phase-specific timeouts
+still apply, so whichever deadline expires first wins. Before a final response has
 started, expiry returns `504 Gateway Timeout`; after response delivery has
 started, ExfilGuard closes or resets the request instead of appending another
 response. Outer CONNECT setup, tunnel lifetime, and cleanup after response
@@ -723,6 +813,13 @@ downstream connections globally and by client, in-flight requests, CONNECT
 tunnels, bumped TLS sessions, active HTTP/2 streams, upstream connections,
 cache usage, and the last successful policy reload time. Rejected downstream
 connections are counted by configured client name.
+
+`client_authentication_pending_connections` and
+`client_password_verifications_in_flight` report authentication resource use.
+`client_password_verification_duration_seconds` measures admitted password
+checks, including blocking worker scheduling and dummy checks.
+`client_authentication_attempts_total{result}` counts `success`, `denied`, and
+`busy` outcomes. Submitted usernames are never used as metric labels.
 
 `requests_method_total` uses a bounded `method` label: the standard HTTP
 methods are reported by name and all extension methods are aggregated as
