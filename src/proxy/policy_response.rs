@@ -313,6 +313,7 @@ mod tests {
             path: "/resource".to_string(),
             policy_path: "/resource".to_string(),
             flow: None,
+            client_name: None,
         }
     }
 

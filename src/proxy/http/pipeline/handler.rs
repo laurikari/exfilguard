@@ -187,12 +187,14 @@ where
         &mut self,
         log: policy_eval::RequestLogContext<'_>,
     ) -> Result<Self::Output> {
+        let snapshot = self.app.policies.snapshot();
+        let challenges = crate::authentication::challenges(&snapshot, self.peer.ip());
         super::respond::respond_with_access_log(
             self.reader.get_mut(),
             http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             None,
             b"proxy authentication required\r\n",
-            Some("ExfilGuard"),
+            Some(challenges.as_slice()),
             self.response_body_timeout,
             self.log_tracker.base_bytes(),
             self.log_tracker.elapsed(),

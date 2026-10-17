@@ -49,6 +49,80 @@ const AUTHORIZATION_SERVICE: &str = "integration-authorization";
 const PROTECTED_VALUE: &str = "Bearer integration-secret";
 const EARLY_H2_BODY_SIZE: usize = 128 * 1024;
 
+#[tokio::test]
+async fn anonymous_password_and_lease_clients_share_one_source() -> Result<()> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let origin = Http1Origin::spawn().await?;
+    let scope = format!("http://127.0.0.1:{}/credential", origin.addr.port());
+    let services = AuthorizationFixture::spawn(scope.clone()).await?;
+    let base = format!("http://127.0.0.1:{}", origin.addr.port());
+    let (_, policies) = TestConfigBuilder::new()
+        .policy(
+            PolicySpec::new("node").rule(RuleSpec::allow(&["GET"], format!("{base}/ubuntu/**"))),
+        )
+        .policy(PolicySpec::new("workload").rule(RuleSpec::allow(&["GET"], format!("{base}/**"))))
+        .policy(
+            PolicySpec::new("password")
+                .rule(RuleSpec::allow(&["GET"], format!("{base}/password/**"))),
+        )
+        .render();
+    let lease = with_delegated_authorization(
+        "[[client]]\nname='lease'\ncidr='127.0.0.0/8'\npolicies=['workload']\n".into(),
+        &scope,
+        BodyAccess::None,
+    );
+    let clients = format!(
+        "{lease}\n[[client]]\nname='node'\nfallback=true\npolicies=['node']\n\n[[client]]\nname='agent'\ncidr='127.0.0.0/8'\npolicies=['password']\npassword_hash='$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie'\n"
+    );
+    let authorization = services.settings();
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(move |settings| settings.authorization = Some(authorization))
+        .with_tls_proxy()
+        .spawn()
+        .await?;
+    let password = format!(
+        "Proxy-Authorization: Basic {}\r\n",
+        STANDARD.encode("agent:correctbatteryhorsestapler")
+    );
+    let token = format!("Proxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\n");
+    for (path, header, status) in [
+        ("/ubuntu/package", "", "200"),
+        ("/credential", "", "407"),
+        ("/password/api", password.as_str(), "200"),
+        ("/credential", token.as_str(), "200"),
+        (
+            "/ubuntu/package",
+            "Proxy-Authorization: ExfilGuard invalid-token\r\n",
+            "407",
+        ),
+        ("/ubuntu/package", password.as_str(), "403"),
+    ] {
+        let mut stream = harness.connect_tls().await?;
+        stream.write_all(format!("GET {base}{path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{header}Connection: close\r\n\r\n", origin.addr.port()).as_bytes()).await?;
+        let response = read_http_response_with_length(&mut stream).await?;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{path}: {response}"
+        );
+        if path == "/credential" && header.is_empty() {
+            assert!(
+                response.contains(
+                    "Proxy-Authenticate: Basic realm=\"exfilguard\", charset=\"UTF-8\"\r\n"
+                )
+            );
+            assert!(response.contains("Proxy-Authenticate: ExfilGuard\r\n"));
+        }
+        if status == "200" {
+            assert!(response.contains("proxy-authorization=<missing>"));
+        }
+        if header == token {
+            assert!(response.contains(PROTECTED_VALUE));
+        }
+    }
+    harness.shutdown().await;
+    Ok(())
+}
+
 struct AuthorizationFixture {
     addr: SocketAddr,
     _temp: TempDir,
@@ -637,11 +711,9 @@ fallback = true
         .await?;
     missing_token.write_all(request.as_bytes()).await?;
     let response = read_http_response_with_length(&mut missing_token).await?;
-    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
-    assert!(
-        response.contains("Proxy-Authenticate: ExfilGuard"),
-        "{response}"
-    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("authorization=<missing>"), "{response}");
+    assert!(!response.contains("Proxy-Authenticate"), "{response}");
     assert_eq!(services.policy_calls.load(Ordering::SeqCst), 0);
 
     let mut delegated_client = harness

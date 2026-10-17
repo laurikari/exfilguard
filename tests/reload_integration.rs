@@ -142,6 +142,7 @@ fn load_settings(dirs: &TestDirs, addr: SocketAddr) -> Result<Settings> {
     write_main_config(dirs, addr)?;
     let config_path = dirs.config_dir.join("exfilguard.toml");
     let cli = Cli {
+        command: None,
         config: Some(config_path),
     };
     Settings::load(&cli)

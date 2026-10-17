@@ -156,7 +156,7 @@ pub fn evaluate_request<'a>(
     let log_ctx = RequestLogContext::new(peer, parsed, log_queries);
     let policy_request = parsed.as_policy_request();
 
-    match snapshot.evaluate_request(peer.ip(), &policy_request) {
+    match snapshot.evaluate_request(peer.ip(), parsed.client_name.as_deref(), &policy_request) {
         Some(result) => match into_decision(result) {
             PolicyOutcomeInternal::Allow(decision) => {
                 crate::metrics::record_rule_hit(decision.rule.as_ref());
@@ -217,7 +217,7 @@ pub(crate) fn evaluate_delegated_request<'a>(
     let (token, authorization_policy) = authorization;
     let log_ctx = RequestLogContext::new(peer, parsed, log_queries);
     let policy_request = parsed.as_policy_request();
-    let Some(client) = snapshot.resolve_client(peer.ip()) else {
+    let Some(client) = snapshot.request_client(peer.ip(), parsed.client_name.as_deref()) else {
         log_policy_default(
             log_config.default_level,
             log_config.default_message,
@@ -239,7 +239,9 @@ pub(crate) fn evaluate_delegated_request<'a>(
             log_config,
         );
     }
-    let Some(static_result) = snapshot.evaluate_request(peer.ip(), &policy_request) else {
+    let Some(static_result) =
+        snapshot.evaluate_request(peer.ip(), parsed.client_name.as_deref(), &policy_request)
+    else {
         log_policy_default(
             log_config.default_level,
             log_config.default_message,
@@ -353,7 +355,9 @@ fn evaluate_delegated_connect<'a>(
     log_config: PolicyLogConfig,
 ) -> PolicyOutcome<'a> {
     let request = parsed.as_policy_request();
-    if let Some(static_result) = snapshot.evaluate_request(peer.ip(), &request) {
+    if let Some(static_result) =
+        snapshot.evaluate_request(peer.ip(), parsed.client_name.as_deref(), &request)
+    {
         match into_decision(static_result) {
             PolicyOutcomeInternal::Deny(decision) => {
                 crate::metrics::record_rule_hit(decision.rule.as_ref());
@@ -392,7 +396,8 @@ fn evaluate_delegated_connect<'a>(
         policy_version = %authorization_policy.policy_version,
         "raw CONNECT tunnel disabled for delegated authorization; evaluating TLS inspection preflight"
     );
-    if let Some(preflight) = snapshot.evaluate_tls_bump_preflight(peer.ip(), &request)
+    if let Some(preflight) =
+        snapshot.evaluate_tls_bump_preflight(peer.ip(), parsed.client_name.as_deref(), &request)
         && authorization_policy.dynamic.allows_tls_bump(&request)
     {
         return PolicyOutcome::TlsBumpPreflight(TlsBumpPreflightOutcome {
@@ -641,6 +646,7 @@ mod tests {
             selector: ClientSelector::Fallback,
             policies: Arc::from(vec![policy.name.clone()].into_boxed_slice()),
             authorization_service: None,
+            password_hash: None,
             credential_limits: Arc::from([]),
             max_connections: 1024,
         }];
@@ -676,6 +682,7 @@ mod tests {
                 selector: ClientSelector::Fallback,
                 policies: Arc::from([policy.name.clone()]),
                 authorization_service: None,
+                password_hash: None,
                 credential_limits: Arc::from([]),
                 max_connections: 1024,
             }],
@@ -697,6 +704,7 @@ mod tests {
             path: "/api/v1/items?token=abc".to_string(),
             policy_path: "/api/v1/items".to_string(),
             flow: None,
+            client_name: None,
         };
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
@@ -718,6 +726,7 @@ mod tests {
             path: "/other/../api/v1/items?token=abc".to_string(),
             policy_path: "/api/v1/items".to_string(),
             flow: None,
+            client_name: None,
         };
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let outcome = evaluate_request(peer, &parsed, &snapshot, false, PolicyLogConfig::http1());
@@ -752,6 +761,7 @@ mod tests {
             path: "/api/items".to_string(),
             policy_path: "/api/items".to_string(),
             flow: None,
+            client_name: None,
         };
         assert!(matches!(
             evaluate_delegated_request(
@@ -815,6 +825,7 @@ mod tests {
             path: "example.com:443".to_string(),
             policy_path: "example.com:443".to_string(),
             flow: None,
+            client_name: None,
         };
         assert!(matches!(
             evaluate_delegated_request(
@@ -852,6 +863,7 @@ mod tests {
             path: "example.com:443".to_string(),
             policy_path: "example.com:443".to_string(),
             flow: None,
+            client_name: None,
         };
 
         assert!(matches!(

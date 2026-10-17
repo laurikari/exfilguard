@@ -269,6 +269,7 @@ mod tests {
             path: "/".to_string(),
             policy_path: "/".to_string(),
             flow: None,
+            client_name: None,
         };
 
         let first = UpstreamKey::from_request(&request, None);
@@ -294,6 +295,7 @@ mod tests {
             path: "/".to_string(),
             policy_path: "/".to_string(),
             flow: None,
+            client_name: None,
         };
         assert_ne!(
             UpstreamKey::from_request(&request, Some([1; 32])),

@@ -14,12 +14,18 @@ pub struct CompiledConfig {
     pub clients: Vec<ClientEntry>,
     pub policies: Arc<[Arc<CompiledPolicy>]>,
     pub cidr_trie: CidrTrie,
-    pub fallback_client: usize,
+    pub fallback_client: Option<usize>,
+    pub lease_cidr_trie: CidrTrie,
+    pub password_cidr_trie: CidrTrie,
+    pub lease_fallback_client: Option<usize>,
+    pub client_names: std::collections::HashMap<Arc<str>, usize>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ClientEntry {
     pub name: Arc<str>,
+    pub selector: crate::config::ClientSelector,
+    pub password_hash: Option<crate::authentication::PasswordHash>,
     pub policies: Arc<[usize]>,
     pub authorization_service: Option<Arc<str>>,
     pub credential_limits: Arc<[CompiledCredentialLimit]>,

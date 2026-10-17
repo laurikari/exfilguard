@@ -414,6 +414,8 @@ where
 pub struct Settings {
     pub listen: SocketAddr,
     #[serde(default)]
+    pub authentication: crate::authentication::AuthenticationSettings,
+    #[serde(default)]
     pub proxy_tls: Option<ProxyTlsSettings>,
     #[serde(default, deserialize_with = "deserialize_proxy_protocol_mode")]
     pub proxy_protocol: ProxyProtocolMode,
@@ -541,6 +543,14 @@ impl Settings {
             &self.policies,
             self.policies_dir.as_deref(),
         )?;
+        ensure!(
+            self.proxy_tls.is_some()
+                || config
+                    .clients
+                    .iter()
+                    .all(|client| client.password_hash.is_none()),
+            "password clients require [proxy_tls]; use an https:// proxy URL"
+        );
         if let Some(authorization) = &self.authorization {
             authorization.validate_clients(&config.clients)?;
         } else if let Some(client) = config
@@ -769,6 +779,17 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.authentication.max_pending_connections > 0
+                && self.authentication.max_concurrent_verifications > 0,
+            "authentication limits must be greater than zero"
+        );
+        ensure!(
+            self.authentication.max_pending_connections <= tokio::sync::Semaphore::MAX_PERMITS
+                && self.authentication.max_concurrent_verifications
+                    <= tokio::sync::Semaphore::MAX_PERMITS,
+            "authentication limits exceed supported semaphore capacity"
+        );
         self.ca.validate()?;
         match &self.proxy_tls {
             Some(ProxyTlsSettings::Files { cert, key }) => {
@@ -1015,6 +1036,7 @@ policies = "policies.toml"
         let dir = TempDir::new().unwrap();
         let config = write_settings_config(&dir, "[ca]\nsource='builtin'\ndir='ca'");
         let defaults = Settings::load(&Cli {
+            command: None,
             config: Some(config),
         })
         .unwrap();
@@ -1050,6 +1072,7 @@ policies = "policies.toml"
             "http2_stream_window_size=2097152\nhttp2_connection_window_size=1048576\n[ca]\nsource='builtin'\ndir='ca'",
         );
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config),
         })
         .unwrap();
@@ -1071,6 +1094,7 @@ policies = "policies.toml"
             let config =
                 write_settings_config(&dir, &format!("{setting}[ca]\nsource='builtin'\ndir='ca'"));
             let settings = Settings::load(&Cli {
+                command: None,
                 config: Some(config),
             })
             .unwrap();
@@ -1100,6 +1124,7 @@ policies = "policies.toml"
                 ),
             );
             let error = Settings::load(&Cli {
+                command: None,
                 config: Some(config),
             })
             .unwrap_err();
@@ -1132,6 +1157,7 @@ dir = "ca-material""#
             );
 
             let settings = Settings::load(&Cli {
+                command: None,
                 config: Some(config_path),
             })
             .unwrap();
@@ -1170,6 +1196,7 @@ key = "authorization-client.key""#,
         );
 
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap();
@@ -1224,6 +1251,7 @@ common_name = "exfilguard-integration""#,
         );
 
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap();
@@ -1276,6 +1304,7 @@ common_name = "exfilguard-integration""#,
         );
 
         let error = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap_err();
@@ -1325,6 +1354,7 @@ cert = "authorization-client.pem"
 key = "authorization-client.key""#,
         );
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap();
@@ -1361,6 +1391,7 @@ key = "authorization-client.key""#,
             "[ca]\nsource='builtin'\ndir='ca'\n[proxy_tls]\nsource='files'\ncert='proxy.pem'\nkey='proxy.key'\n",
         );
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(path.clone()),
         })
         .unwrap();
@@ -1373,10 +1404,13 @@ key = "authorization-client.key""#,
         );
         fs::write(&path, "listen='127.0.0.1:3128'\nclients='clients.toml'\npolicies='policies.toml'\n[ca]\nsource='builtin'\ndir='ca'\n[proxy_tls]\nsource='vault'\nrole='proxy-server'\nserver_name='proxy.example'\n").unwrap();
         assert!(
-            Settings::load(&Cli { config: Some(path) })
-                .unwrap_err()
-                .to_string()
-                .contains("[vault] must be configured")
+            Settings::load(&Cli {
+                command: None,
+                config: Some(path)
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("[vault] must be configured")
         );
     }
 
@@ -1407,6 +1441,7 @@ issuer = "exfilguard""#,
         );
 
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap();
@@ -1456,6 +1491,7 @@ source = "vault"
 issuer = "exfilguard""#,
         );
         let token_settings = Settings::load(&Cli {
+            command: None,
             config: Some(token_config),
         })
         .unwrap();
@@ -1487,6 +1523,7 @@ source = "vault"
 issuer = "exfilguard""#,
         );
         let proxy_settings = Settings::load(&Cli {
+            command: None,
             config: Some(proxy_config),
         })
         .unwrap();
@@ -1578,6 +1615,7 @@ policies = "policies.toml"
         .unwrap();
 
         let error = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap_err();
@@ -1620,6 +1658,7 @@ policies = "policies.toml"
         fs::write(fragment_dir.join("README"), "ignored").unwrap();
 
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap();
@@ -1642,6 +1681,7 @@ policies = "policies.toml"
         fs::write(dir.path().join("config.d"), "not a directory").unwrap();
 
         let error = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap_err();
@@ -1672,6 +1712,7 @@ policies = "policies.toml"
         .unwrap();
 
         let error = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap_err();
@@ -1687,6 +1728,7 @@ policies = "policies.toml"
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_tls: None,
+            authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
             allow_private_upstream_cidrs: Vec::new(),
@@ -1761,6 +1803,7 @@ policies = "policies.toml"
         let mut settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_tls: None,
+            authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
             allow_private_upstream_cidrs: Vec::new(),
@@ -1824,6 +1867,7 @@ policies = "policies.toml"
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_tls: None,
+            authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
             proxy_protocol_allowed_cidrs: None,
             allow_private_upstream_cidrs: Vec::new(),
@@ -1880,6 +1924,7 @@ policies = "policies.toml"
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
             proxy_tls: None,
+            authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Required,
             proxy_protocol_allowed_cidrs: None,
             allow_private_upstream_cidrs: Vec::new(),
@@ -1942,6 +1987,7 @@ source = "builtin"
 dir = "ca-material""#,
         );
         let settings = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap();
@@ -1966,6 +2012,7 @@ source = "builtin"
 dir = "ca-material""#,
         );
         let error = Settings::load(&Cli {
+            command: None,
             config: Some(config_path),
         })
         .unwrap_err();

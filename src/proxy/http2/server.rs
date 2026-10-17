@@ -288,25 +288,71 @@ async fn process_downstream_request(
     }
 
     let snapshot = app.policies.snapshot();
-    // Inner requests inherit the CONNECT token, but must not replace it or
-    // hide malformed/duplicate authentication headers during sanitization.
-    let authorization_token = app.authorization.as_ref().and_then(|authorization| {
-        let bound = flow_context.authorization_token.as_ref()?;
-        authorization
-            .bind_token(
+    let session = flow_context
+        .client_session
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("inspected HTTP/2 has no client session"))?;
+    if let Err(error) = session
+        .authenticate(
+            &snapshot,
+            peer.ip(),
+            request
+                .headers()
+                .get_all(http::header::PROXY_AUTHORIZATION)
+                .iter()
+                .map(http::HeaderValue::as_bytes)
+                .collect(),
+            &app,
+        )
+        .await
+    {
+        let mut respond = respond;
+        let busy = matches!(error, crate::authentication::AuthenticationError::Busy);
+        crate::metrics::record_authentication(if busy { "busy" } else { "denied" });
+        let status = if busy {
+            http::StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            http::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        };
+        let challenges = crate::authentication::challenges(&snapshot, peer.ip());
+        send_error_response(
+            &mut respond,
+            status,
+            "proxy authentication failed",
+            if busy {
+                None
+            } else {
+                Some(challenges.as_slice())
+            },
+        )
+        .await?;
+        let mut log = crate::logging::AccessLogBuilder::new(peer)
+            .method(request.method().as_str())
+            .scheme("https")
+            .host(request.uri().host().unwrap_or(""))
+            .path(crate::proxy::request::request_target_for_log(
                 request
-                    .headers()
-                    .get_all(http::header::PROXY_AUTHORIZATION)
-                    .iter()
-                    .map(http::HeaderValue::as_bytes),
-                Some(bound),
-            )
-            .ok()
-    });
-    let flow_context = RequestFlowContext {
-        authorization_token,
-        ..flow_context
-    };
+                    .uri()
+                    .path_and_query()
+                    .map(|value| value.as_str())
+                    .unwrap_or("/"),
+                app.settings.log_queries,
+            ))
+            .apply_flow_context(Some(&flow_context), request.method().as_str())
+            .status(status)
+            .decision("DENY")
+            .error_reason(if busy {
+                "authentication_busy"
+            } else {
+                "proxy_authentication"
+            })
+            .elapsed(start.elapsed());
+        if let Some(name) = session.client_name() {
+            log = log.client(name.as_ref());
+        }
+        log.log();
+        return Ok(());
+    }
     let max_request_header_size = app.settings.max_request_header_size;
     let (meta, body) = match sanitize_request(request, max_request_header_size, &flow_context) {
         Ok(result) => result,
@@ -820,11 +866,12 @@ impl RequestHandler for Http2RequestHandler {
     }
 
     async fn on_auth_deny(&mut self, log: RequestLogContext<'_>) -> Result<Self::Output> {
+        let challenges = crate::authentication::challenges(&self.ctx.snapshot, self.ctx.peer.ip());
         send_error_response(
             &mut self.ctx.respond,
             http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             "proxy authentication required",
-            Some("ExfilGuard"),
+            Some(challenges.as_slice()),
         )
         .await?;
         log.access_log_builder()

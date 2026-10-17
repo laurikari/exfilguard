@@ -27,6 +27,7 @@ fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
     Settings {
         listen,
         proxy_tls: None,
+        authentication: Default::default(),
         proxy_protocol: ProxyProtocolMode::Off,
         proxy_protocol_allowed_cidrs: None,
         allow_private_upstream_cidrs: Vec::new(),
@@ -82,11 +83,20 @@ pub struct ProxyHarness {
     pub ca: Arc<CertificateAuthority>,
     pub cache: Option<Arc<proxy::cache::HttpCache>>,
     pub proxy_tls_roots: RootCertStore,
-    _policy_tx: watch::Sender<PolicySnapshot>,
+    policy_tx: watch::Sender<PolicySnapshot>,
     handle: JoinHandle<()>,
 }
 
 impl ProxyHarness {
+    pub fn reload(&self, clients: &str, policies: &str) -> Result<()> {
+        write_clients_and_policies(&self.dirs, clients, policies)?;
+        let config = self.settings.load_runtime_config()?;
+        let compiled = Arc::new(policy::compile::compile_config(&config)?);
+        self.policy_tx
+            .send(PolicySnapshot::new(compiled))
+            .map_err(|_| anyhow::anyhow!("proxy policy receiver closed"))?;
+        Ok(())
+    }
     pub async fn connect(&self) -> Result<TcpStream> {
         Ok(TcpStream::connect(self.addr).await?)
     }
@@ -271,7 +281,7 @@ impl ProxyHarnessBuilder {
             ca,
             cache,
             proxy_tls_roots,
-            _policy_tx: policy_tx,
+            policy_tx,
             handle,
         })
     }

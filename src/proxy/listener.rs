@@ -173,36 +173,52 @@ async fn handle_connection(
         );
     }
     let snapshot = app.policies.snapshot();
-    let Some(client) = snapshot.resolve_client(peer.ip()) else {
-        warn!(peer = %peer, "rejecting connection without a configured client identity");
-        return Ok(());
+    let deferred = snapshot.authentication_available(peer.ip());
+    let pending = if deferred {
+        let Some(permit) = app.password_verifier.pending() else {
+            crate::metrics::record_authentication("busy");
+            warn!(peer = %peer, "rejecting connection at authentication pending limit");
+            return Ok(());
+        };
+        Some(permit)
+    } else {
+        None
     };
-    let client_name = client.name.clone();
-    let max_connections = client.max_connections;
-    let Some(_client_connection_permit) = app
-        .client_connections()
-        .try_acquire(client_name.clone(), max_connections)
-    else {
-        crate::metrics::record_downstream_connection_rejection(client_name.as_ref());
-        warn!(
-            peer = %peer,
-            client = %client_name,
-            max_connections,
-            "rejecting connection at client connection limit"
-        );
-        return Ok(());
-    };
-    drop(proxy_protocol_pending_guard);
-    let _client_connection_metric =
-        crate::metrics::track_downstream_connection_for_client(client_name);
-    match &app.proxy_tls {
-        Some(tls) => {
-            let stream = tls
-                .accept(stream, app.settings.tls_handshake_timeout())
-                .await?;
-            http::handle_http(stream, peer, app).await
+    let session = crate::authentication::ConnectionSession::new(pending);
+    if !deferred {
+        let Some(client) = snapshot.resolve_client(peer.ip()) else {
+            return Ok(());
+        };
+        if session.admit_anonymous(client, &app).is_err() {
+            return Ok(());
         }
-        None => http::handle_http(stream, peer, app).await,
+    }
+    drop(snapshot);
+    drop(proxy_protocol_pending_guard);
+    let mut policies = app.policies.subscribe();
+    let revoked = async {
+        while policies.changed().await.is_ok() {
+            if !session.valid(&policies.borrow_and_update(), peer.ip()) {
+                info!(peer = %peer, client = ?session.client_name(), "closing connection after client configuration changed");
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    let serve = async {
+        match &app.proxy_tls {
+            Some(tls) => {
+                let stream = tls
+                    .accept(stream, app.settings.tls_handshake_timeout())
+                    .await?;
+                http::handle_http(stream, peer, app.clone(), session.clone()).await
+            }
+            None => http::handle_http(stream, peer, app.clone(), session.clone()).await,
+        }
+    };
+    tokio::select! {
+        result = serve => result,
+        _ = revoked => Ok(()),
     }
 }
 
