@@ -139,6 +139,11 @@ this complete key.
 
 ## Retry only replayable idempotent requests
 
+`UpstreamPool::take()` polls the idle stream once before reusing it. EOF, read
+errors, and unsolicited HTTP bytes cause the connection to be discarded. The
+check adds no wait or request buffering. A peer can still close immediately
+after the check, so forwarding failures remain subject to the retry rules below.
+
 When reuse of a pooled HTTP/1 upstream connection fails with an error that
 indicates a stale socket, ExfilGuard retries once on a fresh connection only if
 the request is bodyless, no response has started downstream, and it uses a
