@@ -1,0 +1,71 @@
+groups:
+  - name: exfilguard-ca
+    rules:
+      - alert: ExfilGuardCAIssuerUnusable
+        expr: ca_issuer_usable == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ExfilGuard has no usable TLS inspection issuer
+          description: >-
+            Inspected HTTPS will fail closed. Check certificate validity and,
+            in Vault mode, Vault reachability and the signing response.
+
+      - alert: ExfilGuardIntermediateExpiresSoon
+        expr: ca_certificate_not_after_timestamp_seconds{certificate="intermediate"} - time() < 14 * 24 * 60 * 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ExfilGuard intermediate expires in less than 14 days
+          description: >-
+            Renew the externally managed issuer or investigate Vault renewal.
+            Builtin mode requires distributing a newly generated root.
+
+      - alert: ExfilGuardRootExpiresSoon
+        expr: ca_certificate_not_after_timestamp_seconds{certificate="root"} - time() < 90 * 24 * 60 * 60
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: An ExfilGuard trust root expires in less than 90 days
+          description: >-
+            Plan a trust-root overlap and distribute the replacement to
+            clients before the active hierarchy expires.
+
+      - alert: ExfilGuardVaultRenewalFailing
+        expr: increase(ca_vault_renewal_attempts_total{result="failure"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ExfilGuard Vault issuer renewal is failing
+          description: >-
+            The current issuer remains active while valid. Check the bounded
+            reason label, Vault availability, authentication, and PKI policy.
+
+  - name: exfilguard-authorization-service-tls
+    rules:
+      - alert: ExfilGuardAuthorizationClientCertificateUnusable
+        expr: authorization_service_client_certificate_not_after_timestamp_seconds - time() <= 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ExfilGuard cannot authenticate to an authorization service
+          description: >-
+            New policy and credential requests for the named service fail
+            closed. Check Vault reachability, authentication, and PKI policy.
+
+      - alert: ExfilGuardAuthorizationClientCertificateRenewalFailing
+        expr: increase(authorization_service_vault_renewal_attempts_total{result="failure"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Authorization-service client certificate renewal is failing
+          description: >-
+            The current certificate remains active while valid. Check the
+            bounded reason label, Vault availability, authentication, and PKI
+            policy.
