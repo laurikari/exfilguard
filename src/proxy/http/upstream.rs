@@ -3,8 +3,10 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use futures::FutureExt;
 use lru::LruCache;
 use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
@@ -46,10 +48,18 @@ impl UpstreamPool {
     }
 
     pub(super) fn take(&mut self, key: &UpstreamKey) -> Option<UpstreamConnection> {
-        self.entries.pop(key).map(|mut conn| {
-            conn.mark_active();
-            conn
-        })
+        let mut conn = self.entries.pop(key)?;
+        if !idle_stream_is_reusable(&mut conn.stream) {
+            debug!(
+                host = %conn.host,
+                port = conn.port,
+                scheme = ?conn.scheme,
+                "discarding readable or closed idle upstream connection"
+            );
+            return None;
+        }
+        conn.mark_active();
+        Some(conn)
     }
 
     pub(super) fn put(
@@ -90,6 +100,13 @@ impl UpstreamPool {
         }
         Ok(())
     }
+}
+
+fn idle_stream_is_reusable(stream: &mut (impl AsyncRead + Unpin)) -> bool {
+    // Poll once before sending a request. EOF, errors, and unsolicited HTTP
+    // bytes make an idle connection unusable. The peer can still close later.
+    let mut probe = [0u8; 1];
+    stream.read(&mut probe).now_or_never().is_none()
 }
 
 impl UpstreamKey {
@@ -206,6 +223,40 @@ impl Drop for UpstreamConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_stream_reuses_pending_read() {
+        let (mut stream, _peer) = tokio::io::duplex(1);
+        assert!(idle_stream_is_reusable(&mut stream));
+    }
+
+    #[test]
+    fn idle_stream_discards_eof() {
+        assert!(!idle_stream_is_reusable(&mut tokio::io::empty()));
+    }
+
+    #[test]
+    fn idle_stream_discards_unsolicited_data() {
+        let mut stream = b"HTTP/1.1 200 OK\r\n\r\n".as_slice();
+        assert!(!idle_stream_is_reusable(&mut stream));
+    }
+
+    #[test]
+    fn idle_stream_discards_read_error() {
+        struct ResetStream;
+
+        impl AsyncRead for ResetStream {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+            }
+        }
+
+        assert!(!idle_stream_is_reusable(&mut ResetStream));
+    }
 
     #[test]
     fn upstream_key_depends_only_on_origin() {
