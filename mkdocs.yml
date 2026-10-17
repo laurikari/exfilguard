@@ -1,5 +1,5 @@
 site_name: ExfilGuard
-site_description: Egress proxy for data exfiltration prevention
+site_description: Control and audit outbound network access.
 site_url: https://laurikari.github.io/exfilguard
 
 repo_name: laurikari/exfilguard

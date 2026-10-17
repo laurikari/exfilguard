@@ -1,36 +1,63 @@
 # ExfilGuard
 
-**Egress proxy for outbound HTTP and HTTPS**
+**Control and audit outbound network access.**
 
-Control outbound HTTP and HTTPS traffic. Set per-client rules for which
-external endpoints are reachable, and log what happened.
+Restrict workloads to approved destinations and let them use APIs without
+receiving API keys. Sandbox AI agents and limit the damage from supply chain
+attacks or operator mistakes.
 
 ---
 
 ## What is ExfilGuard?
 
-ExfilGuard is an explicit egress proxy written in Rust. Clients should know
-they are talking to a proxy. Each request is checked against the client's
-policy, then either forwarded or denied.
+ExfilGuard is an explicit HTTP and HTTPS egress proxy written in Rust for
+Unix-like systems. Each request is checked against the client's policy, then
+either forwarded or denied.
 
-The main use case is simple: internal services should only reach approved
-external endpoints. ExfilGuard helps enforce that and leaves an audit trail in
-the logs.
+---
 
-ExfilGuard targets Unix-like systems only; Windows is not supported.
+## Use Cases
+
+### AI Agents and Other Untrusted Workloads
+
+Let a coding agent fetch dependencies and call approved APIs while limiting the
+hosts, paths, and HTTP methods it can use. Lease tokens give it API access while
+the API credentials stay outside the agent. The agent cannot leak credentials
+it does not have, including by sending them to an LLM.
+
+### Compromised Dependencies
+
+Limit the destinations a service or build job can reach if a dependency is
+compromised. Attempts to upload data or contact an attacker at an unapproved
+destination are blocked and logged.
+
+### Operator Mistakes
+
+Restrict development tools and maintenance scripts to their intended services.
+A policy that permits only test endpoints blocks a command accidentally
+pointed at a production API.
+
+### Audit and Investigation
+
+Trace outbound requests to a configured client and see which were allowed or
+denied. Use the logs to investigate unexpected destinations and review whether
+services still need the access they have.
 
 ---
 
 ## Key Features
 
 **Per-Client Policy Enforcement**
-:   Map clients by exact IP address or CIDR ranges. Each client references ordered policies; the first matching rule wins.
+:   Apply policies by source address and optional password or lease-token credentials.
+
+**API Access Without API Keys**
+:   Give workloads scoped API access through lease tokens while keeping the API credentials outside the workload. See [delegated authorization](configuration.md#delegated-authorization).
 
 **URL Matching**
 :   Policies specify allowed destinations using wildcard patterns for hostnames and paths.
 
 **TLS Inspection**
-:   Terminates TLS and mints leaf certificates on the fly so ExfilGuard can apply normal HTTP rules to the decrypted request.
+:   Apply HTTP method and URL rules to HTTPS requests.
 
 **Pass-Through Mode**
 :   Tunnels CONNECT streams without decryption for services that use certificate pinning or do not allow TLS interception.
@@ -42,37 +69,13 @@ ExfilGuard targets Unix-like systems only; Windows is not supported.
 :   Blocks non-public upstream addresses by default, with explicit CIDR exceptions for internal services.
 
 **Runtime Policy Reload**
-:   `SIGHUP` reloads client and policy data from the configured files without restarting the process. If you change listener, metrics, cache, TLS, logging, or timeout settings, restart the server.
+:   Reload client and policy data without restarting ExfilGuard.
 
 **Structured Logging**
 :   JSON or text logs with the allow or deny decision and related request metadata.
 
 **Metrics Exporter**
-:   Optional Prometheus endpoint (`/metrics`) with counters and histograms for traffic, decisions, effective mode (`direct`, `bump`, `tunnel`), cache, and upstream reuse, plus gauges for current connections, in-flight work, cache usage, and last successful reload. Supports HTTPS when given a cert and key.
-
----
-
-## Use Cases
-
-### Data Exfiltration Prevention
-
-Block attempts to send data to unapproved cloud storage, analytics, or
-communication services.
-
-### Compliance & Audit
-
-Keep audit logs of outbound traffic. Show which destinations are allowed and
-which requests were blocked.
-
-### Multi-Tenant SaaS
-
-Control which external APIs different backend services can reach. Stop one
-service from talking to destinations meant for another.
-
-### Integration Management
-
-Control integrations with external partners. Restrict which hosts and paths
-each service may use.
+:   Monitor traffic, policy decisions, connections, and cache usage with Prometheus.
 
 ---
 
@@ -110,8 +113,6 @@ sudo systemctl enable --now exfilguard
 ---
 
 ## Quick Examples
-
-These examples assume ExfilGuard is being used as an explicit proxy.
 
 ### Allow specific API endpoint
 
