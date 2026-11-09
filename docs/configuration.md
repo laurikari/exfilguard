@@ -655,6 +655,15 @@ be used, which headers the service may return, and whether the service may recei
 A rule that does not ask for credentials does not need a matching limit. If a rule asks for
 credentials outside the limit, ExfilGuard denies the request.
 
+`origin_scope` uses the same URL pattern syntax as policy rules, including
+[literal query matching](policies.md#query-matching). For example,
+`origin_scope = "https://api.example.net/download?file=allowed.md"` restricts
+credential use to that exact query text. Omitting the query suffix leaves
+queries unrestricted. An optional `query_present = false` on the
+`[[client.credential_limit]]` entry requires no query component;
+`query_present = true` requires a present query, including an empty one.
+A query suffix and `query_present = false` cannot be combined.
+
 The first request from a client that uses delegated authorization must contain
 `Proxy-Authorization: ExfilGuard <base64url-token>`. ExfilGuard keeps that token with the
 connection. Later requests may omit it but cannot replace it. For inspected HTTPS, the outer

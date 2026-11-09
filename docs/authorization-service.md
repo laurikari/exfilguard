@@ -52,6 +52,31 @@ Times are Unix seconds. If `methods` is absent, the rule matches every method. `
 meaning and must be the only entry. `CONNECT` is not allowed. Rules are checked in order, and the
 first match wins.
 
+Rules use the same [URL and query matching](policies.md#query-matching) as local
+policies. A service issuing a URL and a lease can authorize that URL's literal
+query by including it in `url_pattern`:
+
+```json
+{
+  "action": "ALLOW",
+  "methods": ["GET"],
+  "url_pattern": "https://example.com/download?file=allowed.md"
+}
+```
+
+The query must match exactly; extra parameters, reordered parameters, and
+different percent-encoding do not match. Query asterisks are literal. The path
+still uses the existing canonical path and wildcard syntax, including escaping
+literal path asterisks when constructing a pattern.
+
+A URL without `?` leaves queries unrestricted. Add `"query_present": false`
+to require a query-free request, or `"query_present": true` to require a query
+with any contents. A trailing `?` requires a present but empty query.
+`query_present` is optional and can be used without `url_pattern`. A suffix
+combined with `false` is invalid; a suffix combined with `true` is valid and
+redundant. A query mismatch skips the rule, so a restrictive allowlist must not
+have a later broad allow that authorizes the other queries.
+
 Only an allow rule may contain `credential`. ExfilGuard treats `credential_reference` only as a
 name. The reference, requested headers, body access, and request URL must fit a `credential_limit`
 on the selected client.

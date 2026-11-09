@@ -55,7 +55,7 @@ bump flow.
 
 ### 3. The Policy Engine (`src/policy/`)
 
-Takes a request view with scheme, host, port, path, and method, then returns
+Takes a request view with scheme, host, port, path, query, and method, then returns
 allow or deny.
 
 - TOML is compiled up front into matcher structures.
@@ -138,7 +138,10 @@ ExfilGuard preserves the raw request target for upstream forwarding, logging,
 cache keys, and signed requests. Policy evaluation uses a separate, normalized
 path.
 
-- Query strings are ignored for path matching.
+- Queries are matched separately: a `?query` suffix in `url_pattern` requires
+  that exact query text, with no decoding or wildcards. Without a suffix,
+  queries are unrestricted; `query_present = false` requires their absence.
+  See [Query Matching](docs/policies.md#query-matching).
 - Percent-encoded RFC-unreserved characters are decoded. Other valid escapes
   remain encoded and use uppercase hex in the policy view, so `%2F` remains
   distinct from `/`.
@@ -215,7 +218,7 @@ connection.
 Each HTTPS policy rule declares an explicit mode:
 
 - `https_mode = "inspect"` (default) terminates TLS so the proxy can enforce
-  scheme, host, path, and method checks on the inner HTTP request. Matching
+  scheme, host, path, query, and method checks on the inner HTTP request. Matching
   HTTPS `ALLOW` rules authorize a TLS bump preflight for the same host/port,
   but the real policy decision is attached to the inner request. Deny-only
   authorities fail at the outer CONNECT. Private upstream addresses are still
@@ -349,6 +352,11 @@ The `http1_request_head` seeds include absolute HTTPS targets, signed object
 requests, conflicting authorities, non-HTTPS schemes, Upgrade headers, and
 mixed-case `Connection: upgrade` tokens. The target exercises ordinary proxy
 parsing and inspected-request validation against `example.com:443`.
+
+Query seeds cover absent and empty query components, literal query punctuation,
+encoded values, repeated parameters, and query-bearing absolute URLs without a
+path. The `http2_request_sanitize` seeds cover absent, empty, repeated, and nested
+queries using that target's binary host/path encoding.
 
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,

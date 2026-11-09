@@ -110,6 +110,9 @@ impl TestConfigBuilder {
                 if let Some(pattern) = &rule.url_pattern {
                     let _ = writeln!(policies_doc, "  url_pattern = \"{}\"", toml_escape(pattern));
                 }
+                if let Some(present) = rule.query_present {
+                    let _ = writeln!(policies_doc, "  query_present = {present}");
+                }
                 if let Some(https_mode) = &rule.https_mode {
                     let _ = writeln!(
                         policies_doc,
@@ -220,6 +223,7 @@ pub struct RuleSpec {
     action: ActionSpec,
     methods: Option<Vec<String>>,
     url_pattern: Option<String>,
+    query_present: Option<bool>,
     https_mode: Option<String>,
     status: Option<u16>,
     reason: Option<String>,
@@ -245,6 +249,7 @@ impl RuleSpec {
             action: ActionSpec::Allow,
             methods: Some(methods.iter().map(|method| (*method).to_string()).collect()),
             url_pattern: Some(url_pattern.into()),
+            query_present: None,
             https_mode: None,
             status: None,
             reason: None,
@@ -262,12 +267,18 @@ impl RuleSpec {
             action: ActionSpec::Deny,
             methods: Some(methods.iter().map(|method| (*method).to_string()).collect()),
             url_pattern: Some(url_pattern.into()),
+            query_present: None,
             https_mode: None,
             status: None,
             reason: None,
             body: None,
             cache: None,
         }
+    }
+
+    pub fn query_present(mut self, present: bool) -> Self {
+        self.query_present = Some(present);
+        self
     }
 
     pub fn https_mode(mut self, https_mode: &str) -> Self {

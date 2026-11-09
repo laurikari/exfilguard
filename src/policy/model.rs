@@ -36,6 +36,7 @@ pub struct ClientEntry {
 pub struct CompiledCredentialLimit {
     pub credential_reference: Arc<str>,
     pub origin: UrlMatcher,
+    pub query_present: Option<bool>,
     pub protected_headers: Arc<[HeaderName]>,
     pub body_access: BodyAccess,
 }
@@ -150,6 +151,7 @@ pub struct CompiledRule {
     pub action: RuleAction,
     pub methods: MethodMask,
     pub url: Option<UrlMatcher>,
+    pub query_present: Option<bool>,
     pub https_mode: HttpsMode,
     pub cache: Option<CompiledCacheConfig>,
 }
@@ -237,25 +239,22 @@ pub struct UrlMatcher {
     pub host: HostMatcher,
     pub port: Option<u16>,
     pub path: Option<PathMatcher>,
+    pub query: Option<Arc<str>>,
     pub original: Arc<str>,
 }
 
 impl UrlMatcher {
-    /// Matches the full request tuple, including the canonical policy path.
-    pub fn matches_request(
-        &self,
-        scheme: Scheme,
-        host: &str,
-        port: Option<u16>,
-        path: &str,
-    ) -> bool {
-        if !self.matches_authority(scheme, host, port) {
-            return false;
-        }
-        if let Some(path_matcher) = &self.path {
-            return path_matcher.matches(path);
-        }
-        true
+    /// Matches destination, canonical policy path, and the literal query suffix.
+    pub fn matches_request(&self, request: &super::matcher::Request<'_>) -> bool {
+        self.matches_authority(request.scheme, request.host, request.port)
+            && self
+                .path
+                .as_ref()
+                .is_none_or(|path| path.matches(request.path))
+            && self
+                .query
+                .as_deref()
+                .is_none_or(|query| request.query == Some(query))
     }
 
     /// Matches only scheme, host, and port.
@@ -464,6 +463,7 @@ mod tests {
     #[test]
     fn url_matcher_matches_request_requires_path_match() {
         let matcher = UrlMatcher {
+            query: None,
             scheme: Scheme::Https,
             host: HostMatcher::Exact("example.com".to_string()),
             port: Some(443),
@@ -474,13 +474,23 @@ mod tests {
             original: Arc::from("https://example.com/api/**"),
         };
 
-        assert!(matcher.matches_request(Scheme::Https, "example.com", None, "/api/v1"));
-        assert!(!matcher.matches_request(Scheme::Https, "example.com", None, "/admin"));
+        let mut request = super::super::matcher::Request {
+            method: &http::Method::GET,
+            scheme: Scheme::Https,
+            host: "example.com",
+            port: None,
+            path: "/api/v1",
+            query: None,
+        };
+        assert!(matcher.matches_request(&request));
+        request.path = "/admin";
+        assert!(!matcher.matches_request(&request));
     }
 
     #[test]
     fn url_matcher_matches_authority_ignores_path_component() {
         let matcher = UrlMatcher {
+            query: None,
             scheme: Scheme::Https,
             host: HostMatcher::Exact("example.com".to_string()),
             port: Some(443),
@@ -498,6 +508,7 @@ mod tests {
     #[test]
     fn url_matcher_without_explicit_port_uses_scheme_default() {
         let matcher = UrlMatcher {
+            query: None,
             scheme: Scheme::Https,
             host: HostMatcher::Exact("example.com".to_string()),
             port: None,

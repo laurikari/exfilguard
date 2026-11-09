@@ -145,6 +145,31 @@ impl AuthorizationFixture {
         credential_scope: String,
         body_access: BodyAccess,
     ) -> Result<Self> {
+        let body_access_name = match body_access {
+            BodyAccess::None => "none",
+            BodyAccess::BoundedPayload => "bounded_payload",
+        };
+        let allowed_methods = match body_access {
+            BodyAccess::None => json!(["GET"]),
+            BodyAccess::BoundedPayload => json!(["GET", "POST"]),
+        };
+        Self::spawn_with_rules(json!([
+            {
+                "action": "ALLOW",
+                "methods": allowed_methods,
+                "url_pattern": credential_scope,
+                "credential": {
+                    "credential_reference": CREDENTIAL_REFERENCE,
+                    "protected_headers": ["authorization"],
+                    "body_access": body_access_name
+                }
+            },
+            {"action": "ALLOW", "methods": allowed_methods}
+        ]))
+        .await
+    }
+
+    async fn spawn_with_rules(rules: Value) -> Result<Self> {
         let temp = TempDir::new()?;
         let ServiceTls {
             server_config,
@@ -167,7 +192,7 @@ impl AuthorizationFixture {
                     break;
                 };
                 let acceptor = TlsAcceptor::from(server_config.clone());
-                let credential_scope = credential_scope.clone();
+                let rules = rules.clone();
                 let policy_counter = policy_counter.clone();
                 let credential_counter = credential_counter.clone();
                 let captured_requests = captured_requests.clone();
@@ -175,8 +200,7 @@ impl AuthorizationFixture {
                     if let Err(error) = serve_authorization_request(
                         stream,
                         acceptor,
-                        &credential_scope,
-                        body_access,
+                        rules,
                         policy_counter,
                         credential_counter,
                         captured_requests,
@@ -428,6 +452,126 @@ impl Drop for Http1Origin {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorization_service_enforces_literal_queries_and_presence() -> Result<()> {
+    let origin = Http1Origin::spawn().await?;
+    let base = format!("http://127.0.0.1:{}", origin.addr.port());
+    let services = AuthorizationFixture::spawn_with_rules(json!([
+        {"action": "ALLOW", "methods": ["GET"], "url_pattern": format!("{base}/download?file=allowed.md")},
+        {"action": "ALLOW", "methods": ["GET"], "url_pattern": format!("{base}/empty?")},
+        {"action": "ALLOW", "methods": ["GET"], "url_pattern": format!("{base}/absent"), "query_present": false},
+        {"action": "ALLOW", "methods": ["GET"], "url_pattern": format!("{base}/present"), "query_present": true}
+    ]))
+    .await?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["queries"])
+        .policy(PolicySpec::new("queries").rule(RuleSpec::allow(&["GET"], format!("{base}/**"))))
+        .render();
+    let clients = format!("{clients}authorization_service = \"{AUTHORIZATION_SERVICE}\"\n");
+    let authorization = services.settings();
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(move |settings| settings.authorization = Some(authorization))
+        .spawn()
+        .await?;
+    let mut forwarded = 0;
+    for absolute in [false, true] {
+        for (path, allowed) in [
+            ("/download?file=allowed.md", true),
+            ("/download?file=private.md", false),
+            ("/download?file=allowed.md&extra=yes", false),
+            ("/download?file=%61llowed.md", false),
+            ("/download", false),
+            ("/empty?", true),
+            ("/empty", false),
+            ("/absent", true),
+            ("/absent?", false),
+            ("/present?", true),
+            ("/present?anything", true),
+            ("/present", false),
+        ] {
+            let target = if absolute {
+                format!("{base}{path}")
+            } else {
+                path.to_string()
+            };
+            let mut client = TcpStream::connect(harness.addr).await?;
+            client.write_all(format!(
+                "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+                origin.addr.port(),
+            ).as_bytes()).await?;
+            let response = read_http_response_with_length(&mut client).await?;
+            let expected = if allowed { "200" } else { "403" };
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected}")),
+                "{target}: {response}"
+            );
+            if allowed {
+                forwarded += 1;
+                assert!(response.contains(&format!("path={path}\n")), "{response}");
+            }
+            assert_eq!(origin.requests.load(Ordering::SeqCst), forwarded);
+        }
+    }
+    assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credential_limits_enforce_queries_before_preparing_credentials() -> Result<()> {
+    let origin = Http1Origin::spawn().await?;
+    let scope = format!("http://127.0.0.1:{}/credential", origin.addr.port());
+    let services = AuthorizationFixture::spawn(scope.clone()).await?;
+    let mut forwarded = 0;
+    for (suffix, presence) in [("?file=allowed.md", true), ("", false), ("", true)] {
+        let (clients, policies) = TestConfigBuilder::new()
+            .default_client(&["queries"])
+            .policy(PolicySpec::new("queries").rule(RuleSpec::allow(&["GET"], &scope)))
+            .render();
+        let clients =
+            with_delegated_authorization(clients, &format!("{scope}{suffix}"), BodyAccess::None);
+        let clients = format!("{clients}query_present = {presence}\n");
+        let authorization = services.settings();
+        let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+            .with_settings(move |settings| settings.authorization = Some(authorization))
+            .spawn()
+            .await?;
+        for query in [
+            "",
+            "?",
+            "?file=private.md",
+            "?file=allowed.md&extra=yes",
+            "?file=allowed.md",
+        ] {
+            let allowed = if suffix.is_empty() {
+                presence != query.is_empty()
+            } else {
+                query == suffix
+            };
+            let mut client = TcpStream::connect(harness.addr).await?;
+            client.write_all(format!(
+                "GET {scope}{query} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+                origin.addr.port(),
+            ).as_bytes()).await?;
+            let response = read_http_response_with_length(&mut client).await?;
+            let expected = if allowed { "200" } else { "403" };
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected}")),
+                "scope={scope}{suffix}, presence={presence}, query={query}: {response}"
+            );
+            if allowed {
+                forwarded += 1;
+                assert!(response.contains(&format!("path=/credential{query}\n")));
+                assert!(response.contains(PROTECTED_VALUE));
+            }
+            assert_eq!(services.credential_calls.load(Ordering::SeqCst), forwarded);
+            assert_eq!(origin.requests.load(Ordering::SeqCst), forwarded);
+        }
+        harness.shutdown().await;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1214,8 +1358,7 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
 async fn serve_authorization_request(
     stream: TcpStream,
     acceptor: TlsAcceptor,
-    credential_scope: &str,
-    body_access: BodyAccess,
+    rules: Value,
     policy_calls: Arc<AtomicUsize>,
     credential_calls: Arc<AtomicUsize>,
     credential_requests: Arc<Mutex<Vec<Value>>>,
@@ -1224,14 +1367,6 @@ async fn serve_authorization_request(
     let (path, body) = read_json_request(&mut tls).await?;
     let request: Value = serde_json::from_slice(&body)?;
     let now = unix_now();
-    let body_access_name = match body_access {
-        BodyAccess::None => "none",
-        BodyAccess::BoundedPayload => "bounded_payload",
-    };
-    let allowed_methods = match body_access {
-        BodyAccess::None => json!(["GET"]),
-        BodyAccess::BoundedPayload => json!(["GET", "POST"]),
-    };
     let (status, response) = match path.as_str() {
         "/policy" => {
             policy_calls.fetch_add(1, Ordering::SeqCst);
@@ -1262,19 +1397,7 @@ async fn serve_authorization_request(
                         "expires_at": now + 120,
                         "cache_until": now + 30,
                         "policy_version": "integration-v1",
-                        "rules": [
-                            {
-                                "action": "ALLOW",
-                                "methods": allowed_methods,
-                                "url_pattern": credential_scope,
-                                "credential": {
-                                    "credential_reference": CREDENTIAL_REFERENCE,
-                                    "protected_headers": ["authorization"],
-                                    "body_access": body_access_name
-                                }
-                            },
-                            {"action": "ALLOW", "methods": allowed_methods}
-                        ]
+                        "rules": rules
                     }),
                 )
             }
@@ -1311,6 +1434,7 @@ async fn serve_authorization_request(
                             .filter_map(Value::as_u64)
                             .map(|b| b as u8)
                             .collect::<Vec<_>>();
+                        let path = path.split(|byte| *byte == b'?').next().unwrap();
                         path == b"/credential" || path == b"/credential/success"
                     })
                 && finalized_body.as_deref().is_some_and(|body| {

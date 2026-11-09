@@ -125,6 +125,7 @@ Rules run in order. The first matching rule decides the action.
 | `action` | String | Required | `"ALLOW"` or `"DENY"` |
 | `methods` | Array | `["ANY"]` | HTTP methods to match (non-CONNECT by default) |
 | `url_pattern` | String | None | URL pattern to match (see syntax below) |
+| `query_present` | Boolean | None | Require a query component (`true`) or its absence (`false`); omission imposes no presence constraint |
 | `https_mode` | String | `"inspect"` | HTTPS handling mode: `"inspect"` or `"tunnel"` |
 | `cache` | Table | None | Cache configuration (see below) |
 | `status` | u16 | Required for DENY | Final error status from 400 through 599 |
@@ -186,7 +187,9 @@ See [Private Upstream Exceptions](configuration.md#private-upstream-exceptions).
 
 ## URL Pattern Syntax
 
-URL patterns follow the format: `scheme://host[:port][/path]`
+URL patterns follow the format: `scheme://host[:port][/path][?query]`.
+A pattern without a path or query matches any path at that destination. A query
+suffix without an explicit path, such as `https://example.com?x`, matches `/`.
 
 ### Scheme
 
@@ -229,9 +232,9 @@ url_pattern = "https://example.com:8443/api/**"
 | `/files/%2A` | Exact path containing a percent-encoded asterisk: `/files/%2A` |
 
 !!! note
-    Policy path matching uses a canonical path view. It ignores query strings,
-    decodes percent-encoded RFC-unreserved characters, normalizes other valid
-    escapes to uppercase hex, normalizes literal `.` and `..` segments, and
+    Policy path matching uses a canonical path view, separate from query
+    matching. It decodes percent-encoded RFC-unreserved characters, normalizes
+    other valid escapes to uppercase hex, normalizes literal `.` and `..` segments, and
     rejects ambiguous path syntax instead of rewriting it. ExfilGuard still
     preserves the raw request target for upstream forwarding, so signed
     requests keep their original path bytes.
@@ -267,6 +270,54 @@ url_pattern = "https://example.com:8443/api/**"
     with uppercase hexadecimal digits. For example, npm's scoped-package path
     `/@scope%2fname` has the canonical policy path `/@scope%2Fname`, which
     remains distinct from `/@scope/name`.
+
+### Query Matching
+
+The suffix after the first `?` in a URL pattern must match the complete request
+query exactly, including case and encoding. It is literal text: `*` is not a
+wildcard in the query, and `+`, `&`, `=`, and further `?` characters have no
+special matching behavior. ExfilGuard does not decode, sort, or interpret query
+parameters. The request target is still forwarded unchanged.
+
+```toml
+methods = ["GET"]
+url_pattern = "https://example.com/download?file=allowed.md"
+```
+
+This matches `file=allowed.md`, but not `file=private.md`, `file=%61llowed.md`,
+or `file=allowed.md&extra=value`. A query mismatch skips the rule; evaluation
+continues with the next rule.
+
+| URL pattern and optional field | Query requirement |
+|-------------------------------|-------------------|
+| `https://example.com/download` | Any query or none |
+| `https://example.com/download?file=allowed.md` | Exactly `file=allowed.md` |
+| `https://example.com/download?` | Present and empty |
+| `https://example.com/download`, `query_present = false` | Absent |
+| `https://example.com/download`, `query_present = true` | Present, with any contents |
+
+`/download` has no query component; `/download?` has an empty one. To require
+absence, use:
+
+```toml
+methods = ["GET"]
+url_pattern = "https://example.com/download"
+query_present = false
+```
+
+`query_present` can also appear without `url_pattern`. A query suffix combined
+with `query_present = false` is rejected as contradictory; combining a suffix
+with `true` is valid and redundant. URL patterns cannot contain fragments.
+
+Query constraints apply to HTTP requests, including inner requests in HTTPS
+inspect mode. CONNECT tunnel rules cannot specify a query suffix or `query_present`; transport
+preflight checks only the destination authority.
+
+Literal query matching does not identify application-equivalent spellings.
+For example, an exact deny of `file=private.md` does not match
+`file=%70rivate.md`. Use restrictive allow rules with a deny fallback when only
+specified query spellings should be permitted. Keep the existing canonical
+path and path-wildcard requirements when constructing URL patterns.
 
 ### Complete Examples
 

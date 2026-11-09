@@ -197,6 +197,8 @@ struct DynamicRuleWire {
     #[serde(default)]
     url_pattern: Option<String>,
     #[serde(default)]
+    query_present: Option<bool>,
+    #[serde(default)]
     credential: Option<DynamicCredentialWire>,
 }
 
@@ -706,7 +708,7 @@ impl PolicyResolver {
                 })
                 .transpose()?;
             rules.push((
-                make_dynamic_rule(index, action, methods, url_pattern),
+                make_dynamic_rule(index, action, methods, url_pattern, raw.query_present),
                 credential,
             ));
         }
@@ -1199,6 +1201,7 @@ mod tests {
                 0,
                 RuleAction::Allow,
                 MethodMatch::Any,
+                None,
                 None,
             )])
             .unwrap(),

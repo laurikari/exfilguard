@@ -66,6 +66,7 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
                         Ok(CompiledCredentialLimit {
                             credential_reference: limit.credential_reference.clone(),
                             origin: compile_url_pattern(&limit.origin_scope)?,
+                            query_present: limit.query_present,
                             protected_headers: Arc::from(
                                 limit
                                     .protected_headers
@@ -148,9 +149,9 @@ pub(crate) fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {
     for rule in policy.rules.iter() {
         let methods = compile_methods(&rule.methods);
         let url = match &rule.url_pattern {
-            Some(pattern) => Some(compile_url_pattern(pattern).with_context(|| {
-                format!("failed to compile url pattern '{}'", pattern.original)
-            })?),
+            Some(pattern) => Some(
+                compile_url_pattern(pattern).with_context(|| "failed to compile URL pattern")?,
+            ),
             None => None,
         };
         let cache = compile_cache_config(rule);
@@ -160,6 +161,7 @@ pub(crate) fn compile_policy(policy: &Policy) -> Result<CompiledPolicy> {
             action: rule.action.clone(),
             methods,
             url,
+            query_present: rule.query_present,
             https_mode: rule.https_mode,
             cache,
         });
@@ -186,7 +188,11 @@ fn compile_methods(methods: &MethodMatch) -> MethodMask {
 
 pub(crate) fn compile_url_pattern(pattern: &UrlPattern) -> Result<UrlMatcher> {
     let host_matcher = compile_host_pattern(pattern.host.as_ref())?;
-    let path = match pattern.path.as_ref() {
+    let path = match pattern
+        .path
+        .as_deref()
+        .or_else(|| pattern.query.as_ref().map(|_| "/"))
+    {
         Some(path) => Some(
             compile_path_pattern(path)
                 .with_context(|| format!("invalid path pattern '{}'", path))?,
@@ -199,6 +205,7 @@ pub(crate) fn compile_url_pattern(pattern: &UrlPattern) -> Result<UrlMatcher> {
         host: host_matcher,
         port: pattern.port,
         path,
+        query: pattern.query.clone(),
         original: pattern.original.clone(),
     })
 }
@@ -228,10 +235,10 @@ fn compile_host_pattern(host: &str) -> Result<HostMatcher> {
     Ok(HostMatcher::Pattern(HostPattern::new(labels)))
 }
 
-fn compile_path_pattern(pattern: &Arc<str>) -> Result<PathMatcher> {
+fn compile_path_pattern(pattern: &str) -> Result<PathMatcher> {
     let regex = crate::canonical_path::pattern_regex(pattern)?;
     let compiled = Regex::new(&regex).with_context(|| format!("invalid path regex '{}'", regex))?;
-    Ok(PathMatcher::new(compiled, pattern.clone()))
+    Ok(PathMatcher::new(compiled, Arc::from(pattern)))
 }
 
 #[cfg(test)]
@@ -248,10 +255,12 @@ mod tests {
 
     fn sample_policy() -> Policy {
         let allow_rule = Rule {
+            query_present: None,
             id: Arc::<str>::from("allow#0"),
             action: RuleAction::Allow,
             methods: MethodMatch::List(vec![Method::GET, Method::POST]),
             url_pattern: Some(UrlPattern {
+                query: None,
                 scheme: Scheme::Https,
                 host: Arc::<str>::from("*.example.com"),
                 port: None,
@@ -274,6 +283,7 @@ mod tests {
     #[test]
     fn compile_basic_policy() {
         let deny_rule = Rule {
+            query_present: None,
             id: Arc::<str>::from("deny#0"),
             action: RuleAction::Deny {
                 status: StatusCode::FORBIDDEN,
@@ -343,6 +353,7 @@ mod tests {
                 name: Arc::<str>::from("deny-all"),
                 rules: Arc::from(
                     vec![Rule {
+                        query_present: None,
                         id: Arc::<str>::from("deny-all#0"),
                         action: RuleAction::Deny {
                             status: StatusCode::FORBIDDEN,

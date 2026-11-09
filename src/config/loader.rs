@@ -73,11 +73,9 @@ fn load_clients(path: &Path, dir: Option<&Path>) -> Result<Vec<Client>> {
                 Ok(super::CredentialLimit {
                     credential_reference: Arc::from(limit.credential_reference),
                     origin_scope: parse_url_pattern(&limit.origin_scope).with_context(|| {
-                        format!(
-                            "client '{name}' has invalid credential_limit origin_scope '{}'",
-                            limit.origin_scope
-                        )
+                        format!("client '{name}' has invalid credential_limit origin_scope")
                     })?,
+                    query_present: limit.query_present,
                     protected_headers: Arc::from(
                         limit
                             .protected_headers
@@ -156,7 +154,7 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
             let methods = parse_methods(&rule)?;
             let url_pattern = match &rule.url_pattern {
                 Some(pattern) => Some(parse_url_pattern(pattern).with_context(|| {
-                    format!("policy '{}' has invalid url_pattern '{}'", name, pattern)
+                    format!("policy '{}' rule {idx} has invalid url_pattern", name)
                 })?),
                 None => None,
             };
@@ -167,6 +165,7 @@ fn load_policies(path: &Path, dir: Option<&Path>) -> Result<Vec<Policy>> {
                 action,
                 methods,
                 url_pattern,
+                query_present: rule.query_present,
                 https_mode,
                 cache: rule.cache.map(|c| CacheConfig {
                     force_cache_duration: c.force_cache_duration,
@@ -200,6 +199,11 @@ fn parse_policies_file(path: &Path) -> Result<Vec<RawPolicy>> {
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read policies config at {}", path.display()))?;
     let doc: PoliciesDoc = toml::from_str(&data)
+        .map_err(|mut error: toml::de::Error| {
+            // Policy source excerpts can contain sensitive URL queries.
+            error.set_input(None);
+            error
+        })
         .with_context(|| format!("failed to parse policies config at {}", path.display()))?;
     Ok(doc.policies)
 }
@@ -318,7 +322,17 @@ fn parse_methods(rule: &RawRule) -> Result<MethodMatch> {
 }
 
 pub(crate) fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
-    let (scheme_part, rest) = raw
+    if raw.contains('#') {
+        bail!("URL pattern must not contain a URI fragment");
+    }
+    let (url, query) = match raw.split_once('?') {
+        Some((url, query)) => (url, Some(query)),
+        None => (raw, None),
+    };
+    if let Some(query) = query {
+        super::validate_query(query)?;
+    }
+    let (scheme_part, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow!("pattern must include scheme"))?;
     let scheme = match scheme_part {
@@ -340,7 +354,10 @@ pub(crate) fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
     super::validate_host_pattern(raw_host)?;
     let host = canonicalize_ip_literal(raw_host).unwrap_or_else(|| raw_host.to_string());
 
-    let path = host_and_path.next().map(|path| format!("/{}", path));
+    let path = host_and_path
+        .next()
+        .map(|path| format!("/{}", path))
+        .or_else(|| query.map(|_| "/".to_string()));
     if let Some(path_ref) = path.as_ref() {
         super::validate_path_pattern(path_ref)?;
     }
@@ -350,6 +367,7 @@ pub(crate) fn parse_url_pattern(raw: &str) -> Result<UrlPattern> {
         host: Arc::<str>::from(host),
         port,
         path: path.map(Arc::<str>::from),
+        query: query.map(Arc::<str>::from),
         original: Arc::<str>::from(raw.to_string()),
     })
 }
@@ -425,6 +443,8 @@ struct RawClient {
 struct RawCredentialLimit {
     credential_reference: String,
     origin_scope: String,
+    #[serde(default)]
+    query_present: Option<bool>,
     protected_headers: Vec<String>,
     #[serde(default)]
     body_access: super::BodyAccess,
@@ -461,6 +481,8 @@ struct RawCacheConfig {
 struct RawRule {
     #[serde(default)]
     url_pattern: Option<String>,
+    #[serde(default)]
+    query_present: Option<bool>,
     #[serde(default)]
     methods: Option<Vec<String>>,
     #[serde(default)]
@@ -506,6 +528,25 @@ mod tests {
     fn write_dir_file(dir: &TempDir, name: &str, content: &str) {
         let path = dir.path().join(name);
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn policy_query_errors_do_not_echo_query_contents() {
+        const SECRET: &str = "query-secret-sentinel";
+        let malformed = write_temp(&format!(
+            "[[policy]]\nname = \"p\"\n[[policy.rule]]\naction = \"ALLOW\"\nurl_pattern = \"https://example.com/?{SECRET}\" invalid\n"
+        ));
+        let error = parse_policies_file(malformed.path()).unwrap_err();
+        assert!(!format!("{error:?}").contains(SECRET));
+
+        for suffix in [format!("{SECRET}#fragment"), format!("{SECRET} bad")] {
+            let policies = write_temp(&format!(
+                "[[policy]]\nname = \"p\"\n[[policy.rule]]\naction = \"ALLOW\"\nurl_pattern = \"https://example.com/?{suffix}\"\n"
+            ));
+            let error = load_policies(policies.path(), None).unwrap_err();
+            assert!(format!("{error:#}").contains("invalid url_pattern"));
+            assert!(!format!("{error:?}").contains(SECRET));
+        }
     }
 
     #[test]

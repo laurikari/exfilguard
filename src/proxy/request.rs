@@ -235,6 +235,7 @@ impl ParsedRequest {
             host: &self.host,
             port: self.port,
             path: self.policy_path(),
+            query: self.path.split_once('?').map(|(_, query)| query),
         }
     }
 

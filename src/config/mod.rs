@@ -77,6 +77,30 @@ fn validate_path_pattern(path: &str) -> Result<()> {
     crate::canonical_path::pattern_regex(path).map(|_| ())
 }
 
+/// Query matching is lexical: use transport syntax without decoding or rewriting.
+fn validate_query(query: &str) -> Result<()> {
+    let target = format!("/?{query}");
+    let parsed: http::uri::PathAndQuery = target
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid query syntax in URL pattern"))?;
+    ensure!(
+        parsed.as_str() == target,
+        "invalid query syntax in URL pattern"
+    );
+    Ok(())
+}
+
+fn validate_query_constraint(pattern: Option<&UrlPattern>, present: Option<bool>) -> Result<()> {
+    if let Some(query) = pattern.and_then(|pattern| pattern.query.as_deref()) {
+        validate_query(query)?;
+        ensure!(
+            present != Some(false),
+            "query suffix contradicts query_present = false"
+        );
+    }
+    Ok(())
+}
+
 fn validate_reason(reason: &str) -> Result<()> {
     if reason.trim().is_empty() {
         bail!("reason must not be empty");
@@ -180,19 +204,11 @@ pub(crate) fn validate_policy_rules(policy: &Policy) -> Result<()> {
         }
 
         if let Some(pattern) = &rule.url_pattern {
-            validate_host_pattern(pattern.host.as_ref()).with_context(|| {
-                format!(
-                    "policy '{}' has invalid url_pattern '{}'",
-                    policy.name, pattern.original
-                )
-            })?;
+            validate_host_pattern(pattern.host.as_ref())
+                .with_context(|| format!("policy '{}' has invalid url_pattern", policy.name))?;
             if let Some(path) = &pattern.path {
-                validate_path_pattern(path.as_ref()).with_context(|| {
-                    format!(
-                        "policy '{}' has invalid url_pattern '{}'",
-                        policy.name, pattern.original
-                    )
-                })?;
+                validate_path_pattern(path.as_ref())
+                    .with_context(|| format!("policy '{}' has invalid url_pattern", policy.name))?;
             }
         }
 
@@ -226,6 +242,26 @@ pub(crate) fn validate_policy_rules(policy: &Policy) -> Result<()> {
                 idx,
                 MAX_CACHE_TTL_SECONDS,
                 force_cache_duration
+            );
+        }
+
+        validate_query_constraint(rule.url_pattern.as_ref(), rule.query_present).with_context(
+            || {
+                format!(
+                    "policy '{}' rule {idx} has invalid query constraint",
+                    policy.name
+                )
+            },
+        )?;
+        if is_connect_only {
+            ensure!(
+                rule.query_present.is_none()
+                    && rule
+                        .url_pattern
+                        .as_ref()
+                        .is_none_or(|pattern| pattern.query.is_none()),
+                "policy '{}' rule {idx}: CONNECT rules cannot constrain queries",
+                policy.name
             );
         }
 
@@ -308,6 +344,13 @@ fn validate_config(config: &Config) -> Result<()> {
             );
         }
         for (index, limit) in client.credential_limits.iter().enumerate() {
+            validate_query_constraint(Some(&limit.origin_scope), limit.query_present)
+                .with_context(|| {
+                    format!(
+                        "client '{}' credential_limit[{index}] has invalid query constraint",
+                        client.name
+                    )
+                })?;
             ensure!(
                 !limit.credential_reference.trim().is_empty(),
                 "client '{}' credential_limit[{index}].credential_reference must not be empty",
@@ -500,6 +543,7 @@ mod tests {
         url_pattern: Option<UrlPattern>,
     ) -> Rule {
         Rule {
+            query_present: None,
             id: Arc::from("rule#0"),
             action: RuleAction::Allow,
             methods,
@@ -516,6 +560,7 @@ mod tests {
                 name: Arc::from("deny"),
                 rules: Arc::from(
                     vec![Rule {
+                        query_present: None,
                         id: Arc::from("deny#0"),
                         action: RuleAction::Deny {
                             status: StatusCode::from_u16(status).unwrap(),
@@ -628,6 +673,7 @@ mod tests {
                         MethodMatch::Any,
                         HttpsMode::Inspect,
                         Some(UrlPattern {
+                            query: None,
                             scheme: Scheme::Https,
                             host: Arc::from("example.com"),
                             port: None,
@@ -695,6 +741,7 @@ mod tests {
                         MethodMatch::List(vec![Method::GET]),
                         HttpsMode::Tunnel,
                         Some(UrlPattern {
+                            query: None,
                             scheme: Scheme::Https,
                             host: Arc::from("example.com"),
                             port: None,
@@ -722,6 +769,7 @@ mod tests {
                 name: Arc::from("deny"),
                 rules: Arc::from(
                     vec![Rule {
+                        query_present: None,
                         id: Arc::from("rule#0"),
                         action: RuleAction::Deny {
                             status: StatusCode::FORBIDDEN,

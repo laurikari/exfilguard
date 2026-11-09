@@ -625,10 +625,12 @@ mod tests {
             name: Arc::<str>::from("allow-api"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("allow-api#0"),
                     action: RuleAction::Allow,
                     methods: MethodMatch::List(vec![Method::GET]),
                     url_pattern: Some(UrlPattern {
+                        query: None,
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("example.com"),
                         port: None,
@@ -664,6 +666,7 @@ mod tests {
             name: Arc::from("tunnel"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::from("tunnel#0"),
                     action: RuleAction::Allow,
                     methods: MethodMatch::List(vec![Method::CONNECT]),
@@ -750,6 +753,7 @@ mod tests {
                     RuleAction::Allow,
                     MethodMatch::List(vec![Method::POST]),
                     Some(crate::config::parse_url_pattern("https://example.com/api/**").unwrap()),
+                    None,
                 ),
             ]);
         let static_denies = ParsedRequest {
@@ -783,6 +787,7 @@ mod tests {
                     RuleAction::Allow,
                     MethodMatch::List(vec![Method::GET]),
                     Some(crate::config::parse_url_pattern("https://example.com/other/**").unwrap()),
+                    None,
                 ),
             ]);
         let static_allows = ParsedRequest {
@@ -814,6 +819,7 @@ mod tests {
                 RuleAction::Allow,
                 MethodMatch::Any,
                 Some(crate::config::parse_url_pattern("https://example.com:443/**").unwrap()),
+                None,
             ),
         ]);
         let parsed = ParsedRequest {
@@ -852,6 +858,7 @@ mod tests {
                 RuleAction::Allow,
                 MethodMatch::List(vec![Method::GET]),
                 Some(crate::config::parse_url_pattern("https://example.com/api/**").unwrap()),
+                None,
             ),
         ]);
         let parsed = ParsedRequest {

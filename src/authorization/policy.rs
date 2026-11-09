@@ -137,12 +137,8 @@ pub(crate) fn authorize_credential(
     ensure!(
         local_limits.iter().any(|candidate| {
             candidate.credential_reference == dynamic.credential_reference
-                && candidate.origin.matches_request(
-                    request.scheme,
-                    request.host,
-                    request.port,
-                    request.path,
-                )
+                && candidate.origin.matches_request(request)
+                && request.matches_query_presence(candidate.query_present)
                 && headers_are_subset(&dynamic.protected_headers, &candidate.protected_headers)
                 && body_access_is_subset(dynamic.body_access, candidate.body_access)
         }),
@@ -206,12 +202,14 @@ pub(crate) fn make_dynamic_rule(
     action: RuleAction,
     methods: MethodMatch,
     url_pattern: Option<UrlPattern>,
+    query_present: Option<bool>,
 ) -> Rule {
     Rule {
         id: Arc::from(format!("authorization-service#{index}")),
         action,
         methods,
         url_pattern,
+        query_present,
         https_mode: HttpsMode::Inspect,
         cache: None,
     }

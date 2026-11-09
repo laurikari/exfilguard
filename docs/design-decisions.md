@@ -26,15 +26,16 @@ measure throughput and memory use with slow readers.
 
 ## Canonical request data for policy
 
-ExfilGuard makes policy decisions from a normalized request view and keeps the
-original request target for forwarding.
+ExfilGuard makes policy decisions from a separate request view with a normalized
+destination and path, and keeps the original request target for forwarding.
 
-Policy rules should not depend on small syntax differences. ExfilGuard also
-should not rewrite upstream-visible bytes in ways that change request meaning.
+Destination and path rules should not depend on small syntax differences.
+ExfilGuard also should not rewrite upstream-visible bytes in ways that change
+request meaning.
 It rejects ambiguous or conflicting syntax first, then canonicalizes requests
 that already have one clear meaning.
 
-For policy matching, percent-encoded RFC-unreserved characters are decoded and
+For policy path matching, percent-encoded RFC-unreserved characters are decoded and
 the hex digits of retained escapes are uppercased. Dot-segment processing runs
 on that canonical policy path. IP-literal hosts in rules and requests are
 parsed and serialized to one numeric spelling before comparison. The original
@@ -49,6 +50,22 @@ uppercase percent escapes as the canonical request view. Because `*` is the
 path wildcard, `\*` is the policy-only spelling for a literal raw asterisk;
 request paths themselves reject backslashes. This keeps raw `*`, encoded `%2A`,
 and literal `%2A` text exactly distinguishable in policy.
+
+Query constraints deliberately use literal text rather than canonicalization
+or parameter parsing. A URL pattern's query suffix requires the complete query
+with identical case, ordering, and encoding; query asterisks are literal. This
+lets an authorization service restrict a lease to the query spelling of an
+issued URL without adopting application-specific parameter semantics. Such a
+constraint does not claim to cover alternative spellings interpreted identically
+by an origin, which matters when authoring deny rules.
+
+An omitted query suffix imposes no query constraint. An optional Boolean
+`query_present` expresses presence or absence, preserving the distinction
+between an absent query and a present empty query. Local policies, delegated
+policies, and credential limits share these semantics. Query constraints apply
+to HTTP requests, including inner requests in HTTPS inspect mode. CONNECT tunnel
+authorization and TLS bump preflight cannot evaluate them. They do not change
+the bytes used for forwarding or request signing.
 
 ## Policy stops at the application-routing boundary
 

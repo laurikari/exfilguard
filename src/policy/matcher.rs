@@ -179,11 +179,13 @@ pub(crate) fn evaluate_policy(
     }
 
     for rule in policy.rules.iter() {
-        if !rule.methods.allows(request.method) {
+        if !rule.methods.allows(request.method)
+            || !request.matches_query_presence(rule.query_present)
+        {
             continue;
         }
         if let Some(url) = &rule.url
-            && !url.matches_request(request.scheme, request.host, request.port, request.path)
+            && !url.matches_request(request)
         {
             continue;
         }
@@ -276,6 +278,13 @@ pub struct Request<'a> {
     pub host: &'a str,
     pub port: Option<u16>,
     pub path: &'a str,
+    pub query: Option<&'a str>,
+}
+
+impl Request<'_> {
+    pub(crate) fn matches_query_presence(&self, required: Option<bool>) -> bool {
+        required.is_none_or(|present| present == self.query.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -296,10 +305,12 @@ mod tests {
             name: Arc::<str>::from("allow-api"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("allow#0"),
                     action: RuleAction::Allow,
                     methods: MethodMatch::List(vec![Method::GET, Method::POST]),
                     url_pattern: Some(UrlPattern {
+                        query: None,
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("*.example.com"),
                         port: None,
@@ -319,6 +330,7 @@ mod tests {
             name: Arc::<str>::from("deny-all"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("deny#0"),
                     action: RuleAction::Deny {
                         status: StatusCode::FORBIDDEN,
@@ -371,6 +383,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::GET,
             scheme: Scheme::Https,
             host: "api.example.com",
@@ -396,6 +409,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::DELETE,
             scheme: Scheme::Https,
             host: "api.example.com",
@@ -430,6 +444,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::GET,
             scheme: Scheme::Http,
             host: "unmatched.example.net",
@@ -446,10 +461,12 @@ mod tests {
             name: Arc::<str>::from("allow-site"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("allow-site#0"),
                     action: RuleAction::Allow,
                     methods: MethodMatch::Any,
                     url_pattern: Some(UrlPattern {
+                        query: None,
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("example.com"),
                         port: Some(443),
@@ -479,6 +496,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::CONNECT,
             scheme: Scheme::Https,
             host: "example.com",
@@ -505,10 +523,12 @@ mod tests {
             rules: Arc::from(
                 vec![
                     Rule {
+                        query_present: None,
                         id: Arc::<str>::from("deny-sites#0"),
                         action: deny_action.clone(),
                         methods: MethodMatch::Any,
                         url_pattern: Some(UrlPattern {
+                            query: None,
                             scheme: Scheme::Https,
                             host: Arc::<str>::from("*.example.com"),
                             port: None,
@@ -519,6 +539,7 @@ mod tests {
                         cache: None,
                     },
                     Rule {
+                        query_present: None,
                         id: Arc::<str>::from("deny-sites#1"),
                         action: deny_action,
                         methods: MethodMatch::Any,
@@ -549,6 +570,7 @@ mod tests {
 
         for host in ["api.example.com", "unmatched.example.net"] {
             let request = Request {
+                query: None,
                 method: &Method::CONNECT,
                 scheme: Scheme::Https,
                 host,
@@ -568,6 +590,7 @@ mod tests {
             name: Arc::<str>::from("deny-connect"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("deny-connect#0"),
                     action: RuleAction::Deny {
                         status: StatusCode::from_u16(499).unwrap(),
@@ -576,6 +599,7 @@ mod tests {
                     },
                     methods: MethodMatch::List(vec![Method::CONNECT]),
                     url_pattern: Some(UrlPattern {
+                        query: None,
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("example.com"),
                         port: None,
@@ -605,6 +629,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::CONNECT,
             scheme: Scheme::Https,
             host: "example.com",
@@ -733,6 +758,7 @@ mod tests {
         let compiled = Arc::new(compile_config(&config).expect("compile config"));
         let snapshot = PolicySnapshot::new(compiled);
         let request = Request {
+            query: None,
             method: &Method::GET,
             scheme: Scheme::Https,
             host: "api.example.com",
@@ -759,10 +785,12 @@ mod tests {
             name: Arc::<str>::from("allow-default-port"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("allow-default-port#0"),
                     action: RuleAction::Allow,
                     methods: MethodMatch::List(vec![Method::GET]),
                     url_pattern: Some(UrlPattern {
+                        query: None,
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("api.example.com"),
                         port: Some(443),
@@ -793,6 +821,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::GET,
             scheme: Scheme::Https,
             host: "api.example.com",
@@ -811,10 +840,12 @@ mod tests {
             name: Arc::<str>::from("allow-ipv6"),
             rules: Arc::from(
                 vec![Rule {
+                    query_present: None,
                     id: Arc::<str>::from("allow-ipv6#0"),
                     action: RuleAction::Allow,
                     methods: MethodMatch::Any,
                     url_pattern: Some(UrlPattern {
+                        query: None,
                         scheme: Scheme::Https,
                         host: Arc::<str>::from("2001:0DB8:0:0:0:0:0:10"),
                         port: Some(443),
@@ -845,6 +876,7 @@ mod tests {
         let matcher = PolicyMatcher::new(compiled.clone());
         let client = &compiled.clients[0];
         let request = Request {
+            query: None,
             method: &Method::GET,
             scheme: Scheme::Https,
             host: "2001:db8::10",

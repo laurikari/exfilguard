@@ -10,6 +10,9 @@ pub mod compile;
 pub mod matcher;
 pub mod model;
 
+#[cfg(test)]
+mod query_tests;
+
 #[derive(Debug, Clone)]
 pub enum Decision {
     Allow {

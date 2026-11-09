@@ -27,6 +27,7 @@ pub struct Client {
 pub struct CredentialLimit {
     pub credential_reference: Arc<str>,
     pub origin_scope: UrlPattern,
+    pub query_present: Option<bool>,
     pub protected_headers: Arc<[Arc<str>]>,
     pub body_access: BodyAccess,
 }
@@ -69,6 +70,7 @@ pub struct Rule {
     pub action: RuleAction,
     pub methods: MethodMatch,
     pub url_pattern: Option<UrlPattern>,
+    pub query_present: Option<bool>,
     pub https_mode: HttpsMode,
     pub cache: Option<CacheConfig>,
 }
@@ -100,6 +102,8 @@ pub struct UrlPattern {
     pub host: Arc<str>,
     pub port: Option<u16>,
     pub path: Option<Arc<str>>,
+    /// Literal query suffix; None and Some("") are distinct.
+    pub query: Option<Arc<str>>,
     pub original: Arc<str>,
 }
 
