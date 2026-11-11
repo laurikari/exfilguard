@@ -33,6 +33,9 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
             Ok(pair) => pair,
             Err(err) => {
                 error!(error = %err, "failed to accept incoming connection");
+                // Resource exhaustion can persist: bound retries and logging
+                // while allowing existing connections to keep making progress.
+                sleep(Duration::from_millis(250)).await;
                 continue;
             }
         };
