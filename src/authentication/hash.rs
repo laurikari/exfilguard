@@ -13,7 +13,6 @@ pub const MAX_PASSWORD_BYTES: usize = 1024;
 pub enum PasswordAlgorithm {
     Argon2id,
     Bcrypt,
-    Sha512Crypt,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -26,7 +25,6 @@ pub struct PasswordHash {
 enum VerificationProfile {
     Argon2id { params: Params, salt_len: usize },
     Bcrypt { cost: u32 },
-    Sha512Crypt { rounds: u32, salt_len: usize },
 }
 
 impl fmt::Debug for PasswordHash {
@@ -98,50 +96,8 @@ impl PasswordHash {
             VerificationProfile::Bcrypt {
                 cost: parts.get_cost(),
             }
-        } else if encoded.starts_with("$6$") {
-            let parts: Vec<_> = encoded.split('$').collect();
-            let (rounds, salt, digest) = match parts.as_slice() {
-                ["", "6", salt, digest] => (5000, *salt, *digest),
-                ["", "6", rounds, salt, digest] => {
-                    let rounds = rounds
-                        .strip_prefix("rounds=")
-                        .ok_or_else(|| anyhow!("invalid SHA512-crypt rounds"))?;
-                    ensure!(
-                        !rounds.is_empty() && rounds.bytes().all(|b| b.is_ascii_digit()),
-                        "invalid SHA512-crypt rounds"
-                    );
-                    (
-                        rounds
-                            .parse::<u32>()
-                            .map_err(|_| anyhow!("invalid SHA512-crypt rounds"))?,
-                        *salt,
-                        *digest,
-                    )
-                }
-                _ => bail!("invalid SHA512-crypt password hash"),
-            };
-            let valid = |s: &str| {
-                s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/')
-            };
-            ensure!(
-                (1000..=1_000_000).contains(&rounds),
-                "SHA512-crypt rounds must be between 1000 and 1000000"
-            );
-            ensure!(
-                !salt.is_empty()
-                    && salt.len() <= 16
-                    && valid(salt)
-                    && digest.len() == 86
-                    && valid(digest),
-                "invalid SHA512-crypt password hash"
-            );
-            VerificationProfile::Sha512Crypt {
-                rounds,
-                salt_len: salt.len(),
-            }
         } else {
-            bail!("unsupported password hash; use Argon2id, bcrypt, or SHA512-crypt");
+            bail!("unsupported password hash; use Argon2id or bcrypt");
         };
         Ok(Self {
             encoded: encoded.into(),
@@ -166,9 +122,6 @@ impl PasswordHash {
             VerificationProfile::Bcrypt { .. } => {
                 password.len() <= 72
                     && bcrypt::non_truncating_verify(password, &self.encoded).unwrap_or(false)
-            }
-            VerificationProfile::Sha512Crypt { .. } => {
-                sha_crypt::sha512_check(password, &self.encoded).is_ok()
             }
         }
     }
@@ -202,12 +155,6 @@ pub fn generate_hash(password: &str, algorithm: PasswordAlgorithm) -> Result<Str
             bcrypt::non_truncating_hash(password, 12)
                 .map_err(|_| anyhow!("failed to hash password"))
         }
-        PasswordAlgorithm::Sha512Crypt => {
-            let params = sha_crypt::Sha512Params::new(100_000)
-                .map_err(|_| anyhow!("invalid SHA512-crypt parameters"))?;
-            sha_crypt::sha512_simple(password, &params)
-                .map_err(|_| anyhow!("failed to hash password"))
-        }
     }
 }
 
@@ -220,7 +167,6 @@ mod tests {
         let argon =
             "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4";
         let bcrypt = "$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie";
-        let sha = "$6$bbe605c2cce4c642$BiBOywFAm9kdv6ZPpj2GaKVqeh/.c21pf1uFBaq.e59KEE2Ej74iJleXaLXURYV6uh5LF4K7dDc4vtRtPiiKB/";
 
         let different_bcrypt =
             bcrypt::non_truncating_hash_with_salt("different-password", 4, [7; 16])
@@ -239,8 +185,6 @@ mod tests {
             (bcrypt, different_bcrypt),
             (bcrypt, bcrypt.replace("$2b$", "$2a$")),
             (bcrypt, bcrypt.replace("$2b$", "$2y$")),
-            (sha, sha.replace("$6$", "$6$rounds=5000$")),
-            (sha, sha.replace("bbe605c2cce4c642", "0123456789abcdef")),
         ] {
             let original = PasswordHash::parse(original).unwrap();
             let equivalent = PasswordHash::parse(&equivalent).unwrap();
@@ -262,11 +206,7 @@ mod tests {
             ),
             (argon, argon.replace("p=1", "p=1,data=YWJj")),
             (bcrypt, bcrypt.replace("$04$", "$05$")),
-            (sha, sha.replace("$6$", "$6$rounds=10000$")),
-            (sha, sha.replace("bbe605c2cce4c642", "shortsalt")),
             (argon, bcrypt.to_owned()),
-            (bcrypt, sha.to_owned()),
-            (sha, argon.to_owned()),
         ] {
             assert!(
                 !PasswordHash::parse(original)
@@ -278,7 +218,7 @@ mod tests {
 
     #[test]
     fn verifies_reference_hashes() {
-        // Argon2 reference vectors, Python bcrypt, and SHA-crypt test vectors.
+        // Argon2 reference vectors and Python bcrypt.
         for (password, encoded) in [
             (
                 "password",
@@ -287,10 +227,6 @@ mod tests {
             (
                 "correctbatteryhorsestapler",
                 "$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie",
-            ),
-            (
-                "foobar",
-                "$6$bbe605c2cce4c642$BiBOywFAm9kdv6ZPpj2GaKVqeh/.c21pf1uFBaq.e59KEE2Ej74iJleXaLXURYV6uh5LF4K7dDc4vtRtPiiKB/",
             ),
         ] {
             let hash = PasswordHash::parse(encoded).unwrap();
@@ -325,9 +261,8 @@ mod tests {
             "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ",
             "$argon2id$v=19$m=256,t=2,p=1$YQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4",
             "$2b$17$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie",
-            "$6$rounds=999999999$salt$hash",
-            "$6$rounds=zero$salt$hash",
-            "$6$salt$hash",
+            "$6$bbe605c2cce4c642$BiBOywFAm9kdv6ZPpj2GaKVqeh/.c21pf1uFBaq.e59KEE2Ej74iJleXaLXURYV6uh5LF4K7dDc4vtRtPiiKB/",
+            "$6$rounds=5000$bbe605c2cce4c642$BiBOywFAm9kdv6ZPpj2GaKVqeh/.c21pf1uFBaq.e59KEE2Ej74iJleXaLXURYV6uh5LF4K7dDc4vtRtPiiKB/",
         ] {
             assert!(PasswordHash::parse(encoded).is_err(), "{encoded}");
         }

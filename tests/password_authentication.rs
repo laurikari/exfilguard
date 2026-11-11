@@ -74,7 +74,7 @@ async fn request<S: AsyncRead + AsyncWrite + Unpin>(
 fn password_clients_require_one_verification_profile() -> Result<()> {
     let dirs = TestDirs::new()?;
     let (clients, policies) = configuration("127.0.0.1:8080".parse()?);
-    for hash in [HASH, ARGON_HASH, SHA512_HASH] {
+    for hash in [HASH, ARGON_HASH] {
         write_clients_and_policies(&dirs, &clients.replace(HASH, hash), &policies)?;
         config::load_config(&dirs.clients_path, &dirs.policies_path)?;
     }
@@ -82,11 +82,7 @@ fn password_clients_require_one_verification_profile() -> Result<()> {
     // The restriction applies across disjoint source ranges as well as users
     // sharing a source. Errors must not expose any encoded password hash.
     let remote = password_client("remote", "192.0.2.0/24", "bob-policy");
-    for different in [
-        HASH.replace("$04$", "$05$"),
-        ARGON_HASH.into(),
-        SHA512_HASH.into(),
-    ] {
+    for different in [HASH.replace("$04$", "$05$"), ARGON_HASH.into()] {
         let mixed = clients.replace(&remote, &remote.replace(HASH, &different));
         write_clients_and_policies(&dirs, &mixed, &policies)?;
         let error = config::load_config(&dirs.clients_path, &dirs.policies_path).unwrap_err();
@@ -123,11 +119,7 @@ async fn password_profile_reload_preserves_real_and_dummy_authentication() -> Re
 
     let long_password = "x".repeat(73);
     let mut previous_hash = HASH;
-    for (hash, password) in [
-        (HASH, PASSWORD),
-        (ARGON_HASH, "password"),
-        (SHA512_HASH, "foobar"),
-    ] {
+    for (hash, password) in [(HASH, PASSWORD), (ARGON_HASH, "password")] {
         if hash != previous_hash {
             let changed = clients.replace(HASH, hash);
             let mixed = changed.replacen(hash, previous_hash, 1);
@@ -493,11 +485,13 @@ async fn password_clients_require_tls_and_validate_selector_classes() -> Result<
             1,
         ),
         clients.replacen(HASH, "$1$unsupported$hash", 1),
+        clients.replace(HASH, SHA512_HASH),
         clients.replacen("cidr='127.0.0.0/8'", "", 1),
     ] {
         write_clients_and_policies(&dirs, &invalid, &policies)?;
         let error = config::load_config(&dirs.clients_path, &dirs.policies_path).unwrap_err();
         assert!(!format!("{error:#}").contains(HASH));
+        assert!(!format!("{error:#}").contains(SHA512_HASH));
     }
     // TOML source excerpts may contain hashes even when another field is invalid.
     write_clients_and_policies(

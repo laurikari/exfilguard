@@ -356,13 +356,15 @@ client identity.
 
 ### Password verification
 
-Client configuration stores self-describing Argon2id, bcrypt, or SHA512-crypt
-hashes. Argon2id is the generation default; the other formats support existing
-configuration management tooling. Parsing enforces verification cost ceilings
-before publishing a configuration. All password clients in a deployment must
-share one verification profile: algorithm, work parameters, and salt/digest
-lengths. Salt and digest values remain independent. Mixed profiles are rejected
-at startup and reload, including across disjoint source ranges.
+Client configuration stores self-describing Argon2id or bcrypt hashes.
+Argon2id is the generation default; bcrypt supports existing configuration
+management tooling. SHA512-crypt is excluded because its salt-dependent work
+can reveal usernames even with a common verification profile. Parsing enforces
+verification cost ceilings before publishing a configuration. All password
+clients in a deployment must share one verification profile: algorithm, work
+parameters, and salt/digest lengths. Salt and digest values remain independent.
+Mixed profiles are rejected at startup and reload, including across disjoint
+source ranges.
 
 Each immutable policy snapshot retains a representative configured hash for
 dummy verification of unknown or source-ineligible usernames. A successful

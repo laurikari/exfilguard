@@ -271,11 +271,15 @@ tools can supply compatible encoded hashes directly.
 |-----------|-------------------|--------------------|----------------------|
 | `argon2id` (default) | PHC, version 19 | 64 MiB, 3 iterations, 1 lane | 256 MiB, 10 iterations, 8 lanes |
 | `bcrypt` | `$2a$`, `$2b$`, `$2y$` | `$2b$`, cost 12 | Cost 16 |
-| `sha512-crypt` | `$6$` | 100000 rounds | 1000000 rounds |
 
-bcrypt passwords are limited to 72 bytes. SHA512-crypt requires at least 1000
-rounds; an omitted rounds field means 5000. Malformed, unsupported, and
+bcrypt passwords are limited to 72 bytes. Malformed, unsupported, and
 over-budget hashes fail configuration validation.
+
+SHA512-crypt (`$6$`) hashes are no longer supported: their salt-dependent work
+can reveal usernames through timing even when all hashes share the same
+parameters. Before upgrading a deployment that uses these hashes, generate
+replacement Argon2id or bcrypt hashes from the original passwords, or reset
+the passwords. Existing hashes cannot be converted directly.
 
 All password clients in one deployment must share one verification profile,
 including clients with disjoint source ranges. The profile is inferred from
@@ -285,7 +289,6 @@ the hashes; there is no additional setting:
   parameters) and decoded salt length.
 - bcrypt: the same cost. The accepted `$2a$`, `$2b$`, and `$2y$` encodings may
   coexist; their salt and digest lengths are fixed.
-- SHA512-crypt: the same rounds and salt length; digest length is fixed.
 
 Use independent random salts for each password. Salt and digest values do not
 need to match. Unknown usernames and source mismatches use a representative

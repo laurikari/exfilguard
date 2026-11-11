@@ -26,7 +26,7 @@ fn command(input: &[u8], arguments: &[&str]) -> Result<Output> {
 #[test]
 fn generates_supported_hashes_without_loading_configuration() -> Result<()> {
     let password = "cli-test-password";
-    for algorithm in ["argon2id", "bcrypt", "sha512-crypt"] {
+    for algorithm in ["argon2id", "bcrypt"] {
         let output = command(
             format!("{password}\n").as_bytes(),
             &["--algorithm", algorithm],
@@ -55,10 +55,7 @@ fn generates_supported_hashes_without_loading_configuration() -> Result<()> {
                 assert!(hash.starts_with("$2b$12$"));
                 assert!(bcrypt::non_truncating_verify(password, hash)?);
             }
-            _ => {
-                assert!(hash.starts_with("$6$rounds=100000$"));
-                sha_crypt::sha512_check(password, hash).unwrap();
-            }
+            _ => unreachable!("unknown test algorithm"),
         }
     }
     // The default algorithm uses a new salt for each invocation.
@@ -91,5 +88,9 @@ fn rejects_invalid_input_without_printing_passwords() -> Result<()> {
     let output = command(b"secret", &["--password", "secret"])?;
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
+    let output = command(b"", &["--algorithm", "sha512-crypt"])?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value 'sha512-crypt'"));
     Ok(())
 }
