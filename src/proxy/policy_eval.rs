@@ -315,7 +315,7 @@ pub(crate) fn evaluate_delegated_request<'a>(
                 authorization_token_id = token.correlation(),
                 policy_version = %authorization_policy.policy_version,
                 error = %error,
-                "credential request denied by client limit"
+                "credential request denied"
             );
             return PolicyOutcome::DefaultDeny(DefaultDenyOutcome { log: log_ctx });
         }

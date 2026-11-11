@@ -402,6 +402,9 @@ Both the local policy and the service policy must allow every request. The
 service cannot change local settings. If it asks ExfilGuard to use a credential,
 the reference, destination, headers, and body access must fit a local
 `credential_limit` on the selected client.
+Credential-bearing `TRACE` requests, including case variants, are always denied
+before credential retrieval or HTTP forwarding because TRACE can disclose
+injected headers. An allow rule cannot override this restriction.
 
 Before asking for authentication headers, ExfilGuard resolves and checks the
 destination and builds the exact request it will send. The service may fill only

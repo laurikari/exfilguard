@@ -575,6 +575,79 @@ async fn credential_limits_enforce_queries_before_preparing_credentials() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credential_trace_is_denied_before_credential_retrieval_and_forwarding() -> Result<()> {
+    let origin = Http1Origin::spawn().await?;
+    let base = format!("http://127.0.0.1:{}", origin.addr.port());
+    let scope = format!("{base}/credential");
+    for methods in [None, Some(json!(["ANY"])), Some(json!(["GET", "TRACE"]))] {
+        let mut rules = json!([
+            {
+                "action": "ALLOW",
+                "url_pattern": scope,
+                "credential": {
+                    "credential_reference": CREDENTIAL_REFERENCE,
+                    "protected_headers": ["authorization"],
+                    "body_access": "none"
+                }
+            },
+            {"action": "ALLOW", "url_pattern": format!("{base}/plain")}
+        ]);
+        let mut method_setting = String::new();
+        if let Some(methods) = methods {
+            method_setting = format!("methods = {methods}\n");
+            for rule in rules.as_array_mut().unwrap() {
+                rule["methods"] = methods.clone();
+            }
+        }
+        let services = AuthorizationFixture::spawn_with_rules(rules).await?;
+        let clients = with_delegated_authorization(
+            "[[client]]\nname='delegated'\nfallback=true\npolicies=['trace']\n".into(),
+            &scope,
+            BodyAccess::None,
+        );
+        let policies = format!(
+            "[[policy]]\nname='trace'\n[[policy.rule]]\naction='ALLOW'\n{method_setting}url_pattern='{base}/**'\n"
+        );
+        let authorization = services.settings();
+        let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+            .with_settings(move |settings| settings.authorization = Some(authorization))
+            .spawn()
+            .await?;
+        let forwarded_before = origin.requests.load(Ordering::SeqCst);
+        for method in ["TRACE", "trace", "TrAcE"] {
+            let mut client = harness.connect().await?;
+            client.write_all(format!(
+                "{method} {scope} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+                origin.addr.port(),
+            ).as_bytes()).await?;
+            let response = read_http_response_with_length(&mut client).await?;
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(!response.contains(PROTECTED_VALUE), "{response}");
+            assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(origin.requests.load(Ordering::SeqCst), forwarded_before);
+        }
+        // The same grant still permits ordinary credential use and credential-free TRACE.
+        for (method, path, expected_authorization) in [
+            ("GET", "credential", PROTECTED_VALUE),
+            ("TRACE", "plain", "<missing>"),
+        ] {
+            let mut client = harness.connect().await?;
+            client.write_all(format!(
+                "{method} {base}/{path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+                origin.addr.port(),
+            ).as_bytes()).await?;
+            let response = read_http_response_with_length(&mut client).await?;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains(&format!("authorization={expected_authorization}\n")));
+        }
+        assert_eq!(services.credential_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.requests.load(Ordering::SeqCst), forwarded_before + 2);
+        harness.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorization_service_rejects_an_untrusted_server_certificate() -> Result<()> {
     let origin = Http1Origin::spawn().await?;
     let credential_scope = format!("http://127.0.0.1:{}/credential", origin.addr.port());
@@ -1157,15 +1230,24 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
     let interception_ca = Arc::new(CertificateAuthority::load_builtin(&dirs.ca_dir)?);
     let origin = H2Origin::spawn(&interception_ca).await?;
     let credential_scope = format!("https://*:{}/credential/**", origin.addr.port());
-    let services = AuthorizationFixture::spawn_with_body_access(
-        credential_scope.clone(),
-        BodyAccess::BoundedPayload,
-    )
+    let services = AuthorizationFixture::spawn_with_rules(json!([
+        {
+            "action": "ALLOW",
+            "methods": ["GET", "POST", "TRACE"],
+            "url_pattern": credential_scope,
+            "credential": {
+                "credential_reference": CREDENTIAL_REFERENCE,
+                "protected_headers": ["authorization"],
+                "body_access": "bounded_payload"
+            }
+        },
+        {"action": "ALLOW", "methods": ["GET", "POST", "TRACE"]}
+    ]))
     .await?;
 
     let policy_name = "allow-integration-origin";
     let policy = PolicySpec::new(policy_name).rule(RuleSpec::allow(
-        &["GET", "POST"],
+        &["GET", "POST", "TRACE"],
         format!("https://*:{}/**", origin.addr.port()),
     ));
     let (clients, policies) = TestConfigBuilder::new()
@@ -1216,6 +1298,20 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
         origin.addr.port()
     )
     .parse()?;
+    let trace_request = http::Request::builder()
+        .method(Method::TRACE)
+        .uri(credential_uri.clone())
+        .body(())?;
+    let (trace_response, _) = sender.send_request(trace_request, true)?;
+    let trace_response = trace_response.await?;
+    assert_eq!(trace_response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !read_h2_body(trace_response.into_body())
+            .await?
+            .contains(PROTECTED_VALUE)
+    );
+    assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+
     let credential_request = http::Request::builder()
         .method(Method::GET)
         .uri(credential_uri.clone())
@@ -1320,6 +1416,17 @@ async fn inspected_h2_applies_credentials_on_shared_token_connection() -> Result
     assert_eq!(
         plain_body,
         format!("path=/plain\nauthorization=<missing>\nauthority={authority}\nhost-present=false")
+    );
+    let plain_trace = http::Request::builder()
+        .method(Method::TRACE)
+        .uri(format!("https://localhost:{}/plain", origin.addr.port()))
+        .body(())?;
+    let (plain_trace_response, _) = sender.send_request(plain_trace, true)?;
+    let plain_trace_response = plain_trace_response.await?;
+    assert_eq!(plain_trace_response.status(), StatusCode::OK);
+    assert_eq!(
+        read_h2_body(plain_trace_response.into_body()).await?,
+        plain_body
     );
 
     assert_eq!(services.policy_calls.load(Ordering::SeqCst), 1);

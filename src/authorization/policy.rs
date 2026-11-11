@@ -134,6 +134,11 @@ pub(crate) fn authorize_credential(
     let Some(dynamic) = dynamic else {
         return Ok(None);
     };
+    // TRACE can reflect injected headers back to the client (RFC 9110, section 9.3.8).
+    ensure!(
+        !request.method.as_str().eq_ignore_ascii_case("TRACE"),
+        "credential-bearing requests must not use TRACE"
+    );
     ensure!(
         local_limits.iter().any(|candidate| {
             candidate.credential_reference == dynamic.credential_reference

@@ -81,6 +81,11 @@ Only an allow rule may contain `credential`. ExfilGuard treats `credential_refer
 name. The reference, requested headers, body access, and request URL must fit a `credential_limit`
 on the selected client.
 
+Credential-bearing `TRACE` requests are always denied with HTTP 403, including case variants
+and rules with omitted methods or `ANY`. TRACE can reflect injected headers back to the client.
+ExfilGuard rejects these requests before calling the credential endpoint or forwarding the HTTP
+request. Credential-free TRACE requests follow the normal policy rules.
+
 An inactive response needs only `{"active": false}`. This version supports only an exact
 `source_ip` constraint; authenticated connection identities are not yet supported. `policy_version`
 is an identifier containing 1 to 128 visible ASCII bytes.
