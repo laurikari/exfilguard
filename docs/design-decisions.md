@@ -659,6 +659,11 @@ proxy server certificate files.
 ExfilGuard does not currently support some protocol features, including
 HTTP/1.0 and upgrade-style flows such as WebSocket over HTTP/1.1.
 
+HTTP/2 server push is unsupported and disabled in the initial upstream
+handshake. ExfilGuard does not consume or forward pushed responses, so accepting
+push promises would retain unprocessed stream state. The `h2` library rejects
+upstreams that send promises despite this setting with a protocol error.
+
 Supporting protocol upgrades would require separate policy, connection-lifetime,
 and forwarding behavior. `proxy::http::dispatch::serve_http_loop` rejects HTTP/1.1
 requests containing an `Upgrade` header or an `upgrade` connection token with

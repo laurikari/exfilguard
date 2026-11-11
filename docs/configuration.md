@@ -812,6 +812,8 @@ Set `max_request_body_size = 0` to disable the global request-body cap.
 
 ## HTTP/2
 
+HTTP/2 server push is unsupported and disabled on upstream connections.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http2_max_concurrent_streams` | u32 | 100 | Maximum concurrent bumped downstream HTTP/2 streams per connection (must be >= 1) |

@@ -258,6 +258,7 @@ fn client_builder(
 ) -> client::Builder {
     let mut builder = client::Builder::new();
     builder
+        .enable_push(false)
         .max_header_list_size(max_response_header_size)
         .initial_window_size(stream_window_size)
         .initial_connection_window_size(connection_window_size);
@@ -268,6 +269,44 @@ fn client_builder(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, duplex};
+
+    #[tokio::test]
+    async fn upstream_disables_server_push_in_initial_settings() {
+        let (io, mut peer) = duplex(4096);
+        let (_sender, connection) = client_builder(32_768, 65_535, 65_535)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let task = tokio::spawn(connection);
+        let enable_push = timeout(std::time::Duration::from_secs(2), async {
+            let mut preface = [0; 24];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
+            let mut header = [0; 9];
+            peer.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[3], 4, "first frame must be SETTINGS");
+            assert_eq!(header[4], 0, "initial SETTINGS must not be an ACK");
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            assert!(len <= 16_384);
+            let mut payload = vec![0; len];
+            peer.read_exact(&mut payload).await.unwrap();
+            payload
+                .as_chunks::<6>()
+                .0
+                .iter()
+                .find(|setting| setting[..2] == [0, 2]) // SETTINGS_ENABLE_PUSH
+                .map(|setting| u32::from_be_bytes(setting[2..].try_into().unwrap()))
+        })
+        .await
+        .expect("initial SETTINGS were not advertised");
+        task.abort();
+        assert_eq!(
+            enable_push,
+            Some(0),
+            "server push must be explicitly disabled"
+        );
+    }
 
     #[tokio::test]
     async fn upstream_advertises_configured_receive_windows() {
