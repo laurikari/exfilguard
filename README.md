@@ -196,7 +196,7 @@ connection.
   symlinks. Vault mode keeps inspection and authorization-service private keys
   in memory.
 - Review timeout and size limits in [docs/configuration.md](docs/configuration.md).
-- ExfilGuard blocks private upstream addresses by default. Use
+- ExfilGuard blocks non-public and reserved upstream addresses by default. Use
   `allow_private_upstream_cidrs` to allow specific address ranges. Requests to
   those addresses must still pass the configured policies.
 - Treat logs and metrics as sensitive—they contain internal hostnames and can

@@ -214,6 +214,9 @@ mod tests {
             "::1/128",
             "169.254.1.2/32",
             "fe80::1/128",
+            "fec0::1/128",
+            "4000::1/128",
+            "192.88.99.1/32",
         ]
         .iter()
         .map(|net| net.parse().unwrap())
@@ -237,6 +240,14 @@ mod tests {
             ("169.254.1.3", false),
             ("fe80::1", true),
             ("fe80::2", false),
+            ("fec0::1", true),
+            ("fec0::2", false),
+            ("feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("4000::1", true),
+            ("4000::2", false),
+            ("2000::1", false),
+            ("192.88.99.1", true),
+            ("192.88.99.2", false),
             ("::ffff:10.0.201.6", false),
             ("64:ff9b::10.0.201.6", false),
             ("8.8.8.8", true),
@@ -266,6 +277,7 @@ mod tests {
             "8.8.8.8:443",
             "[fd00::1]:443",
             "[2001:4860:4860::8888]:443",
+            "[fec0::1]:443",
         ]
         .iter()
         .map(|addr| addr.parse().unwrap())
@@ -276,10 +288,10 @@ mod tests {
             filtered.allowed,
             vec![candidates[0], candidates[2], candidates[4]]
         );
-        assert_eq!(filtered.filtered_private, 2);
+        assert_eq!(filtered.filtered_private, 3);
         bail_if_empty(&filtered, "example.test", 443, "test").unwrap();
-        let filtered = filter_addresses(vec![candidates[1], candidates[3]], &cidrs);
-        assert_eq!(filtered.filtered_private, 2);
+        let filtered = filter_addresses(vec![candidates[1], candidates[3], candidates[5]], &cidrs);
+        assert_eq!(filtered.filtered_private, 3);
         assert!(
             bail_if_empty(&filtered, "example.test", 443, "test")
                 .unwrap_err()
@@ -327,6 +339,12 @@ mod tests {
             "64:ff9b::169.254.169.254",
             "100:0:0:1::1",
             "192.88.99.2",
+            "192.88.99.1",
+            "2000::1",
+            "2001:1000::1",
+            "4000::1",
+            "fec0::1",
+            "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
         ] {
             let err = resolve_host_with_policy_inner(host, 443, timeout, &[], "unit-test")
                 .await

@@ -11,6 +11,59 @@ use support::*;
 
 const ADDRESS_BLOCK: &str = "upstream address blocked (private_address)";
 
+#[tokio::test]
+async fn non_public_destinations_are_blocked_across_proxy_modes() -> Result<()> {
+    for authority in [
+        "[fec0::1]:8443",
+        "[4000::1]:8443",
+        "[2001:1000::1]:8443",
+        "192.88.99.1:8443",
+    ] {
+        for (method, target, rule) in [
+            (
+                "GET",
+                format!("http://{authority}/probe"),
+                RuleSpec::allow(&["GET"], format!("http://{authority}/**")),
+            ),
+            (
+                "CONNECT",
+                authority.to_owned(),
+                RuleSpec::allow(&["CONNECT"], format!("https://{authority}/**"))
+                    .https_mode("tunnel"),
+            ),
+            (
+                "CONNECT",
+                authority.to_owned(),
+                RuleSpec::allow(&["GET"], format!("https://{authority}/**")),
+            ),
+        ] {
+            let (clients, policies) = TestConfigBuilder::new()
+                .default_client(&["allowed"])
+                .policy(PolicySpec::new("allowed").rule(rule))
+                .render();
+            let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+                .with_private_test_upstreams(false)
+                .spawn()
+                .await?;
+            let mut client = harness.connect().await?;
+            client
+                .write_all(
+                    format!(
+                        "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            let response =
+                timeout(Duration::from_secs(2), read_http_response(&mut client)).await??;
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(response.contains(ADDRESS_BLOCK), "{response}");
+            harness.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
 async fn access_log(
     logs: &LogCapture,
     client_port: u16,

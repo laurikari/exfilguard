@@ -1,11 +1,12 @@
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::LazyLock,
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv6Net};
 use tokio::time::timeout;
 
 /// Represents either a single IP address or a CIDR network.
@@ -56,9 +57,9 @@ pub fn normalize_mapped_ip(addr: IpAddr) -> IpAddr {
 /// space. ExfilGuard blocks upstream addresses that are not valid public-Internet destinations by
 /// default.
 ///
-/// Keep the baseline aligned with the current unstable `std::net::IpAddr::is_global()` logic until
-/// that API stabilizes. The stdlib logic is based on the IANA special-purpose registries, but we
-/// also reject multicast and translation forms that could reach non-global IPv4 destinations.
+/// IPv4 excludes non-public special-purpose ranges. IPv6 requires an allocated public prefix,
+/// with the well-known NAT64 prefix checked against its embedded IPv4 destination. Reserved and
+/// unallocated space must not become implicitly reachable through an allowed hostname.
 pub fn is_private_ip(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => ipv4_is_non_global_upstream(v4),
@@ -101,11 +102,10 @@ fn ipv4_is_non_global_upstream(addr: Ipv4Addr) -> bool {
         || addr.is_loopback()
         || addr.is_link_local()
         || ipv4_is_protocol_assignment(addr)
-        || ipv4_is_6to4_relay_anycast(addr)
+        || ipv4_is_deprecated_relay(addr)
         || addr.is_documentation()
         || ipv4_is_benchmarking(addr)
         || ipv4_is_reserved(addr)
-        || addr.is_broadcast()
         || addr.is_multicast()
 }
 
@@ -119,8 +119,8 @@ fn ipv4_is_protocol_assignment(addr: Ipv4Addr) -> bool {
     octets[0] == 192 && octets[1] == 0 && octets[2] == 0 && octets[3] != 9 && octets[3] != 10
 }
 
-fn ipv4_is_6to4_relay_anycast(addr: Ipv4Addr) -> bool {
-    addr.octets() == [192, 88, 99, 2]
+fn ipv4_is_deprecated_relay(addr: Ipv4Addr) -> bool {
+    matches!(addr.octets(), [192, 88, 99, _])
 }
 
 fn ipv4_is_benchmarking(addr: Ipv4Addr) -> bool {
@@ -130,78 +130,75 @@ fn ipv4_is_benchmarking(addr: Ipv4Addr) -> bool {
 
 fn ipv4_is_reserved(addr: Ipv4Addr) -> bool {
     let octets = addr.octets();
-    (octets[0] & 0xf0) == 0xf0 && !addr.is_broadcast()
+    (octets[0] & 0xf0) == 0xf0
 }
+
+// IANA allocations checked 2026-11-11. Keep this list explicit so reserved gaps inside 2000::/3
+// cannot pass the guard. Newly allocated ranges need an update or a configured CIDR exception.
+// https://www.iana.org/assignments/ipv6-unicast-address-assignments/
+// https://www.iana.org/assignments/iana-ipv6-special-registry/
+static PUBLIC_IPV6_NETWORKS: LazyLock<Vec<Ipv6Net>> = LazyLock::new(|| {
+    [
+        // Public IP locators within 2001::/23. ORCHID/DRIP identifiers are not locators
+        // (RFC 7343 and RFC 9374), so they require explicit exceptions too.
+        "2001:1::1/128",
+        "2001:1::2/128",
+        "2001:1::3/128",
+        "2001:3::/32",
+        "2001:4:112::/48",
+        // Public unicast allocations to regional Internet registries.
+        "2001:200::/23",
+        "2001:400::/23",
+        "2001:600::/23",
+        "2001:800::/22",
+        "2001:c00::/23",
+        "2001:e00::/23",
+        "2001:1200::/23",
+        "2001:1400::/22",
+        "2001:1800::/23",
+        "2001:1a00::/23",
+        "2001:1c00::/22",
+        "2001:2000::/19",
+        "2001:4000::/23",
+        "2001:4200::/23",
+        "2001:4400::/23",
+        "2001:4600::/23",
+        "2001:4800::/23",
+        "2001:4a00::/23",
+        "2001:4c00::/23",
+        "2001:5000::/20",
+        "2001:8000::/19",
+        "2001:a000::/20",
+        "2001:b000::/20",
+        "2003::/18",
+        "2400::/12",
+        "2410::/12",
+        "2600::/12",
+        "2610::/23",
+        "2620::/23",
+        "2630::/12",
+        "2800::/12",
+        "2a00::/12",
+        "2a10::/12",
+        "2c00::/12",
+    ]
+    .into_iter()
+    .map(|cidr| cidr.parse().expect("valid public IPv6 allocation"))
+    .collect()
+});
 
 fn ipv6_is_non_global_upstream(addr: Ipv6Addr) -> bool {
-    addr.is_unspecified()
-        || addr.is_loopback()
-        || addr.to_ipv4_mapped().is_some()
-        || ipv6_is_non_global_translation(addr)
-        || ipv6_is_discard_only(addr)
-        || ipv6_is_dummy(addr)
-        || ipv6_is_protocol_assignment(addr)
-        || ipv6_is_6to4(addr)
-        || ipv6_is_documentation(addr)
-        || ipv6_is_srv6_sid(addr)
-        || addr.is_unique_local()
-        || addr.is_unicast_link_local()
-        || addr.is_multicast()
-}
-
-fn ipv6_is_non_global_translation(addr: Ipv6Addr) -> bool {
-    if matches!(addr.segments(), [0x64, 0xff9b, 1, _, _, _, _, _]) {
-        return true;
+    if matches!(addr.segments(), [0x64, 0xff9b, 0, 0, 0, 0, _, _]) {
+        // NAT64 must not disguise a private or reserved IPv4 destination.
+        let octets = addr.octets();
+        return ipv4_is_non_global_upstream(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
     }
 
-    if !matches!(addr.segments(), [0x64, 0xff9b, 0, 0, 0, 0, _, _]) {
-        return false;
-    }
-
-    // The NAT64 well-known prefix exposes an IPv4 destination in its low 32 bits. Apply the same
-    // public-Internet check so translation cannot disguise a private or otherwise special target.
-    let octets = addr.octets();
-    ipv4_is_non_global_upstream(Ipv4Addr::new(
-        octets[12], octets[13], octets[14], octets[15],
-    ))
-}
-
-fn ipv6_is_discard_only(addr: Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0x100, 0, 0, 0, _, _, _, _])
-}
-
-fn ipv6_is_dummy(addr: Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0x100, 0, 0, 1, _, _, _, _])
-}
-
-fn ipv6_is_protocol_assignment(addr: Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0x2001, b, _, _, _, _, _, _] if b < 0x200)
-        && !ipv6_is_protocol_assignment_exception(addr)
-}
-
-fn ipv6_is_protocol_assignment_exception(addr: Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    let bits = u128::from_be_bytes(addr.octets());
-    bits == 0x2001_0001_0000_0000_0000_0000_0000_0001
-        || bits == 0x2001_0001_0000_0000_0000_0000_0000_0002
-        || matches!(segments, [0x2001, 3, _, _, _, _, _, _])
-        || matches!(segments, [0x2001, 4, 0x112, _, _, _, _, _])
-        || matches!(segments, [0x2001, b, _, _, _, _, _, _] if (0x20..=0x3f).contains(&b))
-}
-
-fn ipv6_is_6to4(addr: Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0x2002, _, _, _, _, _, _, _])
-}
-
-fn ipv6_is_documentation(addr: Ipv6Addr) -> bool {
-    matches!(
-        addr.segments(),
-        [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..]
-    )
-}
-
-fn ipv6_is_srv6_sid(addr: Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0x5f00, ..])
+    // Documentation space is carved out of an otherwise public RIR allocation.
+    matches!(addr.segments(), [0x2001, 0xdb8, ..])
+        || !PUBLIC_IPV6_NETWORKS.iter().any(|net| net.contains(&addr))
 }
 
 #[cfg(test)]
@@ -279,8 +276,31 @@ mod tests {
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 5))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 9))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 10))));
-        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 1))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn blocks_reserved_and_retired_ipv4_space() {
+        for address in [
+            "0.255.255.255",
+            "192.88.99.0",
+            "192.88.99.255",
+            "240.0.0.0",
+            "255.255.255.254",
+            "255.255.255.255",
+        ] {
+            assert!(is_private_ip(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "192.88.98.255",
+            "192.88.100.0",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.175.48.1",
+        ] {
+            assert!(!is_private_ip(address.parse().unwrap()), "{address}");
+        }
     }
 
     #[test]
@@ -321,11 +341,121 @@ mod tests {
     }
 
     #[test]
+    fn blocks_deprecated_site_local_ipv6() {
+        for address in [
+            "fec0::",
+            "fec0::1",
+            "fed0::1234",
+            "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(is_private_ip(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn blocks_reserved_ipv6_space() {
+        for address in [
+            "::2",
+            "::192.168.1.1",
+            "::ffff:0:192.168.1.1",
+            "100:0:0:2::1",
+            "200::1",
+            "400::1",
+            "800::1",
+            "1000::1",
+            "2000::1",
+            "2004::1",
+            "2d00::1",
+            "2e00::1",
+            "3000::1",
+            "3ffe::1",
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "4000::1",
+            "5f00::1",
+            "6000::1",
+            "8000::1",
+            "a000::1",
+            "c000::1",
+            "e000::1",
+            "f000::1",
+            "f800::1",
+            "fe00::1",
+        ] {
+            assert!(is_private_ip(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn public_ipv6_allocations_preserve_boundaries_and_reserved_gaps() {
+        for (address, public) in [
+            ("2001:1::1", true),
+            ("2001:1::2", true),
+            ("2001:1::3", true),
+            ("2001:1::4", false),
+            ("2001:3::1", true),
+            ("2001:4:112::1", true),
+            ("2001:20::1", false),
+            ("2001:2f:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:30::1", false),
+            ("2001:3f:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:40::1", false),
+            ("2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:200::", true),
+            ("2001:db7:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2001:db8::", false),
+            ("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:db9::", true),
+            ("2001:fff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2001:1000::", false),
+            ("2001:11ff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:1200::", true),
+            ("2001:4dff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2001:4e00::", false),
+            ("2001:4fff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:5000::", true),
+            ("2001:5fff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2001:6000::", false),
+            ("2001:7fff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:8000::", true),
+            ("2001:bfff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2001:c000::", false),
+            ("2003:3fff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2003:4000::", false),
+            ("2410::1", true),
+            ("241f:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2420::", false),
+            ("2606:4700:4700::1111", true),
+            ("2610:1ff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2610:200::", false),
+            ("2611::", false),
+            ("2620:1ff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2620:200::", false),
+            ("2621::", false),
+            ("263f:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2640::", false),
+            ("2800::1", true),
+            ("2810::", false),
+            ("2a10::1", true),
+            ("2a20::", false),
+            ("2c00::1", true),
+            ("2c10::", false),
+        ] {
+            assert_eq!(
+                !is_private_ip(address.parse().unwrap()),
+                public,
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
     fn filters_nat64_well_known_prefix_by_embedded_ipv4() {
         for address in [
             "64:ff9b::10.0.0.1",
             "64:ff9b::127.0.0.1",
             "64:ff9b::169.254.169.254",
+            "64:ff9b::192.88.99.1",
+            "64:ff9b::240.0.0.1",
         ] {
             assert!(is_private_ip(IpAddr::V6(
                 address.parse::<Ipv6Addr>().unwrap()

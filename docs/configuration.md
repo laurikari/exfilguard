@@ -146,8 +146,9 @@ Metrics include `proxy_tls_certificate_not_after_timestamp_seconds` and
 |-------|------|---------|-------------|
 | `allow_private_upstream_cidrs` | Array of CIDRs | `[]` | Non-public upstream address ranges eligible for connections |
 
-ExfilGuard blocks non-public upstream addresses by default. To reach selected
-internal services through the proxy, add their addresses or networks:
+ExfilGuard blocks non-public, reserved, and retired upstream address ranges by
+default. To reach selected internal services through the proxy, add their
+addresses or networks:
 
 ```toml
 allow_private_upstream_cidrs = ["10.0.201.6/32", "100.64.0.0/10", "fd00:1234::/48"]
@@ -164,8 +165,16 @@ destinations reachable under every existing policy.
 The resolver checks literal addresses and each DNS result. Connections use only
 eligible addresses; blocked results are discarded even when other results are
 allowed. IPv4 CIDRs do not implicitly include IPv4-mapped IPv6 or NAT64
-representations. Loopback, link-local, and other non-public ranges require
-explicit inclusion.
+representations. Loopback, link-local, deprecated IPv6 site-local (`fec0::/10`),
+and other non-public ranges require explicit inclusion.
+
+IPv6 eligibility follows a built-in list of IANA allocations to regional
+Internet registries and globally reachable special-purpose prefixes. Reserved
+gaps inside `2000::/3` and non-routable ORCHID/DRIP identifiers are blocked too.
+Newly allocated prefixes require an ExfilGuard update or an explicit CIDR
+exception. Public NAT64 destinations in `64:ff9b::/96` remain eligible only
+when the embedded IPv4 address is public.
+IPv4's retired `192.88.99.0/24` relay range is blocked by default.
 
 An address rejection returns HTTP 403 with
 `upstream address blocked (private_address)`. Access logs record

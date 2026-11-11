@@ -438,6 +438,17 @@ This reduces SSRF risk. If a client is compromised or misconfigured,
 ExfilGuard should not let it reach internal or special-purpose network space
 unless an operator makes an explicit exception.
 
+IPv6 eligibility uses a static list of IANA allocations to regional registries
+and globally reachable special-purpose prefixes, excluding documentation
+space and non-routable ORCHID/DRIP identifiers. This blocks reserved gaps both
+within and outside the global-unicast block without relying on the standard
+library's broader `is_global()` meaning.
+The well-known NAT64 prefix is checked using its embedded IPv4 destination.
+IPv4 excludes non-public special-purpose and retired relay ranges. We accept
+the maintenance cost of updating the IPv6 allocation list: new allocations
+require a software update or an explicit CIDR exception. There is no runtime
+registry lookup or dependency on current Internet routing advertisements.
+
 `allow_private_upstream_cidrs` provides global, restart-required exceptions.
 `ConfiguredUpstreamResolver` applies them to literal addresses and individual
 DNS results before connection attempts. Request policies still determine access.
