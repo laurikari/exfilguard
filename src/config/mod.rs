@@ -292,6 +292,7 @@ fn validate_config(config: &Config) -> Result<()> {
     }
 
     let mut client_names = HashSet::new();
+    let mut password_profile: Option<&crate::authentication::PasswordHash> = None;
     for client in &config.clients {
         if !client_names.insert(client.name.as_ref()) {
             bail!("duplicate client name '{}'", client.name);
@@ -321,7 +322,7 @@ fn validate_config(config: &Config) -> Result<()> {
                 client.name
             );
         }
-        if client.password_hash.is_some() {
+        if let Some(hash) = &client.password_hash {
             ensure!(
                 crate::authentication::hash::valid_username(&client.name),
                 "password client name must contain 1 to 128 printable ASCII bytes without whitespace or colons"
@@ -336,6 +337,15 @@ fn validate_config(config: &Config) -> Result<()> {
                 "password client '{}' must specify ip or cidr",
                 client.name
             );
+            if let Some(first) = password_profile {
+                ensure!(
+                    hash.same_profile(first),
+                    "password client '{}' has a different verification profile; all password clients must use the same algorithm, parameters, and salt/digest lengths",
+                    client.name
+                );
+            } else {
+                password_profile = Some(hash);
+            }
         }
         if client.authorization_service.is_none() && !client.credential_limits.is_empty() {
             bail!(

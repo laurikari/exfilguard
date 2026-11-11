@@ -19,14 +19,14 @@ pub enum PasswordAlgorithm {
 #[derive(Clone, PartialEq, Eq)]
 pub struct PasswordHash {
     encoded: Arc<str>,
-    algorithm: HashKind,
+    profile: VerificationProfile,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HashKind {
-    Argon2id,
-    Bcrypt,
-    Sha512Crypt,
+#[derive(Clone, PartialEq, Eq)]
+enum VerificationProfile {
+    Argon2id { params: Params, salt_len: usize },
+    Bcrypt { cost: u32 },
+    Sha512Crypt { rounds: u32, salt_len: usize },
 }
 
 impl fmt::Debug for PasswordHash {
@@ -52,7 +52,7 @@ pub fn valid_password(password: &str) -> bool {
 impl PasswordHash {
     pub fn parse(encoded: &str) -> Result<Self> {
         ensure!(encoded.len() <= 512, "invalid password hash encoding");
-        let algorithm = if encoded.starts_with("$argon2id$") {
+        let profile = if encoded.starts_with("$argon2id$") {
             let hash =
                 PhcHash::new(encoded).map_err(|_| anyhow!("invalid Argon2id password hash"))?;
             ensure!(
@@ -79,7 +79,10 @@ impl PasswordHash {
                 params.m_cost() <= 262_144 && params.t_cost() <= 10 && params.p_cost() <= 8,
                 "Argon2id password hash exceeds verification cost limits"
             );
-            HashKind::Argon2id
+            VerificationProfile::Argon2id {
+                params,
+                salt_len: salt.len(),
+            }
         } else if ["$2a$", "$2b$", "$2y$"]
             .iter()
             .any(|prefix| encoded.starts_with(prefix))
@@ -92,7 +95,9 @@ impl PasswordHash {
                 (4..=16).contains(&parts.get_cost()),
                 "bcrypt password hash cost must be between 4 and 16"
             );
-            HashKind::Bcrypt
+            VerificationProfile::Bcrypt {
+                cost: parts.get_cost(),
+            }
         } else if encoded.starts_with("$6$") {
             let parts: Vec<_> = encoded.split('$').collect();
             let (rounds, salt, digest) = match parts.as_slice() {
@@ -131,31 +136,40 @@ impl PasswordHash {
                     && valid(digest),
                 "invalid SHA512-crypt password hash"
             );
-            HashKind::Sha512Crypt
+            VerificationProfile::Sha512Crypt {
+                rounds,
+                salt_len: salt.len(),
+            }
         } else {
             bail!("unsupported password hash; use Argon2id, bcrypt, or SHA512-crypt");
         };
         Ok(Self {
             encoded: encoded.into(),
-            algorithm,
+            profile,
         })
+    }
+
+    pub(crate) fn same_profile(&self, other: &Self) -> bool {
+        self.profile == other.profile
     }
 
     pub(crate) fn verify(&self, password: &str) -> bool {
         if !valid_password(password) {
             return false;
         }
-        match self.algorithm {
-            HashKind::Argon2id => PhcHash::new(&self.encoded).is_ok_and(|hash| {
+        match &self.profile {
+            VerificationProfile::Argon2id { .. } => PhcHash::new(&self.encoded).is_ok_and(|hash| {
                 Argon2::default()
                     .verify_password(password.as_bytes(), &hash)
                     .is_ok()
             }),
-            HashKind::Bcrypt => {
+            VerificationProfile::Bcrypt { .. } => {
                 password.len() <= 72
                     && bcrypt::non_truncating_verify(password, &self.encoded).unwrap_or(false)
             }
-            HashKind::Sha512Crypt => sha_crypt::sha512_check(password, &self.encoded).is_ok(),
+            VerificationProfile::Sha512Crypt { .. } => {
+                sha_crypt::sha512_check(password, &self.encoded).is_ok()
+            }
         }
     }
 }
@@ -200,6 +214,67 @@ pub fn generate_hash(password: &str, algorithm: PasswordAlgorithm) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_profiles_include_work_and_sizes_but_not_salt_or_digest_values() {
+        let argon =
+            "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4";
+        let bcrypt = "$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie";
+        let sha = "$6$bbe605c2cce4c642$BiBOywFAm9kdv6ZPpj2GaKVqeh/.c21pf1uFBaq.e59KEE2Ej74iJleXaLXURYV6uh5LF4K7dDc4vtRtPiiKB/";
+
+        let different_bcrypt =
+            bcrypt::non_truncating_hash_with_salt("different-password", 4, [7; 16])
+                .unwrap()
+                .to_string();
+        for (original, equivalent) in [
+            (argon, argon.replace("m=256,t=2,p=1", "p=1,t=2,m=256")),
+            (argon, argon.replace("c29tZXNhbHQ", "b3RoZXJzYWw")),
+            (
+                argon,
+                argon.replace(
+                    "nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                ),
+            ),
+            (bcrypt, different_bcrypt),
+            (bcrypt, bcrypt.replace("$2b$", "$2a$")),
+            (bcrypt, bcrypt.replace("$2b$", "$2y$")),
+            (sha, sha.replace("$6$", "$6$rounds=5000$")),
+            (sha, sha.replace("bbe605c2cce4c642", "0123456789abcdef")),
+        ] {
+            let original = PasswordHash::parse(original).unwrap();
+            let equivalent = PasswordHash::parse(&equivalent).unwrap();
+            assert_ne!(original, equivalent);
+            assert!(original.same_profile(&equivalent));
+        }
+
+        for (original, different) in [
+            (argon, argon.replace("m=256", "m=512")),
+            (argon, argon.replace("t=2", "t=3")),
+            (argon, argon.replace("p=1", "p=2")),
+            (argon, argon.replace("c29tZXNhbHQ", "c29tZXNhbHQx")),
+            (
+                argon,
+                argon.replace(
+                    "nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4",
+                    "AAAAAAAAAAAAAAAAAAAAAA",
+                ),
+            ),
+            (argon, argon.replace("p=1", "p=1,data=YWJj")),
+            (bcrypt, bcrypt.replace("$04$", "$05$")),
+            (sha, sha.replace("$6$", "$6$rounds=10000$")),
+            (sha, sha.replace("bbe605c2cce4c642", "shortsalt")),
+            (argon, bcrypt.to_owned()),
+            (bcrypt, sha.to_owned()),
+            (sha, argon.to_owned()),
+        ] {
+            assert!(
+                !PasswordHash::parse(original)
+                    .unwrap()
+                    .same_profile(&PasswordHash::parse(&different).unwrap())
+            );
+        }
+    }
 
     #[test]
     fn verifies_reference_hashes() {

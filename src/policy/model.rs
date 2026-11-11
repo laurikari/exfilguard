@@ -17,6 +17,7 @@ pub struct CompiledConfig {
     pub fallback_client: Option<usize>,
     pub lease_cidr_trie: CidrTrie,
     pub password_cidr_trie: CidrTrie,
+    pub(crate) dummy_password_hash: Option<crate::authentication::PasswordHash>,
     pub lease_fallback_client: Option<usize>,
     pub client_names: std::collections::HashMap<Arc<str>, usize>,
 }

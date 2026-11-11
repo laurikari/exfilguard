@@ -118,6 +118,13 @@ pub fn compile_config(config: &ValidatedConfig) -> Result<CompiledConfig> {
         fallback_client: fallback_index,
         lease_cidr_trie,
         password_cidr_trie,
+        // Validation requires one verification profile for all password clients.
+        // Reuse a representative hash for dummy work; authentication still
+        // requires an eligible named client even if this hash matches.
+        dummy_password_hash: config
+            .clients
+            .iter()
+            .find_map(|client| client.password_hash.clone()),
         lease_fallback_client: lease_fallback_index,
         client_names,
     })
@@ -278,6 +285,52 @@ mod tests {
 
     fn validated_config(config: Config) -> ValidatedConfig {
         ValidatedConfig::new(config).expect("validate config")
+    }
+
+    #[test]
+    fn password_dummy_belongs_to_its_configuration_snapshot() {
+        use crate::authentication::PasswordHash;
+        use crate::policy::matcher::PolicySnapshot;
+
+        let anonymous = Client {
+            name: Arc::from("anonymous"),
+            selector: ClientSelector::Fallback,
+            policies: Arc::from([Arc::from("allow-api")]),
+            authorization_service: None,
+            password_hash: None,
+            credential_limits: Arc::from([]),
+            max_connections: 1024,
+        };
+        let mut snapshots = Vec::new();
+        for encoded in [
+            Some("$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie"),
+            Some(
+                "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4",
+            ),
+            None,
+        ] {
+            let hash = encoded.map(|encoded| PasswordHash::parse(encoded).unwrap());
+            let mut clients = vec![anonymous.clone()];
+            if let Some(hash) = &hash {
+                clients.push(Client {
+                    name: Arc::from("worker"),
+                    selector: ClientSelector::Ip("127.0.0.1".parse().unwrap()),
+                    password_hash: Some(hash.clone()),
+                    ..anonymous.clone()
+                });
+            }
+            let config = validated_config(Config {
+                clients,
+                policies: vec![sample_policy()],
+            });
+            let snapshot = PolicySnapshot::new(Arc::new(compile_config(&config).unwrap()));
+            snapshots.push((snapshot, hash));
+        }
+        // Old and new snapshots retain their own fallback, including removal of
+        // the final password client. No process-global dummy survives a reload.
+        for (snapshot, hash) in snapshots {
+            assert_eq!(snapshot.dummy_password_hash(), hash.as_ref());
+        }
     }
 
     #[test]

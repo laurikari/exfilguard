@@ -102,6 +102,10 @@ impl PolicySnapshot {
             .filter(|client| client.password_hash.is_some())
     }
 
+    pub(crate) fn dummy_password_hash(&self) -> Option<&crate::authentication::PasswordHash> {
+        self.compiled.dummy_password_hash.as_ref()
+    }
+
     pub(crate) fn authentication_available(&self, addr: IpAddr) -> bool {
         self.resolve_lease_client(addr).is_some() || self.password_available(addr)
     }

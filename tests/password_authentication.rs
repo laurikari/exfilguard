@@ -17,6 +17,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const PASSWORD: &str = "correctbatteryhorsestapler";
 const HASH: &str = "$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie";
+const ARGON_HASH: &str =
+    "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4";
+const SHA512_HASH: &str = "$6$bbe605c2cce4c642$BiBOywFAm9kdv6ZPpj2GaKVqeh/.c21pf1uFBaq.e59KEE2Ej74iJleXaLXURYV6uh5LF4K7dDc4vtRtPiiKB/";
 
 fn basic(user: &str, password: &str) -> String {
     format!(
@@ -65,6 +68,122 @@ async fn request<S: AsyncRead + AsyncWrite + Unpin>(
         read_http_response_with_length(stream),
     )
     .await?
+}
+
+#[test]
+fn password_clients_require_one_verification_profile() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let (clients, policies) = configuration("127.0.0.1:8080".parse()?);
+    for hash in [HASH, ARGON_HASH, SHA512_HASH] {
+        write_clients_and_policies(&dirs, &clients.replace(HASH, hash), &policies)?;
+        config::load_config(&dirs.clients_path, &dirs.policies_path)?;
+    }
+
+    // The restriction applies across disjoint source ranges as well as users
+    // sharing a source. Errors must not expose any encoded password hash.
+    let remote = password_client("remote", "192.0.2.0/24", "bob-policy");
+    for different in [
+        HASH.replace("$04$", "$05$"),
+        ARGON_HASH.into(),
+        SHA512_HASH.into(),
+    ] {
+        let mixed = clients.replace(&remote, &remote.replace(HASH, &different));
+        write_clients_and_policies(&dirs, &mixed, &policies)?;
+        let error = config::load_config(&dirs.clients_path, &dirs.policies_path).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("verification profile"), "{error}");
+        assert!(!error.contains(HASH));
+        assert!(!error.contains(&different));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn password_profile_reload_preserves_real_and_dummy_authentication() -> Result<()> {
+    let origin = TestUpstream::http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\norigin",
+    )
+    .await?;
+    let (clients, policies) = configuration(origin.addr());
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_tls_proxy()
+        .spawn()
+        .await?;
+    let mut authenticated = harness.connect_tls().await?;
+    assert!(
+        request(
+            &mut authenticated,
+            origin.addr(),
+            "/alice/api",
+            &basic("alice", PASSWORD)
+        )
+        .await?
+        .starts_with("HTTP/1.1 200")
+    );
+
+    let long_password = "x".repeat(73);
+    let mut previous_hash = HASH;
+    for (hash, password) in [
+        (HASH, PASSWORD),
+        (ARGON_HASH, "password"),
+        (SHA512_HASH, "foobar"),
+    ] {
+        if hash != previous_hash {
+            let changed = clients.replace(HASH, hash);
+            let mixed = changed.replacen(hash, previous_hash, 1);
+            let error = harness.reload(&mixed, &policies).unwrap_err();
+            assert!(format!("{error:#}").contains("verification profile"));
+            assert!(
+                request(&mut authenticated, origin.addr(), "/alice/api", "")
+                    .await?
+                    .starts_with("HTTP/1.1 200"),
+                "rejected profile migration changed the active configuration"
+            );
+
+            harness.reload(&changed, &policies)?;
+            let mut byte = [0];
+            assert!(matches!(
+                timeout(Duration::from_secs(3), authenticated.read(&mut byte)).await?,
+                Ok(0) | Err(_)
+            ));
+            authenticated = harness.connect_tls().await?;
+            assert!(
+                request(
+                    &mut authenticated,
+                    origin.addr(),
+                    "/alice/api",
+                    &basic("alice", password)
+                )
+                .await?
+                .starts_with("HTTP/1.1 200")
+            );
+            previous_hash = hash;
+        }
+
+        // Unknown and source-ineligible names must fail even when the password
+        // matches the representative hash used as the snapshot's dummy.
+        for (user, attempted) in [
+            ("alice", "incorrect-password"),
+            ("unknown", "incorrect-password"),
+            ("unknown", password),
+            ("remote", password),
+            ("alice", long_password.as_str()),
+            ("unknown", long_password.as_str()),
+            ("remote", long_password.as_str()),
+        ] {
+            let mut stream = harness.connect_tls().await?;
+            let response = request(
+                &mut stream,
+                origin.addr(),
+                "/alice/api",
+                &basic(user, attempted),
+            )
+            .await?;
+            assert!(response.starts_with("HTTP/1.1 407"), "{user}: {response}");
+        }
+    }
+    harness.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]

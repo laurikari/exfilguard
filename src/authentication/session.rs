@@ -26,7 +26,6 @@ pub(crate) struct PasswordVerifier {
     pending: Arc<Semaphore>,
     workers: Arc<Semaphore>,
     key: Zeroizing<[u8; 32]>,
-    dummy: PasswordHash,
 }
 
 impl PasswordVerifier {
@@ -39,7 +38,6 @@ impl PasswordVerifier {
             pending: Arc::new(Semaphore::new(settings.max_pending_connections)),
             workers: Arc::new(Semaphore::new(settings.max_concurrent_verifications)),
             key,
-            dummy: PasswordHash::parse("$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHQ$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").expect("valid dummy password hash"),
         }
     }
 
@@ -49,7 +47,7 @@ impl PasswordVerifier {
 
     async fn verify(
         &self,
-        hash: Option<PasswordHash>,
+        hash: PasswordHash,
         password: Zeroizing<String>,
     ) -> Result<(), AuthenticationError> {
         let permit = self
@@ -57,8 +55,6 @@ impl PasswordVerifier {
             .clone()
             .try_acquire_owned()
             .map_err(|_| AuthenticationError::Busy)?;
-        let known = hash.is_some();
-        let hash = hash.unwrap_or_else(|| self.dummy.clone());
         let metric = crate::metrics::track_password_verification();
         let matches = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -67,7 +63,7 @@ impl PasswordVerifier {
         })
         .await
         .map_err(|_| AuthenticationError::Denied)?;
-        if known && matches {
+        if matches {
             Ok(())
         } else {
             Err(AuthenticationError::Denied)
@@ -252,10 +248,15 @@ impl ConnectionSession {
             let client = snapshot
                 .password_client(username)
                 .filter(|client| client.selector.contains(peer));
-            let hash = client.and_then(|client| client.password_hash.clone());
+            let hash = client
+                .and_then(|client| client.password_hash.as_ref())
+                .or_else(|| snapshot.dummy_password_hash())
+                .ok_or(AuthenticationError::Denied)?;
             app.password_verifier
-                .verify(hash, Zeroizing::new(password.to_owned()))
+                .verify(hash.clone(), Zeroizing::new(password.to_owned()))
                 .await?;
+            // A matching dummy hash must never authenticate an unknown or
+            // source-ineligible username.
             let client = client.ok_or(AuthenticationError::Denied)?;
             let latest = app.policies.snapshot();
             let current = latest
@@ -377,7 +378,7 @@ mod tests {
         assert!(matches!(
             verifier
                 .verify(
-                    Some(PasswordHash::parse(HASH).unwrap()),
+                    PasswordHash::parse(HASH).unwrap(),
                     Zeroizing::new("correctbatteryhorsestapler".into())
                 )
                 .await,
@@ -387,7 +388,7 @@ mod tests {
         assert!(
             verifier
                 .verify(
-                    Some(PasswordHash::parse(HASH).unwrap()),
+                    PasswordHash::parse(HASH).unwrap(),
                     Zeroizing::new("correctbatteryhorsestapler".into())
                 )
                 .await
@@ -395,7 +396,10 @@ mod tests {
         );
         assert!(matches!(
             verifier
-                .verify(None, Zeroizing::new("incorrect-password".into()))
+                .verify(
+                    PasswordHash::parse(HASH).unwrap(),
+                    Zeroizing::new("incorrect-password".into())
+                )
                 .await,
             Err(AuthenticationError::Denied)
         ));
@@ -424,7 +428,7 @@ mod tests {
                 let task = tokio::spawn(async move {
                     worker
                         .verify(
-                            Some(PasswordHash::parse(HASH).unwrap()),
+                            PasswordHash::parse(HASH).unwrap(),
                             Zeroizing::new("correctbatteryhorsestapler".into()),
                         )
                         .await

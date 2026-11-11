@@ -359,13 +359,27 @@ client identity.
 Client configuration stores self-describing Argon2id, bcrypt, or SHA512-crypt
 hashes. Argon2id is the generation default; the other formats support existing
 configuration management tooling. Parsing enforces verification cost ceilings
-before publishing a configuration. Passwords require proxy TLS; adding a
-password client to a plaintext listener fails validation.
+before publishing a configuration. All password clients in a deployment must
+share one verification profile: algorithm, work parameters, and salt/digest
+lengths. Salt and digest values remain independent. Mixed profiles are rejected
+at startup and reload, including across disjoint source ranges.
+
+Each immutable policy snapshot retains a representative configured hash for
+dummy verification of unknown or source-ineligible usernames. A successful
+hash check can authenticate only an eligible named client. Keeping the dummy
+with the client hashes makes profile changes atomic and avoids generating or
+calibrating a separate dummy. Matching verification profiles removes the
+algorithm/cost distinction that otherwise reveals usernames; it does not
+promise identical wall-clock times. This restriction is preferable to delays
+or verifying multiple profiles per attempt. Profile migrations must update all
+password clients in one configuration generation.
+
+Passwords require proxy TLS; adding a password client to a plaintext listener
+fails validation.
 
 `authentication::session::PasswordVerifier` bounds pending connections and
 blocking hash verification separately. A canceled verification retains its
-worker permit until the blocking job finishes. Unknown usernames and source
-mismatches perform a dummy verification. Repeated credentials on a bound
+worker permit until the blocking job finishes. Repeated credentials on a bound
 connection use a keyed fingerprint, avoiding repeated expensive hash work.
 Owned password buffers are zeroized, and password hashes have redacted Debug
 output.

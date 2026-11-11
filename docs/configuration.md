@@ -277,6 +277,29 @@ bcrypt passwords are limited to 72 bytes. SHA512-crypt requires at least 1000
 rounds; an omitted rounds field means 5000. Malformed, unsupported, and
 over-budget hashes fail configuration validation.
 
+All password clients in one deployment must share one verification profile,
+including clients with disjoint source ranges. The profile is inferred from
+the hashes; there is no additional setting:
+
+- Argon2id: the same parameters (including digest length and any optional
+  parameters) and decoded salt length.
+- bcrypt: the same cost. The accepted `$2a$`, `$2b$`, and `$2y$` encodings may
+  coexist; their salt and digest lengths are fixed.
+- SHA512-crypt: the same rounds and salt length; digest length is fixed.
+
+Use independent random salts for each password. Salt and digest values do not
+need to match. Unknown usernames and source mismatches use a representative
+hash from the same configuration for dummy verification and always fail
+authentication. This removes username-dependent algorithm and work-factor
+differences; it does not promise identical response times under varying load.
+
+Mixed profiles fail validation at startup and on SIGHUP. To migrate a profile,
+regenerate all password-client hashes with the desired settings and publish
+them together before reloading. Existing hashes cannot be converted to another
+profile without the passwords. A failed reload retains the complete active
+configuration, including its dummy verification profile. Rotating a password
+within the current profile can still update one client at a time.
+
 Optional global limits belong in `exfilguard.toml` and require a restart:
 
 ```toml
