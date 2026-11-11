@@ -270,6 +270,23 @@ authorities fail at the outer CONNECT without opening an upstream connection.
 Preflight does not allow arbitrary inner methods or paths. ExfilGuard checks
 those only after decryption.
 
+Preflight skips an inspection allow when a single earlier authority-matching
+deny covers its methods, paths, and query constraints. The scan retains the
+client's policy order across policy boundaries and is shared with delegated
+policies. Coverage uses method-set inclusion, unrestricted or identical path
+patterns, and unrestricted or identical query constraints. The slash-path
+pattern `/**` does not cover a path-unrestricted `OPTIONS *` allowance.
+
+This is deliberately a bounded shadow check, not a general reachability proof.
+It does not infer containment between different restricted path patterns,
+combine partial denies, or prove that local and delegated allowances intersect.
+Keeping this check simple avoids a second symbolic policy engine. Eligible
+preflight still performs DNS and upstream TLS before the inner request, which
+preserves origin-aware ALPN negotiation for H2-capable clients accessing
+HTTP/1-only origins. Operators must account for those transport effects when
+authoring inspection policies; every actual inner request still undergoes
+normal ordered authorization.
+
 Inspected HTTP/1 accepts both origin-form targets and absolute HTTPS URIs.
 Every inspected HTTP/1 or HTTP/2 request must match the CONNECT host and
 effective port and retain the HTTPS scheme before policy evaluation or cache

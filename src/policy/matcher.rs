@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::Decision;
-use super::model::{ClientEntry, CompiledConfig};
+use super::model::{ClientEntry, CompiledConfig, CompiledRule};
 
 #[derive(Clone)]
 pub struct PolicyMatcher {
@@ -34,15 +34,11 @@ impl PolicyMatcher {
     }
 
     pub fn evaluate_tls_bump_preflight(&self, policy_indices: &[usize], request: &Request) -> bool {
-        for &policy_idx in policy_indices {
-            let Some(policy) = self.config.policies.get(policy_idx) else {
-                continue;
-            };
-            if evaluate_tls_bump_preflight_policy(policy.as_ref(), request) {
-                return true;
-            }
-        }
-        false
+        let rules = policy_indices
+            .iter()
+            .filter_map(|&index| self.config.policies.get(index))
+            .flat_map(|policy| policy.rules.iter());
+        evaluate_tls_bump_preflight(rules, request)
     }
 }
 
@@ -212,38 +208,65 @@ fn evaluate_connect_policy(
     None
 }
 
-pub(crate) fn evaluate_tls_bump_preflight_policy(
-    policy: &super::model::CompiledPolicy,
+pub(crate) fn evaluate_tls_bump_preflight<'a>(
+    rules: impl Iterator<Item = &'a CompiledRule>,
     request: &Request,
 ) -> bool {
     if request.method != Method::CONNECT || request.scheme != Scheme::Https {
         return false;
     }
-    for rule in policy.rules.iter() {
-        // Transport setup has observable network side effects, so a deny rule
-        // must not make an otherwise unauthorized authority reachable.
-        if !matches!(&rule.action, RuleAction::Allow)
-            || rule.https_mode != HttpsMode::Inspect
-            || rule.methods.is_connect_only()
+    let mut denies = Vec::new();
+    for rule in rules {
+        if rule.https_mode != HttpsMode::Inspect || rule.methods.is_connect_only() {
+            continue;
+        }
+        if let Some(url) = &rule.url
+            && !url.matches_authority(request.scheme, request.host, request.port)
         {
             continue;
         }
-        let url_matches = match &rule.url {
-            Some(url) => {
-                if url.scheme != Scheme::Https {
-                    false
-                } else {
-                    url.matches_authority(request.scheme, request.host, request.port)
+        match &rule.action {
+            RuleAction::Deny { .. } => denies.push(rule),
+            RuleAction::Allow => {
+                // Setup performs DNS and upstream TLS, so a plainly shadowed
+                // allow must not authorize it. Check one earlier deny at a time;
+                // this deliberately does not solve general rule reachability.
+                if !denies.iter().any(|deny| deny_covers_allow(deny, rule)) {
+                    return true;
                 }
             }
-            None => true,
-        };
-        if !url_matches {
-            continue;
         }
-        return true;
     }
     false
+}
+
+fn deny_covers_allow(deny: &CompiledRule, allow: &CompiledRule) -> bool {
+    if !deny.methods.covers(&allow.methods) {
+        return false;
+    }
+
+    let deny_path = deny.url.as_ref().and_then(|url| url.path.as_ref());
+    let allow_path = allow.url.as_ref().and_then(|url| url.path.as_ref());
+    let path_covered = match (deny_path, allow_path) {
+        (None, _) => true,
+        (Some(deny), Some(allow)) => {
+            deny.original().as_ref() == "/**" || deny.original() == allow.original()
+        }
+        // Only OPTIONS can use '*', which an unconstrained path accepts but
+        // '/**' does not. All other valid request paths start with '/'.
+        (Some(deny), None) => {
+            deny.original().as_ref() == "/**" && !allow.methods.allows(&Method::OPTIONS)
+        }
+    };
+
+    let deny_query = deny.url.as_ref().and_then(|url| url.query.as_deref());
+    let allow_query = allow.url.as_ref().and_then(|url| url.query.as_deref());
+    let allow_query_present = allow.query_present.or(allow_query.map(|_| true));
+    path_covered
+        && deny_query.is_none_or(|query| Some(query) == allow_query)
+        && deny
+            .query_present
+            .is_none_or(|present| Some(present) == allow_query_present)
 }
 
 fn make_decision(

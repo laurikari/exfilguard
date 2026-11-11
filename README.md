@@ -220,9 +220,12 @@ Each HTTPS policy rule declares an explicit mode:
 - `https_mode = "inspect"` (default) terminates TLS so the proxy can enforce
   scheme, host, path, query, and method checks on the inner HTTP request. Matching
   HTTPS `ALLOW` rules authorize a TLS bump preflight for the same host/port,
-  but the real policy decision is attached to the inner request. Deny-only
-  authorities fail at the outer CONNECT. Private upstream addresses are still
-  blocked.
+  but the real policy decision is attached to the inner request. Preflight skips
+  allows clearly covered by one earlier deny, including across policy boundaries;
+  authorities with no remaining candidate fail at the outer CONNECT. This is a
+  [bounded shadow check](docs/design-decisions.md#https-inspect-and-tunnel-modes),
+  not a general proof that an inner request can be allowed. Private upstream
+  addresses are still blocked.
 - `https_mode = "tunnel"` only enforces scheme/host/port on the outer CONNECT.
   These rules must use `methods = ["CONNECT"]` and a `url_pattern` ending in
   `/**`, making it clear that the intent is to tunnel the host untouched. Use

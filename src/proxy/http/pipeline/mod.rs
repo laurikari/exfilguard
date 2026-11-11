@@ -182,6 +182,136 @@ name = "allow"
     }
 
     #[tokio::test]
+    async fn shadowed_inspection_allows_are_rejected_before_resolution() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use crate::authentication::ConnectionSession;
+        use crate::proxy::resolver::{FilteredAddresses, UpstreamResolver};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+
+        struct RecordingResolver {
+            calls: AtomicUsize,
+            upstream: SocketAddr,
+        }
+
+        #[async_trait::async_trait]
+        impl UpstreamResolver for RecordingResolver {
+            async fn resolve_filtered(
+                &self,
+                _host: &str,
+                _port: u16,
+                _timeout: Duration,
+                _context: &'static str,
+            ) -> Result<FilteredAddresses> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(FilteredAddresses {
+                    allowed: vec![self.upstream],
+                    filtered_private: 0,
+                })
+            }
+        }
+
+        std::fs::create_dir_all("/tmp/exfilguard")?;
+        let temp = tempfile::Builder::new()
+            .prefix("preflight-")
+            .tempdir_in("/tmp/exfilguard")?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let resolver = Arc::new(RecordingResolver {
+            calls: AtomicUsize::new(0),
+            upstream: listener.local_addr()?,
+        });
+        let mut app = build_test_app(&temp)
+            .await?
+            .with_upstream_resolver(resolver.clone());
+        let port = resolver.upstream.port();
+        for split_policies in [false, true] {
+            for methods in ["ANY", "GET"] {
+                let client_policies = if split_policies {
+                    r#"["deny", "allow"]"#
+                } else {
+                    r#"["allow"]"#
+                };
+                std::fs::write(
+                    &app.settings.clients,
+                    format!(
+                        "[[client]]\nname = \"default\"\nfallback = true\npolicies = {client_policies}\n"
+                    ),
+                )?;
+                let denied = format!(
+                    r#"
+[[policy.rule]]
+action = "DENY"
+status = 470
+methods = ["{methods}"]
+url_pattern = "https://*.example.test:{port}/**"
+"#
+                );
+                let allowed = format!(
+                    r#"
+[[policy.rule]]
+action = "ALLOW"
+methods = ["GET"]
+url_pattern = "https://*.example.test:{port}/safe"
+"#
+                );
+                let policies = if split_policies {
+                    format!(
+                        "[[policy]]\nname = \"deny\"\n{denied}\n[[policy]]\nname = \"allow\"\n{allowed}"
+                    )
+                } else {
+                    format!("[[policy]]\nname = \"allow\"\n{denied}\n{allowed}")
+                };
+                std::fs::write(&app.settings.policies, policies)?;
+                let compiled =
+                    policy::compile::compile_config(&app.settings.load_runtime_config()?)?;
+                let (_tx, rx) = watch::channel(PolicySnapshot::new(Arc::new(compiled)));
+                app.policies = PolicyStore::new(rx);
+
+                let authority = format!("secret.example.test:{port}");
+                for (request_line, expected_status) in [
+                    (format!("GET https://{authority}/safe HTTP/1.1"), 470),
+                    (format!("CONNECT {authority} HTTP/1.1"), 403),
+                ] {
+                    let (mut client, server) = tokio::io::duplex(4096);
+                    let task = tokio::spawn(proxy::http::handle_http(
+                        server,
+                        "127.0.0.1:12345".parse()?,
+                        app.clone(),
+                        ConnectionSession::new(None),
+                    ));
+                    client
+                        .write_all(
+                            format!(
+                                "{request_line}\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                    client.shutdown().await?;
+                    let mut response = String::new();
+                    timeout(Duration::from_secs(5), client.read_to_string(&mut response)).await??;
+                    task.await??;
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {expected_status}")),
+                        "{response}"
+                    );
+                    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0, "{request_line}");
+                }
+            }
+        }
+        assert!(
+            timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err(),
+            "shadowed allow caused an upstream connection"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn parse_errors_return_bad_request() -> Result<()> {
         let temp = TempDir::new()?;
         let app = build_test_app(&temp).await?;

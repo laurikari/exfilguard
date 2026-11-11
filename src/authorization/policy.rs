@@ -7,7 +7,7 @@ use http::header::HeaderName;
 use crate::config::{BodyAccess, HttpsMode, MethodMatch, Policy, Rule, RuleAction, UrlPattern};
 use crate::policy::Decision;
 use crate::policy::compile::compile_policy;
-use crate::policy::matcher::{Request, evaluate_policy, evaluate_tls_bump_preflight_policy};
+use crate::policy::matcher::{Request, evaluate_policy, evaluate_tls_bump_preflight};
 use crate::policy::model::{CompiledCredentialLimit, CompiledPolicy};
 
 use super::{AuthorizationToken, ResolvedAuthorizationPolicy};
@@ -62,7 +62,7 @@ impl DynamicPolicy {
     }
 
     pub(crate) fn allows_tls_bump(&self, request: &Request<'_>) -> bool {
-        evaluate_tls_bump_preflight_policy(&self.compiled, request)
+        evaluate_tls_bump_preflight(self.compiled.rules.iter(), request)
     }
 }
 

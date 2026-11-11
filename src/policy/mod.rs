@@ -11,6 +11,8 @@ pub mod matcher;
 pub mod model;
 
 #[cfg(test)]
+mod preflight_tests;
+#[cfg(test)]
 mod query_tests;
 
 #[derive(Debug, Clone)]

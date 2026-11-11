@@ -214,6 +214,15 @@ impl MethodMask {
     pub fn is_any(&self) -> bool {
         self.allow_any
     }
+
+    pub(crate) fn covers(&self, other: &Self) -> bool {
+        if self.allow_any {
+            return !other.allows(&Method::CONNECT);
+        }
+        !other.allow_any
+            && self.mask & other.mask == other.mask
+            && other.extras.iter().all(|method| self.allows(method))
+    }
 }
 
 const CONNECT_BIT: u32 = 1 << 8;

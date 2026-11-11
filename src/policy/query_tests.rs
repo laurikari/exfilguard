@@ -10,7 +10,7 @@ use crate::proxy::request::parse_http1_request;
 
 use super::Decision;
 use super::compile::compile_policy;
-use super::matcher::{evaluate_policy, evaluate_tls_bump_preflight_policy};
+use super::matcher::{evaluate_policy, evaluate_tls_bump_preflight};
 use super::model::CompiledPolicy;
 
 fn rule(url: Option<&str>, present: Option<bool>) -> Rule {
@@ -256,7 +256,7 @@ fn query_constraints_do_not_block_inspection_preflight() {
         path: "example.com:443",
         query: None,
     };
-    assert!(evaluate_tls_bump_preflight_policy(&compiled, &request));
+    assert!(evaluate_tls_bump_preflight(compiled.rules.iter(), &request));
 }
 
 #[test]
