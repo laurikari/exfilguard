@@ -26,6 +26,7 @@ use super::tls::build_proxy_tls_configs;
 fn default_test_settings(listen: SocketAddr, dirs: &TestDirs) -> Settings {
     Settings {
         listen,
+        max_connections: 4096,
         proxy_tls: None,
         authentication: Default::default(),
         proxy_protocol: ProxyProtocolMode::Off,

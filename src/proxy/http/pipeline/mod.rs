@@ -88,6 +88,7 @@ name = "allow"
 
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 4096,
             proxy_tls: None,
             authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,

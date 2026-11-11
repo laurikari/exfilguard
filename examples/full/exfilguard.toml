@@ -1,4 +1,6 @@
 listen = "127.0.0.1:3128"
+# Accepted downstream connections across all clients. Restart to change.
+max_connections = 4096
 proxy_protocol = "off"
 
 ca = { source = "builtin", dir = "/tmp/exfilguard/full-example/ca" }

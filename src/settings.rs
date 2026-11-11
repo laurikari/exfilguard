@@ -23,6 +23,10 @@ struct SettingsDefaults;
 const CONFIG_FRAGMENT_DIR: &str = "config.d";
 
 impl SettingsDefaults {
+    const fn max_connections() -> usize {
+        4096
+    }
+
     fn vault_pki_mount() -> String {
         "pki".to_string()
     }
@@ -413,6 +417,8 @@ where
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub listen: SocketAddr,
+    #[serde(default = "SettingsDefaults::max_connections")]
+    pub max_connections: usize,
     #[serde(default)]
     pub authentication: crate::authentication::AuthenticationSettings,
     #[serde(default)]
@@ -781,6 +787,12 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_connections),
+            "max_connections must be between 1 and {} (got {})",
+            tokio::sync::Semaphore::MAX_PERMITS,
+            self.max_connections
+        );
         ensure!(
             self.authentication.max_pending_connections > 0
                 && self.authentication.max_concurrent_verifications > 0,
@@ -1733,6 +1745,7 @@ policies = "policies.toml"
     fn test_settings_validation_cache_enabled() {
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 4096,
             proxy_tls: None,
             authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
@@ -1809,6 +1822,7 @@ policies = "policies.toml"
     fn test_settings_validation_cache_invalid_sizes() {
         let mut settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 4096,
             proxy_tls: None,
             authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
@@ -1874,6 +1888,7 @@ policies = "policies.toml"
     fn test_settings_validation_cache_disabled_sizes_ignored() {
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 4096,
             proxy_tls: None,
             authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Off,
@@ -1932,6 +1947,7 @@ policies = "policies.toml"
     fn test_settings_validation_proxy_protocol_requires_allowlist() {
         let settings = Settings {
             listen: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 4096,
             proxy_tls: None,
             authentication: Default::default(),
             proxy_protocol: ProxyProtocolMode::Required,
@@ -2006,6 +2022,35 @@ dir = "ca-material""#,
         assert_eq!(settings.proxy_protocol_max_pending_connections, 1024);
         assert!(settings.proxy_protocol_allows_peer(mapped));
         assert!(!settings.proxy_protocol_allows_peer("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn global_connection_limit_defaults_and_validation() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_settings_config(
+            &dir,
+            r#"[ca]
+source = "builtin"
+dir = "ca-material""#,
+        );
+        let mut settings = Settings::load(&Cli {
+            command: None,
+            config: Some(config_path),
+        })
+        .unwrap();
+        assert_eq!(settings.max_connections, 4096);
+        for limit in [0, tokio::sync::Semaphore::MAX_PERMITS + 1] {
+            settings.max_connections = limit;
+            assert!(
+                settings
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_connections must be between 1")
+            );
+        }
+        settings.max_connections = 1;
+        settings.validate().unwrap();
     }
 
     #[test]

@@ -497,7 +497,17 @@ not a complete denial-of-service isolation or multi-tenant fairness boundary,
 but an authorized or compromised client must not retain unbounded downstream
 connections.
 
-Each configured client therefore has a default budget of 1,024 simultaneous
+The proxy listener has a global, configurable limit of 4,096 accepted downstream
+connections by default. One semaphore permit is acquired before `accept` and
+held for the connection's lifetime, covering PROXY processing, TLS handshakes,
+authentication, HTTP keep-alive, and CONNECT sessions. At capacity, arrivals
+remain in the bounded kernel backlog; no waiting handler tasks are created.
+Established connections continue to run, and the separate metrics listener is
+outside this limit. This bounds admitted downstream work independently of the
+process descriptor limit, without trying to infer an appropriate connection
+count from RAM or CPU load.
+
+Each configured client also has a default budget of 1,024 simultaneous
 downstream TCP connections, with an explicit per-client override. The count
 includes ordinary HTTP keep-alive connections, raw CONNECT tunnels, and
 inspected CONNECT sessions. A CIDR identity deliberately shares one budget
@@ -513,12 +523,13 @@ connection, including idle connections and opaque tunnels. Policy-only changes
 apply to subsequent requests; established opaque tunnels retain their setup
 decision while the identity remains valid.
 
-There is no separate global lifetime, per-IP, or per-rule ceiling. Client
-limits remain stable across policy reloads and are observable through bounded
-per-client metrics. Deployments that need broader availability isolation should
-still use firewall, load-balancer, or equivalent network-edge controls. A
-future adaptive overload controller would require real resource-pressure
-signals and hysteresis; it is separate from deterministic client budgets.
+Connection accounting is preserved across policy reloads. The global limit is
+a startup setting; client limits are reloadable. Active connections are observable
+through global and bounded per-client metrics. These limits bound downstream
+connection overhead, not total memory, CPU, or upstream sockets. H2 receive DATA
+has its own shared byte budget. Deployments that need broader availability
+isolation should still use OS resource limits and network-edge controls. There
+is no adaptive overload controller or separate per-IP or per-rule ceiling.
 
 ## Request body limits are opt-in
 

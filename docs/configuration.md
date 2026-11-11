@@ -12,6 +12,7 @@ These settings are required.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `listen` | String | Yes | Listen address and port (e.g., `"127.0.0.1:3128"`) |
+| `max_connections` | usize | 4096 | Maximum accepted downstream proxy connections across all clients; must be positive |
 | `proxy_tls` | Table | No | TLS server certificate for the proxy listener: `files` or `vault` |
 | `proxy_protocol` | String | `"off"` | PROXY protocol mode: `"off"`, `"optional"`, or `"required"` |
 | `proxy_protocol_allowed_cidrs` | Array | None | CIDR allowlist for peers allowed to send PROXY headers (required when `proxy_protocol` is `"optional"` or `"required"`) |
@@ -204,6 +205,20 @@ restarting ExfilGuard.
 ---
 
 ## Client Connection Admission
+
+The global `max_connections` setting in `exfilguard.toml` defaults to 4,096.
+It counts all accepted downstream proxy connections, including those awaiting
+PROXY headers, TLS handshakes, or authentication. When full, the listener waits
+for a connection to close before accepting another. Arrivals wait in the bounded
+kernel backlog and may time out or fail when that fills; ExfilGuard does not
+create waiting handler tasks or evict existing connections. The separate metrics
+listener is outside this limit. Changing the global limit requires a restart.
+
+The default is a fixed capacity policy, not an estimate of available RAM. Tune
+it for the deployment alongside OS resource limits. It bounds downstream
+connection overhead, not total memory, CPU, or upstream sockets: an H2 connection
+can carry many requests. The H2 receive-DATA budget applies separately.
+`downstream_connections_active` reports the number of active proxy handlers.
 
 Every configured client has a simultaneous downstream connection budget. The
 default is 1,024 connections and can be overridden on an individual client:
@@ -830,7 +845,7 @@ targets are half the connection target, bounded by the configured stream maximum
 Before advertising an increase, ExfilGuard reserves its allowance from the shared
 budget. When growth cannot fit, transfers continue using their existing windows.
 A new inspected HTTP/2 session needs both initial receiving allowances; it is
-closed if they cannot fit. Existing per-client connection limits still apply.
+closed if they cannot fit. Global and per-client connection limits also apply.
 Credit already advertised remains charged even after a target decreases, until
 it drains or its owning connection and streams close. A fully stalled connection
 cannot immediately return its reservation merely because its target shrinks.
