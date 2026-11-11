@@ -64,6 +64,8 @@ pub(crate) enum FinalizationRejection {
     Trailers,
     #[error("client supplied a protected header")]
     ProtectedHeader,
+    #[error("credential-bearing requests must use canonical IPv6 spelling")]
+    NonCanonicalIpv6,
 }
 
 pub(crate) struct FinalizedRequestV1 {
@@ -91,6 +93,15 @@ impl FinalizedRequestV1 {
         protocol: FinalizedProtocol,
         max_header_bytes: usize,
     ) -> Result<Self> {
+        // ParsedRequest already has a canonical policy host. Do not let another IPv6 spelling
+        // select a different virtual host when the proxy supplies the credential.
+        if parsed.host.contains(':')
+            && !parsed
+                .authority_host()
+                .starts_with(&format!("[{}]", parsed.host))
+        {
+            return Err(FinalizationRejection::NonCanonicalIpv6.into());
+        }
         let body_length = body.as_ref().map(|body| body.bytes().len());
         if let Some(declared) = declared_content_length {
             ensure!(
@@ -422,6 +433,83 @@ mod tests {
     use super::*;
     use crate::proxy::request::parse_http1_request;
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn credential_requests_require_canonical_ipv6_literals() {
+        for (host, allowed) in [
+            ("[2001:db8::1]", true),
+            ("[2001:DB8::1]", false),
+            ("[2001:0db8::1]", false),
+            ("[2001:db8:0:0:0:0:0:1]", false),
+            ("[::1]", true),
+            ("[0:0:0:0:0:0:0:1]", false),
+            ("[::ffff:192.0.2.1]", true),
+            ("[::ffff:c000:201]", false),
+            ("EXAMPLE.com.", true),
+            ("192.0.2.1", true),
+        ] {
+            for port in ["", ":443", ":8443"] {
+                let authority = format!("{host}{port}");
+                for absolute in [false, true] {
+                    let path = "/raw%2fpath?b=2&a=%41";
+                    let target = if absolute {
+                        format!("https://{authority}{path}")
+                    } else {
+                        path.to_string()
+                    };
+                    let parsed = parse_http1_request(
+                        http::Method::GET,
+                        &target,
+                        Some(&authority),
+                        Scheme::Https,
+                    )
+                    .unwrap();
+                    for protocol in [FinalizedProtocol::Http1, FinalizedProtocol::Http2] {
+                        let result = FinalizedRequestV1::new(
+                            &parsed,
+                            [],
+                            None,
+                            None,
+                            Arc::from([http::header::AUTHORIZATION]),
+                            protocol,
+                            4096,
+                        );
+                        if allowed {
+                            let finalized = result.unwrap();
+                            assert_eq!(finalized.authority(), authority);
+                            assert_eq!(finalized.raw_path_and_query(), path.as_bytes());
+                            match protocol {
+                                FinalizedProtocol::Http1 => {
+                                    assert_eq!(
+                                        finalized.headers()[0].value(),
+                                        authority.as_bytes()
+                                    );
+                                }
+                                FinalizedProtocol::Http2 => {
+                                    let request = finalized.build_http2_request().unwrap();
+                                    assert_eq!(
+                                        request.uri().authority().unwrap().as_str(),
+                                        authority
+                                    );
+                                }
+                            }
+                        } else {
+                            let error = result
+                                .err()
+                                .expect("alternate IPv6 spelling must be rejected");
+                            assert!(
+                                matches!(
+                                    error.downcast_ref::<FinalizationRejection>(),
+                                    Some(FinalizationRejection::NonCanonicalIpv6)
+                                ),
+                                "{authority}: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn protected_values_do_not_change_base_fingerprint() {

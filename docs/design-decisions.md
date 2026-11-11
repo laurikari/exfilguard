@@ -411,6 +411,13 @@ Credential-bearing `TRACE` requests, including case variants, are always denied
 before credential retrieval or HTTP forwarding because TRACE can disclose
 injected headers. An allow rule cannot override this restriction.
 
+Credential-bearing requests also require the IPv6 literal sent in `Host` or
+`:authority` to use the canonical spelling used by policy matching. Alternate
+spellings are rejected before credential retrieval, preventing client-selected
+spellings from routing the credential to another virtual host. Workloads use
+issued or fixed URLs, so supporting alternate IPv6 spellings is unnecessary.
+The port, path, and query remain unchanged, as does credential-free forwarding.
+
 Before asking for authentication headers, ExfilGuard resolves and checks the
 destination and builds the exact request it will send. The service may fill only
 the header positions approved by the client configuration. A unique ID and a

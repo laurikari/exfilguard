@@ -69,6 +69,10 @@ impl CredentialRequestRejected {
                 status: StatusCode::FORBIDDEN,
                 detail: "client supplied a protected header",
             },
+            FinalizationRejection::NonCanonicalIpv6 => Self {
+                status: StatusCode::FORBIDDEN,
+                detail: "credential-bearing requests must use canonical IPv6 spelling",
+            },
         }
     }
 }

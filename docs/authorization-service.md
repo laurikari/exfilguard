@@ -86,6 +86,12 @@ and rules with omitted methods or `ANY`. TRACE can reflect injected headers back
 ExfilGuard rejects these requests before calling the credential endpoint or forwarding the HTTP
 request. Credential-free TRACE requests follow the normal policy rules.
 
+IPv6 literals in credential-bearing URLs must use canonical spelling: lowercase hex, no leading
+zeros, and canonical zero compression (for example, `[2001:db8::1]`). URLs supplied with a lease
+must use this spelling. Alternative spellings are rejected with HTTP 403 before credential
+retrieval; ExfilGuard does not rewrite them. The port, path, and query retain their original
+spelling. This restriction does not apply to requests without injected credentials.
+
 An inactive response needs only `{"active": false}`. This version supports only an exact
 `source_ip` constraint; authenticated connection identities are not yet supported. `policy_version`
 is an identifier containing 1 to 128 visible ASCII bytes.

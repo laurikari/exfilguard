@@ -648,6 +648,51 @@ async fn credential_trace_is_denied_before_credential_retrieval_and_forwarding()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alternate_ipv6_spelling_is_denied_before_credential_retrieval() -> Result<()> {
+    // Rejection must happen before any upstream connection, so no IPv6 listener is needed.
+    let scope = "http://[2001:db8::1]:8443/**";
+    let services = AuthorizationFixture::spawn(scope.to_string()).await?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["ipv6"])
+        .policy(PolicySpec::new("ipv6").rule(RuleSpec::allow(&["GET"], scope)))
+        .render();
+    let clients = with_delegated_authorization(clients, scope, BodyAccess::None);
+    let authorization = services.settings();
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_settings(move |settings| settings.authorization = Some(authorization))
+        .spawn()
+        .await?;
+    for authority in [
+        "[2001:DB8::1]:8443",
+        "[2001:0db8::1]:8443",
+        "[2001:db8:0:0:0:0:0:1]:8443",
+    ] {
+        for absolute in [false, true] {
+            let target = if absolute {
+                format!("http://{authority}/credential")
+            } else {
+                "/credential".to_string()
+            };
+            let mut client = harness.connect().await?;
+            client.write_all(format!(
+                "GET {target} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: ExfilGuard {AUTHORIZATION_TOKEN}\r\nConnection: close\r\n\r\n",
+            ).as_bytes()).await?;
+            let response = read_http_response_with_length(&mut client).await?;
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(
+                response.contains("request blocked by credential policy"),
+                "{response}"
+            );
+            assert!(!response.contains(PROTECTED_VALUE), "{response}");
+            assert_eq!(services.credential_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert_eq!(services.policy_calls.load(Ordering::SeqCst), 1);
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorization_service_rejects_an_untrusted_server_certificate() -> Result<()> {
     let origin = Http1Origin::spawn().await?;
     let credential_scope = format!("http://127.0.0.1:{}/credential", origin.addr.port());
