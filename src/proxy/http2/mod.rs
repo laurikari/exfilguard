@@ -1,8 +1,10 @@
 mod cache;
 mod forward;
+mod memory;
 mod request;
 mod server;
 mod upstream;
+pub(crate) mod window;
 
 pub use server::serve_bumped_http2;
 pub use upstream::PrimedHttp2Upstream;

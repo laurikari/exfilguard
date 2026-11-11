@@ -13,7 +13,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, Semaphore, watch},
     task::JoinSet,
-    time::{sleep, timeout},
+    time::{sleep_until, timeout},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::warn;
@@ -37,6 +37,8 @@ use crate::{
     },
 };
 use async_trait::async_trait;
+
+use super::window::{Body, Controller, Window};
 
 use super::{
     cache::{CacheEvaluation, CacheMiss, evaluate_cache, send_cached_response},
@@ -80,6 +82,8 @@ struct Http2BumpService<S> {
     connect_binding: ResolvedTarget,
     flow_context: RequestFlowContext,
     request_slots: Arc<Semaphore>,
+    window: Arc<Window>,
+    controller: Controller,
 }
 
 impl<S> Http2BumpService<S>
@@ -94,16 +98,26 @@ where
         primed_upstream: Option<PrimedHttp2Upstream>,
         flow_context: RequestFlowContext,
     ) -> Result<Self> {
-        let connection = handshake_downstream(
+        let (window, upstream_window) = app.http2_windows.session(&app.settings)?;
+        let mut connection = handshake_downstream(
             stream,
             app.settings.max_request_header_size,
             app.settings.http2_max_concurrent_streams,
-            app.settings.http2_stream_window_size,
-            app.settings.http2_connection_window_size,
+            window.stream_target(),
+            window.target(),
             app.settings.request_header_timeout(),
         )
         .await?;
-        let upstream = Http2Upstream::new(app.clone(), connect_binding.clone(), primed_upstream);
+        let controller = Controller::new(
+            window.clone(),
+            connection.ping_pong().expect("unused ping handle"),
+        );
+        let upstream = Http2Upstream::new(
+            app.clone(),
+            connect_binding.clone(),
+            primed_upstream,
+            upstream_window,
+        );
         let upstream_closed = upstream.closed_receiver();
         let request_slots = Arc::new(Semaphore::new(
             app.settings.http2_max_concurrent_streams_usize(),
@@ -117,15 +131,23 @@ where
             connect_binding,
             flow_context,
             request_slots,
+            window,
+            controller,
         })
     }
 
     async fn run(&mut self) -> Result<()> {
         let mut tasks = JoinSet::new();
         let keepalive_timeout = self.app.settings.client_keepalive_idle_timeout();
+        let mut keepalive_deadline = tokio::time::Instant::now() + keepalive_timeout;
+        let mut maintenance = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 biased;
+                sample = self.controller.sample() => {
+                    if let Some(sample) = sample { self.controller.update(Some(sample), &mut self.connection); }
+                }
+                _ = maintenance.tick() => self.controller.update(None, &mut self.connection),
                 result = self.upstream_closed.changed() => {
                     match result {
                         Ok(()) if *self.upstream_closed.borrow() => {
@@ -153,6 +175,7 @@ where
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(result) = result {
+                        keepalive_deadline = tokio::time::Instant::now() + keepalive_timeout;
                         log_stream_task_completion(self.peer, result);
                     }
                 }
@@ -162,6 +185,8 @@ where
                     };
                     match result {
                         Ok((request, respond)) => {
+                            keepalive_deadline = tokio::time::Instant::now() + keepalive_timeout;
+                            let request = request.map(|body| Body::new(body, self.window.clone()));
                             let peer = self.peer;
                             let app = self.app.clone();
                             let upstream = self.upstream.clone();
@@ -205,7 +230,7 @@ where
                         }
                     }
                 }
-                _ = sleep(keepalive_timeout), if tasks.is_empty() => {
+                _ = sleep_until(keepalive_deadline), if tasks.is_empty() => {
                     tracing::debug!(
                         peer = %self.peer,
                         "closing idle downstream HTTP/2 session"
@@ -259,7 +284,7 @@ fn log_stream_task_completion(peer: SocketAddr, result: Result<(), tokio::task::
 }
 
 async fn process_downstream_request(
-    request: http::Request<h2::RecvStream>,
+    request: http::Request<Body>,
     respond: SendResponse<Bytes>,
     peer: SocketAddr,
     app: AppContext,
@@ -380,7 +405,7 @@ async fn process_downstream_request(
 struct DownstreamRequestCtx {
     peer: SocketAddr,
     meta: SanitizedRequest,
-    body: h2::RecvStream,
+    body: Body,
     respond: SendResponse<Bytes>,
     snapshot: PolicySnapshot,
     request_body_timeout: Duration,
@@ -401,7 +426,7 @@ struct DownstreamRequestCtx {
 impl DownstreamRequestCtx {
     fn new(
         meta: SanitizedRequest,
-        body: h2::RecvStream,
+        body: Body,
         respond: SendResponse<Bytes>,
         peer: SocketAddr,
         snapshot: PolicySnapshot,

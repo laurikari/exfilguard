@@ -1277,6 +1277,46 @@ fn remaining_deadline(deadline: Instant, context: &str) -> Result<Duration> {
         .ok_or_else(|| anyhow!("timed out {context}"))
 }
 
+static HTTP2_WINDOW_RESERVED: Lazy<IntGauge> = Lazy::new(|| {
+    let metric = IntGauge::new(
+        "http2_receive_window_reserved_bytes",
+        "Receive DATA credit and buffers reserved across both directions",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+static HTTP2_WINDOW_TARGET: Lazy<IntGauge> = Lazy::new(|| {
+    let metric = IntGauge::new(
+        "http2_receive_window_target_bytes",
+        "Aggregate target receive windows",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+static HTTP2_WINDOW_DENIED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let metric = IntCounterVec::new(
+        Opts::new(
+            "http2_receive_window_denied_total",
+            "Receive budget admission and growth failures",
+        ),
+        &["operation"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+pub(crate) fn http2_window_reserved(delta: i64) {
+    HTTP2_WINDOW_RESERVED.add(delta);
+}
+pub(crate) fn http2_window_target(delta: i64) {
+    HTTP2_WINDOW_TARGET.add(delta);
+}
+pub(crate) fn http2_window_denied(operation: &str) {
+    HTTP2_WINDOW_DENIED.with_label_values(&[operation]).inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

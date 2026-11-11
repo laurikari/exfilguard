@@ -4282,3 +4282,53 @@ async fn connect_bump_http2_bounds_unacknowledged_graceful_shutdown() -> Result<
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http2_receive_budget_rejects_excess_sessions_and_recovers() -> Result<()> {
+    let policy = PolicySpec::new("h2-budget").rule(RuleSpec::allow_any("https://localhost/**"));
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new("localhost", "h2-budget", policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::Http2)
+            .with_settings(|s| s.http2_receive_window_budget = Some(2 * 1024 * 1024)),
+    )
+    .await?;
+    let port = fixture.upstream_addr().port();
+    let request = || {
+        http::Request::builder()
+            .uri(format!("https://localhost:{}/budget", port))
+            .body(())
+            .unwrap()
+    };
+    let mut first = fixture.h2_client().await?;
+    assert_eq!(first.request_text(request()).await?.0, StatusCode::OK);
+    if fixture
+        .reconnect(ClientProtocols::Http2Preferred)
+        .await
+        .is_ok()
+        && let Ok(mut excess) = fixture.h2_client().await
+    {
+        excess.wait_closed(StdDuration::from_secs(2)).await?;
+    }
+    assert_eq!(first.request_text(request()).await?.0, StatusCode::OK);
+    first.shutdown().await;
+    timeout(StdDuration::from_secs(3), async {
+        loop {
+            if fixture
+                .reconnect(ClientProtocols::Http2Preferred)
+                .await
+                .is_ok()
+                && let Ok(mut replacement) = fixture.h2_client().await
+                && let Ok((status, _)) = replacement.request_text(request()).await
+            {
+                assert_eq!(status, StatusCode::OK);
+                replacement.shutdown().await;
+                break;
+            }
+            sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    fixture.shutdown().await;
+    Ok(())
+}

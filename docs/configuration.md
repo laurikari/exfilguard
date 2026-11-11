@@ -817,31 +817,45 @@ HTTP/2 server push is unsupported and disabled on upstream connections.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http2_max_concurrent_streams` | u32 | 100 | Maximum concurrent bumped downstream HTTP/2 streams per connection (must be >= 1) |
-| `http2_stream_window_size` | u32 | 33554432 (32 MiB) | Receive window per HTTP/2 stream, in bytes; 65535–2147483647 |
-| `http2_connection_window_size` | u32 | 67108864 (64 MiB) | Combined receive window for all streams on an HTTP/2 connection, in bytes; 65535–2147483647 |
+| `http2_stream_window_size` | u32 | 33554432 (32 MiB) | Maximum adaptive receive window per stream, in bytes; 65535–2147483647 |
+| `http2_connection_window_size` | u32 | 67108864 (64 MiB) | Maximum adaptive receive window per connection, in bytes; 65535–2147483647 |
+| `http2_receive_window_budget` | u64 | automatic | Positive process-wide receive-DATA allowance in bytes, shared by both directions and all clients |
 
-An HTTP/2 receive window limits how much DATA a sender may send before the
-receiver grants more capacity. Both the stream and connection limits apply.
-The connection window may be smaller than the stream window; in that
-configuration, one stalled stream can use all available connection capacity
-and delay other streams.
+An HTTP/2 receive window limits DATA a sender may send before receiving more
+capacity. Connections start at 1 MiB, with 512 KiB per stream, capped by the
+configured maxima (minimum 65535 bytes). Windows grow using forwarded throughput
+and PING round-trip time. Targets decrease after sustained low demand. Stream
+targets are half the connection target, bounded by the configured stream maximum.
 
-ExfilGuard applies these settings to client connections receiving uploads and
-upstream connections receiving responses, including connections opened during
-CONNECT preflight. Changes require a restart. These settings leave HTTP/1
-forwarding and CONNECT tunnels unchanged. The peer's receive windows govern
-outgoing DATA.
+Before advertising an increase, ExfilGuard reserves its allowance from the shared
+budget. When growth cannot fit, transfers continue using their existing windows.
+A new inspected HTTP/2 session needs both initial receiving allowances; it is
+closed if they cannot fit. Existing per-client connection limits still apply.
+Credit already advertised remains charged even after a target decreases, until
+it drains or its owning connection and streams close. A fully stalled connection
+cannot immediately return its reservation merely because its target shrinks.
 
-Larger windows improve throughput on high-bandwidth, high-latency links and can
-increase memory use when the receiver is slow. Memory is allocated as data
-arrives. Each connection has its own limits, and inspected HTTPS uses separate
-client and upstream connections. Total process memory also includes frame
-bookkeeping, TLS/TCP buffers, outgoing queues, headers, caching, and request
-bodies buffered for delegated authorization.
+By default, the budget is computed once at startup as half the effective finite
+cgroup memory limit (cgroup v1/v2 and visible ancestor limits), bounded by physical
+RAM. Without a finite limit, it is the smaller of 256 MiB and 25% of physical RAM.
+If RAM detection also fails, the fallback is 256 MiB. Detection errors are logged.
+Set `http2_receive_window_budget` explicitly to override detection. The selected
+budget and source are logged at startup. Changes require a restart.
 
-For deployments with limited memory, reduce the windows and measure throughput
-using [the local benchmarks](../perf/h2/README.md). Setting both values to 65535
-restores the previous receive-window sizes.
+These settings apply to inspected HTTP/2 uploads and responses. They leave HTTP/1
+forwarding and opaque CONNECT tunnels unchanged. The peer's receive windows govern
+outgoing DATA. Memory is allocated as DATA arrives; reservations are not allocations.
+This budget does not cap total process memory, which also includes frame metadata,
+TLS/TCP buffers, outgoing queues, headers, caching, and delegated authorization
+bodies. Automatic sizing does not establish exclusive ownership of host memory.
+
+Use [the local benchmarks](../perf/h2/README.md) when tuning the ceilings or budget.
+Adaptive growth can add startup time to fresh transfers. Setting both window
+ceilings to 65535 prevents growth beyond that size.
+
+Metrics `http2_receive_window_reserved_bytes` and `http2_receive_window_target_bytes`
+show aggregate charged and target allowances. `http2_receive_window_denied_total`
+has a bounded `operation` label (`admission` or `growth`).
 
 ---
 

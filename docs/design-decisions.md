@@ -2,27 +2,31 @@
 
 This file explains choices that may otherwise look like missing work.
 
-## Fixed HTTP/2 receive windows
+## Adaptive HTTP/2 receive windows
 
-ExfilGuard uses configurable HTTP/2 receive windows with per-stream and
-connection-wide limits. Larger windows improve throughput on high-bandwidth,
-high-latency links, but allow more data to accumulate when the receiving
-application is slow.
+Inspected HTTP/2 uses small initial receive windows and grows them using forwarding
+progress and peer RTT. The configured stream and connection windows are ceilings.
+A shared process-wide reservation budget covers both receiving directions across
+all clients. Growth requires capacity first; budget exhaustion leaves established
+connections using their current windows. Sessions whose initial allowance cannot
+fit are rejected without an admission queue.
 
-`proxy::http2::server` configures the windows for receiving client uploads.
-`proxy::http2::upstream` configures them for receiving upstream responses,
-including connections opened during CONNECT preflight.
+The budget accounts for permission already granted to send DATA, not just bytes
+currently buffered. Lowering a target cannot withdraw connection credit already
+advertised. Reservations therefore decrease only as receive capacity is released
+under the lower target, or after the connection and its body streams are dropped.
+Automatic releases for padding and resets are conservatively left charged. This
+may temporarily underuse the budget but cannot overcommit it. A stalled connection
+can retain its reservation until the existing timeouts end it.
 
-In `proxy::http2::forward`, `send_data_with_backpressure` waits for capacity on
-the outgoing stream. After forwarding a chunk, the caller releases the
-corresponding capacity on the incoming stream. When the receiver stops reading,
-this eventually stops the sender.
-
-The windows have fixed sizes to keep configuration and flow-control behavior
-simple. ExfilGuard does not estimate bandwidth and latency to adjust them
-automatically. Operators can tune the sizes using the
-[configuration settings](configuration.md#http2). The benchmarks in `perf/h2/`
-measure throughput and memory use with slow readers.
+Automatic budget selection uses half the effective finite cgroup memory limit,
+bounded by physical RAM. Without that limit it uses the smaller of 256 MiB and a
+quarter of physical RAM. The budget is selected once at startup; operators can
+supply an explicit byte limit. This is a receive-DATA budget, not a total RSS cap:
+TLS, protocol metadata, outgoing queues, caching, and authorization buffers need
+additional headroom. Adaptive sizing trades some fresh-transfer startup time for
+more concurrent slow connections; `perf/h2/` measures both startup and sustained
+throughput. This is not a per-client fairness scheduler.
 
 ## Canonical request data for policy
 

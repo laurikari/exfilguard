@@ -1,4 +1,94 @@
-# HTTP/2 receive-window measurements
+# Adaptive receive windows — 12 November 2026
+
+Compared the fixed-window proxy at `7457372` with adaptive windows and a shared
+receive-DATA budget. Both proxies used the same instrumented client and origin.
+The host is the ARM64 Linux VM described below. No compilation ran during these
+comparisons. An earlier compilation-contended run is retained but excluded here.
+
+## Sustained throughput and ramp-up
+
+Two repetitions per case, 1 Gbit/s, 100 ms RTT, 20 seconds from connection startup
+with no discarded warmup. Tail speed counts receiver-consumed bytes in the final
+**three seconds**. Upload delay was on the client side; download delay was on the
+origin side. The table shows the range across repetitions, in Mbit/s.
+
+| Transfer | Streams | Fixed-window tail | Adaptive tail |
+|---|---:|---:|---:|
+| Download | 1 | 947.3–947.3 | 947.3–947.3 |
+| Upload | 1 | 533.9–951.0 | 950.9–950.9 |
+| Download | 8 | 947.2–947.3 | 947.3–947.3 |
+| Upload | 8 | 951.0–951.0 | 951.0–951.0 |
+
+All candidate tails were approximately 947–951 Mbit/s, matching the rates the
+baseline could sustain. One baseline upload repeat slowed late in the run; this
+is retained rather than treated as evidence that adaptation inherently increases
+capacity. All these runs had zero queue drops, transfer errors, and payload errors.
+
+In the first candidate single-download run, successive seconds reached about
+74, 758, then 947 Mbit/s; every subsequent second stayed near 947. Its whole-run
+average was only 894 Mbit/s. This is the intended tradeoff: a short ramp, followed
+by full sustained speed. The harness now records per-second rates and tail medians.
+The historical 90% link-rate threshold is a diagnostic convention, not a reason
+alone to discard observations or declare a regression.
+
+## Fresh transfers
+
+Three repetitions, kernel-default TCP startup, warm certificate cache, 100 ms
+upstream RTT. Median proxied HTTP/2 completion seconds:
+
+| Body | Fixed windows | Adaptive |
+|---|---:|---:|
+| 1 KiB | 0.312 | 0.317 |
+| 64 KiB | 0.514 | 0.521 |
+| 1 MiB | 0.935 | 0.931 |
+| 8 MiB | 1.255 | 1.353 |
+| 32 MiB | 1.499 | 1.666 |
+
+## Memory and pressure
+
+All six adaptive slow/paused-reader cases passed, including continued progress
+of seven streams during another stream’s pause and subsequent resumption.
+
+- Fixed windows, eight slow upload sessions: 60 seconds measured, peak RSS 302.5 MiB; final 30-second range 293.4–302.5 MiB. All streams progressed.
+- Adaptive, eight slow upload sessions: 60 seconds measured, peak RSS 23.8 MiB; final 30-second range 23.6–23.8 MiB. All streams progressed.
+- Adaptive, sixteen sessions with two slow uploads each and a 32 MiB budget: 180 seconds measured, peak RSS 46.8 MiB; final 30-second range 46.8–46.8 MiB. All streams progressed.
+
+A mixed workload held forty-four slow sessions while an eight-stream fast transfer
+competed for the same 96 MiB budget. Its final tail reached 952.9 Mbit/s after
+the slow sessions closed. Raw per-second data records the slowdown under pressure
+and recovery after reservations were released.
+
+The budget bounds receive-DATA credit and buffering, not total RSS. Protocol
+bookkeeping, allocator retention, TLS, outgoing buffers, caching, and authorization
+bodies are separate. These measurements cover the listed scenarios, not every
+network or deployment.
+
+## Validation and artifacts
+
+`cargo fmt --check`, `cargo clippy --all-targets --all-features`, and all 723
+application tests passed. The benchmark receiver-counter boundary test also passed.
+New tests cover budget contention, rejection/recovery, adaptive growth/shrink,
+cgroup ancestor limits, and DATA sent under previously advertised credit after
+a target reduction (including padding).
+
+Raw reports, binaries, and the mixed-workload script are under
+`target/perf/adaptive/`. Key files: `{baseline,candidate}-tail.json`,
+`{baseline,candidate}-cold.json`, `{baseline,candidate}-slow-sessions.json`,
+`candidate-readers.json`, `candidate-pressure-long.json`, and `mixed.json`.
+
+```sh
+python3 perf/h2/run.py --binary target/perf/adaptive/baseline \
+  --endpoint-binary target/perf/adaptive/instrumented --profile screen \
+  --skip-http1 --warmup 0 --seconds 20 --repetitions 2 \
+  --output target/perf/adaptive/baseline-tail.json
+# Repeat with --binary target/perf/adaptive/instrumented for the candidate.
+```
+
+Baseline proxy SHA-256: `f63ef9eb407a22b54b364c98fd1e48b8ad4c72419a4573572ced6a4c992c27b0`.
+Candidate proxy and common endpoint SHA-256: `a927a10d554fa17624c86efffd0953ac9af04dd4c478594f7eb2689aa72c24dc`.
+
+
+# Historical fixed-window selection — October 2026
 
 Measured on 15–16 October 2026. The selected defaults are **32 MiB per stream**
 and **64 MiB per connection**, applied independently to the client and upstream

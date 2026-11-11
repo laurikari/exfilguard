@@ -476,6 +476,8 @@ pub struct Settings {
     pub http2_stream_window_size: u32,
     #[serde(default = "SettingsDefaults::http2_connection_window_size")]
     pub http2_connection_window_size: u32,
+    #[serde(default)]
+    pub http2_receive_window_budget: Option<u64>,
     #[serde(default = "SettingsDefaults::max_request_header_size")]
     pub max_request_header_size: usize,
     #[serde(default = "SettingsDefaults::max_response_header_size")]
@@ -847,6 +849,10 @@ impl Settings {
             self.http2_max_concurrent_streams > 0,
             "http2_max_concurrent_streams must be at least 1 (got {})",
             self.http2_max_concurrent_streams
+        );
+        ensure!(
+            self.http2_receive_window_budget != Some(0),
+            "http2_receive_window_budget must be positive"
         );
         for (name, value) in [
             ("http2_stream_window_size", self.http2_stream_window_size),
@@ -1762,6 +1768,7 @@ policies = "policies.toml"
             http2_max_concurrent_streams: 100,
             http2_stream_window_size: 32 * 1024 * 1024,
             http2_connection_window_size: 64 * 1024 * 1024,
+            http2_receive_window_budget: None,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -1837,6 +1844,7 @@ policies = "policies.toml"
             http2_max_concurrent_streams: 100,
             http2_stream_window_size: 32 * 1024 * 1024,
             http2_connection_window_size: 64 * 1024 * 1024,
+            http2_receive_window_budget: None,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -1901,6 +1909,7 @@ policies = "policies.toml"
             http2_max_concurrent_streams: 100,
             http2_stream_window_size: 32 * 1024 * 1024,
             http2_connection_window_size: 64 * 1024 * 1024,
+            http2_receive_window_budget: None,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,
@@ -1958,6 +1967,7 @@ policies = "policies.toml"
             http2_max_concurrent_streams: 100,
             http2_stream_window_size: 32 * 1024 * 1024,
             http2_connection_window_size: 64 * 1024 * 1024,
+            http2_receive_window_budget: None,
             max_request_header_size: 1024,
             max_response_header_size: 1024,
             max_request_body_size: 1024,

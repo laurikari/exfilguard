@@ -49,6 +49,8 @@ enum Command {
         stream_window: Option<u32>,
         #[arg(long)]
         connection_window: Option<u32>,
+        #[arg(long)]
+        receive_budget: Option<u64>,
     },
     Origin {
         #[arg(long, default_value = "0.0.0.0:8443")]
@@ -113,6 +115,8 @@ struct Transfer {
 #[derive(Default)]
 struct Stats {
     bytes: AtomicU64,
+    tail_bytes: AtomicU64,
+    seconds_bytes: [AtomicU64; 32],
     errors: AtomicU64,
     first_ns: AtomicU64,
     streams: Mutex<Vec<Arc<StreamProgress>>>,
@@ -126,6 +130,12 @@ struct StreamProgress {
 }
 
 impl Stats {
+    fn seconds_bytes(&self) -> Vec<u64> {
+        self.seconds_bytes
+            .iter()
+            .map(|v| v.load(Ordering::Relaxed))
+            .collect()
+    }
     fn stream_progress(&self) -> Vec<serde_json::Value> {
         self.streams
             .lock()
@@ -184,15 +194,31 @@ async fn serve_probe(socket: UdpSocket) -> std::io::Result<()> {
 }
 
 fn record(stats: &Stats, transfer: &Transfer, data: &[u8]) -> Result<u64> {
-    ensure!(data.iter().all(|byte| *byte == b'x'), "corrupt payload");
     let now = now_ns();
+    record_at(stats, transfer, data, now)?;
+    Ok(now)
+}
+
+fn record_at(stats: &Stats, transfer: &Transfer, data: &[u8], now: u64) -> Result<()> {
+    ensure!(data.iter().all(|byte| *byte == b'x'), "corrupt payload");
     let _ = stats
         .first_ns
         .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
     if now >= transfer.start_ns && now < transfer.end_ns {
         stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        let second = ((now - transfer.start_ns) / 1_000_000_000) as usize;
+        if let Some(bucket) = stats.seconds_bytes.get(second) {
+            bucket.fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        if transfer.end_ns != u64::MAX
+            && now >= transfer.end_ns - (transfer.end_ns - transfer.start_ns).min(3_000_000_000)
+        {
+            stats
+                .tail_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
     }
-    Ok(now)
+    Ok(())
 }
 
 async fn pace(transfer: &Transfer, first: &mut bool) {
@@ -549,6 +575,7 @@ async fn main() -> Result<()> {
             listen,
             stream_window,
             connection_window,
+            receive_budget,
         } => {
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
@@ -557,6 +584,7 @@ async fn main() -> Result<()> {
             let mut settings: exfilguard::settings::Settings = toml::from_str(
                 "listen='127.0.0.1:3128'\nclients='clients.toml'\npolicies='policies.toml'\nca={source='builtin',dir='ca'}",
             )?;
+            settings.http2_receive_window_budget = receive_budget;
             if let Some(value) = stream_window {
                 settings.http2_stream_window_size = value;
             }
@@ -581,6 +609,7 @@ async fn main() -> Result<()> {
                     target.listen = listen;
                     target.http2_stream_window_size = settings.http2_stream_window_size;
                     target.http2_connection_window_size = settings.http2_connection_window_size;
+                    target.http2_receive_window_budget = settings.http2_receive_window_budget;
                     target.client_keepalive_idle_timeout = 120;
                     target.request_body_idle_timeout = 120;
                     target.response_body_idle_timeout = 120;
@@ -607,7 +636,7 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = admin.accept().await.unwrap();
-                    let result = json!({"bytes":admin_stats.bytes.load(Ordering::Relaxed), "errors":admin_stats.errors.load(Ordering::Relaxed), "stream_progress":admin_stats.stream_progress()});
+                    let result = json!({"bytes":admin_stats.bytes.load(Ordering::Relaxed), "tail_bytes":admin_stats.tail_bytes.load(Ordering::Relaxed), "seconds_bytes":admin_stats.seconds_bytes(), "errors":admin_stats.errors.load(Ordering::Relaxed), "stream_progress":admin_stats.stream_progress()});
                     let _ = socket.write_all(result.to_string().as_bytes()).await;
                 }
             });
@@ -731,9 +760,39 @@ async fn main() -> Result<()> {
             let first_ns = stats.first_ns.load(Ordering::Relaxed);
             println!(
                 "{}",
-                json!({"bytes":stats.bytes.load(Ordering::Relaxed), "seconds":if bytes.is_some() { elapsed } else { seconds as f64 }, "elapsed":elapsed, "first_byte_seconds":if first_ns == 0 { None } else { Some((first_ns - started) as f64 / 1e9) }, "errors":*errors.lock().unwrap(), "started_ns":started, "stream_progress":stats.stream_progress()})
+                json!({"bytes":stats.bytes.load(Ordering::Relaxed), "tail_bytes":stats.tail_bytes.load(Ordering::Relaxed), "seconds_bytes":stats.seconds_bytes(), "seconds":if bytes.is_some() { elapsed } else { seconds as f64 }, "elapsed":elapsed, "first_byte_seconds":if first_ns == 0 { None } else { Some((first_ns - started) as f64 / 1e9) }, "errors":*errors.lock().unwrap(), "started_ns":started, "stream_progress":stats.stream_progress()})
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    #[test]
+    fn receiver_counts_interval_tail_and_seconds_with_exclusive_deadline() {
+        let transfer = Transfer {
+            target: "127.0.0.1:1".parse().unwrap(),
+            proxy: None,
+            upload: false,
+            size: BODY_SIZE,
+            start_ns: 2_000_000_000,
+            end_ns: 12_000_000_000,
+            read_delay_ms: 0,
+            pause_ms: 0,
+            pause_deadline_ns: 0,
+        };
+        let stats = Stats::default();
+        for second in [1, 2, 9, 11, 12] {
+            record_at(&stats, &transfer, b"xxxx", second * 1_000_000_000).unwrap();
+        }
+        assert_eq!(stats.bytes.load(Ordering::Relaxed), 12);
+        assert_eq!(stats.tail_bytes.load(Ordering::Relaxed), 8);
+        assert_eq!(stats.seconds_bytes()[0], 4);
+        assert_eq!(stats.seconds_bytes()[7], 4);
+        assert_eq!(stats.seconds_bytes()[9], 4);
+        assert_eq!(stats.seconds_bytes().iter().sum::<u64>(), 12);
+        assert!(record_at(&stats, &transfer, b"bad", 3_000_000_000).is_err());
+    }
 }

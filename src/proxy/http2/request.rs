@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use h2::RecvStream;
 use http::{self, HeaderMap, HeaderName, HeaderValue, Uri};
 
 use crate::{
@@ -31,11 +30,11 @@ impl SanitizedRequest {
     }
 }
 
-pub(super) fn sanitize_request(
-    request: http::Request<RecvStream>,
+pub(super) fn sanitize_request<B>(
+    request: http::Request<B>,
     max_header_bytes: usize,
     flow_context: &RequestFlowContext,
-) -> Result<(SanitizedRequest, RecvStream)> {
+) -> Result<(SanitizedRequest, B)> {
     let sanitized = sanitize_request_parts(
         request.method(),
         request.uri(),

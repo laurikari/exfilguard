@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::future::poll_fn;
-use h2::{RecvStream, SendStream};
+use h2::SendStream;
 use h2::{client, server::SendResponse};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use tokio::{sync::Mutex, time::timeout};
@@ -28,6 +28,8 @@ use super::{
     request::{SanitizedRequest, build_upstream_uri},
     upstream::UpstreamCheckout,
 };
+
+use super::window::Body;
 
 const HEADER_PADDING: usize = 4;
 
@@ -107,7 +109,7 @@ async fn open_upstream_stream(
 
 #[allow(clippy::too_many_arguments)]
 async fn upload_request_body(
-    body: &mut RecvStream,
+    body: &mut Body,
     send_stream: &mut SendStream<Bytes>,
     body_tracker: &mut BodySizeTracker,
     request_body_timeout: Duration,
@@ -135,8 +137,7 @@ async fn upload_request_body(
             "forwarding HTTP/2 request body upstream",
         )
         .await?;
-        body.flow_control()
-            .release_capacity(chunk_len)
+        body.release(chunk_len, true)
             .context("failed to release HTTP/2 request body flow-control capacity")?;
     }
 
@@ -171,7 +172,7 @@ async fn upload_request_body(
 }
 
 pub(super) async fn buffer_request_body(
-    body: &mut RecvStream,
+    body: &mut Body,
     request_body_timeout: Duration,
     request_deadline: Option<Instant>,
     max_request_body_size: usize,
@@ -189,8 +190,7 @@ pub(super) async fn buffer_request_body(
         let chunk_len = chunk.len();
         tracker.record(chunk_len)?;
         buffered.extend_from_slice(&chunk);
-        body.flow_control()
-            .release_capacity(chunk_len)
+        body.release(chunk_len, false)
             .context("failed to release HTTP/2 request body flow-control capacity")?;
     }
     let trailers = with_total_deadline(request_deadline, async {
@@ -219,7 +219,7 @@ struct RelayedResponse {
 
 #[allow(clippy::too_many_arguments)]
 async fn relay_upstream_response(
-    response: http::Response<RecvStream>,
+    response: http::Response<Body>,
     respond: &mut SendResponse<Bytes>,
     response_body_timeout: Duration,
     request_deadline: Option<Instant>,
@@ -335,8 +335,7 @@ async fn relay_upstream_response(
             .await?;
             response_progress.add_bytes(chunk_len as u64);
             response_body
-                .flow_control()
-                .release_capacity(chunk_len)
+                .release(chunk_len, true)
                 .context("failed to release HTTP/2 response body flow-control capacity")?;
         }
 
@@ -420,7 +419,7 @@ impl ForwardOutcome {
 pub(super) async fn forward_request_to_upstream(
     checkout: UpstreamCheckout,
     meta: SanitizedRequest,
-    body: &mut RecvStream,
+    body: &mut Body,
     respond: &mut SendResponse<Bytes>,
     request_body_timeout: Duration,
     response_header_timeout: Duration,
@@ -468,6 +467,7 @@ pub(super) async fn forward_request_to_upstream(
     let receive_response = async {
         response_fut
             .await
+            .map(|response| response.map(|body| Body::new(body, checkout.window.clone())))
             .context("failed while receiving HTTP/2 response from upstream")
     };
     tokio::pin!(receive_response);
@@ -602,6 +602,7 @@ pub(super) async fn forward_finalized_request_to_upstream(
     let receive_response = async {
         response_fut
             .await
+            .map(|response| response.map(|body| Body::new(body, checkout.window.clone())))
             .context("failed while receiving HTTP/2 response from upstream")
     };
     tokio::pin!(receive_response);

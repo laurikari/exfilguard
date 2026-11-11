@@ -55,6 +55,7 @@ pub struct AppContext {
     pub(crate) proxy_tls: Option<Arc<crate::tls::proxy::ProxyTls>>,
     pub(crate) password_verifier: Arc<crate::authentication::PasswordVerifier>,
     client_connections: Arc<admission::ClientConnectionLimiter>,
+    pub(crate) http2_windows: Arc<http2::window::Budget>,
     proxy_protocol_pending_connections: Arc<Semaphore>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
 }
@@ -107,6 +108,7 @@ impl AppContext {
             password_verifier: Arc::new(crate::authentication::PasswordVerifier::new(
                 &settings.authentication,
             )),
+            http2_windows: http2::window::Budget::new(&settings),
             settings,
             policies,
             tls,

@@ -89,8 +89,8 @@ Throughput counts bytes consumed by the receiver during the measurement interval
 Upload counts come from the upstream server's loopback control socket. All
 containers use the host's monotonic clock. Timed runs cancel their 1 TiB transfers
 at the deadline.
-The `cold` profile opens fresh TCP/TLS connections, transfers complete 1 KiB and
-64 KiB bodies, and reports completion and first-byte times separately. The proxy's
+The `cold` profile opens fresh TCP/TLS connections, transfers complete 1 KiB,
+64 KiB, 1 MiB, 8 MiB, and 32 MiB bodies, and reports completion and first-byte times separately. The proxy's
 certificate cache remains warm between connections.
 
 `readers` measures slow readers, one paused stream alongside seven active
@@ -107,3 +107,29 @@ route and offload settings, memory and CPU samples, tool versions, revision,
 diff summary, and binary SHA-256. Keep raw files under `target/perf/`.
 [RESULTS.md](RESULTS.md) records the measurements, benchmark limitations, and
 default-window selection.
+
+## Adaptive windows and sustained speed
+
+For adaptive-window comparisons, use `--warmup 0 --seconds 20` to retain the ramp
+and inspect `per_second_mbps` (up to 32 seconds) and `tail_mbps` (the final three
+seconds, or the entire measured interval if shorter). Both upload and download
+counts come from the receiver. Case summaries include `tail_medians` alongside
+the original interval averages. Fresh-transfer completion remains a separate cost.
+A lower average during window growth is expected; compare the eventual plateau,
+not just the average, when evaluating sustained throughput.
+
+The existing 90% link-rate criterion is a diagnostic convention. Retain and examine
+runs below it: direct/proxy distributions, the time series, CPU noise, queue drops,
+and transfer errors determine how useful a comparison is. A threshold alone does
+not establish a regression or make a measurement worthless.
+
+`--endpoint-binary PATH` runs the same instrumented client and origin with either
+an old or new proxy selected by `--binary`, so baseline proxy builds need not change
+to add measurements. Reports include both binary hashes.
+
+For budget pressure, combine `--profile readers --reader-case upload/sessions`
+with `--reader-sessions 16 --reader-streams 2 --receive-budget 33554432` and extend
+`--seconds` to inspect memory stabilization. These arguments change only the
+benchmark proxy and workload.
+
+Use `--skip-http1` when comparing only direct and proxied HTTP/2.

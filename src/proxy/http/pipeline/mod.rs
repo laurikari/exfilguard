@@ -123,6 +123,7 @@ name = "allow"
             http2_max_concurrent_streams: 100,
             http2_stream_window_size: 32 * 1024 * 1024,
             http2_connection_window_size: 64 * 1024 * 1024,
+            http2_receive_window_budget: None,
             max_request_header_size: 4096,
             max_response_header_size: 4096,
             max_request_body_size: 1024 * 1024,

@@ -12,11 +12,12 @@ log = "text"
 # Use /32 or /128 for a single address.
 allow_private_upstream_cidrs = []
 
-# HTTP/2 receive-window sizes in bytes. Larger windows can improve throughput
-# on high-latency links and increase memory use with slow receivers.
+# Adaptive HTTP/2 receive-window ceilings in bytes. Growth uses a shared budget.
 # Changes require a restart.
 http2_stream_window_size = 33554432
 http2_connection_window_size = 67108864
+# Optional explicit budget; omitted selects an automatic memory-based allowance.
+# http2_receive_window_budget = 268435456
 
 # Enable HTTPS on the proxy listener with a certificate for its hostname.
 # [proxy_tls]

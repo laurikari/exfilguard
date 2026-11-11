@@ -12,6 +12,7 @@ use tokio::{
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use tracing::debug;
 
+use super::window::{Controller, Window};
 use crate::{
     config::Scheme,
     proxy::{
@@ -38,6 +39,7 @@ pub(super) struct Http2Upstream {
     primed: Option<PrimedHttp2Upstream>,
     closed_tx: watch::Sender<bool>,
     closed_rx: watch::Receiver<bool>,
+    window: Arc<Window>,
 }
 
 pub(super) struct UpstreamHandle {
@@ -52,6 +54,7 @@ pub(super) struct UpstreamCheckout {
     pub sender: Arc<Mutex<client::SendRequest<Bytes>>>,
     pub peer: SocketAddr,
     pub reused_existing: bool,
+    pub window: Arc<Window>,
 }
 
 impl Http2Upstream {
@@ -59,6 +62,7 @@ impl Http2Upstream {
         app: AppContext,
         binding: ResolvedTarget,
         primed: Option<PrimedHttp2Upstream>,
+        window: Arc<Window>,
     ) -> Self {
         let (closed_tx, closed_rx) = watch::channel(false);
         Self {
@@ -68,6 +72,7 @@ impl Http2Upstream {
             primed,
             closed_tx,
             closed_rx,
+            window,
         }
     }
 
@@ -97,6 +102,7 @@ impl Http2Upstream {
             sender: handle.sender.clone(),
             peer: handle.peer,
             reused_existing,
+            window: self.window.clone(),
         })
     }
 
@@ -132,8 +138,7 @@ impl Http2Upstream {
                     .max_response_header_size
                     .min(u32::MAX as usize) as u32,
                 self.closed_tx.clone(),
-                self.app.settings.http2_stream_window_size,
-                self.app.settings.http2_connection_window_size,
+                self.window.clone(),
             )
             .await;
         }
@@ -179,8 +184,7 @@ impl Http2Upstream {
                 .max_response_header_size
                 .min(u32::MAX as usize) as u32,
             self.closed_tx.clone(),
-            self.app.settings.http2_stream_window_size,
-            self.app.settings.http2_connection_window_size,
+            self.window.clone(),
         )
         .await
     }
@@ -219,24 +223,38 @@ async fn make_handle_from_stream(
     peer: SocketAddr,
     max_response_header_size: u32,
     closed_tx: watch::Sender<bool>,
-    stream_window_size: u32,
-    connection_window_size: u32,
+    window: Arc<Window>,
 ) -> Result<UpstreamHandle> {
     let builder = client_builder(
         max_response_header_size,
-        stream_window_size,
-        connection_window_size,
+        window.stream_target(),
+        window.target(),
     );
     let metrics = crate::metrics::track_upstream_connection();
     let task_metrics = metrics.clone();
-    let (sender, connection) = builder
+    let (sender, mut connection) = builder
         .handshake(tls_stream)
         .await
         .context("failed to complete HTTP/2 handshake with upstream")?;
 
+    let controller = Controller::new(
+        window.clone(),
+        connection.ping_pong().expect("unused ping handle"),
+    );
     let task = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            debug!(error = %err, "HTTP/2 upstream connection terminated with error");
+        let _reservation = window;
+        let mut controller = controller;
+        let mut connection = connection;
+        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                result = &mut connection => {
+                    if let Err(err) = result { debug!(%err, "HTTP/2 upstream connection terminated with error"); }
+                    break;
+                }
+                sample = controller.sample() => if let Some(sample) = sample { controller.update(Some(sample), &mut connection); },
+                _ = maintenance.tick() => controller.update(None, &mut connection),
+            }
         }
         task_metrics.close();
         let _ = closed_tx.send(true);
@@ -263,6 +281,14 @@ fn client_builder(
         .initial_window_size(stream_window_size)
         .initial_connection_window_size(connection_window_size);
     builder
+}
+
+impl Drop for Http2Upstream {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.connection_task.abort();
+        }
+    }
 }
 
 #[cfg(test)]

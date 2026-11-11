@@ -24,11 +24,13 @@ def command(*args, check=True):
 
 
 class Rig:
-    def __init__(self, binary, image, receive_window):
+    def __init__(self, binary, image, receive_window, receive_budget=None, endpoint_binary=None):
         self.prefix = "exfilguard-h2-" + uuid.uuid4().hex[:10]
         self.binary = binary
+        self.endpoint_binary = endpoint_binary or binary
         self.image = image
         self.receive_window = receive_window
+        self.receive_budget = receive_budget
         self.containers = []
         self.networks = []
         self.volume = None
@@ -60,7 +62,7 @@ class Rig:
             self.containers.append(name)
             if node == "proxy":
                 command("docker", "network", "connect", "--ip", "10.221.2.3", self.prefix + "-back", name)
-            command("docker", "cp", self.binary, name + ":/h2-perf")
+            command("docker", "cp", self.binary if node == "proxy" else self.endpoint_binary, name + ":/h2-perf")
             command("docker", "start", name)
         self.exec("client", "ip", "route", "add", "10.221.2.0/24", "via", "10.221.1.3")
         self.exec("origin", "ip", "route", "add", "10.221.1.0/24", "via", "10.221.2.3")
@@ -120,7 +122,8 @@ class Rig:
             else:
                 raise RuntimeError("previous proxy did not stop")
         self.background("proxy", ["/h2-perf", "proxy", "--stream-window", str(pair[0]),
-                                   "--connection-window", str(pair[1])])
+                                   "--connection-window", str(pair[1])] +
+                        (["--receive-budget", str(self.receive_budget)] if self.receive_budget is not None else []))
         for _ in range(100):
             if ":3128" in self.exec("proxy", "ss", "-ltn"):
                 self.proxy_running = True
@@ -191,10 +194,17 @@ class Rig:
         after = self.stats()
         if upload:
             result["bytes"] = after["bytes"] - before["bytes"]
+            if "tail_bytes" in after:
+                result["tail_bytes"] = after["tail_bytes"] - before["tail_bytes"]
+                result["seconds_bytes"] = [a-b for a,b in zip(after["seconds_bytes"], before["seconds_bytes"])]
             result["stream_progress"] = after["stream_progress"][len(before["stream_progress"]):]
         if result["errors"] or after["errors"] != before["errors"]:
             raise RuntimeError(f"transfer failed: {result}\n" + self.exec("proxy", "cat", "/data/proxy.stderr"))
         result.update(mode=mode, resources=samples, mbps=result["bytes"] * 8 / result["seconds"] / 1e6)
+        if "tail_bytes" in result and "--bytes" not in extra:
+            result["tail_seconds"] = min(3, args.seconds)
+            result["tail_mbps"] = result["tail_bytes"] * 8 / result["tail_seconds"] / 1e6
+            result["per_second_mbps"] = [v * 8 / 1e6 for v in result["seconds_bytes"][:min(args.seconds, 32)]]
         return result
 
     def close(self):
@@ -235,10 +245,15 @@ def queue_drop_count(qdiscs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, default=ROOT / "target/release/examples/h2-perf")
+    parser.add_argument("--endpoint-binary", type=pathlib.Path, help="instrumented client/origin binary; proxy still uses --binary")
     parser.add_argument("--image", default="exfilguard-h2-perf-tools")
     parser.add_argument("--profile", choices=["smoke", "screen", "full", "readers", "cold"], default="screen")
+    parser.add_argument("--receive-budget", type=int, help="candidate proxy receive-window budget in bytes")
+    parser.add_argument("--reader-sessions", type=int, default=8)
+    parser.add_argument("--reader-streams", type=int, default=1)
     parser.add_argument("--windows", default="32/64", help="stream/connection MiB; 'baseline' uses 65535 bytes")
     parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument("--skip-http1", action="store_true", help="compare only direct and proxied HTTP/2")
     parser.add_argument("--fail-fast", action="store_true", help="stop after the first failing case")
     parser.add_argument("--case", action="append", dest="case_filter",
                         help="select rate/RTT/placement/upload|download/streams; repeat to select several")
@@ -269,11 +284,13 @@ def main():
             parser.error("--case must name a throughput case in the selected profile")
         cases = [case for case in cases if case_name(case) in args.case_filter]
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    rig = Rig(args.binary.resolve(), args.image, 65535 if args.profile == "readers" else 128 * MIB)
+    rig = Rig(args.binary.resolve(), args.image, 65535 if args.profile == "readers" else 128 * MIB, args.receive_budget, args.endpoint_binary.resolve() if args.endpoint_binary else None)
     report = {"revision": command("git", "-C", ROOT, "rev-parse", "HEAD"),
               "rig": rig.prefix,
               "binary_sha256": hashlib.file_digest(args.binary.open("rb"), "sha256").hexdigest(),
+              "endpoint_binary_sha256": hashlib.file_digest(rig.endpoint_binary.open("rb"), "sha256").hexdigest(),
               "diff": command("git", "-C", ROOT, "diff", "--stat"),
+              "receive_budget": args.receive_budget,
               "windows": pair, "profile": args.profile,
               "case_filter": args.case_filter,
               "reader_case": args.reader_case,
@@ -305,7 +322,7 @@ def main():
             report["rtt_probes"] = rig.shape(1000, 20, "upstream")
             for upload in [False, True]:
                 for kind, streams, sessions, delay, pause in [
-                    ("slow", 1, 1, 20, 0), ("paused", 8, 1, 0, 5000), ("sessions", 1, 8, 20, 0)
+                    ("slow", 1, 1, 20, 0), ("paused", 8, 1, 0, 5000), ("sessions", args.reader_streams, args.reader_sessions, 20, 0)
                 ]:
                     if args.reader_case and args.reader_case != f"{'upload' if upload else 'download'}/{kind}":
                         continue
@@ -341,7 +358,7 @@ def main():
                 probes = rig.shape(rate, rtt, placement)
                 runs = []
                 for repetition in range(args.repetitions):
-                    modes = ["direct_h2", "proxy_h2", "proxy_h1"]
+                    modes = ["direct_h2", "proxy_h2"] if args.skip_http1 else ["direct_h2", "proxy_h2", "proxy_h1"]
                     if repetition % 2:
                         modes.reverse()
                     for mode in modes:
@@ -351,12 +368,13 @@ def main():
                         report["runs"].append(result)
                         save()
                 medians = {mode: statistics.median(r["mbps"] for r in runs if r["mode"] == mode)
-                           for mode in ["direct_h2", "proxy_h2", "proxy_h1"]}
+                           for mode in modes}
                 qdiscs = rig.qdiscs()
                 drops = queue_drop_count(qdiscs)
                 valid = medians["direct_h2"] >= rate * 0.9 and drops == 0
                 ratio = medians["proxy_h2"] / medians["direct_h2"] if medians["direct_h2"] else 0
-                summary = dict(case, medians=medians, ratio=ratio, valid=valid, passed=valid and ratio >= 0.9,
+                tail_medians = {mode: statistics.median(r["tail_mbps"] for r in runs if r["mode"] == mode) for mode in medians} if all("tail_mbps" in r for r in runs) else None
+                summary = dict(case, medians=medians, tail_medians=tail_medians, ratio=ratio, valid=valid, passed=valid and ratio >= 0.9,
                                rtt_probes=probes, qdiscs=qdiscs)
                 report["cases"].append(summary)
                 save()
@@ -368,9 +386,9 @@ def main():
             report["cold_tcp_routes"] = rig.tcp_windows(0)
             report["cold_rtt_probes"] = rig.shape(1000, 100, "upstream")
             report["cold"] = []
-            for size in [1024, 65536]:
+            for size in [1024, 65536, 1 * MIB, 8 * MIB, 32 * MIB]:
                 for repetition in range(args.repetitions):
-                    modes = ["direct_h2", "proxy_h2", "proxy_h1"]
+                    modes = ["direct_h2", "proxy_h2"] if args.skip_http1 else ["direct_h2", "proxy_h2", "proxy_h1"]
                     for mode in (list(reversed(modes)) if repetition % 2 else modes):
                         result = rig.run(mode, False, 1, args, ["--bytes", str(size)])
                         result.update(size=size, repetition=repetition)
