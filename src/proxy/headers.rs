@@ -18,11 +18,14 @@ pub enum HeaderDisposition {
 
 /// Returns true when the header conveys forwarding metadata that should be stripped.
 pub fn is_forwarding_header(name: &str) -> bool {
+    // CGI/WSGI mappings can make underscores indistinguishable from hyphens.
+    // Normalize only for this comparison; forwarded header names stay unchanged.
+    let name = name.replace('_', "-");
     if name.starts_with("x-forwarded-") {
         return true;
     }
     matches!(
-        name,
+        name.as_str(),
         "forwarded"
             | "x-real-ip"
             | "x-client-ip"
@@ -548,9 +551,35 @@ mod tests {
         let sanitized = sanitize_request_trailer_lines(&[
             "Digest: sha-256=abc".to_string(),
             "X-Forwarded-For: 127.0.0.1".to_string(),
+            "X_Forwarded_For: 127.0.0.1".to_string(),
+            "X-Forwarded_Host: internal.example".to_string(),
+            "X_Real-IP: 127.0.0.1".to_string(),
+            "X_Custom_Header: keep_me".to_string(),
         ])
         .expect("sanitize request trailers");
-        assert_eq!(sanitized, vec![b"Digest: sha-256=abc\r\n".to_vec()]);
+        assert_eq!(
+            sanitized,
+            vec![
+                b"Digest: sha-256=abc\r\n".to_vec(),
+                b"X_Custom_Header: keep_me\r\n".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_trailer_map_strips_forwarding_aliases() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x_forwarded_for",
+            "x-forwarded_host",
+            "x_real-ip",
+            "x_custom_header",
+        ] {
+            headers.insert(name, HeaderValue::from_static("keep_me"));
+        }
+        let sanitized = sanitize_request_trailer_map(&headers, 1024).unwrap();
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized["x_custom_header"], "keep_me");
     }
 
     #[test]

@@ -233,14 +233,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(accepted.credential_reference.as_ref(), "profile-a");
-        assert!(
-            build_dynamic_credential(
-                "profile-a".to_string(),
-                vec!["cookie".to_string()],
-                BodyAccess::None,
-            )
-            .is_err()
-        );
+        for forbidden in ["cookie", "X_Forwarded_For", "X-Forwarded_Host", "X_Real_IP"] {
+            assert!(
+                build_dynamic_credential(
+                    "profile-a".to_string(),
+                    vec![forbidden.to_string()],
+                    BodyAccess::None,
+                )
+                .is_err(),
+                "{forbidden}"
+            );
+        }
     }
 
     #[test]

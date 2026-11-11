@@ -71,7 +71,8 @@ fn build_header_name(bytes: &[u8]) -> Option<HeaderName> {
         let ch = match b % 38 {
             0..=25 => (b'a' + (b % 26)) as char,
             26..=35 => (b'0' + (b % 10)) as char,
-            _ => '-',
+            36 => '-',
+            _ => '_',
         };
         if name.is_empty() && ch == '-' {
             continue;

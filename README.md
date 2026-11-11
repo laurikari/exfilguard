@@ -361,6 +361,10 @@ encoded values, repeated parameters, and query-bearing absolute URLs without a
 path. The `http2_request_sanitize` seeds cover absent, empty, repeated, and nested
 queries using that target's binary host/path encoding.
 
+Forwarding-header alias seeds cover underscore and mixed hyphen/underscore
+spellings alongside an unrelated underscore header. They exercise HTTP/1 and
+HTTP/2 request headers and HTTP/1 chunked trailers.
+
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,
 conflicting transfer encoding, and a forged response appended after a 204:

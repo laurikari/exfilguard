@@ -214,6 +214,36 @@ mod tests {
     use super::Http1HeaderAccumulator;
 
     #[test]
+    fn forwarding_aliases_are_stripped_without_rewriting_other_headers() -> anyhow::Result<()> {
+        let mut accumulator = Http1HeaderAccumulator::new(2048);
+        for name in [
+            "Forwarded",
+            "X-Forwarded-For",
+            "X_Forwarded_For",
+            "X_Forwarded_Host",
+            "x_fOrWaRdEd-Proto",
+            "X-Forwarded_Port",
+            "X_Real_IP",
+            "X_Client_IP",
+            "X_Cluster_Client_IP",
+            "True_Client_IP",
+            "CF_Connecting_IP",
+            "Fastly_Client_IP",
+            "Fly_Client_IP",
+            "Custom_Client-IP",
+            "X_Custom_Header",
+        ] {
+            accumulator.push_line(&format!("{name}: keep_me\r\n"))?;
+        }
+        let forwarded: Vec<_> = accumulator
+            .forward_headers()
+            .map(|header| (header.name_text(), header.value_text()))
+            .collect();
+        assert_eq!(forwarded, vec![("X_Custom_Header", "keep_me")]);
+        Ok(())
+    }
+
+    #[test]
     fn upgrade_detection_survives_header_sanitization() -> anyhow::Result<()> {
         for lines in [
             vec!["Upgrade: websocket\r\n", "Connection: Upgrade\r\n"],

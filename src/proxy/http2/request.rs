@@ -219,6 +219,32 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_request_strips_forwarding_aliases() -> Result<()> {
+        let uri: Uri = "https://example.com/".parse()?;
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x_forwarded_for",
+            "x_forwarded-host",
+            "cf_connecting_ip",
+            "x_custom_header",
+        ] {
+            headers.insert(name, HeaderValue::from_static("keep_me"));
+        }
+        let flow_context = RequestFlowContext {
+            session_id: "test-session".into(),
+            outer_method: "CONNECT".into(),
+            effective_mode: EffectiveMode::Bump,
+            authorization_token: None,
+            client_session: None,
+        };
+        let sanitized = sanitize_request_parts(&Method::GET, &uri, &headers, 1024, &flow_context)?;
+        let forwarded = sanitized.forward_header_map();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded["x_custom_header"], "keep_me");
+        Ok(())
+    }
+
+    #[test]
     fn build_upstream_uri_preserves_authority_and_path() -> Result<()> {
         for authority in [
             "example.com",

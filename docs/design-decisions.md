@@ -348,6 +348,11 @@ By default, it trusts the immediate peer address. If you enable PROXY protocol
 and trust the sender, it may use the address from that header instead. It does
 not use `X-Forwarded-For` or similar HTTP headers for client identity.
 
+Client-supplied forwarding metadata is stripped from request headers and
+trailers. This comparison treats underscores as hyphens because CGI/WSGI
+gateways can map both spellings to the same application field. Normalization
+is confined to this check; unrelated underscore headers retain their names.
+
 Allowlisted PROXY peers are trusted infrastructure and must send their complete
 header promptly as the first bytes on the backend connection. A timeout and a
 separate pending-connection limit bound resource retention if that
