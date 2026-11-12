@@ -1,5 +1,4 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -7,7 +6,7 @@ use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::{
     io::AsyncReadExt,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::OwnedSemaphorePermit,
     time::{sleep, timeout},
 };
 use tracing::{debug, error, info, warn};
@@ -27,13 +26,9 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind listener on {}", bind_addr))?;
     let local_addr = listener.local_addr().unwrap_or(bind_addr);
-    info!(address = %local_addr, tls = app.proxy_tls.is_some(), max_connections = app.settings.max_connections, "proxy listener started");
-    let connections = Arc::new(Semaphore::new(app.settings.max_connections));
+    info!(address = %local_addr, tls = app.proxy_tls.is_some(), "proxy listener started");
 
     loop {
-        // Leave excess arrivals in the bounded kernel backlog, before spawning
-        // a task or beginning PROXY protocol, TLS, or authentication work.
-        let permit = connections.clone().acquire_owned().await?;
         let (stream, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
             Err(err) => {
@@ -65,7 +60,6 @@ pub async fn start_listener(app: AppContext) -> Result<()> {
         };
         let connection_app = app.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             if let Err(err) = handle_connection(
                 stream,
                 peer_addr,
