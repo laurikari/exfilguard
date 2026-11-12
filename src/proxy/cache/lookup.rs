@@ -39,6 +39,11 @@ impl CacheHit {
             );
         if cached.status == StatusCode::NO_CONTENT {
             cached.headers.remove(http::header::CONTENT_LENGTH);
+        } else if cached.status == StatusCode::RESET_CONTENT {
+            cached.headers.insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_static("0"),
+            );
         }
         if !body_is_empty {
             cached.headers.remove(http::header::CONTENT_LENGTH);

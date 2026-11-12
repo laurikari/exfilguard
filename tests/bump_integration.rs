@@ -3005,6 +3005,89 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bumped_cached_reset_content_preserves_http1_response_boundaries() -> Result<()> {
+    let policy_name = "cache-reset-content";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(&["GET"], "https://localhost/**").cache_force_duration(60));
+    let mut fixture =
+        BumpedTlsFixture::new(BumpedTlsOptions::new("localhost", policy_name, policy).with_cache())
+            .await?;
+    let authority = format!("localhost:{}", fixture.upstream_addr().port());
+    let cache = fixture.cache();
+    let request_headers = http::HeaderMap::new();
+    let next_uri: Uri = format!("https://{authority}/next").parse()?;
+    cache
+        .store(
+            &Method::GET,
+            &next_uri,
+            &request_headers,
+            StatusCode::OK,
+            &http::HeaderMap::new(),
+            b"next response",
+            StdDuration::from_secs(60),
+        )
+        .await?;
+
+    // Model both an H2 entry without Content-Length and an older persisted
+    // entry with an incorrect length. Neither may absorb the next response.
+    for (path, length) in [("/no-length", None), ("/old-length", Some("99"))] {
+        let uri: Uri = format!("https://{authority}{path}").parse()?;
+        let mut headers = http::HeaderMap::new();
+        if let Some(length) = length {
+            headers.insert(
+                http::header::CONTENT_LENGTH,
+                HeaderValue::from_static(length),
+            );
+        }
+        cache
+            .store(
+                &Method::GET,
+                &uri,
+                &request_headers,
+                StatusCode::RESET_CONTENT,
+                &headers,
+                b"",
+                StdDuration::from_secs(60),
+            )
+            .await?;
+
+        let mut client = fixture.http1_client();
+        client
+            .send(format!(
+                "GET {path} HTTP/1.1\r\nHost: {authority}\r\n\r\n\
+                 GET /next HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+            ))
+            .await?;
+        let response = timeout(
+            StdDuration::from_secs(2),
+            client.read_response_with_length(),
+        )
+        .await??;
+        assert!(response.starts_with("HTTP/1.1 205 "), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("\r\ncontent-length: 0\r\n")
+        );
+        assert!(response.ends_with("\r\n\r\n"), "{response}");
+        let next = timeout(
+            StdDuration::from_secs(2),
+            client.read_response_with_length(),
+        )
+        .await??;
+        assert!(next.starts_with("HTTP/1.1 200 "), "{next}");
+        assert!(next.ends_with("\r\n\r\nnext response"), "{next}");
+    }
+    assert_eq!(
+        fixture.request_count(),
+        0,
+        "all responses must come from cache"
+    );
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_bump_http2_body_requests_bypass_cache() -> Result<()> {
     let upstream_host = "localhost";
     let policy_name = "cache-h2-bodyless-only";
