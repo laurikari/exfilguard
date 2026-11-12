@@ -193,6 +193,25 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_request_rejects_bracketed_non_ipv6_authorities() -> Result<()> {
+        let flow_context = RequestFlowContext {
+            session_id: "test-session".into(),
+            outer_method: "CONNECT".into(),
+            effective_mode: EffectiveMode::Bump,
+            authorization_token: None,
+            client_session: None,
+        };
+        for host in ["[v1.allowed.invalid]", "[allowed.invalid]", "[127.0.0.1]"] {
+            let uri: Uri = format!("https://{host}/").parse()?;
+            assert!(
+                sanitize_request_parts(&Method::GET, &uri, &HeaderMap::new(), 1024, &flow_context)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sanitize_request_preserves_content_length() -> Result<()> {
         let uri: Uri = "https://example.com/upload".parse()?;
         let mut headers = HeaderMap::new();

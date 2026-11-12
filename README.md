@@ -350,6 +350,8 @@ cargo fuzz run http1_chunked_body fuzz/seeds/http1_chunked_body
 
 The `connect_target` seeds cover signed, empty, textual, and overflowing ports.
 Their decoded first byte selects the split between the two candidate authorities.
+Bracketed DNS and IPvFuture seeds exercise rejection in CONNECT targets and
+HTTP/1 Host fields and absolute request targets.
 
 The `http1_request_head` seeds include absolute HTTPS targets, signed object
 requests, conflicting authorities, non-HTTPS schemes, Upgrade headers, and

@@ -422,6 +422,11 @@ spellings from routing the credential to another virtual host. Workloads use
 issued or fixed URLs, so supporting alternate IPv6 spellings is unnecessary.
 The port, path, and query remain unchanged, as does credential-free forwarding.
 
+All request authorities require bracketed hosts to parse as IPv6. Unsupported
+IPvFuture literals and bracketed DNS names are rejected before policy evaluation
+or resolution; removing their brackets would authorize a different kind of host
+from the one sent to the origin.
+
 Before asking for authentication headers, ExfilGuard resolves and checks the
 destination and builds the exact request it will send. The service may fill only
 the header positions approved by the client configuration. A unique ID and a

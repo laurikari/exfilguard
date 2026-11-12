@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -187,10 +187,18 @@ pub fn parse_host_header(value: &str) -> Result<(String, Option<u16>)> {
     };
     let host = uri
         .host()
-        .ok_or_else(|| anyhow!("Host header missing hostname"))?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let host = canonicalize_policy_host(host)?;
+        .ok_or_else(|| anyhow!("Host header missing hostname"))?;
+    let host = if let Some(literal) = host.strip_prefix('[') {
+        // IPvFuture and bracketed DNS names must never become DNS policy hosts.
+        literal
+            .strip_suffix(']')
+            .ok_or_else(|| anyhow!("unterminated IP literal"))?
+            .parse::<Ipv6Addr>()
+            .context("bracketed authority must contain an IPv6 address")?
+            .to_string()
+    } else {
+        canonicalize_policy_host(host)?
+    };
     Ok((host, port))
 }
 
@@ -322,6 +330,32 @@ fn build_parsed_request(
 mod tests {
     use super::*;
     use http::Method;
+
+    #[test]
+    fn reject_bracketed_non_ipv6_authorities_on_every_request_path() -> Result<()> {
+        for host in [
+            "[v1.allowed.invalid]",
+            "[allowed.invalid]",
+            "[127.0.0.1]",
+            "[v1.a:b]",
+        ] {
+            for suffix in ["", ":443"] {
+                let authority = format!("{host}{suffix}");
+                assert!(parse_host_header(&authority).is_err(), "{authority}");
+                assert!(
+                    parse_http1_request(Method::GET, "/", Some(&authority), Scheme::Https).is_err()
+                );
+                let target = format!("https://{authority}/");
+                assert!(parse_http1_request(Method::GET, &target, None, Scheme::Https).is_err());
+                let uri: Uri = target.parse()?;
+                assert!(parse_uri_request(Method::GET, &uri, Scheme::Https).is_err());
+                let valid =
+                    parse_http1_request(Method::GET, "/", Some("allowed.invalid"), Scheme::Https)?;
+                assert!(valid.validate_host_header(&authority).is_err());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn reject_invalid_explicit_ports() {

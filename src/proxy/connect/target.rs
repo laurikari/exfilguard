@@ -29,12 +29,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_explicit_ports() {
+    fn rejects_invalid_authorities() {
         for target in [
             "example.com:",
             "example.com:+80",
             "example.com:wat",
             "[::1]:65536",
+            "[v1.allowed.invalid]:443",
+            "[allowed.invalid]:443",
+            "[127.0.0.1]:443",
         ] {
             assert!(parse_connect_target(target).is_err(), "{target}");
         }
