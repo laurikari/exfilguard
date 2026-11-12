@@ -109,6 +109,64 @@ mod tests {
     }
 
     #[test]
+    fn cache_keys_keep_outbound_authority_spellings_distinct() -> anyhow::Result<()> {
+        use crate::config::Scheme;
+        use crate::proxy::request::{parse_http1_request, parse_uri_request};
+        for authorities in [
+            vec!["[::1]", "[::1]:443", "[::1]:0443", "[0:0:0:0:0:0:0:1]:443"],
+            vec![
+                "[2001:db8::a]:443",
+                "[2001:DB8::A]:443",
+                "[2001:0db8:0:0:0:0:0:a]:443",
+            ],
+            vec!["[::ffff:127.0.0.1]:443", "[::ffff:7f00:1]:443"],
+            vec![
+                "example.com",
+                "example.com:443",
+                "EXAMPLE.com:443",
+                "example.com.:443",
+            ],
+        ] {
+            let mut keys = std::collections::HashSet::new();
+            let mut policy_destination = None;
+            for authority in authorities {
+                let uri: Uri = format!("https://{authority}/resource?x=%2F").parse()?;
+                let requests = [
+                    parse_http1_request(
+                        Method::GET,
+                        "/resource?x=%2F",
+                        Some(authority),
+                        Scheme::Https,
+                    )?,
+                    parse_http1_request(
+                        Method::GET,
+                        &uri.to_string(),
+                        Some(authority),
+                        Scheme::Https,
+                    )?,
+                    parse_uri_request(Method::GET, &uri, Scheme::Https)?,
+                ];
+                let expected_key = CacheKey::new(&Method::GET, &uri);
+                assert!(
+                    keys.insert(expected_key.entry_id().to_string()),
+                    "authority collision: {authority}"
+                );
+                for request in requests {
+                    let destination = (request.host.clone(), request.port);
+                    assert_eq!(
+                        policy_destination.get_or_insert(destination.clone()),
+                        &destination
+                    );
+                    let key = CacheKey::new(&request.method, &request.cache_uri()?);
+                    assert_eq!(key.key_base(), expected_key.key_base());
+                    assert_eq!(key.entry_id(), expected_key.entry_id());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn vary_matches_complete_ordered_value_list() {
         let name = HeaderName::from_static("x-variant");
         let mut request = HeaderMap::new();

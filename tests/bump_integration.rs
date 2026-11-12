@@ -2939,7 +2939,8 @@ async fn bumped_cache_reuses_http1_chunk_payload_for_http2() -> Result<()> {
     )
     .await?;
     let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
-    let expected_body = "request=1\npath=/cross/h1-to-h2\nprotocol=http/1.1";
+    let expected_body =
+        format!("request=1\npath=/cross/h1-to-h2\nprotocol=http/1.1\nauthority={authority}");
 
     {
         let mut client = fixture.http1_client();
@@ -2998,7 +2999,8 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
     )
     .await?;
     let authority = format!("{}:{}", upstream_host, fixture.upstream_addr().port());
-    let expected_body = "request=1\npath=/cross/h2-to-h1\nprotocol=h2";
+    let expected_body =
+        format!("request=1\npath=/cross/h2-to-h1\nprotocol=h2\nauthority={authority}");
     let uri = Uri::builder()
         .scheme("https")
         .authority(authority.as_str())
@@ -3043,6 +3045,55 @@ async fn bumped_cache_reuses_http2_payload_for_fixed_http1_response() -> Result<
         "HTTP/1 request should reuse the HTTP/2-populated cache entry"
     );
 
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bumped_cache_separates_authority_spellings_across_protocols() -> Result<()> {
+    let policy_name = "cache-authorities";
+    let policy = PolicySpec::new(policy_name)
+        .rule(RuleSpec::allow(&["GET"], "https://localhost/**").cache_enabled());
+    let mut fixture = BumpedTlsFixture::new(
+        BumpedTlsOptions::new("localhost", policy_name, policy)
+            .client_protocols(ClientProtocols::Http2Preferred)
+            .upstream_mode(UpstreamMode::DualProtocolCacheInspect)
+            .with_cache(),
+    )
+    .await?;
+    let port = fixture.upstream_addr().port();
+    let authorities = [format!("LOCALHOST.:{port}"), format!("localhost:{port}")];
+    let mut bodies = Vec::new();
+    let mut client = fixture.h2_client().await?;
+    for authority in &authorities {
+        let request = bumped_h2_request(authority, Method::GET, "/authority")?;
+        let uri = request.uri().clone();
+        let (status, body) = client.request_text(request).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.ends_with(&format!("authority={authority}")), "{body}");
+        bodies.push(body);
+        wait_for_bumped_cache_entry(&fixture, &uri).await?;
+    }
+    assert_eq!(fixture.request_count(), 2, "alternate authority was reused");
+    client.shutdown().await;
+
+    for (authority, expected) in authorities.iter().zip(bodies) {
+        fixture.reconnect(ClientProtocols::Http1).await?;
+        let mut client = fixture.http1_client();
+        client
+            .send(format!(
+                "GET /authority HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            ))
+            .await?;
+        let response = client.read_response_with_length().await?;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1, expected);
+    }
+    assert_eq!(
+        fixture.request_count(),
+        2,
+        "matching authorities should reuse cached payloads across protocols"
+    );
     fixture.shutdown().await;
     Ok(())
 }

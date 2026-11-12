@@ -12,7 +12,9 @@ use tracing::{trace, warn};
 
 use super::{CacheEntry, CacheKey, CacheState, PersistedEntry, SweepStats};
 
-const CACHE_LAYOUT_VERSION: u32 = 6;
+// v7 keys include the exact outbound authority; v6 entries may contain responses
+// obtained from a different virtual host under an equivalent policy authority.
+const CACHE_LAYOUT_VERSION: u32 = 7;
 const CACHE_VERSION_PREFIX: &str = "v";
 const CACHE_TOMBSTONE_PREFIX: &str = "tombstone-";
 

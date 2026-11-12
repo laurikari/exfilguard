@@ -281,17 +281,12 @@ impl ParsedRequest {
         self.flow.as_ref()
     }
 
-    /// Build an absolute URI for cache keying that includes scheme, host, port, and path/query.
+    /// Cache the exact outbound authority and path/query, not the canonical policy host.
     pub fn cache_uri(&self) -> Result<Uri> {
-        let port = self.port.unwrap_or_else(|| self.scheme.default_port());
-        let authority = if self.host.contains(':') {
-            format!("[{}]:{}", self.host, port)
-        } else {
-            format!("{}:{}", self.host, port)
-        };
+        let authority = self.authority_host();
         Uri::builder()
             .scheme(scheme_name(self.scheme))
-            .authority(authority.as_str())
+            .authority(authority)
             .path_and_query(self.path.as_str())
             .build()
             .with_context(|| {

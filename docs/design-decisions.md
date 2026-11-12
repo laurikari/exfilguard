@@ -611,6 +611,13 @@ Inspected HTTP/1.1 and HTTP/2 traffic uses one shared response cache. Entries
 store canonical response headers and decoded payload bytes, not HTTP/1 chunk
 framing or HTTP/2 frames. A hit is framed for the downstream protocol.
 
+Cache keys retain the exact outbound `Host` / `:authority` spelling as well as
+the raw path and query. Policy-equivalent authorities can select different origin
+virtual hosts, so their responses must not share a cache entry. This sacrifices
+cache sharing between alternate spellings without rewriting forwarded requests.
+The cache namespace changed from v6 to v7 to discard existing entries whose
+original outbound authority cannot be recovered.
+
 This keeps cache policy independent of ALPN and allows an entry populated over
 one HTTP version to serve the other. Responses with trailers are forwarded but
 not stored, and HTTP/1 responses with transfer-coding chains other than a sole

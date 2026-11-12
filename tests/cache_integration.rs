@@ -1,7 +1,7 @@
 mod support;
 
 use std::{
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -9,7 +9,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -17,6 +17,86 @@ use tokio::{
 };
 
 use support::*;
+
+#[tokio::test]
+async fn alternate_ipv6_hosts_cannot_poison_another_clients_cache() -> Result<()> {
+    let origin = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await?;
+    let port = origin.local_addr()?.port();
+    let origin_task = tokio::spawn(async move {
+        // Model two virtual hosts on one origin, selected by the forwarded Host.
+        for _ in 0..2 {
+            let (mut stream, _) = origin.accept().await?;
+            let request = read_until_double_crlf(&mut stream).await?;
+            let host = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("host").then(|| value.trim())
+                })
+                .context("upstream request missing Host")?;
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: public, max-age=600\r\nConnection: close\r\n\r\n{host}",
+                host.len(),
+            ).as_bytes()).await?;
+            stream.shutdown().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let (clients, policies) = TestConfigBuilder::new()
+        .client_ip("attacker", "127.0.0.1", &["cache"])
+        .fallback_client("victim", &["cache"])
+        .policy(
+            PolicySpec::new("cache")
+                .rule(RuleSpec::allow(&["GET"], format!("http://[::1]:{port}/**")).cache_enabled()),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let alternate = format!("[0:0:0:0:0:0:0:1]:{port}");
+    let canonical = format!("[::1]:{port}");
+    for (source, authority) in [
+        (Ipv4Addr::new(127, 0, 0, 1), &alternate),
+        (Ipv4Addr::new(127, 0, 0, 2), &canonical),
+        (Ipv4Addr::new(127, 0, 0, 1), &alternate),
+        (Ipv4Addr::new(127, 0, 0, 2), &canonical),
+    ] {
+        let socket = TcpSocket::new_v4()?;
+        socket.bind((source, 0).into())?;
+        let mut stream = socket.connect(harness.addr).await?;
+        stream
+            .write_all(
+                format!("GET /resource HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let response =
+            tokio::time::timeout(StdDuration::from_secs(2), read_http_response(&mut stream))
+                .await??;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.ends_with(&format!("\r\n\r\n{authority}")),
+            "wrong virtual host: {response}"
+        );
+        let uri: Uri = format!("http://{authority}/resource").parse()?;
+        let cache = harness.cache.as_ref().unwrap();
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while cache
+                .lookup(&Method::GET, &uri, &HeaderMap::new())
+                .await
+                .is_none()
+            {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await?;
+    }
+    origin_task.await??;
+    harness.shutdown().await;
+    Ok(())
+}
 
 fn response_header_values<'a>(response: &'a str, name: &str) -> Vec<&'a str> {
     response
@@ -1192,7 +1272,7 @@ async fn test_cache_write_failure_does_not_abort_response() -> Result<()> {
         .cache_dir
         .as_ref()
         .expect("cache dir enabled")
-        .join("v6");
+        .join("v7");
 
     let readonly_marker = Arc::new(AtomicUsize::new(0));
     let watcher_dir = cache_version_dir.clone();

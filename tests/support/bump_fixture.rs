@@ -898,6 +898,7 @@ async fn serve_dual_cache_h2(
         let (request, mut respond) = result.context("failed to accept HTTP/2 request")?;
         let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
         let path = request.uri().path().to_string();
+        let authority = request.uri().authority().unwrap().as_str().to_string();
         let mut request_body = request.into_body();
         while let Some(frame) = request_body.data().await {
             let chunk = frame.context("failed to read HTTP/2 request body")?;
@@ -907,9 +908,11 @@ async fn serve_dual_cache_h2(
                 .context("failed to release HTTP/2 request body capacity")?;
         }
 
-        let response_body = format!("request={sequence}\npath={path}\nprotocol=h2");
+        let response_body =
+            format!("request={sequence}\npath={path}\nprotocol=h2\nauthority={authority}");
         let response = http::Response::builder()
             .status(StatusCode::OK)
+            .header(http::header::CACHE_CONTROL, "public, max-age=600")
             .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(())
             .map_err(|err| anyhow!("failed to build HTTP/2 response: {err}"))?;
@@ -936,14 +939,22 @@ async fn serve_dual_cache_http1(
         let sequence = request_count.fetch_add(1, Ordering::SeqCst) + 1;
         let path = request_path(&request);
         let close = request.to_ascii_lowercase().contains("connection: close");
-        let response_body = format!("request={sequence}\npath={path}\nprotocol=http/1.1");
+        let authority = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("host").then(|| value.trim())
+            })
+            .context("request missing Host")?;
+        let response_body =
+            format!("request={sequence}\npath={path}\nprotocol=http/1.1\nauthority={authority}");
         let split = response_body.len().div_ceil(2);
         let chunks = [
             &response_body.as_bytes()[..split],
             &response_body.as_bytes()[split..],
         ];
         let response_head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: {}\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: public, max-age=600\r\nTransfer-Encoding: chunked\r\nConnection: {}\r\n\r\n",
             if close { "close" } else { "keep-alive" }
         );
         tls.write_all(response_head.as_bytes()).await?;

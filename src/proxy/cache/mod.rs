@@ -1096,6 +1096,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discards_fresh_entries_from_the_canonical_authority_cache() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cache = build_cache(4, dir.path().to_path_buf(), 1024, 10240).await?;
+        let uri: Uri = "https://[::1]:443/resource".parse()?;
+        let headers = HeaderMap::new();
+        cache
+            .store(
+                &Method::GET,
+                &uri,
+                &headers,
+                StatusCode::OK,
+                &headers,
+                b"wrong virtual host",
+                Duration::from_secs(600),
+            )
+            .await?;
+        assert!(cache.lookup(&Method::GET, &uri, &headers).await.is_some());
+        drop(cache);
+        // The on-disk entry format is unchanged; model a fresh v6 entry whose
+        // canonical key no longer identifies the authority that produced it.
+        fs::rename(cache_version_dir(dir.path()), dir.path().join("v6"))?;
+        let rebuilt = build_cache(4, dir.path().to_path_buf(), 1024, 10240).await?;
+        assert!(rebuilt.lookup(&Method::GET, &uri, &headers).await.is_none());
+        assert!(!dir.path().join("v6").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn uses_versioned_cache_dir_and_cleans_old_versions() -> Result<()> {
         let dir = TempDir::new()?;
         let old_dir = dir.path().join("v4");
@@ -1112,7 +1140,7 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
-        assert_eq!(active_name, "v6");
+        assert_eq!(active_name, "v7");
         let mut cleaned = false;
         for _ in 0..10 {
             let dirs = fs::read_dir(dir.path())?

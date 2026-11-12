@@ -934,7 +934,9 @@ The cache follows standard HTTP cache headers from upstream servers.
 #### Scope
 
 Within one ExfilGuard instance, the cache is shared across all clients and
-inspected HTTP/1.1 and HTTP/2 traffic. Responses are keyed by method and absolute URI. `Vary` headers
+inspected HTTP/1.1 and HTTP/2 traffic. Responses are keyed by method and absolute
+URI, retaining the exact outbound authority spelling and raw path/query. Alternate
+host spellings do not share responses, even when they match the same policy. `Vary` headers
 decide which request headers are part of the cache key. Enable caching only if
 cross-client sharing is acceptable in your environment.
 
@@ -1008,7 +1010,7 @@ removed on lookup.
 
 #### Layout and Sweeping
 
-Cache entries live under a versioned subdirectory (`v6` under the cache root).
+Cache entries live under a versioned subdirectory (`v7` under the cache root).
 Metadata is keyed by request URI and points to an immutable body generation.
 When the layout changes, old version directories are deleted asynchronously. A
 background sweeper runs every `cache_sweeper_interval` seconds and inspects up
