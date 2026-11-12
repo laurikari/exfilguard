@@ -46,6 +46,12 @@ parsed and serialized to one numeric spelling before comparison. The original
 request target remains unchanged for forwarding, logging, cache keys, and
 signature-sensitive traffic.
 
+Host wildcards operate on ASCII labels: an embedded `*` matches zero or more
+letters, digits, or hyphens within one label. Whole-label `*` and `**` retain
+their one-label and one-or-more-label meanings. Partial labels use the existing
+linear-time regex engine; literal labels keep direct comparisons. All policy
+paths share this matcher, including CONNECT preflight and delegated policies.
+
 Policy path patterns must already be canonical: configurations containing dot
 segments or repeated slash separators are rejected. Rewriting a pattern could
 silently change operator intent, especially when the removed segment contains

@@ -232,12 +232,18 @@ fn compile_host_pattern(host: &str) -> Result<HostMatcher> {
 
     let labels = host
         .split('.')
-        .map(|label| match label {
-            "*" => HostLabel::Single,
-            "**" => HostLabel::Multi,
-            other => HostLabel::Exact(Arc::from(other.to_ascii_lowercase())),
+        .map(|label| {
+            Ok(match label {
+                "*" => HostLabel::Single,
+                "**" => HostLabel::Multi,
+                other if other.contains('*') => HostLabel::Partial(Regex::new(&format!(
+                    r"\A{}\z",
+                    regex::escape(&other.to_ascii_lowercase()).replace(r"\*", "[a-z0-9-]*")
+                ))?),
+                other => HostLabel::Exact(Arc::from(other.to_ascii_lowercase())),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(HostMatcher::Pattern(HostPattern::new(labels)))
 }
@@ -363,6 +369,54 @@ mod tests {
             matcher,
             HostMatcher::Ip(addr) if addr == "2001:db8::10".parse::<IpAddr>().unwrap()
         ));
+    }
+
+    #[test]
+    fn partial_host_labels_match_without_crossing_dots() {
+        for (pattern, host, expected) in [
+            ("cdn-*.example.com", "cdn-1.example.com", true),
+            ("cdn-*.example.com", "CDN-eu.EXAMPLE.COM", true),
+            ("cdn-*.example.com", "cdn-.example.com", true),
+            ("cdn-*.example.com", "cdn.example.com", false),
+            ("cdn-*.example.com", "xcdn-1.example.com", false),
+            ("cdn-*.example.com", "cdn-1.eu.example.com", false),
+            ("cdn-*.example.com", "cdn-_.example.com", false),
+            ("cdn-*.example.com", "cdn-é.example.com", false),
+            ("download*.example.net", "download.example.net", true),
+            ("download*.example.net", "download2.example.net", true),
+            ("download*.example.net", "download.2.example.net", false),
+            ("*-prod.example.com", "api-prod.example.com", true),
+            ("*-prod.example.com", "prod.example.com", false),
+            ("a-*-b-*.example.com", "a-eu-b-123.example.com", true),
+            ("a-*-b-*.example.com", "a--b-.example.com", true),
+            ("a-*-b-*.example.com", "a-eu-b.example.com", false),
+            ("**.cdn-*.example.com", "a.b.cdn-eu.example.com", true),
+            ("**.cdn-*.example.com", "cdn-eu.example.com", false),
+            ("*.cdn-*.example.com", "a.b.cdn-eu.example.com", false),
+            ("xn--*.example.com", "xn--bcher-kva.example.com", true),
+        ] {
+            let url = crate::config::parse_url_pattern(&format!("https://{pattern}/**")).unwrap();
+            let matcher = compile_host_pattern(&url.host).unwrap();
+            assert_eq!(matcher.matches(host), expected, "{pattern} against {host}");
+        }
+    }
+
+    #[test]
+    fn reject_embedded_double_stars_and_non_ipv6_brackets() {
+        for host in [
+            "cdn-**.example.com",
+            "a***b.example.com",
+            "a_b*.example.com",
+            "[2001:db8::*]",
+            "[cdn-*.example.com]",
+            "[example.com]",
+            "[192.0.2.1]",
+        ] {
+            assert!(
+                crate::config::parse_url_pattern(&format!("https://{host}/**")).is_err(),
+                "accepted {host}"
+            );
+        }
     }
 
     #[test]

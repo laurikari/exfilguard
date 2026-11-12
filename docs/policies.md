@@ -201,6 +201,9 @@ Use `http` or `https`.
 |---------|---------|
 | `example.com` | Exact domain |
 | `*.example.com` | Exactly one subdomain label of example.com |
+| `cdn-*.example.com` | `cdn-1.example.com`, `cdn-eu.example.com`, or `cdn-.example.com` |
+| `download*.example.net` | `download.example.net` or `download2.example.net` |
+| `*-prod.example.com` | `api-prod.example.com` or `web-prod.example.com` |
 | `**.example.com` | Any depth of subdomains of example.com (one or more) |
 | `example.**` | Any suffix depth under example |
 | `*` | Any host |
@@ -208,9 +211,16 @@ Use `http` or `https`.
 | `[2001:db8::1]` | Exact IPv6 address (bracketed) |
 
 !!! note
-    Host matching is case-insensitive. Wildcards must be whole labels:
-    `*.example.com` and `**.example.com` are valid, but `a*b.com` is not.
-    `*` matches one label. `**` matches one or more labels.
+    Host matching is case-insensitive. Within a label, `*` matches zero or more
+    ASCII letters, digits, or hyphens, never a dot. Multiple separated wildcards
+    are allowed, as in `a-*-b-*`. A whole-label `*` matches one label; `**` matches
+    one or more labels and must occupy a whole label. Bracketed IPv6 addresses
+    must be literal addresses without wildcards.
+
+    Internationalized names match their ASCII A-label spelling, so `xn--*`
+    matches encoded labels. Prefer a specific literal prefix or suffix to keep
+    permissions narrow. These semantics apply to HTTP requests, HTTPS inspection
+    preflight, tunnel rules, and delegated policies.
 
 ### Port
 

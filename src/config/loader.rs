@@ -378,6 +378,8 @@ fn parse_host_and_port(value: &str) -> Result<(&str, Option<u16>)> {
             .find(']')
             .ok_or_else(|| anyhow!("invalid IPv6 host pattern"))?;
         let host = &value[1..end];
+        host.parse::<std::net::Ipv6Addr>()
+            .context("bracketed host pattern must be an IPv6 address")?;
         let rest = &value[end + 1..];
         if rest.is_empty() {
             return Ok((host, None));

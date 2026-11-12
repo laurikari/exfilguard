@@ -314,6 +314,7 @@ pub struct HostPattern {
 #[derive(Debug, Clone)]
 pub enum HostLabel {
     Exact(Arc<str>),
+    Partial(Regex),
     Single,
     Multi,
 }
@@ -340,6 +341,10 @@ impl HostPattern {
         while label_idx < labels.len() {
             match self.labels.get(pattern_idx) {
                 Some(HostLabel::Exact(expected)) if labels[label_idx] == expected.as_ref() => {
+                    pattern_idx += 1;
+                    label_idx += 1;
+                }
+                Some(HostLabel::Partial(pattern)) if pattern.is_match(labels[label_idx]) => {
                     pattern_idx += 1;
                     label_idx += 1;
                 }

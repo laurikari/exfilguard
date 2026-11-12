@@ -394,6 +394,47 @@ mod tests {
     }
 
     #[test]
+    fn partial_host_labels_apply_to_inspection_tunnels_and_delegated_policies() {
+        let mut policy = allow_policy();
+        let rule = &mut Arc::make_mut(&mut policy.rules)[0];
+        rule.url_pattern =
+            Some(crate::config::parse_url_pattern("https://cdn-*.example.com/**").unwrap());
+        let dynamic =
+            crate::authorization::policy::DynamicPolicy::compile_rules(policy.rules.to_vec())
+                .unwrap();
+        let inspect = crate::policy::compile::compile_policy(&policy).unwrap();
+        let rule = &mut Arc::make_mut(&mut policy.rules)[0];
+        rule.methods = MethodMatch::List(vec![Method::CONNECT]);
+        rule.https_mode = HttpsMode::Tunnel;
+        crate::config::validate_policy_rules(&policy).unwrap();
+        let tunnel = crate::policy::compile::compile_policy(&policy).unwrap();
+
+        for (host, allowed) in [
+            ("cdn-EU.example.com", true),
+            ("other.example.com", false),
+            ("cdn-eu.extra.example.com", false),
+        ] {
+            let mut request = Request {
+                method: &Method::GET,
+                scheme: Scheme::Https,
+                host,
+                port: Some(443),
+                path: "/file",
+                query: None,
+            };
+            assert_eq!(evaluate_policy(&inspect, &request).is_some(), allowed);
+            assert_eq!(dynamic.evaluate(&request).is_some(), allowed);
+            request.method = &Method::CONNECT;
+            assert_eq!(
+                evaluate_tls_bump_preflight(inspect.rules.iter(), &request),
+                allowed
+            );
+            assert_eq!(dynamic.allows_tls_bump(&request), allowed);
+            assert_eq!(evaluate_policy(&tunnel, &request).is_some(), allowed);
+        }
+    }
+
+    #[test]
     fn snapshot_exposes_client_and_policy_counts() {
         let config = build_config(true);
         let compiled = Arc::new(compile_config(&config).expect("compile config"));

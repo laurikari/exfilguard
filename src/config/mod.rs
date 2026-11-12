@@ -35,13 +35,8 @@ fn methods_connect_only(methods: &MethodMatch) -> bool {
 }
 
 fn validate_host_pattern(host: &str) -> Result<()> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if host.contains('*') {
-            bail!("IP literals must not contain '*'");
-        }
-        match ip {
-            IpAddr::V4(_) | IpAddr::V6(_) => return Ok(()),
-        }
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
     }
 
     if host.contains('/') {
@@ -59,11 +54,11 @@ fn validate_host_pattern(host: &str) -> Result<()> {
         if label == "*" || label == "**" {
             continue;
         }
-        if label.contains('*') {
-            bail!("'*' may only appear as entire host label");
+        if label.contains("**") {
+            bail!("'**' may only appear as entire host label");
         }
         for ch in label.chars() {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '*' {
                 continue;
             }
             bail!("host label '{}' contains invalid character '{}'", label, ch);
