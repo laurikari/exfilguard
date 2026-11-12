@@ -274,7 +274,10 @@ url_pattern = "https://*.example.test:{port}/safe"
                 let authority = format!("secret.example.test:{port}");
                 for (request_line, expected_status) in [
                     (format!("GET https://{authority}/safe HTTP/1.1"), 470),
-                    (format!("CONNECT {authority} HTTP/1.1"), 403),
+                    (
+                        format!("CONNECT {authority} HTTP/1.1"),
+                        if methods == "ANY" { 470 } else { 403 },
+                    ),
                 ] {
                     let (mut client, server) = tokio::io::duplex(4096);
                     let task = tokio::spawn(proxy::http::handle_http(

@@ -1332,6 +1332,7 @@ async fn connect_default_deny_returns_403() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_inspect_deny_does_not_authorize_transport_preflight() -> Result<()> {
+    let logs = LogCapture::new("info").await;
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let upstream_addr = upstream_listener.local_addr()?;
     let dirs = TestDirs::new()?;
@@ -1341,6 +1342,7 @@ async fn connect_inspect_deny_does_not_authorize_transport_preflight() -> Result
             PolicySpec::new("deny-only").rule(
                 RuleSpec::deny(&["ANY"], format!("https://*:{}/**", upstream_addr.port()))
                     .status(470)
+                    .reason("Policy Blocked")
                     .body("inner request denied"),
             ),
         )
@@ -1356,11 +1358,22 @@ async fn connect_inspect_deny_does_not_authorize_transport_preflight() -> Result
     );
     client.send(request).await?;
 
-    let response = client.read_headers().await?;
+    let response = client.read_response().await?;
     assert!(
-        response.starts_with("HTTP/1.1 403"),
-        "deny-only inspect rule authorized CONNECT preflight: {response}"
+        response.starts_with("HTTP/1.1 470 Policy Blocked"),
+        "missing configured CONNECT denial: {response}"
     );
+    assert!(response.ends_with("inner request denied"), "{response}");
+    let log = logs.wait_for("policy=\"deny-only\"").await?;
+    let line = log
+        .lines()
+        .find(|line| {
+            line.contains("transport=\"tls_bump_preflight\"") && line.contains("deny-only")
+        })
+        .unwrap();
+    assert!(line.contains("policy=\"deny-only\""), "{line}");
+    assert!(line.contains("rule=\"deny-only#0\""), "{line}");
+    assert!(line.contains("effective_mode=\"bump\""), "{line}");
     assert!(
         timeout(StdDuration::from_millis(100), upstream_listener.accept())
             .await
@@ -1368,6 +1381,36 @@ async fn connect_inspect_deny_does_not_authorize_transport_preflight() -> Result
         "deny-only inspect rule caused an upstream connection"
     );
 
+    client.shutdown().await;
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_preflight_uses_the_first_catch_all_deny_response() -> Result<()> {
+    let dirs = TestDirs::new()?;
+    let clients = "[[client]]\nname='default'\nfallback=true\npolicies=['first', 'second']\n";
+    let policies = r#"
+[[policy]]
+name = "first"
+rule = [{ action = "DENY", status = 470, reason = "Policy Blocked", body = "first deny" }]
+[[policy]]
+name = "second"
+rule = [{ action = "DENY", status = 471, body = "second deny" }]
+"#;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, clients, policies)
+        .spawn()
+        .await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    client
+        .send(b"CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n\r\n")
+        .await?;
+    let response = client.read_response().await?;
+    assert!(
+        response.starts_with("HTTP/1.1 470 Policy Blocked"),
+        "{response}"
+    );
+    assert!(response.ends_with("first deny"), "{response}");
     client.shutdown().await;
     harness.shutdown().await;
     Ok(())

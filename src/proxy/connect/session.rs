@@ -163,6 +163,7 @@ impl ConnectSession {
         stream: &mut S,
         deny: &DenyDecision,
         log: &RequestLogContext<'_>,
+        mode: EffectiveMode,
     ) -> Result<()> {
         let spec = policy_response::policy_deny_spec(deny);
         self.respond_with_builder(
@@ -172,12 +173,15 @@ impl ConnectSession {
             spec.body_http1,
             "DENY",
             |builder| {
-                policy_response::decorate_policy_deny_log(
+                let builder = builder
+                    .request_id(log.request_id())
+                    .effective_mode(mode.as_str());
+                let builder = if mode == EffectiveMode::Bump {
+                    builder.transport("tls_bump_preflight")
+                } else {
                     builder
-                        .request_id(log.request_id())
-                        .effective_mode("tunnel"),
-                    deny,
-                )
+                };
+                policy_response::decorate_policy_deny_log(builder, deny)
             },
         )
         .await

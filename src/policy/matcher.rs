@@ -157,6 +157,51 @@ impl PolicySnapshot {
         }
         None
     }
+
+    /// Select presentation for a refused preflight, never permission to connect.
+    pub(crate) fn tls_bump_denial_response(
+        &self,
+        addr: IpAddr,
+        name: Option<&str>,
+        request: &Request,
+    ) -> Option<EvaluationResult> {
+        let client = self.request_client(addr, name)?;
+        if request.method != Method::CONNECT
+            || request.scheme != Scheme::Https
+            || self
+                .matcher
+                .evaluate_tls_bump_preflight(&client.policies, request)
+        {
+            return None;
+        }
+        for policy in client
+            .policies
+            .iter()
+            .filter_map(|&index| self.compiled.policies.get(index))
+        {
+            let rule = policy.rules.iter().find(|rule| {
+                matches!(rule.action, RuleAction::Deny { .. })
+                    && rule.https_mode == HttpsMode::Inspect
+                    && rule.methods.is_any()
+                    && rule.query_present.is_none()
+                    && rule.url.as_ref().is_none_or(|url| {
+                        url.matches_authority(request.scheme, request.host, request.port)
+                            && url.query.is_none()
+                            && url
+                                .path
+                                .as_ref()
+                                .is_none_or(|path| path.original().as_ref() == "/**")
+                    })
+            });
+            if let Some(rule) = rule {
+                return Some(EvaluationResult {
+                    client: client.name.clone(),
+                    decision: make_decision(policy, rule),
+                });
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +476,76 @@ mod tests {
             );
             assert_eq!(dynamic.allows_tls_bump(&request), allowed);
             assert_eq!(evaluate_policy(&tunnel, &request).is_some(), allowed);
+        }
+    }
+
+    #[test]
+    fn preflight_denial_response_requires_an_unrestricted_inner_request_scope() {
+        let request = Request {
+            method: &Method::CONNECT,
+            scheme: Scheme::Https,
+            host: "blocked.test",
+            port: Some(443),
+            path: "/",
+            query: None,
+        };
+        for (pattern, method, query_present, selected) in [
+            (None, None, None, true),
+            (Some("https://blocked.test"), None, None, true),
+            (Some("https://blocked.test/**"), None, None, true),
+            (Some("https://blocked.test:8443/**"), None, None, false),
+            (Some("https://other.test/**"), None, None, false),
+            (Some("http://blocked.test/**"), None, None, false),
+            (Some("https://blocked.test/private/**"), None, None, false),
+            (Some("https://blocked.test/**?token=x"), None, None, false),
+            (None, Some(Method::GET), None, false),
+            (None, None, Some(true), false),
+            (None, None, Some(false), false),
+        ] {
+            let mut config = build_config(true).into_inner();
+            let deny = &mut Arc::make_mut(&mut config.policies[1].rules)[0];
+            deny.url_pattern =
+                pattern.map(|pattern| crate::config::parse_url_pattern(pattern).unwrap());
+            deny.methods =
+                method.map_or(MethodMatch::Any, |method| MethodMatch::List(vec![method]));
+            deny.query_present = query_present;
+            let compiled = compile_config(&ValidatedConfig::new(config).unwrap()).unwrap();
+            let snapshot = PolicySnapshot::new(Arc::new(compiled));
+            let result =
+                snapshot.tls_bump_denial_response("127.0.0.1".parse().unwrap(), None, &request);
+            assert_eq!(
+                result.is_some(),
+                selected,
+                "pattern={pattern:?}, query_present={query_present:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_denial_response_preserves_policy_order_and_eligible_allows() {
+        let request = Request {
+            method: &Method::CONNECT,
+            scheme: Scheme::Https,
+            host: "api.example.com",
+            port: Some(443),
+            path: "/",
+            query: None,
+        };
+        for deny_first in [false, true] {
+            let mut config = build_config(true).into_inner();
+            if deny_first {
+                Arc::make_mut(&mut config.clients[0].policies).reverse();
+            }
+            let compiled = compile_config(&ValidatedConfig::new(config).unwrap()).unwrap();
+            let snapshot = PolicySnapshot::new(Arc::new(compiled));
+            let result =
+                snapshot.tls_bump_denial_response("127.0.0.1".parse().unwrap(), None, &request);
+            assert_eq!(result.is_some(), deny_first);
+            if let Some(result) = result {
+                assert!(
+                    matches!(result.decision, Decision::Deny { policy, .. } if policy.as_ref() == "deny-all")
+                );
+            }
         }
     }
 

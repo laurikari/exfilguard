@@ -297,6 +297,15 @@ HTTP/1-only origins. Operators must account for those transport effects when
 authoring inspection policies; every actual inner request still undergoes
 normal ordered authorization.
 
+If local inspection preflight fails, its response may come from the first
+authority-wide inspection deny: unrestricted methods and queries, with no path
+constraint or `/**`. Response selection runs only after the authorization check
+fails and cannot grant transport access. This reuses configured denial responses
+without pretending to know an inner method or URL; authentication challenges and
+explicit tunnel decisions retain precedence. A local allowance rejected only by
+delegated policy keeps the default refusal rather than borrowing a local deny
+that did not block it.
+
 Inspected HTTP/1 accepts both origin-form targets and absolute HTTPS URIs.
 Every inspected HTTP/1 or HTTP/2 request must match the CONNECT host and
 effective port and retain the HTTPS scheme before policy evaluation or cache

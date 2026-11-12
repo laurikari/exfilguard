@@ -363,6 +363,18 @@ path and path-wildcard requirements when constructing URL patterns.
 - Enables normal request logging, metrics, and caching when configured
 - Request metrics use `effective_mode="bump"` on the inspected inner request
 
+When local inspection preflight refuses an authority, ExfilGuard uses the first
+applicable inspection `DENY` rule's status, reason, and body. Eligible rules have
+`methods = ["ANY"]`, no query constraints, and either no URL pattern or a matching
+HTTPS host/port with no path or `/**`. Method-, path-, and query-specific denials
+cannot determine an unknown inner request. If none qualifies, the response is the
+built-in 403. Authentication challenges still take precedence.
+
+This only selects the refusal response; it does not change which connections
+preflight permits. The access log identifies the supplying policy and rule with
+`effective_mode="bump"` and `transport="tls_bump_preflight"`. Deployments using a
+custom catch-all DENY status should expect that status on refused CONNECTs too.
+
 ### https_mode = "tunnel"
 
 - Traffic is tunneled without inspection

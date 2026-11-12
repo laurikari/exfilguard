@@ -414,6 +414,22 @@ enum PolicyOutcomeInternal {
     Deny(DenyDecision),
 }
 
+pub(crate) fn tls_bump_denial_response(
+    snapshot: &PolicySnapshot,
+    peer: SocketAddr,
+    parsed: &ParsedRequest,
+) -> Option<DenyDecision> {
+    let result = snapshot.tls_bump_denial_response(
+        peer.ip(),
+        parsed.client_name.as_deref(),
+        &parsed.as_policy_request(),
+    )?;
+    match into_decision(result) {
+        PolicyOutcomeInternal::Deny(deny) => Some(deny),
+        PolicyOutcomeInternal::Allow(_) => None,
+    }
+}
+
 fn into_decision(result: EvaluationResult) -> PolicyOutcomeInternal {
     let EvaluationResult { client, decision } = result;
     match decision {
