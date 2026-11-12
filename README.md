@@ -369,7 +369,8 @@ HTTP/2 request headers and HTTP/1 chunked trailers.
 
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,
-conflicting transfer encoding, and a forged response appended after a 204:
+conflicting transfer encoding, Unicode whitespace around transfer-coding tokens,
+and a forged response appended after a 204:
 
 ```shell
 cargo fuzz run http1_response_head fuzz/seeds/http1_response_head

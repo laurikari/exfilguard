@@ -314,7 +314,7 @@ fn parse_transfer_codings(value: &str) -> Result<Vec<String>> {
 
     let mut codings = Vec::with_capacity(items.len());
     for item in items {
-        let item = item.trim();
+        let item = item.trim_matches([' ', '\t']);
         if item.is_empty() {
             bail!("empty transfer coding in upstream Transfer-Encoding");
         }
@@ -323,7 +323,7 @@ fn parse_transfer_codings(value: &str) -> Result<Vec<String>> {
             .map_or((item, None), |(coding, parameters)| {
                 (coding, Some(parameters))
             });
-        let coding = coding.trim();
+        let coding = coding.trim_matches([' ', '\t']);
         parse_header_name(coding)
             .map_err(|_| anyhow!("invalid transfer coding '{coding}' from upstream"))?;
         if coding.eq_ignore_ascii_case("chunked") && parameters.is_some() {
@@ -511,7 +511,7 @@ mod tests {
     use super::super::headers::Http1HeaderLine;
     use super::{
         ConnectionOverride, Http1ResponseHead, encode_cached_http1_response,
-        parse_http1_status_line, read_http1_response_head,
+        parse_http1_status_line, parse_transfer_codings, read_http1_response_head,
     };
     use crate::proxy::http::forward::ResponseBodyPlan;
     use http::{StatusCode, Version};
@@ -862,6 +862,49 @@ mod tests {
         assert!(head.transfer_encoding_present);
         assert!(!head.chunked);
         Ok(())
+    }
+
+    #[test]
+    fn transfer_codings_reject_unicode_whitespace_and_invalid_tokens() {
+        for whitespace in [
+            '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2028}', '\u{2029}', '\u{202f}',
+            '\u{205f}', '\u{3000}',
+        ] {
+            for value in [
+                format!("{whitespace}chunked"),
+                format!("chunked{whitespace}"),
+                format!("ch{whitespace}unked"),
+                format!("gzip,{whitespace}chunked"),
+                format!("gzip{whitespace}; note=x, chunked"),
+            ] {
+                assert!(
+                    parse_transfer_codings(&value).is_err(),
+                    "accepted {value:?}"
+                );
+            }
+        }
+        for value in [
+            "",
+            ",chunked",
+            "gzip,,chunked",
+            "chunk ed",
+            "(chunked)",
+            "chunked; x=1",
+        ] {
+            assert!(parse_transfer_codings(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn transfer_codings_accept_http_whitespace_and_preserve_quoted_data() {
+        assert_eq!(
+            parse_transfer_codings(" \tChUnKeD\t ").unwrap(),
+            ["chunked"]
+        );
+        assert_eq!(
+            parse_transfer_codings(" \tGZIP \t; note=\"a,b\u{a0}\", \tCHUNKED\t ").unwrap(),
+            ["gzip", "chunked"],
+        );
     }
 
     #[tokio::test]

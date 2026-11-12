@@ -468,6 +468,66 @@ async fn http_invalid_upstream_header_value_returns_502() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_transfer_codings_use_only_http_whitespace() -> Result<()> {
+    for (coding, valid) in [("\u{a0}chunked\u{a0}", false), (" \tChUnKeD\t ", true)] {
+        let first = TestUpstream::http_response(
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {coding}\r\n\r\n4\r\nONE!\r\n0\r\n\r\n")
+                .into_bytes(),
+        )
+        .await?;
+        let second = TestUpstream::http_ok("PRIVATE SECOND RESPONSE").await?;
+        let (clients, policies) = TestConfigBuilder::new()
+            .default_client(&["allow"])
+            .policy(
+                PolicySpec::new("allow")
+                    .rule(RuleSpec::allow(
+                        &["GET"],
+                        format!("http://127.0.0.1:{}/**", first.port()),
+                    ))
+                    .rule(RuleSpec::allow(
+                        &["GET"],
+                        format!("http://127.0.0.1:{}/**", second.port()),
+                    )),
+            )
+            .render();
+        let harness = ProxyHarnessBuilder::with_dirs(TestDirs::new()?, &clients, &policies)
+            .spawn()
+            .await?;
+        let mut client = ProxyClient::connect(harness.addr).await?;
+        client.send(format!(
+            "GET http://127.0.0.1:{first}/one HTTP/1.1\r\nHost: 127.0.0.1:{first}\r\n\r\n\
+             GET http://127.0.0.1:{second}/two HTTP/1.1\r\nHost: 127.0.0.1:{second}\r\nConnection: close\r\n\r\n",
+            first = first.port(), second = second.port(),
+        )).await?;
+        let response = timeout(StdDuration::from_secs(2), client.read_response()).await??;
+        if valid {
+            assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+            assert_eq!(response.matches("HTTP/1.1 200").count(), 2, "{response:?}");
+            assert!(
+                response.contains("ONE!") && response.contains("PRIVATE SECOND RESPONSE"),
+                "{response:?}"
+            );
+            assert_eq!(second.accept_count(), 1);
+        } else {
+            assert!(response.starts_with("HTTP/1.1 502"), "{response:?}");
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response:?}");
+            assert!(
+                !response.contains("ONE!") && !response.contains("PRIVATE SECOND RESPONSE"),
+                "{response:?}"
+            );
+            assert_eq!(
+                second.accept_count(),
+                0,
+                "pipelined origin was contacted after malformed framing"
+            );
+        }
+        client.shutdown().await;
+        harness.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_upstream_status_lines_are_rejected_before_forwarding() -> Result<()> {
     let cases = [
         (

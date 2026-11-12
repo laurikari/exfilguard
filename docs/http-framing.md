@@ -24,6 +24,11 @@ is found after the origin response headers have already been sent downstream,
 ExfilGuard closes the downstream connection instead of appending a second HTTP
 response.
 
+Upstream transfer-coding names are ASCII HTTP tokens. Only ASCII space and tab
+are treated as surrounding whitespace; Unicode whitespace is rejected rather
+than interpreted as part of `chunked` framing. Invalid coding names produce a 502
+before upstream headers are sent, and the client connection closes.
+
 ## Legacy or Lenient Upstreams
 
 Some origins incorrectly send `Content-Length: 0` on a `204 No Content`
