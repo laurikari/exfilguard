@@ -852,7 +852,8 @@ This budget does not cap total process memory, which also includes frame metadat
 TLS/TCP buffers, outgoing queues, headers, caching, and delegated authorization
 bodies. Automatic sizing does not establish exclusive ownership of host memory.
 
-Use [the local benchmarks](../perf/h2/README.md) when tuning the ceilings or budget.
+Use [the local benchmarks](https://github.com/laurikari/exfilguard/blob/main/perf/h2/README.md)
+when tuning the ceilings or budget.
 Adaptive growth can add startup time to fresh transfers. Setting both window
 ceilings to 65535 prevents growth beyond that size.
 
