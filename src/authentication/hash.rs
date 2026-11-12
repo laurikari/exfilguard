@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use anyhow::{Result, anyhow, bail, ensure};
 use argon2::{
     Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHash as PhcHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash as PhcHash},
 };
 use rand::{TryRng, rngs::SysRng};
 
@@ -61,14 +61,9 @@ impl PasswordHash {
                 hash.salt.is_some() && hash.hash.is_some(),
                 "incomplete Argon2id password hash"
             );
-            let mut salt = [0; 64];
-            let salt = hash
-                .salt
-                .expect("checked salt")
-                .decode_b64(&mut salt)
-                .map_err(|_| anyhow!("invalid Argon2id salt"))?;
+            let salt_len = hash.salt.as_ref().expect("checked salt").len();
             ensure!(
-                salt.len() >= argon2::MIN_SALT_LEN,
+                salt_len >= argon2::MIN_SALT_LEN,
                 "Argon2id salt is too short"
             );
             let params =
@@ -77,10 +72,7 @@ impl PasswordHash {
                 params.m_cost() <= 262_144 && params.t_cost() <= 10 && params.p_cost() <= 8,
                 "Argon2id password hash exceeds verification cost limits"
             );
-            VerificationProfile::Argon2id {
-                params,
-                salt_len: salt.len(),
-            }
+            VerificationProfile::Argon2id { params, salt_len }
         } else if ["$2a$", "$2b$", "$2y$"]
             .iter()
             .any(|prefix| encoded.starts_with(prefix))
@@ -138,12 +130,10 @@ pub fn generate_hash(password: &str, algorithm: PasswordAlgorithm) -> Result<Str
             SysRng
                 .try_fill_bytes(&mut salt)
                 .map_err(|_| anyhow!("failed to generate password salt"))?;
-            let salt = SaltString::encode_b64(&salt)
-                .map_err(|_| anyhow!("failed to encode password salt"))?;
             let params = Params::new(65_536, 3, 1, Some(32))
                 .map_err(|_| anyhow!("invalid Argon2id parameters"))?;
             Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-                .hash_password(password.as_bytes(), &salt)
+                .hash_password_with_salt(password.as_bytes(), &salt)
                 .map(|hash| hash.to_string())
                 .map_err(|_| anyhow!("failed to hash password"))
         }

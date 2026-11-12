@@ -45,10 +45,7 @@ fn generates_supported_hashes_without_loading_configuration() -> Result<()> {
             "argon2id" => {
                 assert!(hash.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
                 argon2::Argon2::default()
-                    .verify_password(
-                        password.as_bytes(),
-                        &argon2::PasswordHash::new(hash).unwrap(),
-                    )
+                    .verify_password(password.as_bytes(), hash)
                     .unwrap();
             }
             "bcrypt" => {
