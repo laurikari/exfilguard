@@ -5,6 +5,8 @@ use anyhow::{Result, anyhow};
 use http::StatusCode;
 use time::OffsetDateTime;
 use tracing::Level;
+use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::fmt::format::{DefaultFields, FormatFields, Writer};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::cli::LogFormat;
@@ -44,11 +46,44 @@ pub fn init_logger(format: LogFormat) -> Result<()> {
             .with_env_filter(filter)
             .with_target(false)
             .compact()
+            .fmt_fields(EscapedTextFields)
             .try_init()
             .map_err(|err| anyhow!(err))?,
     }
 
     Ok(())
+}
+
+struct EscapedTextFields;
+
+impl<'writer> FormatFields<'writer> for EscapedTextFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        writer: Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        // Format fields without ANSI styling so only the outer event formatter
+        // can emit terminal controls. This also covers Display-formatted errors.
+        DefaultFields::new().format_fields(Writer::new(&mut EscapedTextWriter(writer)), fields)
+    }
+}
+
+struct EscapedTextWriter<'a>(Writer<'a>);
+
+impl std::fmt::Write for EscapedTextWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if !value.contains(char::is_control) {
+            return self.0.write_str(value);
+        }
+        for ch in value.chars() {
+            if ch.is_control() {
+                write!(self.0, "{}", ch.escape_debug())?;
+            } else {
+                self.0.write_char(ch)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +451,33 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn text_fields_escape_controls_in_errors_messages_and_spans() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufferWriter {
+                buf: buffer.clone(),
+            })
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .compact()
+            .fmt_fields(EscapedTextFields)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request", host = %"example.com\rforged");
+            let _entered = span.enter();
+            let error = anyhow!("invalid method '\x1b[2J\nforged\x08\u{009b}'");
+            tracing::warn!(error = %error, "rejected\r\nrequest – café");
+        });
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let line = output.strip_suffix('\n').expect("one event terminator");
+        assert!(!line.contains(char::is_control), "{output:?}");
+        assert!(line.contains(r"example.com\rforged"), "{output:?}");
+        assert!(line.contains(r"\u{1b}[2J\nforged\u{8}\u{9b}"), "{output:?}");
+        assert!(line.contains(r"rejected\r\nrequest – café"), "{output:?}");
+    }
 
     #[derive(Clone)]
     struct BufferWriter {

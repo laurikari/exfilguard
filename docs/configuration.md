@@ -742,6 +742,9 @@ request format.
 | `log` | String | `"json"` | Log format: `"json"` or `"text"` |
 | `log_queries` | Boolean | false | Whether to log each request query |
 
+Text log fields escape control characters, including terminal escapes and embedded
+newlines. JSON logs use JSON escaping.
+
 ---
 
 ## Timeout Settings
