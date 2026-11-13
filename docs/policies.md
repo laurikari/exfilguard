@@ -210,6 +210,12 @@ Use `http` or `https`.
 | `192.0.2.1` | Exact IPv4 address |
 | `[2001:db8::1]` | Exact IPv6 address (bracketed) |
 
+IPv4 addresses in requests and literal policy hosts must have four decimal
+components without leading zeros. Legacy abbreviated, octal, hexadecimal, and
+single-integer spellings recognized by the system resolver are rejected.
+DNS names with numeric labels, such as `123.example.com`, and standard compressed
+or expanded IPv6 spellings remain supported.
+
 !!! note
     Host matching is case-insensitive. Within a label, `*` matches zero or more
     ASCII letters, digits, or hyphens, never a dot. Multiple separated wildcards

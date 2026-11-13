@@ -8,7 +8,7 @@ use crate::canonical_path::canonicalize_request_path;
 use crate::config::Scheme;
 use crate::logging::AccessLogBuilder;
 use crate::policy::matcher::Request as PolicyRequest;
-use crate::util::canonicalize_ip_literal;
+use crate::util::{canonicalize_ip_literal, reject_legacy_ipv4};
 
 /// Common representation of an HTTP request after parsing the start line / pseudo headers.
 ///
@@ -212,6 +212,7 @@ fn canonicalize_policy_host(host: &str) -> Result<String> {
     if host.is_empty() {
         bail!("Host header missing hostname");
     }
+    reject_legacy_ipv4(host)?;
     Ok(host.to_string())
 }
 
@@ -381,6 +382,52 @@ mod tests {
                 assert_eq!(parsed.port, Some(expected));
                 assert_eq!(parsed.authority_host(), authority);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reject_legacy_ipv4_on_every_request_path() -> Result<()> {
+        for host in [
+            "127.1",
+            "127.0.1",
+            "0177.0.0.1",
+            "2130706433",
+            "0x7f000001",
+            "0x7f.1",
+            "0X7F.0.0.1",
+            "01.01.01.01",
+            "0x01010101",
+            "0",
+            "127.1.",
+            "0x7f000001.",
+        ] {
+            let authority = format!("{host}:443");
+            assert!(parse_host_header(&authority).is_err(), "{host}");
+            assert!(
+                parse_http1_request(Method::GET, "/", Some(&authority), Scheme::Https).is_err(),
+                "{host}"
+            );
+            let uri: Uri = format!("https://{authority}/").parse()?;
+            assert!(
+                parse_uri_request(Method::GET, &uri, Scheme::Https).is_err(),
+                "{host}"
+            );
+            assert!(
+                parse_http1_request(Method::GET, &uri.to_string(), None, Scheme::Https).is_err(),
+                "{host}"
+            );
+        }
+        for host in [
+            "127.0.0.1",
+            "1.1.1.1",
+            "[2001:0DB8::0001]",
+            "123.example.com",
+            "0x7f.example.com",
+            "EXAMPLE.com.",
+        ] {
+            let parsed = parse_http1_request(Method::GET, "/", Some(host), Scheme::Http)?;
+            assert_eq!(parsed.authority_host(), host);
         }
         Ok(())
     }

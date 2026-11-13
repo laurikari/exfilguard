@@ -16,7 +16,7 @@ pub use model::{
     Rule, RuleAction, Scheme, UrlPattern,
 };
 
-use crate::util::cidrs_overlap;
+use crate::util::{cidrs_overlap, reject_legacy_ipv4};
 
 pub(crate) const MAX_CACHE_TTL_SECONDS: u64 = 1 << 31;
 
@@ -65,6 +65,9 @@ fn validate_host_pattern(host: &str) -> Result<()> {
         }
     }
 
+    if !host.contains('*') {
+        reject_legacy_ipv4(host)?;
+    }
     Ok(())
 }
 
@@ -529,6 +532,43 @@ mod tests {
     };
     use http::{Method, StatusCode};
     use std::sync::Arc;
+
+    #[test]
+    fn policy_hosts_reject_legacy_ipv4_without_restricting_dns_patterns() {
+        for host in [
+            "127.1",
+            "127.0.1",
+            "0177.0.0.1",
+            "2130706433",
+            "0x7f000001",
+            "0x7f.1",
+            "0X7F.0.0.1",
+            "01.01.01.01",
+            "0",
+        ] {
+            let error = super::parse_url_pattern(&format!("http://{host}/**")).unwrap_err();
+            assert!(
+                error.to_string().contains("four decimal components"),
+                "{host}: {error}"
+            );
+        }
+        for host in [
+            "127.0.0.1",
+            "1.1.1.1",
+            "[2001:0DB8::0001]",
+            "123.example.com",
+            "0x7f.example.com",
+            "*",
+            "*.example.com",
+            "0x*.example.com",
+            "123.*",
+        ] {
+            assert!(
+                super::parse_url_pattern(&format!("http://{host}/**")).is_ok(),
+                "{host}"
+            );
+        }
+    }
 
     fn fallback_client(policy_name: &str) -> Client {
         Client {

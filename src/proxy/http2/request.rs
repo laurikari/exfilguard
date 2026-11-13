@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_request_rejects_bracketed_non_ipv6_authorities() -> Result<()> {
+    fn sanitize_request_rejects_invalid_numeric_authorities() -> Result<()> {
         let flow_context = RequestFlowContext {
             session_id: "test-session".into(),
             outer_method: "CONNECT".into(),
@@ -201,7 +201,15 @@ mod tests {
             authorization_token: None,
             client_session: None,
         };
-        for host in ["[v1.allowed.invalid]", "[allowed.invalid]", "[127.0.0.1]"] {
+        for host in [
+            "[v1.allowed.invalid]",
+            "[allowed.invalid]",
+            "[127.0.0.1]",
+            "127.1",
+            "0177.0.0.1",
+            "2130706433",
+            "0x7f000001",
+        ] {
             let uri: Uri = format!("https://{host}/").parse()?;
             assert!(
                 sanitize_request_parts(&Method::GET, &uri, &HeaderMap::new(), 1024, &flow_context)

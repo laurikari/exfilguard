@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use ipnet::{IpNet, Ipv6Net};
 use tokio::time::timeout;
 
@@ -39,6 +39,35 @@ pub fn parse_ip_or_cidr(value: &str) -> Result<IpOrCidr> {
 /// Return the canonical textual representation when `value` is an IP literal.
 pub fn canonicalize_ip_literal(value: &str) -> Option<String> {
     value.parse::<IpAddr>().ok().map(|addr| addr.to_string())
+}
+
+/// Reject nonstandard IPv4 spellings recognized by the system resolver.
+/// Call this on the host spelling that will actually be passed to the resolver.
+pub(crate) fn reject_legacy_ipv4(host: &str) -> Result<()> {
+    use nix::libc;
+
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let host = std::ffi::CString::new(host).context("host contains a NUL byte")?;
+    // SAFETY: addrinfo is a C struct whose unspecified hints must be zero/null.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = libc::AF_INET;
+    hints.ai_socktype = libc::SOCK_STREAM;
+    hints.ai_flags = libc::AI_NUMERICHOST;
+    let mut result = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for this call. AI_NUMERICHOST prohibits DNS
+    // lookups, so even ordinary hostnames are checked locally and synchronously.
+    let status = unsafe { libc::getaddrinfo(host.as_ptr(), std::ptr::null(), &hints, &mut result) };
+    match status {
+        0 => {
+            // SAFETY: a successful getaddrinfo call owns this result list.
+            unsafe { libc::freeaddrinfo(result) };
+            bail!("IPv4 addresses must use four decimal components without leading zeros");
+        }
+        libc::EAI_NONAME => Ok(()),
+        _ => bail!("numeric host validation failed (resolver error {status})"),
+    }
 }
 
 /// Treat an IPv4-mapped IPv6 address as the IPv4 address it represents.

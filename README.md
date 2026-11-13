@@ -367,6 +367,9 @@ Forwarding-header alias seeds cover underscore and mixed hyphen/underscore
 spellings alongside an unrelated underscore header. They exercise HTTP/1 and
 HTTP/2 request headers and HTTP/1 chunked trailers.
 
+Legacy IPv4 seeds cover abbreviated, octal, hexadecimal, and single-integer
+hosts in HTTP/1 requests and CONNECT targets, including trailing root dots.
+
 The HTTP/1 response target also checks final-response framing normalization.
 Its seeds cover zero-length 204 compatibility, signed-zero rejection,
 conflicting transfer encoding, Unicode whitespace around transfer-coding tokens,

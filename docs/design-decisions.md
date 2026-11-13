@@ -46,6 +46,13 @@ parsed and serialized to one numeric spelling before comparison. The original
 request target remains unchanged for forwarding, logging, cache keys, and
 signature-sensitive traffic.
 
+IPv4 literals must use four decimal components without leading zeros, in both
+requests and literal policy hosts. Other spellings recognized as numeric IPv4 by
+the system resolver are rejected using its numeric-only mode, without DNS queries.
+This prevents policy matching from treating a resolver-recognized address as a
+DNS name, without maintaining another address parser or rewriting forwarded hosts.
+Standard IPv6 spellings remain supported and canonicalized for policy matching.
+
 Host wildcards operate on ASCII labels: an embedded `*` matches zero or more
 letters, digits, or hyphens within one label. Whole-label `*` and `**` retain
 their one-label and one-or-more-label meanings. Partial labels use the existing

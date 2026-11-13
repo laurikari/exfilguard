@@ -12,6 +12,68 @@ use support::*;
 const ADDRESS_BLOCK: &str = "upstream address blocked (private_address)";
 
 #[tokio::test]
+async fn legacy_ipv4_cannot_evade_a_literal_deny_before_a_broad_allow() -> Result<()> {
+    let origin = TestUpstream::http_ok("should not be reached").await?;
+    let port = origin.port();
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["numeric"])
+        .policy(
+            PolicySpec::new("numeric")
+                .rule(
+                    RuleSpec::deny(&["CONNECT"], format!("https://127.0.0.1:{port}/**"))
+                        .status(403)
+                        .https_mode("tunnel"),
+                )
+                .rule(
+                    RuleSpec::allow(&["CONNECT"], format!("https://*:{port}/**"))
+                        .https_mode("tunnel"),
+                )
+                .rule(RuleSpec::deny(&["GET"], format!("http://127.0.0.1:{port}/**")).status(403))
+                .rule(RuleSpec::allow(&["GET"], format!("http://*:{port}/**"))),
+        )
+        .render();
+    let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+        .with_private_test_upstreams(false)
+        .with_settings(|settings| {
+            settings.allow_private_upstream_cidrs = vec!["127.0.0.1/32".parse().unwrap()]
+        })
+        .spawn()
+        .await?;
+    for host in [
+        "127.0.0.1",
+        "127.1",
+        "127.0.1",
+        "0177.0.0.1",
+        "0x7f000001",
+        "2130706433",
+        "0x7f.1",
+        "127.1.",
+    ] {
+        let authority = format!("{host}:{port}");
+        let status = if host == "127.0.0.1" { 403 } else { 400 };
+        for (method, target) in [
+            ("GET", "/probe".to_string()),
+            ("GET", format!("http://{authority}/probe")),
+            ("CONNECT", authority.clone()),
+        ] {
+            let mut client = harness.connect().await?;
+            client.write_all(format!(
+                "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await?;
+            let response =
+                timeout(Duration::from_secs(2), read_http_response(&mut client)).await??;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{method} {target}: {response}"
+            );
+        }
+    }
+    assert_eq!(origin.accept_count(), 0);
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn non_public_destinations_are_blocked_across_proxy_modes() -> Result<()> {
     for authority in [
         "[fec0::1]:8443",
