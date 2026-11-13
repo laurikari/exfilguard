@@ -1,0 +1,33 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: ExfilGuard
+Label: ExfilGuard
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: ExfilGuard APT repository
+Date: Fri, 13 Nov 2026 12:50:48 +0000
+MD5Sum:
+ a2b7b99d60896093fc1fea36f5977832 1232 Packages
+ 1b2925d0318219def54485cbaff414dd 540 Packages.gz
+SHA256:
+ ca8b70477c85707c316c47c6526b616bb740ddd5660feb2cc02d026a275c6f4c 1232 Packages
+ 5cd54f956b115fc8b6bc6ea8ef93ee2592ef9529f378aef48532ada75eb4d3b8 540 Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEyJFWZ7YnOfoL4nUHN+p1Ine1luAFAmr3B6oACgkQN+p1Ine1
+luBGCQ/+Jt6y31MqTnJ70rbkYGUggEgu0IXelnoHNWkE/8ubRtVl8BINpYP6r4Kh
+9mx38ZrLn65LynohUehQX0Wsm8wKEZ5jL1z0ValleAFxBPayZE+3/GZNfaZ3BVl7
+sklGVpNDwIsYXXULEsVbb5qdlHhRyowY23KwmmeeZT/FjtLYzaHZlh+x8Lc78JuU
+6luigBM74tmWSjQXMZ+dqXIocf89TmkOzpMW0b6SmOSp55K3j0BYdpdCqf19VEUB
+B4pWp2didTtVs22APGBYSkLCsND2RmE6Go1+jjNc7G4P8kdgdeIxSWhfcQqbyAfi
+k7RRkxaxcNYYRvdtbVQJy+bTH+Wj3XtSb/vLfA/TzciV8Uh+et1Dvp4crceRJcax
+49L5x3c1bURveBOhb58WBMK92RiQbjJjv5i0e0Zvbr+s9NQ0xQNniNR4T8LMiPC0
+In5ZeT+tXcUGG3SvTD3Tp3J/FsrcaMNdYWuMQhNGgwltc4hHqhBSFs3ba6DzL81N
+wZXjXbHm5OKSoIsJHQrye7OQPt/vm8L1hBw9mgr6vWs0k2YJ4OJK8VIO0cypKCAr
+fpoCUmhmbsDczxh5mA9WylSoak6E3PVcHgNDzhFshC9gaCNMvrWK7lgcB4N1sht2
+gE5tADuIx81uwpXIAzQ/RxENsbAKR0WgCnPYw78PjgOePkbV/uQ=
+=lQqR
+-----END PGP SIGNATURE-----
