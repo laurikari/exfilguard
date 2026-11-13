@@ -280,10 +280,7 @@ impl UrlMatcher {
         }
         let expected = self.port.unwrap_or(self.scheme.default_port());
         let actual = port.unwrap_or(scheme.default_port());
-        if expected != actual {
-            return false;
-        }
-        true
+        expected == actual
     }
 }
 
