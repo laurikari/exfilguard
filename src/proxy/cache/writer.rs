@@ -321,7 +321,7 @@ impl CacheWriter {
             .state
             .insert_entry(self.key.key_base().to_string(), entry);
         self.committed = true;
-        trace!("stored cache entry for {}", self.key.key_base());
+        trace!(entry_id = %key_id, "stored cache entry");
 
         self.state
             .remove_evicted_files_async(evicted, &key_id)

@@ -5,6 +5,41 @@ use http::{Method, StatusCode};
 
 use support::*;
 
+#[tokio::test]
+async fn cache_trace_does_not_disclose_redacted_queries() -> Result<()> {
+    let logs = LogCapture::new("info,exfilguard::proxy::cache=trace").await;
+    let origin = TestUpstream::http_response(
+        b"HTTP/1.1 200 OK\r\nCache-Control: public, max-age=600\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ).await?;
+    let (clients, policies) = TestConfigBuilder::new()
+        .default_client(&["cache"])
+        .policy(
+            PolicySpec::new("cache").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{}/**", origin.port()))
+                    .cache_enabled(),
+            ),
+        )
+        .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .with_settings(|settings| settings.log_queries = false)
+        .spawn()
+        .await?;
+    let mut client = ProxyClient::connect(harness.addr).await?;
+    client.send(format!(
+        "GET http://127.0.0.1:{port}/resource?token=cache-query-secret HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+        port = origin.port(),
+    )).await?;
+    assert!(client.read_response().await?.starts_with("HTTP/1.1 200"));
+    let output = logs.wait_for("stored cache entry").await?;
+    assert!(output.contains("entry_id="), "{output}");
+    assert!(!output.contains("cache-query-secret"), "{output}");
+    client.shutdown().await;
+    harness.shutdown().await;
+    Ok(())
+}
+
 fn query_policy() -> PolicySpec {
     PolicySpec::new("queries")
         .rule(RuleSpec::allow(
