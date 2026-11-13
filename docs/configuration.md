@@ -984,6 +984,8 @@ the response's current age.
 - **Bypass**: Requests with `Authorization` or `Cookie` headers are never
   served from cache and are not stored. Requests with fixed-length or chunked
   bodies, or with `Range`, are also bypassed.
+  Request `Cache-Control` fields containing non-ASCII bytes also bypass lookup
+  and storage, so an unrecognized extension cannot hide `no-cache` or `no-store`.
 - **Not cached**: Responses with `no-store`, `no-cache`, or `private`
   directives, any `Set-Cookie` header, or response trailers. HTTP/1 responses
   with transfer codings other than a sole `chunked` coding are also forwarded

@@ -60,6 +60,7 @@ pub mod fuzzing {
             }
             let _ = head.headers.expect_continue();
             let _ = head.headers.content_length();
+            let _ = super::cache_control::request_cache_bypass(&head.headers.forward_header_map());
         }
         Ok(())
     }

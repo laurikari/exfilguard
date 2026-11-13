@@ -1380,6 +1380,64 @@ async fn test_cache_bypass_on_no_cache() -> Result<()> {
     run_cache_bypass_test("Cache-Control: no-cache", "").await
 }
 
+#[tokio::test]
+async fn nonascii_request_cache_control_bypasses_storage_and_hits() -> Result<()> {
+    let upstream = MockUpstream::new("Cache-Control: public, max-age=600").await?;
+    let port = upstream.port();
+    let requests = upstream.requests.clone();
+    let upstream_task = tokio::spawn(upstream.run());
+    let (clients, policies) =
+        TestConfigBuilder::new()
+            .default_client(&["cache"])
+            .policy(PolicySpec::new("cache").rule(
+                RuleSpec::allow(&["GET"], format!("http://127.0.0.1:{port}/**")).cache_enabled(),
+            ))
+            .render();
+    let mut dirs = TestDirs::new()?;
+    dirs.enable_cache_dir()?;
+    let harness = ProxyHarnessBuilder::with_dirs(dirs, &clients, &policies)
+        .spawn()
+        .await?;
+    let uri: Uri = format!("http://127.0.0.1:{port}/nonascii").parse()?;
+    for (header, expected_requests) in [
+        ("Cache-Control: no-store, x=\"é\"\r\n", 1),
+        ("", 2),
+        ("Cache-Control: no-cache, x=\"é\"\r\n", 3),
+        ("", 3),
+    ] {
+        let mut stream = TcpStream::connect(harness.addr).await?;
+        stream.write_all(format!(
+            "GET {uri} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{header}Connection: close\r\n\r\n"
+        ).as_bytes()).await?;
+        let response = read_http_response(&mut stream).await?;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            expected_requests,
+            "{header}"
+        );
+        if expected_requests == 2 {
+            tokio::time::timeout(StdDuration::from_secs(2), async {
+                while harness
+                    .cache
+                    .as_ref()
+                    .unwrap()
+                    .lookup(&Method::GET, &uri, &HeaderMap::new())
+                    .await
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
+    }
+    harness.shutdown().await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cache_bypass_on_authorization_header() -> Result<()> {
     run_cache_bypass_test(

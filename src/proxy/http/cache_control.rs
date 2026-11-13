@@ -237,22 +237,24 @@ pub fn request_cache_bypass(headers: &HeaderMap) -> bool {
     }
 
     for value in headers.get_all(http::header::CACHE_CONTROL) {
-        if let Ok(s) = value.to_str() {
-            for part in s.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                let (name, value) = split_directive(part);
-                if name == "no-cache" || name == "no-store" {
-                    return true;
-                }
-                if name == "max-age"
-                    && let Some(value) = value
-                    && normalize_cc_value(value).parse::<u64>().ok() == Some(0)
-                {
-                    return true;
-                }
+        // An opaque extension must not hide no-cache/no-store in the same field.
+        let Ok(s) = value.to_str() else {
+            return true;
+        };
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (name, value) = split_directive(part);
+            if name == "no-cache" || name == "no-store" {
+                return true;
+            }
+            if name == "max-age"
+                && let Some(value) = value
+                && normalize_cc_value(value).parse::<u64>().ok() == Some(0)
+            {
+                return true;
             }
         }
     }
@@ -596,6 +598,26 @@ mod tests {
             HeaderValue::from_static("no-store"),
         );
         assert!(request_cache_bypass(&headers));
+    }
+
+    #[test]
+    fn request_cache_bypass_on_opaque_cache_control() {
+        for value in [
+            b"no-store, x=\"\xc3\xa9\"".as_slice(),
+            b"no-cache, x=\"\xff\"".as_slice(),
+            b"x=\"\x80\"".as_slice(),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=600"),
+            );
+            headers.append(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+            assert!(request_cache_bypass(&headers), "{value:?}");
+        }
     }
 
     #[test]
