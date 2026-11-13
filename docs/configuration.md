@@ -742,8 +742,9 @@ request format.
 | `log` | String | `"json"` | Log format: `"json"` or `"text"` |
 | `log_queries` | Boolean | false | Whether to log each request query |
 
-Text log fields escape control characters, including terminal escapes and embedded
-newlines. JSON logs use JSON escaping.
+Text log fields escape control characters, including terminal escapes, embedded
+newlines, and Unicode bidirectional controls. Ordinary Unicode text is preserved.
+JSON logs use JSON escaping; display handling belongs to the JSON log viewer.
 
 Rejected CONNECT targets are omitted from warning and access logs. These events
 retain the peer and a fixed rejection reason, without logging the malformed target.

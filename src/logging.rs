@@ -70,13 +70,20 @@ impl<'writer> FormatFields<'writer> for EscapedTextFields {
 
 struct EscapedTextWriter<'a>(Writer<'a>);
 
+fn needs_text_escape(ch: char) -> bool {
+    // Unicode Bidi_Control characters can rearrange displayed fields, but are
+    // format characters rather than char::is_control() control characters.
+    ch.is_control()
+        || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 impl std::fmt::Write for EscapedTextWriter<'_> {
     fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        if !value.contains(char::is_control) {
+        if !value.contains(needs_text_escape) {
             return self.0.write_str(value);
         }
         for ch in value.chars() {
-            if ch.is_control() {
+            if needs_text_escape(ch) {
                 write!(self.0, "{}", ch.escape_debug())?;
             } else {
                 self.0.write_char(ch)?;
@@ -454,6 +461,7 @@ mod tests {
 
     #[test]
     fn text_fields_escape_controls_in_errors_messages_and_spans() {
+        let bidi = "\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}";
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(BufferWriter {
@@ -466,17 +474,23 @@ mod tests {
             .fmt_fields(EscapedTextFields)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("request", host = %"example.com\rforged");
+            let span = tracing::info_span!("request", host = %format!("example.com\rforged{bidi}"));
             let _entered = span.enter();
-            let error = anyhow!("invalid method '\x1b[2J\nforged\x08\u{009b}'");
-            tracing::warn!(error = %error, "rejected\r\nrequest – café");
+            let error = anyhow!("invalid method '\x1b[2J\nforged\x08\u{009b}{bidi}'");
+            tracing::warn!(error = %error, "rejected\r\nrequest – café – العربية {bidi}");
         });
         let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         let line = output.strip_suffix('\n').expect("one event terminator");
-        assert!(!line.contains(char::is_control), "{output:?}");
+        assert!(!line.contains(needs_text_escape), "{output:?}");
+        for ch in bidi.chars() {
+            assert!(line.contains(&ch.escape_debug().to_string()), "{output:?}");
+        }
         assert!(line.contains(r"example.com\rforged"), "{output:?}");
         assert!(line.contains(r"\u{1b}[2J\nforged\u{8}\u{9b}"), "{output:?}");
-        assert!(line.contains(r"rejected\r\nrequest – café"), "{output:?}");
+        assert!(
+            line.contains(r"rejected\r\nrequest – café – العربية"),
+            "{output:?}"
+        );
     }
 
     #[derive(Clone)]
