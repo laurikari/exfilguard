@@ -54,12 +54,11 @@ pub(crate) async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     let mut prefetched = Some(prefetched);
     let parsed_target = match parse_connect_target(target) {
         Ok(parsed) => parsed,
-        Err(err) => {
-            warn!(peer = %peer, target, error = %err, "invalid CONNECT target");
+        Err(_) => {
+            warn!(peer = %peer, "invalid CONNECT target");
             respond_invalid_connect_target(
                 stream.as_mut().expect("stream present"),
                 peer,
-                target,
                 response_timeout,
                 request_bytes as u64,
                 start,
@@ -277,7 +276,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> ConnectRequestHandler<'
 async fn respond_invalid_connect_target<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
     peer: SocketAddr,
-    target: &str,
     response_timeout: std::time::Duration,
     bytes_in: u64,
     start: Instant,
@@ -291,8 +289,9 @@ async fn respond_invalid_connect_target<S: AsyncRead + AsyncWrite + Unpin + Send
         response_timeout,
         bytes_in,
         start.elapsed(),
-        AccessLogBuilder::for_connect(peer, target.to_string(), target.to_string())
-            .decision("ERROR"),
+        AccessLogBuilder::for_connect(peer, "", "")
+            .decision("ERROR")
+            .error_reason("invalid_connect_target"),
     )
     .await
 }

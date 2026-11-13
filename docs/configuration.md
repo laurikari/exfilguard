@@ -745,6 +745,9 @@ request format.
 Text log fields escape control characters, including terminal escapes and embedded
 newlines. JSON logs use JSON escaping.
 
+Rejected CONNECT targets are omitted from warning and access logs. These events
+retain the peer and a fixed rejection reason, without logging the malformed target.
+
 ---
 
 ## Timeout Settings

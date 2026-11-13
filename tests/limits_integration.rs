@@ -550,6 +550,45 @@ async fn early_http1_errors_log_queries_only_when_enabled() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn invalid_connect_targets_are_omitted_from_logs() -> Result<()> {
+    for log_queries in [false, true] {
+        let logs = LogCapture::new("info").await;
+        let (clients, policies) = TestConfigBuilder::new()
+            .default_client(&["allow"])
+            .policy(
+                PolicySpec::new("allow").rule(RuleSpec::allow(&["GET"], "https://example.com/**")),
+            )
+            .render();
+        let harness = ProxyHarnessBuilder::new(&clients, &policies)?
+            .with_settings(move |settings| settings.log_queries = log_queries)
+            .spawn()
+            .await?;
+        for target in [
+            "example.com:443?token=connect-secret-sentinel",
+            "user:connect-secret-sentinel@example.com:443",
+            "example\u{202e}connect-secret-sentinel:443",
+        ] {
+            let mut client = ProxyClient::connect(harness.addr).await?;
+            client
+                .send(format!(
+                    "CONNECT {target} HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+                ))
+                .await?;
+            let response = timeout(StdDuration::from_secs(2), client.read_response()).await??;
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            client.shutdown().await;
+        }
+        harness.shutdown().await;
+        let output = logs.text();
+        assert!(output.contains("invalid CONNECT target"), "{output}");
+        assert!(output.contains("invalid_connect_target"), "{output}");
+        assert!(!output.contains("connect-secret-sentinel"), "{output}");
+        assert!(!output.contains('\u{202e}'), "{output}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn head_response_body_does_not_poison_keepalive() -> Result<()> {
     let dirs = TestDirs::new()?;

@@ -9,7 +9,7 @@ pub struct ConnectTarget {
 }
 
 pub fn parse_connect_target(target: &str) -> Result<ConnectTarget> {
-    parse_host_port(target).with_context(|| format!("failed to parse CONNECT target '{target}'"))
+    parse_host_port(target).context("failed to parse CONNECT target")
 }
 
 fn parse_host_port(value: &str) -> Result<ConnectTarget> {
